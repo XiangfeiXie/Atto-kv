@@ -1,6 +1,3 @@
-
-
-
 #ifndef __KV_STORE_H__
 #define __KV_STORE_H__
 
@@ -10,17 +7,10 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <stddef.h>
-//内存池控制
-#define JEMALLOC 1
 
-#if JEMALLOC
+#include<jemalloc/jemalloc.h>
 
-//内存管理组件
-#include <jemalloc/jemalloc.h>
 
-#endif
-
-//网络引擎控制
 #define NETWORK_REACTOR 	0
 #define NETWORK_PROACTOR	1
 #define NETWORK_NTYCO		2
@@ -31,10 +21,10 @@
 
 #define KVS_MAX_TOKENS		128
 
-//存储引擎控制
-#define ENABLE_ARRAY		1
+#define ENABLE_ARRAY		0
 #define ENABLE_RBTREE		0
 #define ENABLE_HASH			0
+#define ENABLE_SKIPTABLE	1
 
 
 typedef int (*msg_handler)(char *msg, int length, char *response);
@@ -80,7 +70,7 @@ int kvs_array_exist(kvs_array_t *inst, char *key);
 #define BLACK 			2
 
 #define ENABLE_KEY_CHAR		1
-//红黑树存储数据类型控制
+
 #if ENABLE_KEY_CHAR
 typedef char* KEY_TYPE;
 #else
@@ -112,19 +102,16 @@ int kvs_rbtree_del(kvs_rbtree_t *inst, char *key);
 int kvs_rbtree_mod(kvs_rbtree_t *inst, char *key, char *value);
 int kvs_rbtree_exist(kvs_rbtree_t *inst, char *key);
 
-
-
 #endif
 
-//哈希数据类型控制
+
 #if ENABLE_HASH
 
-#define MAX_KEY_LEN	128
+#define MAX_KEY_LEN		128
 #define MAX_VALUE_LEN	512
 #define MAX_TABLE_SIZE	1024
 
 #define ENABLE_KEY_POINTER	1
-
 
 typedef struct hashnode_s {
 #if ENABLE_KEY_POINTER
@@ -135,21 +122,15 @@ typedef struct hashnode_s {
 	char value[MAX_VALUE_LEN];
 #endif
 	struct hashnode_s *next;
-	
 } hashnode_t;
 
-
 typedef struct hashtable_s {
-
-	hashnode_t **nodes; //* change **, 
-
+	hashnode_t **nodes;
 	int max_slots;
 	int count;
-
 } hashtable_t;
 
 typedef struct hashtable_s kvs_hash_t;
-
 
 int kvs_hash_create(kvs_hash_t *hash);
 void kvs_hash_destory(kvs_hash_t *hash);
@@ -159,17 +140,46 @@ int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value);
 int kvs_hash_del(kvs_hash_t *hash, char *key);
 int kvs_hash_exist(kvs_hash_t *hash, char *key);
 
+#endif
+
+
+
+#if ENABLE_SKIPTABLE
+
+
+#define MAX_LEVEL 6
+
+typedef struct Node {
+	int key;
+	char value[128];
+	struct Node **forward;
+} Node;
+
+typedef struct SkipList {
+	int level;
+	Node *header;
+} SkipList;
+
+struct kvs_skiptable {
+	SkipList *skl;
+};
+
+typedef struct kvs_skiptable kvs_skiptable_t;
+
+int kvs_skiptable_create(kvs_skiptable_t *inst);
+void kvs_skiptable_destroy(kvs_skiptable_t *inst);
+
+int kvs_skiptable_set(kvs_skiptable_t *inst, char *key, char *value);
+char* kvs_skiptable_get(kvs_skiptable_t *inst, char *key);
+int kvs_skiptable_del(kvs_skiptable_t *inst, char *key);
+int kvs_skiptable_mod(kvs_skiptable_t *inst, char *key, char *value);
+int kvs_skiptable_exist(kvs_skiptable_t *inst, char *key);
 
 #endif
+
 
 
 void *kvs_malloc(size_t size);
 void kvs_free(void *ptr);
 
-
-
-
 #endif
-
-
-

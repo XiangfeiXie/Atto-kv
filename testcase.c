@@ -45,7 +45,7 @@ void testcase(int connfd, char *msg, char *pattern, char *casename) {
 	recv_msg(connfd, result, MAX_MSG_LENGTH);
 
 	if (strcmp(result, pattern) == 0) {
-		//printf("==> PASS ->  %s\n", casename);
+		printf("==> PASS ->  %s\n", casename);
 	} else {
 		printf("==> FAILED -> %s, '%s' != '%s' \n", casename, result, pattern);
 		exit(1);
@@ -223,13 +223,48 @@ void hash_testcase(int connfd) {
 	testcase(connfd, "HEXIST Teacher", "NO EXIST\r\n", "HEXIST-Teacher");
 
 }
+void skiptable_testcase(int connfd){
+		
+	int count = 10000;
+	int i = 0;
 
+	struct timeval tv_begin;
+	gettimeofday(&tv_begin, NULL);
 
-// ./testcase 192.168.30.128  2000 
+	for (i = 0;i < count;i ++) {
+
+		testcase(connfd, "SSET Teacher King", "OK\r\n", "SSET-Teacher");
+		testcase(connfd, "SGET Teacher", "King\r\n", "SGET-King-Teacher");
+		testcase(connfd, "SMOD Teacher Darren", "OK\r\n", "SMOD-D-Teacher");
+		testcase(connfd, "SGET Teacher", "Darren\r\n", "SGET-Darren-Teacher");
+		testcase(connfd, "SEXIST Teacher", "EXIST\r\n", "SEXIST-Teacher");
+		testcase(connfd, "SDEL Teacher", "OK\r\n", "SDEL-Teacher");
+		testcase(connfd, "SGET Teacher", "NO EXIST\r\n", "SGET-K-Teacher");
+		testcase(connfd, "SMOD Teacher KING", "NO EXIST\r\n", "SMOD-K-Teacher");
+		testcase(connfd, "SEXIST Teacher", "NO EXIST\r\n", "SEXIST-Teacher");
+
+	}
+
+	struct timeval tv_end;
+	gettimeofday(&tv_end, NULL);
+
+	int time_used = TIME_SUB_MS(tv_end, tv_begin); // ms
+
+	printf("skiptable testcase --> time_used: %d, qps: %d\n", time_used, 90000 * 1000 / time_used);
+}
+
+// testcase 192.168.243.131  2000
 int main(int argc, char *argv[]) {
 
 	if (argc != 4) {
-		printf("arg error!!! eg ./testcase 192.168.30.128 2000 + mode\n");
+printf("=================== KV Store Test Menu ===================\n"
+       "  		./kvstore 192.168.30.128	2000 mode			  \n"
+       "  MODE 0        rbtree_testcase_1w(connfd);		     	  \n"
+       "  MODE 1        rbtree_testcase_3w(connfd);		     	  \n"
+       "  MODE 2        array_testcase_1w(connfd);		     	  \n"
+       "  MODE 3        hash_testcase(connfd);		    	 	  \n"
+	   "  MODE 4        skiptable_testcase(connfd);		     	  \n"
+       "==========================================================\n");
 		return -1;
 	}
 
@@ -247,6 +282,8 @@ int main(int argc, char *argv[]) {
 		array_testcase_1w(connfd);
 	} else if (mode == 3) {
 		hash_testcase(connfd);
+	}else if (mode == 4 ){
+		skiptable_testcase(connfd);
 	}
 
 	return 0;

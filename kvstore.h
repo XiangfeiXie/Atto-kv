@@ -10,8 +10,17 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <stddef.h>
+//内存池控制
+#define JEMALLOC 1
 
+#if JEMALLOC
 
+//内存管理组件
+#include <jemalloc/jemalloc.h>
+
+#endif
+
+//网络引擎控制
 #define NETWORK_REACTOR 	0
 #define NETWORK_PROACTOR	1
 #define NETWORK_NTYCO		2
@@ -22,9 +31,10 @@
 
 #define KVS_MAX_TOKENS		128
 
+//存储引擎控制
 #define ENABLE_ARRAY		1
-#define ENABLE_RBTREE		1
-#define ENABLE_HASH			1
+#define ENABLE_RBTREE		0
+#define ENABLE_HASH			0
 
 
 typedef int (*msg_handler)(char *msg, int length, char *response);
@@ -70,7 +80,7 @@ int kvs_array_exist(kvs_array_t *inst, char *key);
 #define BLACK 			2
 
 #define ENABLE_KEY_CHAR		1
-
+//红黑树存储数据类型控制
 #if ENABLE_KEY_CHAR
 typedef char* KEY_TYPE;
 #else
@@ -106,7 +116,7 @@ int kvs_rbtree_exist(kvs_rbtree_t *inst, char *key);
 
 #endif
 
-
+//哈希数据类型控制
 #if ENABLE_HASH
 
 #define MAX_KEY_LEN	128

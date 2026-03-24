@@ -45,7 +45,7 @@ void testcase(int connfd, char *msg, char *pattern, char *casename) {
 	recv_msg(connfd, result, MAX_MSG_LENGTH);
 
 	if (strcmp(result, pattern) == 0) {
-		printf("==> PASS ->  %s\n", casename);
+		//printf("==> PASS ->  %s\n", casename);
 	} else {
 		printf("==> FAILED -> %s, '%s' != '%s' \n", casename, result, pattern);
 		exit(1);
@@ -225,11 +225,11 @@ void hash_testcase(int connfd) {
 }
 
 
-// testcase 192.168.243.131  2000
+// ./testcase 192.168.30.128  2000 
 int main(int argc, char *argv[]) {
 
 	if (argc != 4) {
-		printf("arg error\n");
+		printf("arg error!!! eg ./testcase 192.168.30.128 2000 + mode\n");
 		return -1;
 	}
 

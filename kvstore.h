@@ -22,9 +22,9 @@
 
 #define KVS_MAX_TOKENS		128
 
-#define ENABLE_ARRAY		1
-#define ENABLE_RBTREE		1
-#define ENABLE_HASH			1
+#define ENABLE_ARRAY		0
+#define ENABLE_RBTREE		0
+#define ENABLE_HASH			0
 #define ENABLE_SKIPTABLE	1
 
 

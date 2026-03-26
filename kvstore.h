@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <stddef.h>
+#include<sys/time.h>
 
 
 #include<jemalloc/jemalloc.h>
@@ -22,10 +23,10 @@
 
 #define KVS_MAX_TOKENS		128
 
-#define ENABLE_ARRAY		0
+#define ENABLE_ARRAY		1
 #define ENABLE_RBTREE		0
 #define ENABLE_HASH			0
-#define ENABLE_SKIPTABLE	1
+#define ENABLE_SKIPTABLE	0
 
 
 typedef int (*msg_handler)(char *msg, int length, char *response);
@@ -35,14 +36,24 @@ extern int reactor_start(unsigned short port, msg_handler handler);
 extern int proactor_start(unsigned short port, msg_handler handler);
 extern int ntyco_start(unsigned short port, msg_handler handler);
 
+//value结构体负责存储值
+typedef struct {
+    char*  value;	//数据本体
+    size_t len;		//数据长度（大文件，二进制文件）
+    long long expire;//过期时间戳
+} KVItem;
 
 
 #if ENABLE_ARRAY
 
+
 typedef struct kvs_array_item_s {
-	char *key;
-	char *value;
+	char*key;
+	KVItem*item;
 } kvs_array_item_t;
+
+
+
 
 #define KVS_ARRAY_SIZE		1024
 
@@ -55,11 +66,11 @@ typedef struct kvs_array_s {
 int kvs_array_create(kvs_array_t *inst);
 void kvs_array_destory(kvs_array_t *inst);
 
-int kvs_array_set(kvs_array_t *inst, char *key, char *value);
-char* kvs_array_get(kvs_array_t *inst, char *key);
-int kvs_array_del(kvs_array_t *inst, char *key);
-int kvs_array_mod(kvs_array_t *inst, char *key, char *value);
-int kvs_array_exist(kvs_array_t *inst, char *key);
+int kvs_array_set(kvs_array_t *inst, const char *key,const KVItem*item);
+char* kvs_array_get(kvs_array_t *inst, const char *key);
+int kvs_array_del(kvs_array_t *inst, const char *key);
+int kvs_array_mod(kvs_array_t *inst, const char *key, const KVItem*item);
+int kvs_array_exist(kvs_array_t *inst, const char *key);
 
 
 #endif
@@ -177,6 +188,20 @@ int kvs_skiptable_mod(kvs_skiptable_t *inst, char *key, char *value);
 int kvs_skiptable_exist(kvs_skiptable_t *inst, char *key);
 
 #endif
+
+//获取当前毫秒时间戳
+long long get_ms_now(void){
+
+	struct timeval tv;
+	gettimeofday(&tv,NULL);
+	//秒转毫秒 +微秒转毫秒
+	return tv.tv_sec*1000LL + tv.tv_usec/1000;
+
+}
+
+
+
+
 
 
 

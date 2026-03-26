@@ -46,6 +46,8 @@ void kvs_free(void *ptr) {
 
 int kvs_filter_protocol(char **tokens, int count, char *response);
 void kvs_flush_all();
+void rdb_save();
+void aof_append(char **tokens,int argc);
 
 const char *command[] = {
     "SET", "GET", "DEL", "MOD", "EXIST",
@@ -184,7 +186,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
     switch(cmd) {
         case KVS_CMD_SET:
 #if ENABLE_ARRAY
-            ret = kvs_array_set(&global_array, key, value);
+            // kvs_array_set(inst, key,item);
 #endif
 #if ENABLE_RBTREE
             ret = kvs_rbtree_set(&global_rbtree, key, value);
@@ -202,6 +204,8 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             } else {
                 length = sprintf(response, RESP_EXIST);
             }
+            // AOF 持久化
+            aof_append(tokens, 4);
             break;
 
         case KVS_CMD_GET: {
@@ -246,6 +250,8 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             } else {
                 length = sprintf(response, RESP_NOEXIST);
             }
+            // AOF 持久化
+            aof_append(tokens, 2);
             break;
 
         case KVS_CMD_MOD:
@@ -268,6 +274,9 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             } else {
                 length = sprintf(response, RESP_NOEXIST);
             }
+
+            // AOF 持久化
+            aof_append(tokens, 4);
             break;
 
         case KVS_CMD_EXIST:
@@ -291,6 +300,8 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             break;
 
         case KVS_CMD_SAVE:
+            //rdb全量持久化
+            rdb_save();
             break;
 
         case KVS_CMD_FLUSHALL:
@@ -355,6 +366,29 @@ void kvs_flush_all() {
 #endif
 
     mallctl("arenas.purge", NULL, NULL, NULL, 0);
+}
+
+//RDB全量持久化实现
+void rdb_save(){
+    // FILE*fp
+
+}
+
+//AOF增量持久化实现
+/*
+SET → 无论之前是什么，都覆盖 expire
+MOD → 不带时间 → 保留旧 expire
+MOD → 带时间 → 覆盖 expire
+DEL → 直接删除
+*/
+void aof_append(char **tokens,int argc){
+    FILE *fp = fopen("appendonly.aof","a");
+
+    for(int i=0;i<argc; i++){
+        fprintf(fp,"%s",tokens[i]);
+    }
+    fprintf(fp,"\n");
+    fclose(fp);
 }
 
 int main(int argc, char *argv[]) {

@@ -29,161 +29,138 @@ void kvs_array_destory(kvs_array_t *inst) {
 	if (!inst) return ;
 
 	if (inst->table) {
+		for(int i=0;i< inst -> total ;i++){
+			if(inst -> table[i].key){
+				kvs_free(inst -> table[i].key);
+				kvs_free(inst -> table[i].item->value);
+			}
+		}
 		kvs_free(inst->table);
 	}
 
 }
 
 
-/*
- * @return: <0, error; =0, success; >0, exist
- */
 
-int kvs_array_set(kvs_array_t *inst, char *key, char *value) {
+int kvs_array_set(kvs_array_t *inst, const char *key,const KVItem*item) {
 
-	if (inst == NULL || key == NULL || value == NULL) return -1;
+	if (!inst || !key || !item) return -1;
 	if (inst->total == KVS_ARRAY_SIZE) return -1;
 
-	char *str = kvs_array_get(inst, key);
-	if (str) {
-		return 1; // 
+	//检查是否存在
+	for(int i=0;i< inst -> total;i++){
+		if(inst -> table[i].key && strcmp( inst -> table[i].key,key)==0)
+		return 1;
 	}
 
-	char *kcopy = kvs_malloc(strlen(key) + 1);
-	if (kcopy == NULL) return -2;
-	memset(kcopy, 0, strlen(key) + 1);
-	strncpy(kcopy, key, strlen(key));
+	//复制key
+	char *kcopy = kvs_malloc(strlen(key)+1);
+	strcpy(kcopy,key);
 
-	char *kvalue = kvs_malloc(strlen(value) + 1);
-	if (kvalue == NULL) return -2;
-	memset(kvalue, 0, strlen(value) + 1);
-	strncpy(kvalue, value, strlen(value));
+	//复制value
+	char* vcopy = kvs_malloc(item -> len +1);
+	memcpy(vcopy,item -> value ,item->len);
+	vcopy[item -> len ] = 0;
 
-	int i = 0;
-	for (i = 0;i < inst->total;i ++) {
-		if (inst->table[i].key == NULL) {
-			
-			inst->table[i].key = kcopy;
-			inst->table[i].value = kvalue;
-			inst->total ++;
-			
-			return 0;
+	int pos =-1 ;
+	for (int i = 0;i < KVS_ARRAY_SIZE; i++){
+		if(inst -> table[i].key == NULL){
+			pos = i;
+			break;
 		}
 	}
-
-	if (i == inst->total && i < KVS_ARRAY_SIZE) {
-
-		inst->table[i].key = kcopy;
-		inst->table[i].value = kvalue;
-		inst->total ++;
+	if(pos == -1){
+		return -1;
 	}
 
-	return 0;
+	inst -> table[pos].key = kcopy;
+    inst->table[pos].item->value = vcopy;
+    inst->table[pos].item->len = item->len;
+    inst->table[pos].item->expire = item->expire;
+
+	inst -> total++;
 }
 
 char* kvs_array_get(kvs_array_t *inst, char *key) {
 
-	if (inst == NULL || key == NULL) return NULL;
-
-	int i = 0;
-	for (i = 0;i < inst->total;i ++) {
-		if (inst->table[i].key == NULL) {
-			continue;
-		}
-
-		if (strcmp(inst->table[i].key, key) == 0) {
-			return inst->table[i].value;
-		}
+	if(!inst || ! key){
+		return NULL;
 	}
 
+	long long now = get_ms_now();
+
+	for(int i=0;i < KVS_ARRAY_SIZE; i++){
+		kvs_array_item_t *it = &inst -> table[i];
+		if(!it -> key )continue;
+
+		if(strcmp(it -> key , key)==0){
+			//惰性删除
+			if(it->item->expire != 0&& now > it->item->expire){
+				kvs_free(it -> key);
+				kvs_free(it -> item -> value);
+				it -> key =NULL;
+				inst ->total --;
+				return NULL;
+			}
+			return &it->item;
+		}
+	}
 	return NULL;
 }
 
 
-/*
- * @return < 0, error;  =0,  success; >0, no exist
- */
 
 int kvs_array_del(kvs_array_t *inst, char *key) {
+    if (!inst || !key) return -1;
 
-	if (inst == NULL || key == NULL) return -1;
+    for (int i = 0; i < KVS_ARRAY_SIZE; i++) {
+        kvs_array_item_t *it = &inst->table[i];
+        if (!it->key) continue;
 
-	int i = 0;
-	for (i = 0;i < inst->total;i ++) {
+        if (strcmp(it->key, key) == 0) {
+            free(it->key);
+            free(it->item -> value);
+            it->key = NULL;
+            inst->total--;
+            return 0;
+        }
+    }
+    return 1;
 
-		if (strcmp(inst->table[i].key, key) == 0) {
-
-			kvs_free(inst->table[i].key);
-			inst->table[i].key = NULL;
-
-			kvs_free(inst->table[i].value);
-			inst->table[i].value = NULL;
-// error: > 1024
-			if (inst->total-1 == i) {
-				inst->total --;
-			}
-			
-
-			return 0;
-		}
-	}
-
-	return i;
 }
 
 
-/*
- * @return : < 0, error; =0, success; >0, no exist 
- */
 
-int kvs_array_mod(kvs_array_t *inst, char *key, char *value) {
+int kvs_array_mod(kvs_array_t *inst, const char *key, const KVItem*item) {
 
-	if (inst == NULL || key == NULL || value == NULL) return -1;
-// error: > 1024
-	if (inst->total == 0) {
-		return KVS_ARRAY_SIZE;
-	}
-	
+    if (!inst || !key || !item) return -1;
 
-	int i = 0;
-	for (i = 0;i < inst->total;i ++) {
+    KVItem* old = kvs_array_get(inst, key);
+    if (!old) return 1;
 
-		if (inst->table[i].key == NULL) {
-			continue;
-		}
+    // 释放旧值
+    free(old->value);
 
-		if (strcmp(inst->table[i].key, key) == 0) {
+    // 复制新值
+    char* vcopy = malloc(item->len + 1);
+    memcpy(vcopy, item->value, item->len);
+    vcopy[item->len] = 0;
 
-			kvs_free(inst->table[i].value);
+    old->value = vcopy;
+    old->len = item->len;
 
-			char *kvalue = kvs_malloc(strlen(value) + 1);
-			if (kvalue == NULL) return -2;
-			memset(kvalue, 0, strlen(value) + 1);
-			strncpy(kvalue, value, strlen(value));
+    // 只有新item带expire才更新
+    if (item->expire != 0) {
+        old->expire = item->expire;
+    }
 
-			inst->table[i].value = kvalue;
-
-			return 0;
-		}
-
-	}
-
-	return i;
+    return 0;
 }
 
 
-/*
- * @return 0: exist, 1: no exist
- */
+
 int kvs_array_exist(kvs_array_t *inst, char *key) {
-
-	if (!inst || !key) return -1;
-	
-	char *str = kvs_array_get(inst, key);
-	if (!str) {
-		return 1; // 
-	}
-	return 0;
+	return kvs_array_get(inst, key) ? 0 : 1;
 }
 
 

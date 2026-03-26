@@ -49,6 +49,7 @@ void kvs_flush_all();
 void rdb_save();
 void aof_append(char **tokens,int argc);
 
+
 const char *command[] = {
     "SET", "GET", "DEL", "MOD", "EXIST",
     "SAVE","FLUSHALL"
@@ -167,6 +168,16 @@ char* resp_pack_request(char *msg) {
     return out_buf; // 调用者记得 free
 }
 
+
+//获取当前毫秒时间戳
+static long long get_ms_now(void){
+
+	struct timeval tv;
+	gettimeofday(&tv,NULL);
+	//秒转毫秒 +微秒转毫秒
+	return tv.tv_sec*1000LL + tv.tv_usec/1000;
+
+}
 // 命令处理
 int kvs_filter_protocol(char **tokens, int count, char *response) {
     if (tokens[0] == NULL || count == 0 || response == NULL)
@@ -181,12 +192,35 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
     int length = 0;
     int ret = 0;
     char *key = tokens[1];
-    char *value = tokens[2];
+    // KVItem* item = (KVItem*)kvs_malloc(sizeof(KVItem));
+    // item -> value = tokens[2];
+    // item -> len = sizeof(tokens[2]);
+    // item -> expire = tokens[3];
+
+    // 正确、安全、支持大文件、无野指针
+    KVItem *item = (KVItem*)kvs_malloc(sizeof(KVItem));
+    memset(item, 0, sizeof(KVItem));
+
+    // 1. value 必须深拷贝（不能直接赋值指针）
+    char *val_str = tokens[2];
+    item->len = strlen(val_str);               // 真实长度
+    item->value = (char*)kvs_malloc(item->len + 1);
+    memcpy(item->value, val_str, item->len);
+    item->value[item->len] = '\0';
+
+    // 2. 过期时间：有就用，没有默认 0
+    item->expire = 0; // 默认永不过期
+    if (tokens[3] != NULL) {
+        int sec = atoi(tokens[3]);
+        item->expire = get_ms_now() + (long long)sec * 1000;
+    }
+
+
 
     switch(cmd) {
         case KVS_CMD_SET:
 #if ENABLE_ARRAY
-            // kvs_array_set(inst, key,item);
+             kvs_array_set(&global_array, key,item);
 #endif
 #if ENABLE_RBTREE
             ret = kvs_rbtree_set(&global_rbtree, key, value);
@@ -209,7 +243,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             break;
 
         case KVS_CMD_GET: {
-            char *result = NULL;
+            KVItem *result = NULL;
 #if ENABLE_ARRAY
             result = kvs_array_get(&global_array, key);
 #endif
@@ -225,7 +259,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (result == NULL) {
                 length = sprintf(response, RESP_NOEXIST);
             } else {
-                length = sprintf(response, "%s\r\n", result);
+                length = sprintf(response, "%s\r\n", result->value);
             }
             break;
         }
@@ -256,7 +290,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
 
         case KVS_CMD_MOD:
 #if ENABLE_ARRAY
-            ret = kvs_array_mod(&global_array, key, value);
+            ret = kvs_array_mod(&global_array,key,item);
 #endif
 #if ENABLE_RBTREE
             ret = kvs_rbtree_mod(&global_rbtree, key, value);
@@ -390,6 +424,8 @@ void aof_append(char **tokens,int argc){
     fprintf(fp,"\n");
     fclose(fp);
 }
+
+
 
 int main(int argc, char *argv[]) {
     if (argc != 2) {

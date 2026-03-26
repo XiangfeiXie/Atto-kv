@@ -13,6 +13,7 @@
 #include<jemalloc/jemalloc.h>
 
 
+
 #define NETWORK_REACTOR 	0
 #define NETWORK_PROACTOR	1
 #define NETWORK_NTYCO		2
@@ -67,7 +68,7 @@ int kvs_array_create(kvs_array_t *inst);
 void kvs_array_destory(kvs_array_t *inst);
 
 int kvs_array_set(kvs_array_t *inst, const char *key,const KVItem*item);
-char* kvs_array_get(kvs_array_t *inst, const char *key);
+KVItem* kvs_array_get(kvs_array_t *inst, const char *key);
 int kvs_array_del(kvs_array_t *inst, const char *key);
 int kvs_array_mod(kvs_array_t *inst, const char *key, const KVItem*item);
 int kvs_array_exist(kvs_array_t *inst, const char *key);
@@ -189,15 +190,7 @@ int kvs_skiptable_exist(kvs_skiptable_t *inst, char *key);
 
 #endif
 
-//获取当前毫秒时间戳
-long long get_ms_now(void){
 
-	struct timeval tv;
-	gettimeofday(&tv,NULL);
-	//秒转毫秒 +微秒转毫秒
-	return tv.tv_sec*1000LL + tv.tv_usec/1000;
-
-}
 
 
 

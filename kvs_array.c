@@ -76,12 +76,14 @@ int kvs_array_set(kvs_array_t *inst, const char *key,const KVItem*item) {
 	inst -> table[pos].key = kcopy;
     inst->table[pos].item->value = vcopy;
     inst->table[pos].item->len = item->len;
-    inst->table[pos].item->expire = item->expire;
+	inst->table[pos].item->expire = item->expire;
+
+    
 
 	inst -> total++;
 }
 
-char* kvs_array_get(kvs_array_t *inst, char *key) {
+KVItem* kvs_array_get(kvs_array_t *inst,const  char *key) {
 
 	if(!inst || ! key){
 		return NULL;
@@ -102,7 +104,7 @@ char* kvs_array_get(kvs_array_t *inst, char *key) {
 				inst ->total --;
 				return NULL;
 			}
-			return &it->item;
+			return it->item;
 		}
 	}
 	return NULL;
@@ -110,7 +112,7 @@ char* kvs_array_get(kvs_array_t *inst, char *key) {
 
 
 
-int kvs_array_del(kvs_array_t *inst, char *key) {
+int kvs_array_del(kvs_array_t *inst,const  char *key) {
     if (!inst || !key) return -1;
 
     for (int i = 0; i < KVS_ARRAY_SIZE; i++) {
@@ -159,7 +161,7 @@ int kvs_array_mod(kvs_array_t *inst, const char *key, const KVItem*item) {
 
 
 
-int kvs_array_exist(kvs_array_t *inst, char *key) {
+int kvs_array_exist(kvs_array_t *inst,const  char *key) {
 	return kvs_array_get(inst, key) ? 0 : 1;
 }
 

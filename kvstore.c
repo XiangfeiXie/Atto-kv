@@ -18,6 +18,8 @@
 
 #define BUF_LEN 1024
 #define MAX_TOKENS   256     // 最多命令参数
+//启动AOF
+#define ENABLE_AOF 1
 
 
 #if ENABLE_ARRAY
@@ -268,7 +270,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
     switch(cmd) {
         case KVS_CMD_SET:
 #if ENABLE_ARRAY
-             kvs_array_set(&global_array, key,item);
+            ret = kvs_array_set(&global_array, key,item);
 #endif
 #if ENABLE_RBTREE
             ret = kvs_rbtree_set(&global_rbtree, key, value);
@@ -287,7 +289,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
                 length = sprintf(response, RESP_EXIST);
             }
             // AOF 持久化
-            aof_append(tokens, 4);
+            if(ENABLE_AOF)aof_append(tokens, count);
             break;
 
         case KVS_CMD_GET: {
@@ -307,6 +309,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (result == NULL) {
                 length = sprintf(response, RESP_NOEXIST);
             } else {
+                // length = sprintf(response, "$%zu\r\n%s\r\n", result->len, result->value);
                 length = sprintf(response, "%s\r\n", result->value);
             }
             break;
@@ -333,7 +336,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
                 length = sprintf(response, RESP_NOEXIST);
             }
             // AOF 持久化
-            aof_append(tokens, 2);
+            if(ENABLE_AOF)aof_append(tokens, count);
             break;
 
         case KVS_CMD_MOD:
@@ -358,7 +361,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             }
 
             // AOF 持久化
-            aof_append(tokens, 4);
+            if(ENABLE_AOF)aof_append(tokens, count);
             break;
 
         case KVS_CMD_EXIST:
@@ -473,6 +476,7 @@ void aof_append(char **tokens,int argc){
     FILE *fp = fopen("appendonly.aof","a");
 
     for(int i=0;i<argc; i++){
+        if(tokens[i] == NULL )break;
         fprintf(fp,"%s",tokens[i]);
     }
     fprintf(fp,"\n");

@@ -122,7 +122,7 @@ char *resp_pack_request(char *msg){
 			int len = p- start;
 			tokens[idx] = malloc(len + 1);
 			strncpy(tokens[idx],start,len);
-			tokens[idx][len]!='\0';
+			tokens[idx][len]='\0';
 			idx++;
 			p++; //跳过闭合逗号
 		}else{
@@ -292,7 +292,7 @@ printf("=================== KV Store Test Menu ===================\n"
        "  MODE 0        spe_test_free(connfd);    		     	  \n"
        "  MODE 1        common_testcase_01(connfd);		     	  \n"
        "  MODE 2        common_testcase_02(connfd);		     	  \n"
-       "  MODE 3        hash_testcase(connfd);		    	 	  \n"
+       "  MODE 3        common_testcase_03(connfd);               \n"
 	   "  MODE 4        skiptable_testcase(connfd);		     	  \n"
        "==========================================================\n");
 		return -1;
@@ -311,6 +311,8 @@ printf("=================== KV Store Test Menu ===================\n"
 		common_testcase_01(connfd);
 	}else if(mode == 2){
 		common_testcase_02(connfd);
+	}else if(mode==3){
+		common_testcase_03(connfd);
 	}
     return 0;
 }

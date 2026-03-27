@@ -309,8 +309,8 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (result == NULL) {
                 length = sprintf(response, RESP_NOEXIST);
             } else {
-                // length = sprintf(response, "$%zu\r\n%s\r\n", result->len, result->value);
-                length = sprintf(response, "%s\r\n", result->value);
+                length = sprintf(response, "$%zu\r\n%s\r\n", result->len, result->value);
+                // length = sprintf(response, "%s\r\n", result->value);
             }
             break;
         }

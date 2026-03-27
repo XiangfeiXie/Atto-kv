@@ -6,6 +6,7 @@ TESTCASE_SRCS = testcase.c
 TARGET = kvstore
 SUBDIR = ./NtyCo/
 TESTCASE = testcase
+AOF = *.aof
 
 OBJS = $(SRCS:.c=.o)
 
@@ -28,6 +29,6 @@ $(TESTCASE): $(TESTCASE_SRCS)
 	$(CC) $(FLAGS) -c $^ -o $@
 
 clean: 
-	rm -rf $(OBJS) $(TARGET) $(TESTCASE)
+	rm -rf $(OBJS) $(TARGET) $(TESTCASE) $(AOF)
 
 

@@ -109,9 +109,6 @@ KVItem* kvs_array_get(kvs_array_t *inst,const  char *key) {
 				inst ->total --;
 				return NULL;
 			}
-			printf("now: %lld\n", now);
-			printf("expire: %lld\n", it->item->expire);
-			printf("now > expire ? %d \n", now > it->item->expire);
 			return it->item;
 		}
 	}

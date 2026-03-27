@@ -101,39 +101,53 @@ int connect_tcpserver(const char *ip, unsigned short port) {
 }
 
 // 封包函数
-char* resp_pack_request(char *msg) {
-    // 修复：改用 malloc，避免静态数组覆盖/线程冲突
-    char *out_buf = (char*)malloc(BUF_LEN);
-    if (!out_buf) return NULL;
-    memset(out_buf, 0, BUF_LEN);
+char *resp_pack_request(char *msg){
+	char *out_buf = (char*)malloc(BUF_LEN);
+	if(!out_buf) return NULL;
+	memset(out_buf,0,BUF_LEN);
 
-    char tmp_msg[BUF_LEN];
-    char *tokens[MAX_TOKENS] = {0};
-    int idx = 0;
+	char*tokens[MAX_TOKENS] = {0};
+	int idx = 0;
+	char *p = msg;
 
-    if (msg == NULL) {
-        free(out_buf);
-        return NULL;
-    }
+	while(*p && idx < MAX_TOKENS){
+		while(*p == ' ') p++;
+		if(*p == '\0') break;
 
-    strncpy(tmp_msg, msg, BUF_LEN - 1);
+		//长文本处理
+		if(*p == '"'){
+			p++;
+			char *start = p;
+			while(*p && *p !='"') p++;
+			int len = p- start;
+			tokens[idx] = malloc(len + 1);
+			strncpy(tokens[idx],start,len);
+			tokens[idx][len]!='\0';
+			idx++;
+			p++; //跳过闭合逗号
+		}else{
+			//普通token
+			char * start = p;
+			while(*p && *p!=' ') p++;
+			int len = p - start;
+			tokens[idx] = malloc(len + 1);
+			strncpy(tokens[idx],start,len);
+			tokens[idx][len] = '\0';
+			idx++;
+		}
+	}
 
-    char *token = strtok(tmp_msg, " ");
-    while (token != NULL && idx < MAX_TOKENS) {
-        tokens[idx++] = token;
-        token = strtok(NULL, " ");
-    }
-
+    // 生成 RESP
     int total = 0;
     total += snprintf(out_buf + total, BUF_LEN - total, "*%d\r\n", idx);
-
     for (int i = 0; i < idx; i++) {
         int len = strlen(tokens[i]);
-        total += snprintf(out_buf + total, BUF_LEN - total,
-                          "$%d\r\n%s\r\n", len, tokens[i]);
+        total += snprintf(out_buf + total, BUF_LEN - total, "$%d\r\n%s\r\n", len, tokens[i]);
+        free(tokens[i]);
     }
 
-    return out_buf; // 调用者记得 free
+	return out_buf;
+
 }
 
 void common_testcase_03(int connfd){
@@ -216,6 +230,57 @@ void common_testcase_01(int connfd){
 }
 
 
+void spe_test_free(int connfd){
+	char input[BUF_LEN];
+	char response[BUF_LEN];
+
+	printf("===================================\n");
+    printf("    KV Store CLI (redis-cli mode)\n");
+    printf("===================================\n");
+    printf("输入命令即可执行 (SET/GET/DEL/MOD/EXIST/SAVE)\n");
+    printf("输入 quit 退出\n\n");
+
+
+	while(1){
+		//提示符
+		printf("kv-cli->");
+		fflush(stdout);
+
+		//读终端输入
+		if(!fgets(input,sizeof(input),stdin)){
+			break;
+		}
+
+		int len = strlen(input);
+		if(len > 0 && input[len - 1]=='\n')
+			input[len-1] = '\n';
+
+		//空指令跳过
+		if(strlen(input) == 0) continue;
+
+		//退出
+		if(strcmp(input,"quit") == 0 || strcmp(input,"exit") == 0){
+			printf("bye~\n");
+			break;
+		}
+
+		//封装成RESP
+		char*resp_buf = resp_pack_request(input);
+		if(!resp_buf) continue;
+
+		//发送 & 接收
+		send_msg(connfd,resp_buf,strlen(resp_buf));
+		memset(response,0,sizeof(response));
+		recv_msg(connfd,response,sizeof(response)-1);
+
+		//输出结果
+		printf("%s",response);
+
+		free(resp_buf);
+	}
+}
+
+
 
 
 
@@ -224,9 +289,9 @@ int main(int argc,char *argv[]){
     	if (argc != 4) {
 printf("=================== KV Store Test Menu ===================\n"
        "  		./kvstore 192.168.30.128	2000 mode			  \n"
-       "  MODE 0        common_testcase_01(connfd);		     	  \n"
-       "  MODE 1        common_testcase_02(connfd);		     	  \n"
-       "  MODE 2        common_testcase_03(connfd);		     	  \n"
+       "  MODE 0        spe_test_free(connfd);    		     	  \n"
+       "  MODE 1        common_testcase_01(connfd);		     	  \n"
+       "  MODE 2        common_testcase_02(connfd);		     	  \n"
        "  MODE 3        hash_testcase(connfd);		    	 	  \n"
 	   "  MODE 4        skiptable_testcase(connfd);		     	  \n"
        "==========================================================\n");
@@ -240,6 +305,12 @@ printf("=================== KV Store Test Menu ===================\n"
 
 	int connfd = connect_tcpserver(ip, port);
 
-    common_testcase_03(connfd);
+    if(mode == 0){
+		spe_test_free(connfd);
+	}else if(mode == 1){
+		common_testcase_01(connfd);
+	}else if(mode == 2){
+		common_testcase_02(connfd);
+	}
     return 0;
 }

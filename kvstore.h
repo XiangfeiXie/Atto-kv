@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <stddef.h>
 #include<sys/time.h>
+#include<unistd.h>
 
 
 #include<jemalloc/jemalloc.h>

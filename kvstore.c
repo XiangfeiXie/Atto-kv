@@ -49,7 +49,7 @@ void kvs_free(void *ptr) {
 int kvs_filter_protocol(char **tokens, int count, char *response);
 void kvs_flush_all();
 void rdb_save();
-void aof_append(char **tokens,int argc);
+void aof_append(const char* resp_buf,int buf_len);
 //修复token释放
 void free_tokens(char** tokens,int count);
 
@@ -145,45 +145,20 @@ int kvs_protocol(char *msg, int length, char *response) {
         return -1;
 
     int ret = kvs_filter_protocol(tokens, KVS_MAX_TOKENS, response);
+
+    //aof正确添加位置
+    if(ENABLE_AOF && ret > 0){
+        if(strcmp(tokens[0],"SET") == 0 ||
+            strcmp(tokens[0],"DEL") == 0 ||
+            strcmp(tokens[0],"MOD") == 0 ){
+
+                aof_append(msg,length);
+            }
+    }
     free_tokens(tokens,KVS_MAX_TOKENS);
     return ret;
 }
 
-// 封包函数
-// char* resp_pack_request(char *msg) {
-
-//     char *out_buf = (char*)kvs_malloc(BUF_LEN);
-//     if (!out_buf) return NULL;
-//     memset(out_buf, 0, BUF_LEN);
-
-//     char tmp_msg[BUF_LEN];
-//     char *tokens[MAX_TOKENS] = {0};
-//     int idx = 0;
-
-//     if (msg == NULL) {
-//         kvs_free(out_buf);
-//         return NULL;
-//     }
-
-//     strncpy(tmp_msg, msg, BUF_LEN - 1);
-
-//     char *token = strtok(tmp_msg, " ");
-//     while (token != NULL && idx < MAX_TOKENS) {
-//         tokens[idx++] = token;
-//         token = strtok(NULL, " ");
-//     }
-
-//     int total = 0;
-//     total += snprintf(out_buf + total, BUF_LEN - total, "*%d\r\n", idx);
-
-//     for (int i = 0; i < idx; i++) {
-//         int len = strlen(tokens[i]);
-//         total += snprintf(out_buf + total, BUF_LEN - total,
-//                           "$%d\r\n%s\r\n", len, tokens[i]);
-//     }
-
-//     return out_buf; // 调用者记得 free
-// }
 
 
 //获取当前毫秒时间戳
@@ -267,9 +242,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
                 length = sprintf(response, RESP_OK);
             } else {
                 length = sprintf(response, RESP_EXIST);
-            }
-            // AOF 持久化
-            if(ENABLE_AOF)aof_append(tokens, count);
+            }  
             break;
 
         case KVS_CMD_GET: {
@@ -315,8 +288,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             } else {
                 length = sprintf(response, RESP_NOEXIST);
             }
-            // AOF 持久化
-            if(ENABLE_AOF)aof_append(tokens, count);
+
             break;
 
         case KVS_CMD_MOD:
@@ -340,8 +312,6 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
                 length = sprintf(response, RESP_NOEXIST);
             }
 
-            // AOF 持久化
-            if(ENABLE_AOF)aof_append(tokens, count);
             break;
 
         case KVS_CMD_EXIST:
@@ -374,7 +344,9 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             break;
 
         default:
-            assert(0);
+            // assert(0);
+            length = sprintf(response, "-ERR unknown command\r\n");
+            break;
     }
 
     //释放Item
@@ -440,8 +412,13 @@ void kvs_flush_all() {
 
 //RDB全量持久化实现
 void rdb_save(){
-    // FILE*fp
     
+    
+
+}
+//rdb加载
+void rdb_load(){
+
 
 }
 
@@ -452,15 +429,70 @@ MOD → 不带时间 → 保留旧 expire
 MOD → 带时间 → 覆盖 expire
 DEL → 直接删除
 */
-void aof_append(char **tokens,int argc){
-    FILE *fp = fopen("appendonly.aof","a");
-
-    for(int i=0;i<argc; i++){
-        if(tokens[i] == NULL )break;
-        fprintf(fp,"%s",tokens[i]);
+void aof_append(const char* resp_buf,int buf_len){
+    FILE *fp = fopen("appendonly.aof","ab");
+    if (!fp) {
+        printf("AOF: 打开文件失败\n"); 
+        return;
     }
-    fprintf(fp,"\n");
+
+    //写入原始数据
+    fwrite(resp_buf,1,buf_len,fp);
+
+    //刷入磁盘
+    fflush(fp);
+    fsync(fileno(fp));
+
     fclose(fp);
+}
+
+
+void aof_reload(){
+
+    FILE*fp = fopen("appendonly.aof","rb");
+    if(!fp) return ;
+
+    //获取文件大小
+    fseek(fp,0,SEEK_END);
+    long file_size = ftell(fp);
+    fseek(fp,0,SEEK_SET);
+
+    char* buf = kvs_malloc(file_size + 1);
+    fread(buf,1,file_size,fp);
+    buf[file_size] = 0;
+    fclose(fp);
+
+   
+    //逐行解析RESP命令
+    char*p = buf ;
+    while(p < buf + file_size){
+        //找到当前命令的结尾(\r\n分隔多条命令)
+        char *end = strstr(p,"\r\n*");
+        if(!end) end = buf + file_size;
+
+        int cmd_len = end -p;
+        if(cmd_len <= 0) break;
+
+        //单挑命令交给kvs_protocol执行
+        char response[1024];
+        kvs_protocol(p,cmd_len,response);
+
+        p = end;
+    }
+}
+
+
+void engine_reload(void) {
+    // 1. AOF 优先
+    if (ENABLE_AOF && access("appendonly.aof", F_OK) == 0) {
+        printf("Loading AOF...\n");
+        aof_reload();
+    } 
+    // 2. 没有 AOF 才加载 RDB
+    else if (access("dump.rdb", F_OK) == 0) {
+        printf("Loading RDB...\n");
+        rdb_load();
+    }
 }
 
 
@@ -474,7 +506,7 @@ int main(int argc, char *argv[]) {
     }
     int port = atoi(argv[1]);
     init_kvengine();
-
+    engine_reload();
 #if (NETWORK_SELECT == NETWORK_REACTOR)
     reactor_start(port, kvs_protocol);
 #elif (NETWORK_SELECT == NETWORK_PROACTOR)

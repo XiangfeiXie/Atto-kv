@@ -150,44 +150,44 @@ int kvs_protocol(char *msg, int length, char *response) {
 }
 
 // 封包函数
-char* resp_pack_request(char *msg) {
+// char* resp_pack_request(char *msg) {
 
-    char *out_buf = (char*)kvs_malloc(BUF_LEN);
-    if (!out_buf) return NULL;
-    memset(out_buf, 0, BUF_LEN);
+//     char *out_buf = (char*)kvs_malloc(BUF_LEN);
+//     if (!out_buf) return NULL;
+//     memset(out_buf, 0, BUF_LEN);
 
-    char tmp_msg[BUF_LEN];
-    char *tokens[MAX_TOKENS] = {0};
-    int idx = 0;
+//     char tmp_msg[BUF_LEN];
+//     char *tokens[MAX_TOKENS] = {0};
+//     int idx = 0;
 
-    if (msg == NULL) {
-        kvs_free(out_buf);
-        return NULL;
-    }
+//     if (msg == NULL) {
+//         kvs_free(out_buf);
+//         return NULL;
+//     }
 
-    strncpy(tmp_msg, msg, BUF_LEN - 1);
+//     strncpy(tmp_msg, msg, BUF_LEN - 1);
 
-    char *token = strtok(tmp_msg, " ");
-    while (token != NULL && idx < MAX_TOKENS) {
-        tokens[idx++] = token;
-        token = strtok(NULL, " ");
-    }
+//     char *token = strtok(tmp_msg, " ");
+//     while (token != NULL && idx < MAX_TOKENS) {
+//         tokens[idx++] = token;
+//         token = strtok(NULL, " ");
+//     }
 
-    int total = 0;
-    total += snprintf(out_buf + total, BUF_LEN - total, "*%d\r\n", idx);
+//     int total = 0;
+//     total += snprintf(out_buf + total, BUF_LEN - total, "*%d\r\n", idx);
 
-    for (int i = 0; i < idx; i++) {
-        int len = strlen(tokens[i]);
-        total += snprintf(out_buf + total, BUF_LEN - total,
-                          "$%d\r\n%s\r\n", len, tokens[i]);
-    }
+//     for (int i = 0; i < idx; i++) {
+//         int len = strlen(tokens[i]);
+//         total += snprintf(out_buf + total, BUF_LEN - total,
+//                           "$%d\r\n%s\r\n", len, tokens[i]);
+//     }
 
-    return out_buf; // 调用者记得 free
-}
+//     return out_buf; // 调用者记得 free
+// }
 
 
 //获取当前毫秒时间戳
-long long get_ms_now(void){
+long long get_time_now(void){
 
 	struct timeval tv;
 	gettimeofday(&tv,NULL);
@@ -213,7 +213,7 @@ KVItem*create_kvitem(char*value_str,char*expire_str){
     item->expire = 0;
     if(expire_str){
         int  sec = atoi(expire_str);
-        item->expire = get_ms_now() + (long long)sec*1000;
+        item->expire = get_time_now() + (long long)sec*1000;
     }
     return item;
 }
@@ -240,26 +240,6 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
     int ret = 0;
     char *key = tokens[1];
 
-    //KVItem只有set和mod才会创建
-/*
-    // 正确、安全、支持大文件、无野指针
-    KVItem *item = (KVItem*)kvs_malloc(sizeof(KVItem));
-    memset(item, 0, sizeof(KVItem));
-
-    // 1. value 必须深拷贝（不能直接赋值指针）
-    char *val_str = tokens[2];
-    item->len = strlen(val_str);               // 真实长度
-    item->value = (char*)kvs_malloc(item->len + 1);
-    memcpy(item->value, val_str, item->len);
-    item->value[item->len] = '\0';
-
-    // 2. 过期时间：有就用，没有默认 0
-    item->expire = 0; // 默认永不过期
-    if (tokens[3] != NULL) {
-        int sec = atoi(tokens[3]);
-        item->expire = get_ms_now() + (long long)sec * 1000;
-    }
-*/
 
     KVItem *item = NULL;
     if(cmd == KVS_CMD_SET || cmd == KVS_CMD_MOD){

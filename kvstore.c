@@ -48,6 +48,8 @@ int kvs_filter_protocol(char **tokens, int count, char *response);
 void kvs_flush_all();
 void rdb_save();
 void aof_append(char **tokens,int argc);
+//修复token释放
+void free_tokens(char** tokens,int count);
 
 
 const char *command[] = {
@@ -103,7 +105,7 @@ bool resp_unpack(const char *data, int len, char** out_commands) {
         }
 
         // ===================== 修复：分配内存 =====================
-        out_commands[i] = (char*)malloc(str_len + 1);
+        out_commands[i] = (char*)kvs_malloc(str_len + 1);
         if (!out_commands[i])
             return false;
 
@@ -115,6 +117,17 @@ bool resp_unpack(const char *data, int len, char** out_commands) {
         idx += 2;
     }
     return true;
+}
+
+
+//修复:释放解包的token
+void free_tokens(char **tokens,int count ){
+    for(int i=0;i< count ;i++){
+        if(tokens[i]){
+            free(tokens[i]);
+            tokens[i] = NULL;
+        }
+    }
 }
 
 // 修复：kvs_protocol 调用逻辑
@@ -129,13 +142,15 @@ int kvs_protocol(char *msg, int length, char *response) {
     if (!ok)
         return -1;
 
-    return kvs_filter_protocol(tokens, KVS_MAX_TOKENS, response);
+    int ret = kvs_filter_protocol(tokens, KVS_MAX_TOKENS, response);
+    free_tokens(tokens,KVS_MAX_TOKENS);
+    return ret;
 }
 
 // 封包函数
 char* resp_pack_request(char *msg) {
-    // 修复：改用 malloc，避免静态数组覆盖/线程冲突
-    char *out_buf = (char*)malloc(BUF_LEN);
+
+    char *out_buf = (char*)kvs_malloc(BUF_LEN);
     if (!out_buf) return NULL;
     memset(out_buf, 0, BUF_LEN);
 
@@ -144,7 +159,7 @@ char* resp_pack_request(char *msg) {
     int idx = 0;
 
     if (msg == NULL) {
-        free(out_buf);
+        kvs_free(out_buf);
         return NULL;
     }
 
@@ -170,7 +185,7 @@ char* resp_pack_request(char *msg) {
 
 
 //获取当前毫秒时间戳
-static long long get_ms_now(void){
+long long get_ms_now(void){
 
 	struct timeval tv;
 	gettimeofday(&tv,NULL);
@@ -178,6 +193,36 @@ static long long get_ms_now(void){
 	return tv.tv_sec*1000LL + tv.tv_usec/1000;
 
 }
+
+//item创建函数
+KVItem*create_kvitem(char*value_str,char*expire_str){
+    if(!value_str) return NULL;
+
+    KVItem*item = (KVItem*)kvs_malloc(sizeof(KVItem));
+    memset(item,0,sizeof(KVItem));
+
+    //拷贝value
+    item->len = strlen(value_str);
+    item->value = (char*)kvs_malloc(item->len + 1);
+    memcpy(item->value,value_str,item->len);
+    item->value[item->len] = 0;
+
+    //过期时间
+    item->expire = 0;
+    if(expire_str){
+        int  sec = atoi(expire_str);
+        item->expire = get_ms_now() + (long long)sec*1000;
+    }
+    return item;
+}
+
+//item释放函数
+void free_kvitem(KVItem*item){
+    if(!item) return ;
+    if(item -> value) kvs_free(item->value);
+    kvs_free(item);
+}
+
 // 命令处理
 int kvs_filter_protocol(char **tokens, int count, char *response) {
     if (tokens[0] == NULL || count == 0 || response == NULL)
@@ -192,11 +237,9 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
     int length = 0;
     int ret = 0;
     char *key = tokens[1];
-    // KVItem* item = (KVItem*)kvs_malloc(sizeof(KVItem));
-    // item -> value = tokens[2];
-    // item -> len = sizeof(tokens[2]);
-    // item -> expire = tokens[3];
 
+    //KVItem只有set和mod才会创建
+/*
     // 正确、安全、支持大文件、无野指针
     KVItem *item = (KVItem*)kvs_malloc(sizeof(KVItem));
     memset(item, 0, sizeof(KVItem));
@@ -214,7 +257,12 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
         int sec = atoi(tokens[3]);
         item->expire = get_ms_now() + (long long)sec * 1000;
     }
+*/
 
+    KVItem *item = NULL;
+    if(cmd == KVS_CMD_SET || cmd == KVS_CMD_MOD){
+        item = create_kvitem(tokens[2],tokens[3]);
+    }
 
 
     switch(cmd) {
@@ -346,6 +394,11 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             assert(0);
     }
 
+    //释放Item
+    if(item){
+        free_kvitem(item);
+    }
+
     return length;
 }
 
@@ -405,6 +458,7 @@ void kvs_flush_all() {
 //RDB全量持久化实现
 void rdb_save(){
     // FILE*fp
+    
 
 }
 

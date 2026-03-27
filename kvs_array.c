@@ -19,6 +19,7 @@ int kvs_array_create(kvs_array_t *inst) {
 		return -1;
 	}
 
+	memset(inst->table, 0, KVS_ARRAY_SIZE * sizeof(kvs_array_item_t));
 	inst->total = 0;
 
 	return 0;
@@ -33,6 +34,7 @@ void kvs_array_destory(kvs_array_t *inst) {
 			if(inst -> table[i].key){
 				kvs_free(inst -> table[i].key);
 				kvs_free(inst -> table[i].item->value);
+				kvs_free(inst -> table[i].item);
 			}
 		}
 		kvs_free(inst->table);
@@ -73,6 +75,7 @@ int kvs_array_set(kvs_array_t *inst, const char *key,const KVItem*item) {
 		return -1;
 	}
 
+	inst -> table[pos].item = (KVItem*)kvs_malloc(sizeof(KVItem));
 	inst -> table[pos].key = kcopy;
     inst->table[pos].item->value = vcopy;
     inst->table[pos].item->len = item->len;
@@ -81,6 +84,7 @@ int kvs_array_set(kvs_array_t *inst, const char *key,const KVItem*item) {
     
 
 	inst -> total++;
+	return 0;
 }
 
 KVItem* kvs_array_get(kvs_array_t *inst,const  char *key) {
@@ -100,6 +104,7 @@ KVItem* kvs_array_get(kvs_array_t *inst,const  char *key) {
 			if(it->item->expire != 0&& now > it->item->expire){
 				kvs_free(it -> key);
 				kvs_free(it -> item -> value);
+				kvs_free(it -> item);
 				it -> key =NULL;
 				inst ->total --;
 				return NULL;
@@ -141,7 +146,7 @@ int kvs_array_mod(kvs_array_t *inst, const char *key, const KVItem*item) {
     if (!old) return 1;
 
     // 释放旧值
-    free(old->value);
+    kvs_free(old->value);
 
     // 复制新值
     char* vcopy = malloc(item->len + 1);

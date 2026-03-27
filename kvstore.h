@@ -22,7 +22,7 @@
 
 
 
-#define KVS_MAX_TOKENS		128
+#define KVS_MAX_TOKENS		256
 
 #define ENABLE_ARRAY		1
 #define ENABLE_RBTREE		0

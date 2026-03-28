@@ -1,0 +1,28 @@
+SET name alice
+GET name
+EXIST name
+MOD name alice_new
+GET name
+DEL name
+GET name
+EXIST name
+SET temp_key temp_value 10
+GET temp_key
+EXIST temp_key
+SET k1 v1
+SET k2 v2
+SET k3 v3
+GET k1
+GET k2
+GET k3
+DEL k1
+DEL k2
+DEL k3
+SET key_with_space "hello world 123"
+GET key_with_space
+SET special_char "!@#$%^&*()_+-=[]{}|;':\",./<>?"
+GET special_char
+SET empty_key ""
+GET empty_key
+DEL empty_key
+EOF

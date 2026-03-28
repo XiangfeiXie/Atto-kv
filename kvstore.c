@@ -12,7 +12,7 @@
 #define RESP_NIL        "$-1\r\n"
 //查询是否存在
 #define RESP_EXIST      ":1\r\n"
-#define RESP_NOEXIST    ":0\r\n"
+
 //错误
 #define RESP_ERROR      "-ERR error\r\n"
 
@@ -289,7 +289,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             result = kvs_skiptable_get(&global_skiptable, key);
 #endif
             if (result == NULL) {
-                length = sprintf(response, RESP_NOEXIST);
+                length = sprintf(response, RESP_NIL);
             } else {
                 length = sprintf(response, "$%zu\r\n%s\r\n", result->len, result->value);
                 // length = sprintf(response, "%s\r\n", result->value);
@@ -315,7 +315,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             } else if (ret == 0) {
                 length = sprintf(response, RESP_OK);
             } else {
-                length = sprintf(response, RESP_NOEXIST);
+                length = sprintf(response, RESP_NIL);
             }
 
             break;
@@ -338,7 +338,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             } else if (ret == 0) {
                 length = sprintf(response, RESP_OK);
             } else {
-                length = sprintf(response, RESP_NOEXIST);
+                length = sprintf(response, RESP_NIL);
             }
 
             break;
@@ -359,7 +359,7 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             if (ret == 0) {
                 length = sprintf(response, RESP_EXIST);
             } else {
-                length = sprintf(response, RESP_NOEXIST);
+                length = sprintf(response, RESP_NIL);
             }
             break;
 

@@ -12,6 +12,14 @@
 #define EVENT_READ		1
 #define EVENT_WRITE		2
 
+#define ENTRIES_LENGTH		1024
+#define BUFFER_LENGTH		1024
+
+typedef struct {
+	char buf[BUFFER_LENGTH];
+	int len;
+}UringClient;
+
 extern int kvs_protocol(char *msg, int length, char *response);
 
 
@@ -20,6 +28,11 @@ struct conn_info {
 	int fd;
 	int event;
 };
+
+UringClient uring_clients[1024] = {0};
+
+
+
 
 
 int p_init_server(unsigned short port) {	
@@ -43,8 +56,7 @@ int p_init_server(unsigned short port) {
 
 
 
-#define ENTRIES_LENGTH		1024
-#define BUFFER_LENGTH		1024
+
 
 int set_event_recv(struct io_uring *ring, int sockfd,
 				      void *buf, size_t len, int flags) {
@@ -130,60 +142,55 @@ int proactor_start(unsigned short port, msg_handler handler) {
 
 
 	while (1) {
-
 		io_uring_submit(&ring);
-
-
 		struct io_uring_cqe *cqe;
 		io_uring_wait_cqe(&ring, &cqe);
-
 		struct io_uring_cqe *cqes[128];
-		int nready = io_uring_peek_batch_cqe(&ring, cqes, 128);  // epoll_wait
+		int nready = io_uring_peek_batch_cqe(&ring, cqes, 128);
 
 		int i = 0;
-		for (i = 0;i < nready;i ++) {
-
+		for (i = 0; i < nready; i++) {
 			struct io_uring_cqe *entries = cqes[i];
 			struct conn_info result;
 			memcpy(&result, &entries->user_data, sizeof(struct conn_info));
 
 			if (result.event == EVENT_ACCEPT) {
-
 				set_event_accept(&ring, sockfd, (struct sockaddr*)&clientaddr, &len, 0);
-				//printf("set_event_accept\n"); //
-
 				int connfd = entries->res;
-
-				set_event_recv(&ring, connfd, buffer, BUFFER_LENGTH, 0);
-
-				
-			} else if (result.event == EVENT_READ) {  //
-
+                // === 初始化缓冲区 ===
+                uring_clients[connfd].len = 0;
+				set_event_recv(&ring, connfd, uring_clients[connfd].buf + uring_clients[connfd].len,
+                              BUFFER_LENGTH - uring_clients[connfd].len, 0);
+			} else if (result.event == EVENT_READ) {
 				int ret = entries->res;
-
-				if (ret == 0) {
+				if (ret <= 0) {
 					close(result.fd);
-				} else if (ret > 0) {
-					
-					//int kvs_protocol(char *msg, int length, char *response);
-					ret = kvs_handler(buffer, ret, response);
-					
-					set_event_send(&ring, result.fd, response, ret, 0);
+					continue;
 				}
-			}  else if (result.event == EVENT_WRITE) {  //
+                UringClient *cli = &uring_clients[result.fd];
+                cli->len += ret;
 
-				int ret = entries->res;
-				//printf("set_event_send ret: %d, %s\n", ret, buffer);
+                // === 流式循环解析 ===
+                while (1) {
+                    int cmd_len = resp_try_parse_full_cmd(cli->buf, cli->len);
+                    if (cmd_len <= 0) break;
 
-				set_event_recv(&ring, result.fd, buffer, BUFFER_LENGTH, 0);
-				
+                    int slen = kvs_handler(cli->buf, cmd_len, response);
+                    set_event_send(&ring, result.fd, response, slen, 0);
+
+                    memmove(cli->buf, cli->buf + cmd_len, cli->len - cmd_len);
+                    cli->len -= cmd_len;
+                }
+                // 继续读
+                set_event_recv(&ring, result.fd, cli->buf + cli->len,
+                              BUFFER_LENGTH - cli->len, 0);
+			} else if (result.event == EVENT_WRITE) {
+				set_event_recv(&ring, result.fd, uring_clients[result.fd].buf + uring_clients[result.fd].len,
+                              BUFFER_LENGTH - uring_clients[result.fd].len, 0);
 			}
-			
 		}
-
 		io_uring_cq_advance(&ring, nready);
 	}
-
 }
 
 

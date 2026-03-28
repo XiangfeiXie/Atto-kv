@@ -8,8 +8,19 @@
 
 #define MAX_MSG_LENGTH		1024
 #define TIME_SUB_MS(tv1, tv2)  ((tv1.tv_sec - tv2.tv_sec) * 1000 + (tv1.tv_usec - tv2.tv_usec) / 1000)
-#define BUF_LEN 1024
+#define BUF_LEN (1024*1024)
 #define MAX_TOKENS   256     // 最多命令参数
+#define PIPELINE_BUF_SIZE (1024*1024)	//批量处理缓冲区
+
+
+typedef enum{
+	MODE_INTERACTIVE,
+	MODE_PIPELINE,
+}ClientMode;
+
+ClientMode current_mode = MODE_INTERACTIVE;
+char*pipeline_buf = NULL;	//批量命令缓冲区
+int pipeline_len = 0;
 
 char* resp_pack_request(char *msg);
 
@@ -32,6 +43,84 @@ int recv_msg(int connfd, char *msg, int length) {
 	}
 	return res;
 
+}
+//初始化批量缓冲区
+void pipeline_init(void){
+	if(!pipeline_buf){
+		pipeline_buf = malloc(PIPELINE_BUF_SIZE);
+		pipeline_len = 0;
+	}
+}
+//向缓冲区添加命令
+void pipeline_append(int connfd,char *cmd){
+	pipeline_init();
+	char*resp = resp_pack_request(cmd);
+	int resp_len = strlen(resp);
+
+	//缓冲区批量扩容
+	if(pipeline_len + resp_len >= PIPELINE_BUF_SIZE){
+		PIPELINE_BUF_SIZE*2;
+		pipeline_buf = realloc(pipeline_buf,PIPELINE_BUF_SIZE);
+	}
+
+	memcpy(pipeline_buf+pipeline_len,resp,resp_len);
+	pipeline_len +=resp_len;
+	free(resp);
+}
+//批量发送所有命令
+void pipeline_exec(int connfd){
+	if(pipeline_len == 0){
+		printf("(empty pipeline)\n");
+		return ;
+	}
+	//批量发送
+	send_msg(connfd,pipeline_buf,pipeline_len);
+
+	//批量接受所有响应（流式读取）
+	char recv_buf[BUF_LEN] = {0};
+	int total_recv =0;
+	while(total_recv<pipeline_len){
+		int n= recv_msg(connfd,recv_buf + total_recv,BUF_LEN-total_recv);
+		if(n <= 0) break;
+		total_recv += n;
+		printf("%s",recv_buf + total_recv - n);
+	}
+
+	//重置批量缓冲区
+	pipeline_len = 0;
+	current_mode = MODE_INTERACTIVE;
+	printf("\n(pipeline executed)\n");
+}
+
+//新增：-x长文本（交互模式）
+void exec_x_command(int connfd,char*key,const char*filename){
+
+	FILE*fp = fopen(filename,"rb");
+	if(!fp){perror("fopen");return ;}
+
+	fseek(fp,0,SEEK_END);
+	int data_len = ftell(fp);
+	fseek(fp,0,SEEK_SET);
+
+	char*data = malloc(data_len);
+	fread(data,1,data_len,fp);
+	fclose(fp);
+
+	//组装RESP长文本SET
+	char send_buf[BUF_LEN] = {0};
+	int len = snprintf(send_buf,BUF_LEN,
+		"*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n",
+		(int)strlen(key),key,data_len);
+	memcpy(send_buf+len,data,data_len);
+	memcpy(send_buf+len+data_len,"\r\n",2);
+
+	send_msg(connfd,send_buf,len + data_len +2);
+	
+	char res[BUF_LEN] = {0};
+	recv_msg(connfd,res,BUF_LEN);
+	printf("%s",res);
+
+	free(data);
 }
 
 void testcase(int connfd, char *msg, char *pattern, char *casename) {
@@ -234,50 +323,82 @@ void spe_test_free(int connfd){
 	char input[BUF_LEN];
 	char response[BUF_LEN];
 
-	printf("===================================\n");
-    printf("    KV Store CLI (redis-cli mode)\n");
     printf("===================================\n");
-    printf("输入命令即可执行 (SET/GET/DEL/MOD/EXIST/SAVE)\n");
-    printf("输入 quit 退出\n\n");
+    printf("    KV Store CLI (Enhanced)\n");
+    printf("  支持: PIPELINE / EXEC / -x <file>\n");
+    printf("===================================\n");
+
 
 
 	while(1){
-		//提示符
-		printf("kv-cli->");
+		//提示符显示当前模式
+		if(current_mode == MODE_PIPELINE){
+			printf("kv-cli(pipeline)->");
+		}else{
+			printf("kv-cli->");
+		}
 		fflush(stdout);
 
-		//读终端输入
-		if(!fgets(input,sizeof(input),stdin)){
-			break;
-		}
+		//支持超长文本输入（getline）动态分配
+		char *line = NULL;
+		size_t line_len = 0;
+		ssize_t n = getline(&line,&line_len,stdin);
+		if(n<=0) {free(line);break;}
 
-		int len = strlen(input);
-		if(len > 0 && input[len - 1]=='\n')
-			input[len-1] = '\n';
+		//去掉换行符
+		if(line[n-1]=='\n') line[n-1] = '\0';
+		if(strlen(line) == 0){free(line);continue;}
 
-		//空指令跳过
-		if(strlen(input) == 0) continue;
-
-		//退出
-		if(strcmp(input,"quit") == 0 || strcmp(input,"exit") == 0){
+		//退出命令
+		if(strcmp(line,"quit") == 0 || strcmp(line,"exit")==0){
+			free(line);
 			printf("bye~\n");
 			break;
 		}
 
-		//封装成RESP
-		char*resp_buf = resp_pack_request(input);
-		if(!resp_buf) continue;
+		//模式切换命令
+		if(strcmp(line,"PIPELINE")==0){
+			current_mode = MODE_PIPELINE;
+			pipeline_init();
+			printf("Entering pipeline mode. Use EXEC to send.\n");
+			free(line);
+			continue;
+		}
+		if(strcmp(line,"EXEC") == 0){
+			pipeline_exec(connfd);
+			free(line);
+			continue;
+		}
 
-		//发送 & 接收
-		send_msg(connfd,resp_buf,strlen(resp_buf));
-		memset(response,0,sizeof(response));
-		recv_msg(connfd,response,sizeof(response)-1);
+		//支持-x长文本
+		//格式：SET key < file.txt
+		if(strstr(line,"<")!= NULL){
+			char cmd[64], key[256], filename[256];
+			if(sscanf(line,"%s %s < %s",cmd,key,filename)== 3&&
+			strcasecmp(cmd,"SET")==0){
+				exec_x_command(connfd,key,filename);
+				free(line);
+				continue;
+			}
+		}
+		//普通命令处理
+		if(current_mode == MODE_PIPELINE){
+			//批量处理：缓存模式
+			pipeline_append(connfd,line);
+		}else {
+			//普通模式：逐条发送
+			char*resp_buf = resp_pack_request(line);
+			send_msg(connfd,resp_buf,strlen(resp_buf));
 
-		//输出结果
-		printf("%s",response);
+			memset(response,0,sizeof(response));
+			recv_msg(connfd,response,sizeof(response)-1);
+			printf("%s",response);
 
-		free(resp_buf);
+			free(resp_buf);
+		}
+		free(line);
 	}
+	if(pipeline_buf) free(pipeline_buf);
 }
 
 

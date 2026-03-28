@@ -20,6 +20,7 @@
 #define NETWORK_NTYCO		2
 
 #define NETWORK_SELECT		NETWORK_PROACTOR
+#define ENABLE_JEMALLOC 1
 
 
 
@@ -38,6 +39,7 @@ extern int reactor_start(unsigned short port, msg_handler handler);
 extern int proactor_start(unsigned short port, msg_handler handler);
 extern int ntyco_start(unsigned short port, msg_handler handler);
 long long get_time_now(void);
+int resp_try_parse_full_cmd(const char*buf ,int buflen);
 
 //value结构体负责存储值
 typedef struct {
@@ -74,6 +76,7 @@ KVItem* kvs_array_get(kvs_array_t *inst, const char *key);
 int kvs_array_del(kvs_array_t *inst, const char *key);
 int kvs_array_mod(kvs_array_t *inst, const char *key, const KVItem*item);
 int kvs_array_exist(kvs_array_t *inst, const char *key);
+
 
 
 #endif

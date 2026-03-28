@@ -7,34 +7,47 @@
 #include <arpa/inet.h>
 
 
+#define BUFFER_SIZE 1024
+
 typedef int (*msg_handler)(char *msg, int length, char *response);
 static msg_handler kvs_handler;
 
 
+typedef struct {
+	char buf[BUFFER_SIZE];
+	int len ;
+}StreamClient;
+
+
 void server_reader(void *arg) {
 	int fd = *(int *)arg;
-	int ret = 0;
+	StreamClient client = {0};
 
  
 	while (1) {
-		
-		char buf[1024] = {0};
-		ret = recv(fd, buf, 1024, 0);
-		if (ret > 0) {
-			
-			char response[1024] = {0};
-			int slength = kvs_handler(buf, ret, response);
+		//流式修改，追加读取，不清空
+		int remain = BUFFER_SIZE - client.len;
+		if(remain <= 0) break;
+		int ret = recv(fd,client.buf + client.len ,remain,0);
 
-			ret = send(fd, response, slength, 0);
-			if (ret == -1) {
-				close(fd);
-				break;
-			}
-		} else if (ret == 0) {	
+		if(ret <= 0){
 			close(fd);
 			break;
 		}
+		client.len += ret;
 
+		while(1){
+			int cmd_len = resp_try_parse_full_cmd(client.buf,client.len);
+			if(cmd_len <= 0) break;
+
+			char response[1024] = {0};
+			int slen = kvs_handler(client.buf,cmd_len,response);
+			send(fd,response,slen,0);
+
+			//移除已解析数据
+			memmove(client.buf,client.buf + cmd_len,client.len - cmd_len);
+			client.len -= cmd_len;
+		}
 	}
 }
 

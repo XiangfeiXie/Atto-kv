@@ -43,7 +43,7 @@ void *kvs_malloc(size_t size) {
 }
 
 void kvs_free(void *ptr) {
-    free(ptr);
+    return free(ptr);
 }
 
 int kvs_filter_protocol(char **tokens, int count, char *response);
@@ -73,6 +73,35 @@ enum {
     KVS_CMD_COUNT,
 };
 
+
+int resp_try_parse_full_cmd(const char*buf ,int buflen){
+	int idx = 0;
+	if(buflen<5 || buf[idx]!= '*') return -1;
+
+	idx++;
+	int argc = 0;
+	while(idx < buflen && buf[idx]!='\r'){
+		argc = argc * 10 + (buf[idx] - '0');
+		idx++;
+	}
+	if(idx + 2 > buflen ) return 0;
+	idx += 2;
+
+	for(int i=0;i < argc ;i++){
+		if(idx + 1>=buflen || buf[idx] != '$') return -1;
+		idx++;
+		int slen = 0;
+		while(idx <buflen && buf[idx] != '\r'){
+			slen = slen * 10 + (buf[idx] - '0');
+			idx++;
+		}
+		if(idx + 2 >buflen) return 0;
+		idx+=2;
+		if(idx + slen +2 > buflen) return 0;
+		idx+=slen + 2;
+	}
+	return idx;
+}
 // 修复：resp_unpack 函数（核心段错误来源）
 bool resp_unpack(const char *data, int len, char** out_commands) {
     int idx = 0;
@@ -508,7 +537,7 @@ int main(int argc, char *argv[]) {
     init_kvengine();
     engine_reload();
 #if (NETWORK_SELECT == NETWORK_REACTOR)
-    reactor_start(port, kvs_protocol);
+    //reactor_start(port, kvs_protocol);
 #elif (NETWORK_SELECT == NETWORK_PROACTOR)
     proactor_start(port, kvs_protocol);
 #elif (NETWORK_SELECT == NETWORK_NTYCO)

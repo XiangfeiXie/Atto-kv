@@ -15,7 +15,7 @@
 
 
 #include "server.h"
-
+#include"kvstore.h"
 
 #define CONNECTION_SIZE			1024 // 1024 * 1024
 
@@ -33,7 +33,18 @@ static msg_handler kvs_handler;
 
 int kvs_request(struct conn *c) {
 
-	c->wlength = kvs_handler(c->rbuffer, c->rlength, c->wbuffer);
+	//流式解析：循环解析
+	while(1){
+		int cmd_len = resp_try_parse_full_cmd(c->rbuffer,c->rlength);
+		if(cmd_len<=0) break;
+
+		c->wlength = kvs_handler(c->rbuffer,cmd_len,c->wbuffer);
+
+		//移除已解析数据
+		memmove(c->rbuffer,c->rbuffer + cmd_len,c->rlength - cmd_len);
+		c->rlength -= cmd_len;
+	}
+	return 0;
 
 }
 
@@ -136,26 +147,17 @@ int accept_cb(int fd) {
 
 int recv_cb(int fd) {
 
-	memset(conn_list[fd].rbuffer, 0, BUFFER_LENGTH );
-	int count = recv(fd, conn_list[fd].rbuffer, BUFFER_LENGTH, 0);
-	if (count == 0) { // disconnect
-		//printf("client disconnect: %d\n", fd);
+	//流式修改：追加读取
+	int remain = BUFFER_LENGTH - conn_list[fd].rlength;
+	if(remain <= 0) return -1;
+	int count = recv(fd,conn_list[fd].rbuffer + conn_list[fd].rlength,remain,0);
+
+	if(count <= 0){
 		close(fd);
-
-		epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL); // unfinished
-
-		return 0;
-	} else if (count < 0) { // 
-
-		printf("count: %d, errno: %d, %s\n", count, errno, strerror(errno));
-		close(fd);
-		epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-
+		epoll_ctl(epfd,EPOLL_CTL_DEL,fd,NULL);
 		return 0;
 	}
-
-	
-	conn_list[fd].rlength = count;
+	conn_list[fd].rlength += count;
 	//printf("RECV: %s\n", conn_list[fd].rbuffer);
 
 #if 0 // echo
@@ -308,5 +310,7 @@ int reactor_start(unsigned short port, msg_handler handler) {
 	
 
 }
+
+
 
 

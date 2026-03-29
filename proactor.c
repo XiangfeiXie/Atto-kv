@@ -14,13 +14,29 @@
 
 #define ENTRIES_LENGTH		1024
 #define BUFFER_LENGTH		1024
+#define MAX_RESPONSE 		1024
 
+// typedef struct {
+// 	char buf[BUFFER_LENGTH];
+// 	int len;
+// }UringClient;
+
+// 给每个连接增加：读缓冲区 + 写缓冲区（解决异步覆盖问题）
 typedef struct {
-	char buf[BUFFER_LENGTH];
-	int len;
-}UringClient;
+    char rbuf[BUFFER_LENGTH];  // 读缓冲区（流式解析）
+    int  rlen;                 // 读长度
+
+    char wbuf[MAX_RESPONSE];   // 写缓冲区（每条命令独立）
+    int  wlen;                // 写长度
+    int  sending;             // 是否正在发送
+} ClientData;
+
+
+ClientData client_data[1024] = {0};  // 固定大小，对应 fd
+
 
 extern int kvs_protocol(char *msg, int length, char *response);
+int resp_try_parse_full_cmd(const char *buf, int buflen);
 
 
 
@@ -29,7 +45,7 @@ struct conn_info {
 	int event;
 };
 
-UringClient uring_clients[1024] = {0};
+// UringClient uring_clients[1024] = {0};
 
 
 
@@ -114,83 +130,95 @@ static msg_handler kvs_handler;
 
 
 int proactor_start(unsigned short port, msg_handler handler) {
+    int sockfd = p_init_server(port);
+    kvs_handler = handler;
 
-	int sockfd = p_init_server(port);
-	kvs_handler = handler;
+    struct io_uring_params params;
+    memset(&params, 0, sizeof(params));
+    struct io_uring ring;
+    io_uring_queue_init_params(ENTRIES_LENGTH, &ring, &params);
 
-	struct io_uring_params params;
-	memset(&params, 0, sizeof(params));
+    struct sockaddr_in clientaddr;
+    socklen_t len = sizeof(clientaddr);
+    set_event_accept(&ring, sockfd, (struct sockaddr*)&clientaddr, &len, 0);
 
-	struct io_uring ring;
-	io_uring_queue_init_params(ENTRIES_LENGTH, &ring, &params);
+    while (1) {
+        io_uring_submit(&ring);
+        struct io_uring_cqe *cqe;
+        io_uring_wait_cqe(&ring, &cqe);
+        struct io_uring_cqe *cqes[128];
+        int nready = io_uring_peek_batch_cqe(&ring, cqes, 128);
 
-	
-#if 0
-	struct sockaddr_in clientaddr;	
-	socklen_t len = sizeof(clientaddr);
-	accept(sockfd, (struct sockaddr*)&clientaddr, &len);
-#else
+        int i = 0;
+        for (i = 0; i < nready; i++) {
+            struct io_uring_cqe *entries = cqes[i];
+            struct conn_info result;
+            memcpy(&result, &entries->user_data, sizeof(struct conn_info));
+            int fd = result.fd;
 
-	struct sockaddr_in clientaddr;	
-	socklen_t len = sizeof(clientaddr);
-	set_event_accept(&ring, sockfd, (struct sockaddr*)&clientaddr, &len, 0);
-	
-#endif
+            if (result.event == EVENT_ACCEPT) {
+                // 重新监听 accept
+                set_event_accept(&ring, sockfd, (struct sockaddr*)&clientaddr, &len, 0);
+                int connfd = entries->res;
 
-	char buffer[BUFFER_LENGTH] = {0};
-	char response[BUFFER_LENGTH] = {0};
+                // 初始化连接数据
+                memset(&client_data[connfd], 0, sizeof(ClientData));
 
+                // 开始接收
+                set_event_recv(&ring, connfd,
+                               client_data[connfd].rbuf,
+                               BUFFER_LENGTH, 0);
+            }
+            else if (result.event == EVENT_READ) {
+                int ret = entries->res;
+                ClientData *c = &client_data[fd];
 
-	while (1) {
-		io_uring_submit(&ring);
-		struct io_uring_cqe *cqe;
-		io_uring_wait_cqe(&ring, &cqe);
-		struct io_uring_cqe *cqes[128];
-		int nready = io_uring_peek_batch_cqe(&ring, cqes, 128);
-
-		int i = 0;
-		for (i = 0; i < nready; i++) {
-			struct io_uring_cqe *entries = cqes[i];
-			struct conn_info result;
-			memcpy(&result, &entries->user_data, sizeof(struct conn_info));
-
-			if (result.event == EVENT_ACCEPT) {
-				set_event_accept(&ring, sockfd, (struct sockaddr*)&clientaddr, &len, 0);
-				int connfd = entries->res;
-                // === 初始化缓冲区 ===
-                uring_clients[connfd].len = 0;
-				set_event_recv(&ring, connfd, uring_clients[connfd].buf + uring_clients[connfd].len,
-                              BUFFER_LENGTH - uring_clients[connfd].len, 0);
-			} else if (result.event == EVENT_READ) {
-				int ret = entries->res;
-				if (ret <= 0) {
-					close(result.fd);
-					continue;
-				}
-                UringClient *cli = &uring_clients[result.fd];
-                cli->len += ret;
-
-                // === 流式循环解析 ===
-                while (1) {
-                    int cmd_len = resp_try_parse_full_cmd(cli->buf, cli->len);
-                    if (cmd_len <= 0) break;
-
-                    int slen = kvs_handler(cli->buf, cmd_len, response);
-                    set_event_send(&ring, result.fd, response, slen, 0);
-
-                    memmove(cli->buf, cli->buf + cmd_len, cli->len - cmd_len);
-                    cli->len -= cmd_len;
+                if (ret <= 0) {
+                    close(fd);
+                    continue;
                 }
-                // 继续读
-                set_event_recv(&ring, result.fd, cli->buf + cli->len,
-                              BUFFER_LENGTH - cli->len, 0);
-			} else if (result.event == EVENT_WRITE) {
-				set_event_recv(&ring, result.fd, uring_clients[result.fd].buf + uring_clients[result.fd].len,
-                              BUFFER_LENGTH - uring_clients[result.fd].len, 0);
-			}
-		}
-		io_uring_cq_advance(&ring, nready);
-	}
+
+                // 把新收到的数据加入读缓冲区
+                if (c->rlen + ret > BUFFER_LENGTH) {
+                    ret = BUFFER_LENGTH - c->rlen; // 防止越界
+                }
+                c->rlen += ret;
+
+                // ====================== 流式解析核心 ======================
+                while (1) {
+                    int cmd_len = resp_try_parse_full_cmd(c->rbuf, c->rlen);
+                    if (cmd_len <= 0) break; // 数据不完整，退出
+
+                    // 处理命令 → 写入独立写缓冲区
+                    c->wlen = kvs_handler(c->rbuf, cmd_len, c->wbuf);
+
+                    // 发送回复
+                    set_event_send(&ring, fd, c->wbuf, c->wlen, 0);
+                    c->sending = 1;
+
+                    // 移除已处理命令（关键！）
+                    memmove(c->rbuf, c->rbuf + cmd_len, c->rlen - cmd_len);
+                    c->rlen -= cmd_len;
+                }
+
+                // 继续接收
+                set_event_recv(&ring, fd,
+                               c->rbuf + c->rlen,
+                               BUFFER_LENGTH - c->rlen, 0);
+            }
+            else if (result.event == EVENT_WRITE) {
+                ClientData *c = &client_data[fd];
+                c->sending = 0;
+
+                // 发送完成 → 继续接收
+                set_event_recv(&ring, fd,
+                               c->rbuf + c->rlen,
+                               BUFFER_LENGTH - c->rlen, 0);
+            }
+        }
+
+        io_uring_cq_advance(&ring, nready);
+    }
 }
 
 

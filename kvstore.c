@@ -543,6 +543,7 @@ int main(int argc, char *argv[]) {
     init_kvengine();
     engine_reload();
 #if (NETWORK_SELECT == NETWORK_REACTOR)
+    reactor_start(port, kvs_protocol);
 #elif (NETWORK_SELECT == NETWORK_PROACTOR)
     proactor_start(port, kvs_protocol);
 #elif (NETWORK_SELECT == NETWORK_NTYCO)

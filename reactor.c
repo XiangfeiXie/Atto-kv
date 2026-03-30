@@ -1,6 +1,3 @@
-
-
-
 #include <errno.h>
 #include <stdio.h>
 #include <sys/socket.h>
@@ -10,16 +7,16 @@
 #include <unistd.h>
 #include <poll.h>
 #include <sys/epoll.h>
-#include <errno.h>
 #include <sys/time.h>
+#include <stdlib.h>
 
 
 #include "server.h"
 #include"kvstore.h"
 
 #define CONNECTION_SIZE			1024 // 1024 * 1024
-
-#define MAX_PORTS			20
+#define MAX_PORTS				20
+#define BUF_INIT_CAP			4096
 
 #define TIME_SUB_MS(tv1, tv2)  ((tv1.tv_sec - tv2.tv_sec) * 1000 + (tv1.tv_usec - tv2.tv_usec) / 1000)
 
@@ -27,22 +24,23 @@
 
 #if ENABLE_KVSTORE
 
-typedef int (*msg_handler)(char *msg, int length, char *response);
-
-static msg_handler kvs_handler;
+int kvs_request(struct conn*c);
+int kvs_response(struct conn *c);
 
 int kvs_request(struct conn *c) {
 
 	//流式解析：循环解析
 	while(1){
-		int cmd_len = resp_try_parse_full_cmd(c->rbuffer,c->rlength);
-		if(cmd_len<=0) break;
+		//解析完整RESP命令
+		int cmd_len = resp_try_parse_full_cmd(c->read_buf.buf,c ->read_buf.len);
+		if(cmd_len <= 0) break;
 
-		c->wlength = kvs_handler(c->rbuffer,cmd_len,c->wbuffer);
+		//调用动态缓冲区版本kvs_protocol
+		kvs_protocol(c->read_buf.buf,cmd_len,&c->write_buf);
 
-		//移除已解析数据
-		memmove(c->rbuffer,c->rbuffer + cmd_len,c->rlength - cmd_len);
-		c->rlength -= cmd_len;
+		//移除已解析数据（动态缓冲区）
+		memmove(c->read_buf.buf,c->read_buf.buf + cmd_len,c->read_buf.len - cmd_len);
+		c->read_buf.len -= cmd_len;
 	}
 	return 0;
 
@@ -51,7 +49,7 @@ int kvs_request(struct conn *c) {
 int kvs_response(struct conn *c) {
 
 	
-
+	return 0;
 }
 
 
@@ -104,11 +102,8 @@ int event_register(int fd, int event) {
 	conn_list[fd].r_action.recv_callback = recv_cb;
 	conn_list[fd].send_callback = send_cb;
 
-	memset(conn_list[fd].rbuffer, 0, BUFFER_LENGTH);
-	conn_list[fd].rlength = 0;
-
-	memset(conn_list[fd].wbuffer, 0, BUFFER_LENGTH);
-	conn_list[fd].wlength = 0;
+	dynbuf_init(&conn_list[fd].read_buf,BUF_INIT_CAP);
+	dynbuf_init(&conn_list[fd].write_buf,BUF_INIT_CAP);
 
 	set_event(fd, event, 1);
 }
@@ -128,110 +123,61 @@ int accept_cb(int fd) {
 	
 	event_register(clientfd, EPOLLIN);  // | EPOLLET
 
-	if ((clientfd % 1000) == 0) {
-
-		struct timeval current;
-		gettimeofday(&current, NULL);
-
-		int time_used = TIME_SUB_MS(current, begin);
-		memcpy(&begin, &current, sizeof(struct timeval));
-		
-
-		//printf("accept finshed: %d, time_used: %d\n", clientfd, time_used);
-
-	}
-
 	return 0;
 }
 
 
 int recv_cb(int fd) {
 
-	//流式修改：追加读取
-	int remain = BUFFER_LENGTH - conn_list[fd].rlength;
-	if(remain <= 0) return -1;
-	int count = recv(fd,conn_list[fd].rbuffer + conn_list[fd].rlength,remain,0);
+	struct conn*c = &conn_list[fd];
+	//计算动态缓冲区剩余空间
+	int remain = c->read_buf.cap - c->read_buf.len;
+	if(remain <= 0){
+		//自动扩容
+		char *new_buf = realloc(c->read_buf.buf,c->read_buf.cap*2);
+		if(!new_buf) return -1;
+		c->read_buf.buf = new_buf;
+		c->read_buf.cap *= 2;
+		remain = c->read_buf.cap - c->read_buf.len; 
+	}
 
+	//读取数据到动态缓冲区
+	int count = recv(fd,c->read_buf.buf + c->read_buf.len,remain,0);
 	if(count <= 0){
+		//关闭时释放动态缓冲区内存
+		dynbuf_free(&c->read_buf);
+		dynbuf_free(&c->write_buf);
 		close(fd);
 		epoll_ctl(epfd,EPOLL_CTL_DEL,fd,NULL);
 		return 0;
 	}
-	conn_list[fd].rlength += count;
-	//printf("RECV: %s\n", conn_list[fd].rbuffer);
+	c->read_buf.len += count;
 
-#if 0 // echo
-
-	conn_list[fd].wlength = conn_list[fd].rlength;
-	memcpy(conn_list[fd].wbuffer, conn_list[fd].rbuffer, conn_list[fd].wlength);
-
-	printf("[%d]RECV: %s\n", conn_list[fd].rlength, conn_list[fd].rbuffer);
-
-#elif ENABLE_HTTP
-
-	http_request(&conn_list[fd]);
-
-#elif ENABLE_WEBSOCKET
-
-	ws_request(&conn_list[fd]);
-
-#elif ENABLE_KVSTORE
-
-	kvs_request(&conn_list[fd]);
-
+#if ENABLE_KVSTORE
+	kvs_request(c);
 #endif
-
-
-	set_event(fd, EPOLLOUT, 0);
-
+	set_event(fd,EPOLLOUT,0);
 	return count;
 }
 
 
 int send_cb(int fd) {
 
-#if ENABLE_HTTP
+	struct conn*c = &conn_list[fd];
 
-	http_response(&conn_list[fd]);
-
-#elif ENABLE_WEBSOCKET
-
-	ws_response(&conn_list[fd]);
-
-#elif ENABLE_KVSTORE
-
-	kvs_response(&conn_list[fd]);
-
+#if ENABLE_KVSTORE
+	kvs_response(c);
 #endif
 
 	int count = 0;
-
-#if 0
-	if (conn_list[fd].status == 1) {
-		//printf("SEND: %s\n", conn_list[fd].wbuffer);
-		count = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
-		set_event(fd, EPOLLOUT, 0);
-	} else if (conn_list[fd].status == 2) {
-		set_event(fd, EPOLLOUT, 0);
-	} else if (conn_list[fd].status == 0) {
-
-		if (conn_list[fd].wlength != 0) {
-			count = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
-		}
-		
-		set_event(fd, EPOLLIN, 0);
+	if(c->write_buf.len > 0){
+		count = send( fd ,c->write_buf.buf,c->write_buf.len,0);
+		//发送完成后清空写缓冲区
+		dynbuf_clear(&c->write_buf);
 	}
-#else
 
-	if (conn_list[fd].wlength != 0) {
-		count = send(fd, conn_list[fd].wbuffer, conn_list[fd].wlength, 0);
-	}
-	
-	set_event(fd, EPOLLIN, 0);
-
-#endif
-	//set_event(fd, EPOLLOUT, 0);
-
+	//切换回读事件
+	set_event(fd,EPOLLIN,0);
 	return count;
 }
 
@@ -248,6 +194,7 @@ int r_init_server(unsigned short port) {
 
 	if (-1 == bind(sockfd, (struct sockaddr*)&servaddr, sizeof(struct sockaddr))) {
 		printf("bind failed: %s\n", strerror(errno));
+		return -1;
 	}
 
 	listen(sockfd, 10);
@@ -259,8 +206,7 @@ int r_init_server(unsigned short port) {
 
 int reactor_start(unsigned short port, msg_handler handler) {
 
-	//unsigned short port = 2000;
-	kvs_handler = handler;
+	(void)handler;
 
 	epfd = epoll_create(1);
 

@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include<sys/time.h>
 #include<unistd.h>
+#include "server.h"
 
 
 #include<jemalloc/jemalloc.h>
@@ -32,7 +33,8 @@
 #define ENABLE_SKIPTABLE	0
 
 
-typedef int (*msg_handler)(char *msg, int length, char *response);
+// 协议处理回调（统一所有网络模型：io_uring / reactor / 协程）
+typedef int (*msg_handler)(char *msg, int len, DynBuf *write_buf);
 
 
 extern int reactor_start(unsigned short port, msg_handler handler);

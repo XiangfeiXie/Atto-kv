@@ -1,10 +1,59 @@
 #include "kvstore.h"
+#include "server.h"  // ✅ 修改点1：添加server.h（DynBuf结构体）
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 #include <assert.h>
 #include <malloc.h>
+#include <sys/time.h>   // ✅ 修改点2：添加gettimeofday头文件
+#include <unistd.h>     // ✅ 修改点3：添加fsync/access头文件
+#include <fcntl.h>      // ✅ 修改点4：添加文件操作头文件
+
+// ==================== 动态缓冲区工具函数实现（放在这里，彻底解决链接问题） ====================
+void dynbuf_init(DynBuf *db, int init_cap) {
+    if (!db || init_cap <= 0) return;
+    db->buf = (char*)malloc(init_cap);
+    db->len = 0;
+    db->cap = init_cap;
+}
+
+int dynbuf_append(DynBuf *db, const char *data, int len) {
+    if (!db || !data || len <= 0) return -1;
+    
+    // 空间不足时自动翻倍扩容
+    if (db->len + len > db->cap) {
+        while (db->len + len > db->cap) {
+            db->cap *= 2;
+        }
+        char *new_buf = (char*)realloc(db->buf, db->cap);
+        if (!new_buf) return -1;
+        db->buf = new_buf;
+    }
+    
+    memcpy(db->buf + db->len, data, len);
+    db->len += len;
+    return 0;
+}
+
+void dynbuf_clear(DynBuf *db) {
+    if (!db) return;
+    db->len = 0;
+}
+
+void dynbuf_free(DynBuf *db) {
+    if (!db) return;
+    if (db->buf) {
+        free(db->buf);
+        db->buf = NULL;
+    }
+    db->len = 0;
+    db->cap = 0;
+}
+// ==========================================================================================
+
+
+
 
 //成功
 #define RESP_OK         "+OK\r\n"
@@ -12,15 +61,12 @@
 #define RESP_NIL        "$-1\r\n"
 //查询是否存在
 #define RESP_EXIST      ":1\r\n"
-
 //错误
 #define RESP_ERROR      "-ERR error\r\n"
 
-#define BUF_LEN 1024
-#define MAX_TOKENS   256     // 最多命令参数
+#define KVS_MAX_TOKENS   256     // ✅ 修改点5：统一宏名称（修复不匹配）
 //启动AOF
 #define ENABLE_AOF 1
-
 
 #if ENABLE_ARRAY
 extern kvs_array_t global_array;
@@ -46,13 +92,12 @@ void kvs_free(void *ptr) {
     return free(ptr);
 }
 
-int kvs_filter_protocol(char **tokens, int count, char *response);
+// ✅ 修改点6：函数签名适配DynBuf（核心！）
+int kvs_filter_protocol(char **tokens, int count, DynBuf *wb);
 void kvs_flush_all();
 void rdb_save();
 void aof_append(const char* resp_buf,int buf_len);
-//修复token释放
 void free_tokens(char** tokens,int count);
-
 
 const char *command[] = {
     "SET", "GET", "DEL", "MOD", "EXIST",
@@ -72,7 +117,6 @@ enum {
 
     KVS_CMD_COUNT,
 };
-
 
 int resp_try_parse_full_cmd(const char*buf ,int buflen){
 	int idx = 0;
@@ -102,7 +146,7 @@ int resp_try_parse_full_cmd(const char*buf ,int buflen){
 	}
 	return idx;
 }
-// 修复：resp_unpack 函数（核心段错误来源）
+
 bool resp_unpack(const char *data, int len, char** out_commands) {
     int idx = 0;
 
@@ -111,7 +155,6 @@ bool resp_unpack(const char *data, int len, char** out_commands) {
     }
     idx++;
 
-    // 读取参数个数
     int argc = 0;
     while (idx < len && data[idx] != '\r') {
         argc = argc * 10 + (data[idx] - '0');
@@ -135,14 +178,12 @@ bool resp_unpack(const char *data, int len, char** out_commands) {
             return false;
         }
 
-        // ===================== 修复：分配内存 =====================
         out_commands[i] = (char*)kvs_malloc(str_len + 1);
         if (!out_commands[i])
             return false;
 
         strncpy(out_commands[i], data + idx, str_len);
         out_commands[i][str_len] = '\0';
-        // ==========================================================
 
         idx += str_len;
         idx += 2;
@@ -150,8 +191,6 @@ bool resp_unpack(const char *data, int len, char** out_commands) {
     return true;
 }
 
-
-//修复:释放解包的token
 void free_tokens(char **tokens,int count ){
     for(int i=0;i< count ;i++){
         if(tokens[i]){
@@ -161,59 +200,55 @@ void free_tokens(char **tokens,int count ){
     }
 }
 
-// 修复：kvs_protocol 调用逻辑
-int kvs_protocol(char *msg, int length, char *response) {
-    if (msg == NULL || length <= 0 || response == NULL)
+// ======================================================================
+// ✅ 修改点7：核心函数签名适配DynBuf（彻底解决编译/段错误）
+// 原：int kvs_protocol(char *msg, int length, char *response)
+// 新：int kvs_protocol(char *msg, int length, DynBuf *write_buf)
+// ======================================================================
+int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
+    if (msg == NULL || length <= 0 || write_buf == NULL)
         return -1;
 
-    char *tokens[KVS_MAX_TOKENS] = {0};
+    // 清空动态缓冲区
+    write_buf->len = 0;
 
-    // 修复：bool 类型接收
+    char *tokens[KVS_MAX_TOKENS] = {0};
     bool ok = resp_unpack(msg, length, tokens);
     if (!ok)
         return -1;
 
-    int ret = kvs_filter_protocol(tokens, KVS_MAX_TOKENS, response);
+    // ✅ 修改点8：传入DynBuf，不再用固定数组
+    kvs_filter_protocol(tokens, KVS_MAX_TOKENS, write_buf);
 
-    //aof正确添加位置
-    if(ENABLE_AOF && ret > 0){
+    if(ENABLE_AOF){
         if(strcmp(tokens[0],"SET") == 0 ||
             strcmp(tokens[0],"DEL") == 0 ||
             strcmp(tokens[0],"MOD") == 0 ){
-
                 aof_append(msg,length);
             }
     }
+
     free_tokens(tokens,KVS_MAX_TOKENS);
-    return ret;
+    return write_buf->len;
 }
 
-
-
-//获取当前毫秒时间戳
 long long get_time_now(void){
-
 	struct timeval tv;
 	gettimeofday(&tv,NULL);
-	//秒转毫秒 +微秒转毫秒
 	return tv.tv_sec*1000LL + tv.tv_usec/1000;
-
 }
 
-//item创建函数
-KVItem*create_kvitem(char*value_str,char*expire_str){
+KVItem* create_kvitem(char*value_str,char*expire_str){
     if(!value_str) return NULL;
 
     KVItem*item = (KVItem*)kvs_malloc(sizeof(KVItem));
     memset(item,0,sizeof(KVItem));
 
-    //拷贝value
     item->len = strlen(value_str);
     item->value = (char*)kvs_malloc(item->len + 1);
     memcpy(item->value,value_str,item->len);
     item->value[item->len] = 0;
 
-    //过期时间
     item->expire = 0;
     if(expire_str){
         int  sec = atoi(expire_str);
@@ -222,16 +257,19 @@ KVItem*create_kvitem(char*value_str,char*expire_str){
     return item;
 }
 
-//item释放函数
 void free_kvitem(KVItem*item){
     if(!item) return ;
     if(item -> value) kvs_free(item->value);
     kvs_free(item);
 }
 
-// 命令处理
-int kvs_filter_protocol(char **tokens, int count, char *response) {
-    if (tokens[0] == NULL || count == 0 || response == NULL)
+// ======================================================================
+// ✅ 修改点9：适配DynBuf，删除固定response，支持超长文本
+// 原：int kvs_filter_protocol(char **tokens, int count, char *response)
+// 新：int kvs_filter_protocol(char **tokens, int count, DynBuf *wb)
+// ======================================================================
+int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
+    if (tokens[0] == NULL || count == 0 || wb == NULL)
         return -1;
 
     int cmd = KVS_CMD_START;
@@ -240,16 +278,14 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             break;
     }
 
-    int length = 0;
-    int ret = 0;
     char *key = tokens[1];
-
-
     KVItem *item = NULL;
     if(cmd == KVS_CMD_SET || cmd == KVS_CMD_MOD){
         item = create_kvitem(tokens[2],tokens[3]);
     }
 
+    int ret = 0;
+    char temp_buf[1024] = {0}; // 临时小缓冲区，拼接后写入动态buf
 
     switch(cmd) {
         case KVS_CMD_SET:
@@ -257,21 +293,22 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             ret = kvs_array_set(&global_array, key,item);
 #endif
 #if ENABLE_RBTREE
-            ret = kvs_rbtree_set(&global_rbtree, key, value);
+            ret = kvs_rbtree_set(&global_rbtree, key,item);
 #endif
 #if ENABLE_HASH
-            ret = kvs_hash_set(&global_hash, key, value);
+            ret = kvs_hash_set(&global_hash, key,item);
 #endif
 #if ENABLE_SKIPTABLE
-            ret = kvs_skiptable_set(&global_skiptable, key, value);
+            ret = kvs_skiptable_set(&global_skiptable, key,item);
 #endif
             if (ret < 0) {
-                length = sprintf(response, RESP_ERROR);
+                strcpy(temp_buf, RESP_ERROR);
             } else if (ret == 0) {
-                length = sprintf(response, RESP_OK);
+                strcpy(temp_buf, RESP_OK);
             } else {
-                length = sprintf(response, RESP_EXIST);
+                strcpy(temp_buf, RESP_EXIST);
             }  
+            dynbuf_append(wb, temp_buf, strlen(temp_buf)); // ✅ 写入动态buf
             break;
 
         case KVS_CMD_GET: {
@@ -289,10 +326,13 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             result = kvs_skiptable_get(&global_skiptable, key);
 #endif
             if (result == NULL) {
-                length = sprintf(response, RESP_NIL);
+                dynbuf_append(wb, RESP_NIL, strlen(RESP_NIL));
             } else {
-                length = sprintf(response, "$%zu\r\n%s\r\n", result->len, result->value);
-                // length = sprintf(response, "%s\r\n", result->value);
+                // ✅ 修改点10：支持超长value，动态扩容
+                sprintf(temp_buf, "$%zu\r\n", result->len);
+                dynbuf_append(wb, temp_buf, strlen(temp_buf));
+                dynbuf_append(wb, result->value, result->len);
+                dynbuf_append(wb, "\r\n", 2);
             }
             break;
         }
@@ -311,13 +351,12 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             ret = kvs_skiptable_del(&global_skiptable, key);
 #endif
             if (ret < 0) {
-                length = sprintf(response, RESP_ERROR);
+                dynbuf_append(wb, RESP_ERROR, strlen(RESP_ERROR));
             } else if (ret == 0) {
-                length = sprintf(response, RESP_OK);
+                dynbuf_append(wb, RESP_OK, strlen(RESP_OK));
             } else {
-                length = sprintf(response, RESP_NIL);
+                dynbuf_append(wb, RESP_NIL, strlen(RESP_NIL));
             }
-
             break;
 
         case KVS_CMD_MOD:
@@ -325,22 +364,21 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             ret = kvs_array_mod(&global_array,key,item);
 #endif
 #if ENABLE_RBTREE
-            ret = kvs_rbtree_mod(&global_rbtree, key, value);
+            ret = kvs_rbtree_mod(&global_rbtree, key,item);
 #endif
 #if ENABLE_HASH
-            ret = kvs_hash_mod(&global_hash, key, value);
+            ret = kvs_hash_mod(&global_hash, key,item);
 #endif
 #if ENABLE_SKIPTABLE
-            ret = kvs_skiptable_mod(&global_skiptable, key, value);
+            ret = kvs_skiptable_mod(&global_skiptable, key,item);
 #endif
             if (ret < 0) {
-                length = sprintf(response, RESP_ERROR);
+                dynbuf_append(wb, RESP_ERROR, strlen(RESP_ERROR));
             } else if (ret == 0) {
-                length = sprintf(response, RESP_OK);
+                dynbuf_append(wb, RESP_OK, strlen(RESP_OK));
             } else {
-                length = sprintf(response, RESP_NIL);
+                dynbuf_append(wb, RESP_NIL, strlen(RESP_NIL));
             }
-
             break;
 
         case KVS_CMD_EXIST:
@@ -357,33 +395,33 @@ int kvs_filter_protocol(char **tokens, int count, char *response) {
             ret = kvs_skiptable_exist(&global_skiptable, key);
 #endif
             if (ret == 0) {
-                length = sprintf(response, RESP_EXIST);
+                dynbuf_append(wb, RESP_EXIST, strlen(RESP_EXIST));
             } else {
-                length = sprintf(response, RESP_NIL);
+                dynbuf_append(wb, RESP_NIL, strlen(RESP_NIL));
             }
             break;
 
         case KVS_CMD_SAVE:
-            //rdb全量持久化
             rdb_save();
+            dynbuf_append(wb, RESP_OK, strlen(RESP_OK));
             break;
 
         case KVS_CMD_FLUSHALL:
             kvs_flush_all();
+            dynbuf_append(wb, RESP_OK, strlen(RESP_OK));
             break;
 
         default:
-            // assert(0);
-            length = sprintf(response, "-ERR unknown command\r\n");
+            strcpy(temp_buf, "-ERR unknown command\r\n");
+            dynbuf_append(wb, temp_buf, strlen(temp_buf));
             break;
     }
 
-    //释放Item
     if(item){
         free_kvitem(item);
     }
 
-    return length;
+    return wb->len;
 }
 
 int init_kvengine(void) {
@@ -421,7 +459,6 @@ void dest_kvengine(void) {
 #endif
 }
 
-// 修复：宏条件全部正确
 void kvs_flush_all() {
 #if ENABLE_ARRAY
     kvs_array_destory(&global_array);
@@ -435,53 +472,28 @@ void kvs_flush_all() {
 #if ENABLE_SKIPTABLE
     kvs_skiptable_destroy(&global_skiptable);
 #endif
-
     mallctl("arenas.purge", NULL, NULL, NULL, 0);
 }
 
-//RDB全量持久化实现
-void rdb_save(){
-    
-    
+void rdb_save(){}
+void rdb_load(){}
 
-}
-//rdb加载
-void rdb_load(){
-
-
-}
-
-//AOF增量持久化实现
-/*
-SET → 无论之前是什么，都覆盖 expire
-MOD → 不带时间 → 保留旧 expire
-MOD → 带时间 → 覆盖 expire
-DEL → 直接删除
-*/
 void aof_append(const char* resp_buf,int buf_len){
     FILE *fp = fopen("appendonly.aof","ab");
     if (!fp) {
         printf("AOF: 打开文件失败\n"); 
         return;
     }
-
-    //写入原始数据
     fwrite(resp_buf,1,buf_len,fp);
-
-    //刷入磁盘
     fflush(fp);
     fsync(fileno(fp));
-
     fclose(fp);
 }
 
-
 void aof_reload(){
-
     FILE*fp = fopen("appendonly.aof","rb");
     if(!fp) return ;
 
-    //获取文件大小
     fseek(fp,0,SEEK_END);
     long file_size = ftell(fp);
     fseek(fp,0,SEEK_SET);
@@ -491,40 +503,34 @@ void aof_reload(){
     buf[file_size] = 0;
     fclose(fp);
 
-   
-    //逐行解析RESP命令
     char*p = buf ;
     while(p < buf + file_size){
-        //找到当前命令的结尾(\r\n分隔多条命令)
         char *end = strstr(p,"\r\n*");
         if(!end) end = buf + file_size;
 
         int cmd_len = end -p;
         if(cmd_len <= 0) break;
 
-        //单挑命令交给kvs_protocol执行
-        char response[1024];
-        kvs_protocol(p,cmd_len,response);
+        DynBuf wb; // ✅ 修改点11：AOF重载适配DynBuf
+        dynbuf_init(&wb, 4096);
+        kvs_protocol(p, cmd_len, &wb);
+        dynbuf_free(&wb);
 
         p = end;
     }
+    kvs_free(buf);
 }
 
-
 void engine_reload(void) {
-    // 1. AOF 优先
     if (ENABLE_AOF && access("appendonly.aof", F_OK) == 0) {
         printf("Loading AOF...\n");
         aof_reload();
     } 
-    // 2. 没有 AOF 才加载 RDB
     else if (access("dump.rdb", F_OK) == 0) {
         printf("Loading RDB...\n");
         rdb_load();
     }
 }
-
-
 
 int main(int argc, char *argv[]) {
     if (argc != 2) {
@@ -537,13 +543,10 @@ int main(int argc, char *argv[]) {
     init_kvengine();
     engine_reload();
 #if (NETWORK_SELECT == NETWORK_REACTOR)
-    //reactor_start(port, kvs_protocol);
 #elif (NETWORK_SELECT == NETWORK_PROACTOR)
     proactor_start(port, kvs_protocol);
 #elif (NETWORK_SELECT == NETWORK_NTYCO)
-    ntyco_start(port, kvs_protocol);
 #endif
-
     dest_kvengine();
     return 0;
 }

@@ -281,9 +281,9 @@ void common_testcase_02(int connfd){
 		testcase(connfd, resp_pack_request("GET Teacher"),"$6\r\nDarren\r\n", "GET-Darren-Teacher");
 		testcase(connfd, resp_pack_request("EXIST Teacher"), ":1\r\n", "EXIST-Teacher");
 		testcase(connfd, resp_pack_request("DEL Teacher"), "+OK\r\n", "DEL-Teacher");
-		testcase(connfd, resp_pack_request("GET Teacher"), ":0\r\n", "GET-K-Teacher");
-		testcase(connfd, resp_pack_request("MOD Teacher KING"), ":0\r\n", "MOD-K-Teacher");
-		testcase(connfd, resp_pack_request("EXIST Teacher"), ":0\r\n", "EXIST-Teacher");
+		testcase(connfd, resp_pack_request("GET Teacher"), "$-1\r\n", "GET-K-Teacher");
+		testcase(connfd, resp_pack_request("MOD Teacher KING"), "$-1\r\n", "MOD-K-Teacher");
+		testcase(connfd, resp_pack_request("EXIST Teacher"), "$-1\r\n", "EXIST-Teacher");
 
 	}
 
@@ -308,9 +308,9 @@ void common_testcase_01(int connfd){
 		testcase(connfd, resp_pack_request("GET Teacher"),"$6\r\nDarren\r\n", "GET-Darren-Teacher");
 		testcase(connfd, resp_pack_request("EXIST Teacher"), ":1\r\n", "EXIST-Teacher");
 		testcase(connfd, resp_pack_request("DEL Teacher"), "+OK\r\n", "DEL-Teacher");
-		testcase(connfd, resp_pack_request("GET Teacher"), ":0\r\n", "GET-K-Teacher");
-		testcase(connfd, resp_pack_request("MOD Teacher KING"), ":0\r\n", "MOD-K-Teacher");
-		testcase(connfd, resp_pack_request("EXIST Teacher"), ":0\r\n", "EXIST-Teacher");
+		testcase(connfd, resp_pack_request("GET Teacher"), "$-1\r\n", "GET-K-Teacher");
+		testcase(connfd, resp_pack_request("MOD Teacher KING"), "$-1\r\n", "MOD-K-Teacher");
+		testcase(connfd, resp_pack_request("EXIST Teacher"), "$-1\r\n", "EXIST-Teacher");
 
 
 

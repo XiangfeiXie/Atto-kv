@@ -1,54 +1,153 @@
 *3
 $3
 SET
+$7
+Teacher
+$4
+King
+*3
+$3
+MOD
+$7
+Teacher
+$6
+Darren
+*2
+$3
+DEL
+$7
+Teacher
+*3
+$3
+MOD
+$7
+Teacher
+$4
+KING
+*3
+$3
+SET
 $6
 MYFILE
-$386
-SET name alice
-GET name
-EXIST name
-MOD name alice_new
-GET name
-DEL name
-GET name
-EXIST name
-SET temp_key temp_value 10
-GET temp_key
-EXIST temp_key
-SET k1 v1
-SET k2 v2
-SET k3 v3
-GET k1
-GET k2
-GET k3
-DEL k1
-DEL k2
-DEL k3
-SET key_with_space "hello world 123"
-GET key_with_space
-SET special_char "!@#$%^&*()_+-=[]{}|;':\",./<>?"
-GET special_char
-SET empty_key ""
-GET empty_key
-DEL empty_key
+$0
+
 *3
 $3
 SET
-$12
-special_char
-$29
-!@#$%^&*()_+-=[]{}|;':",./<>?
+$6
+MYFILE
+$0
+
 *3
 $3
 SET
-$12
-special_char
-$29
-!@#$%^&*()_+-=[]{}|;':",./<>?
+$6
+MYFILe
+$0
+
 *3
+$3
+SET
+$7
+Teacher
+$4
+King*3
+$3
+SET
+$2
+k1
+$5
+hello
+*3
+$3
+MOD
+$2
+k1
+$10
+helloworld
+*2
+$3
+DEL
+$2
+k1
+*3
+$3
+SET
+$2
+k2
+$6
+123456
+*3
+$3
+SET
+$5
+empty
+$0
+
+*3
+$3
+SET
+$4
+zero
+$1
+0
+*3
+$3
+SET
+$5
+space
+$18
+hello test kvstore
+*3
+$3
+SET
+$4
+wrap
+$12
+line1\nline2
+*3
+$3
+SET
+$2
+cn
+$29
+测试自研KV存储服务器
+*3
+$3
+SET
+$3
+mix
+$17
+KV_123_!@#_测试
+*4
 $3
 SET
 $11
-specialchar
-$29
-!@#$%^&*()_+-=[]{}|;':",./<>?
+expire_test
+$10
+test_value
+$2
+10
+*3
+$3
+MOD
+$8
+mod_test
+$7
+old_val
+*4
+$3
+MOD
+$8
+mod_test
+$7
+new_val
+$2
+20
+*3
+$3
+SET
+$8
+long_txt
+$388
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA

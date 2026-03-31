@@ -29,8 +29,8 @@
 
 #define KVS_MAX_TOKENS		256
 
-#define ENABLE_ARRAY		1
-#define ENABLE_RBTREE		0
+#define ENABLE_ARRAY		0
+#define ENABLE_RBTREE		1
 #define ENABLE_HASH			0
 #define ENABLE_SKIPTABLE	0
 
@@ -110,7 +110,7 @@ void kvs_array_clear(kvs_array_t *db);
 #if ENABLE_KEY_CHAR
 typedef char* KEY_TYPE;
 #else
-typedef int KEY_TYPE; // key
+typedef int KEY_TYPE;
 #endif
 
 typedef struct _rbtree_node {
@@ -119,24 +119,29 @@ typedef struct _rbtree_node {
 	struct _rbtree_node *left;
 	struct _rbtree_node *parent;
 	KEY_TYPE key;
-	void *value;
+	void *value;     // 这里存 KVItem*
 } rbtree_node;
 
 typedef struct _rbtree {
 	rbtree_node *root;
 	rbtree_node *nil;
+	int total;      // ✅ 键值对数量
 } rbtree;
-
 
 typedef struct _rbtree kvs_rbtree_t;
 
+// 全部统一成 KVItem 接口
 int kvs_rbtree_create(kvs_rbtree_t *inst);
 void kvs_rbtree_destory(kvs_rbtree_t *inst);
-int kvs_rbtree_set(kvs_rbtree_t *inst, char *key, char *value);
-char* kvs_rbtree_get(kvs_rbtree_t *inst, char *key);
-int kvs_rbtree_del(kvs_rbtree_t *inst, char *key);
-int kvs_rbtree_mod(kvs_rbtree_t *inst, char *key, char *value);
-int kvs_rbtree_exist(kvs_rbtree_t *inst, char *key);
+
+int kvs_rbtree_set(kvs_rbtree_t *inst, const char *key, const KVItem *item);
+KVItem* kvs_rbtree_get(kvs_rbtree_t *inst, const char *key);
+int kvs_rbtree_del(kvs_rbtree_t *inst, const char *key);
+int kvs_rbtree_mod(kvs_rbtree_t *inst, const char *key, const KVItem *item);
+int kvs_rbtree_exist(kvs_rbtree_t *inst, const char *key);
+
+void kvs_rbtree_scan(kvs_rbtree_t *db, kv_scan_cb cb, void *priv);
+void kvs_rbtree_clear(kvs_rbtree_t *db);
 
 #endif
 

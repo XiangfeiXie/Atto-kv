@@ -20,9 +20,10 @@
 #define NETWORK_PROACTOR	1
 #define NETWORK_NTYCO		2
 
-#define NETWORK_SELECT		NETWORK_REACTOR
+#define NETWORK_SELECT		NETWORK_NTYCO
 #define ENABLE_JEMALLOC 1
-
+//初始缓冲区大小
+#define BUF_INIT_CAP			4096
 
 
 #define KVS_MAX_TOKENS		256
@@ -35,7 +36,7 @@
 
 // 协议处理回调（统一所有网络模型：io_uring / reactor / 协程）
 typedef int (*msg_handler)(char *msg, int len, DynBuf *write_buf);
-
+extern msg_handler kvs_handler;
 
 extern int reactor_start(unsigned short port, msg_handler handler);
 extern int proactor_start(unsigned short port, msg_handler handler);

@@ -5,48 +5,70 @@
 #include "nty_coroutine.h"
 
 #include <arpa/inet.h>
+#include "server.h"
+#include "kvstore.h"
 
 
-#define BUFFER_SIZE 1024
-
-typedef int (*msg_handler)(char *msg, int length, char *response);
-static msg_handler kvs_handler;
+msg_handler kvs_handler = NULL;
 
 
+
+// 协程客户端结构体（和 Reactor 完全一致）
 typedef struct {
-	char buf[BUFFER_SIZE];
-	int len ;
-}StreamClient;
+    int fd;
+    DynBuf read_buf;   // 动态读缓冲区
+    DynBuf write_buf;  // 动态写缓冲区
+} NtyClient;
 
 
-void server_reader(void *arg) {
+//协程读包 + 协议解析 + 处理
+void server_reader(void*arg){
 	int fd = *(int *)arg;
-	StreamClient client = {0};
+	NtyClient client = {0};
+	client.fd = fd;
 
- 
-	while (1) {
-		//流式修改，追加读取，不清空
-		int remain = BUFFER_SIZE - client.len;
-		if(remain <= 0) break;
-		int ret = recv(fd,client.buf + client.len ,remain,0);
+	//初始化动态缓冲区
+	dynbuf_init(&client.read_buf,BUF_INIT_CAP);
+	dynbuf_init(&client.write_buf,BUF_INIT_CAP);
+
+	while(1){
+		//临时接收缓冲区
+		char tmp[2096];
+		int ret = recv(fd,tmp,sizeof(tmp),0);
 
 		if(ret <= 0){
+			//客户端断开，释放内存
+			dynbuf_free(&client.read_buf);
+			dynbuf_free(&client.write_buf);
 			close(fd);
 			break;
 		}
-		client.len += ret;
 
+		//动态扩容追加数据（支持无限长文本）
+		dynbuf_append(&client.read_buf,tmp,ret);
+
+		//流式解析RESP协议
 		while(1){
-			int cmd_len = resp_try_parse_full_cmd(client.buf,client.len);
+			int cmd_len = resp_try_parse_full_cmd(client.read_buf.buf,client.read_buf.len);
 			if(cmd_len <= 0) break;
 
-			char response[1024] = {0};
-			int slen = kvs_handler(client.buf,cmd_len,response);
-			send(fd,response,slen,0);
+			//调用统一KV协议处理
+			kvs_protocol(client.read_buf.buf,cmd_len,&client.write_buf);
 
-			//移除已解析数据
-			memmove(client.buf,client.buf + cmd_len,client.len - cmd_len);
-			client.len -= cmd_len;
+			//移除已解析命令
+			memmove(client.read_buf.buf,client.read_buf.buf + cmd_len,client.read_buf.len - cmd_len);
+			client.read_buf.len -= cmd_len;
+		}
+
+		//发送响应数据
+		if(client.write_buf.len > 0){
+			ssize_t count = send(fd,client.write_buf.buf,client.write_buf.len,0);
+			if (count > 0) {
+                memmove(client.write_buf.buf,
+                        client.write_buf.buf + count,
+                        client.write_buf.len - count);
+                client.write_buf.len -= count;
+            }
 		}
 	}
 }
@@ -96,7 +118,7 @@ int ntyco_start(unsigned short port, msg_handler handler) {
 	nty_coroutine_create(&co, server, &port);
 
 	nty_schedule_run();
-
+	return 0;
 }
 
 

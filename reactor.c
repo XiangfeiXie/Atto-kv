@@ -16,7 +16,7 @@
 
 #define CONNECTION_SIZE			1024 // 1024 * 1024
 #define MAX_PORTS				20
-#define BUF_INIT_CAP			4096
+
 
 #define TIME_SUB_MS(tv1, tv2)  ((tv1.tv_sec - tv2.tv_sec) * 1000 + (tv1.tv_usec - tv2.tv_usec) / 1000)
 
@@ -162,23 +162,24 @@ int recv_cb(int fd) {
 
 
 int send_cb(int fd) {
+    struct conn *c = &conn_list[fd];
+    int count = 0;
 
-	struct conn*c = &conn_list[fd];
+    if (c->write_buf.len > 0) {
+        count = send(fd, c->write_buf.buf, c->write_buf.len, 0);
+		//printf("[SEND] fd=%d, len=%d, buf: %.*s\n", fd, c->write_buf.len, c->write_buf.len, c->write_buf.buf);
+        if (count > 0) {
+            // 只移除已发送的数据，不全部清空
+            memmove(c->write_buf.buf, c->write_buf.buf + count, c->write_buf.len - count);
+            c->write_buf.len -= count;
+        }
+    }
 
-#if ENABLE_KVSTORE
-	kvs_response(c);
-#endif
+    // 数据发完再切回读事件
+    if (c->write_buf.len == 0)
+        set_event(fd, EPOLLIN, 0);
 
-	int count = 0;
-	if(c->write_buf.len > 0){
-		count = send( fd ,c->write_buf.buf,c->write_buf.len,0);
-		//发送完成后清空写缓冲区
-		dynbuf_clear(&c->write_buf);
-	}
-
-	//切换回读事件
-	set_event(fd,EPOLLIN,0);
-	return count;
+    return count;
 }
 
 

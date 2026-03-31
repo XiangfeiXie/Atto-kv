@@ -8,7 +8,7 @@ DEL k1
 EXIST k1
 SET k2 123456
 GET k2
-FLUSHALL
+
 GET k2
 
 SET empty ""

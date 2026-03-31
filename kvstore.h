@@ -30,9 +30,9 @@
 #define KVS_MAX_TOKENS		256
 
 #define ENABLE_ARRAY		0
-#define ENABLE_RBTREE		1
+#define ENABLE_RBTREE		0
 #define ENABLE_HASH			0
-#define ENABLE_SKIPTABLE	0
+#define ENABLE_SKIPTABLE	1
 
 
 
@@ -157,7 +157,7 @@ void kvs_rbtree_clear(kvs_rbtree_t *db);
 typedef struct hashnode_s {
 #if ENABLE_KEY_POINTER
 	char *key;
-	char *value;
+	KVItem *value;  // 🔥 统一改成 KVItem
 #else
 	char key[MAX_KEY_LEN];
 	char value[MAX_VALUE_LEN];
@@ -173,13 +173,19 @@ typedef struct hashtable_s {
 
 typedef struct hashtable_s kvs_hash_t;
 
+// 🔥 全部对齐 KVItem 接口
 int kvs_hash_create(kvs_hash_t *hash);
 void kvs_hash_destory(kvs_hash_t *hash);
-int kvs_hash_set(hashtable_t *hash, char *key, char *value);
-char * kvs_hash_get(kvs_hash_t *hash, char *key);
-int kvs_hash_mod(kvs_hash_t *hash, char *key, char *value);
-int kvs_hash_del(kvs_hash_t *hash, char *key);
-int kvs_hash_exist(kvs_hash_t *hash, char *key);
+
+int kvs_hash_set(kvs_hash_t *hash, const char *key, const KVItem *item);
+KVItem* kvs_hash_get(kvs_hash_t *hash, const char *key);
+int kvs_hash_mod(kvs_hash_t *hash, const char *key, const KVItem *item);
+int kvs_hash_del(kvs_hash_t *hash, const char *key);
+int kvs_hash_exist(kvs_hash_t *hash, const char *key);
+
+//  RDB 遍历 + 清空
+void kvs_hash_scan(kvs_hash_t *db, kv_scan_cb cb, void *priv);
+void kvs_hash_clear(kvs_hash_t *db);
 
 #endif
 
@@ -187,34 +193,40 @@ int kvs_hash_exist(kvs_hash_t *hash, char *key);
 
 #if ENABLE_SKIPTABLE
 
-
 #define MAX_LEVEL 6
 
+// 彻底改成字符串key，和其他引擎统一
 typedef struct Node {
-	int key;
-	char value[128];
-	struct Node **forward;
+    char *key;          // 字符串key，支持中文/任意字符
+    KVItem *value;      // 统一KVItem
+    struct Node **forward;
 } Node;
 
 typedef struct SkipList {
-	int level;
-	Node *header;
+    int level;
+    Node *header;
+    int total;          // RDB计数
 } SkipList;
 
 struct kvs_skiptable {
-	SkipList *skl;
+    SkipList *skl;
 };
 
 typedef struct kvs_skiptable kvs_skiptable_t;
 
+// 统一接口，和array/hash/rbtree完全一致
 int kvs_skiptable_create(kvs_skiptable_t *inst);
 void kvs_skiptable_destroy(kvs_skiptable_t *inst);
 
-int kvs_skiptable_set(kvs_skiptable_t *inst, char *key, char *value);
-char* kvs_skiptable_get(kvs_skiptable_t *inst, char *key);
-int kvs_skiptable_del(kvs_skiptable_t *inst, char *key);
-int kvs_skiptable_mod(kvs_skiptable_t *inst, char *key, char *value);
-int kvs_skiptable_exist(kvs_skiptable_t *inst, char *key);
+int kvs_skiptable_set(kvs_skiptable_t *inst, const char *key, const KVItem *item);
+KVItem* kvs_skiptable_get(kvs_skiptable_t *inst, const char *key);
+int kvs_skiptable_del(kvs_skiptable_t *inst, const char *key);
+int kvs_skiptable_mod(kvs_skiptable_t *inst, const char *key, const KVItem *item);
+int kvs_skiptable_exist(kvs_skiptable_t *inst, const char *key);
+
+// RDB遍历+清空
+void kvs_skiptable_scan(kvs_skiptable_t *db, kv_scan_cb cb, void *priv);
+void kvs_skiptable_clear(kvs_skiptable_t *db);
 
 #endif
 

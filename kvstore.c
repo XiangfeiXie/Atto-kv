@@ -507,6 +507,15 @@ void rdb_save(void){
 #if ENABLE_ARRAY
     int key_count = global_array.total;           //统一宏处理
 #endif
+#if ENABLE_RBTREE
+    int key_count = global_rbtree.total;           //统一宏处理
+#endif
+#if ENABLE_HASH
+    int key_count = global_hash.count;           //统一宏处理
+#endif
+#if ENABLE_SKIPTABLE
+    int key_count = global_skiptable.skl->total;
+#endif
 
     fwrite(&magic, sizeof(int), 1, fp);
     fwrite(&version, sizeof(int), 1, fp);

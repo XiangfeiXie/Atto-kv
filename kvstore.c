@@ -499,26 +499,34 @@ void aof_reload(){
     fseek(fp,0,SEEK_SET);
 
     char* buf = kvs_malloc(file_size + 1);
+    if(!buf) return ;
     fread(buf,1,file_size,fp);
     buf[file_size] = 0;
     fclose(fp);
 
     char*p = buf ;
-    while(p < buf + file_size){
-        char *end = strstr(p,"\r\n*");
-        if(!end) end = buf + file_size;
+    long remaining = file_size;
+    printf("AOF load start,size:%ld\n",file_size);
 
-        int cmd_len = end -p;
-        if(cmd_len <= 0) break;
+    while(remaining > 0){
+        int cmd_len = resp_try_parse_full_cmd(p,remaining);
 
-        DynBuf wb; // ✅ 修改点11：AOF重载适配DynBuf
-        dynbuf_init(&wb, 4096);
+        if(cmd_len <= 0){
+            printf("AOF load exit,cmd_len:%d,remaining:%ld\n",cmd_len,remaining);
+            break;
+        }
+
+        DynBuf wb; //  修改点11：AOF重载适配DynBuf
+        dynbuf_init(&wb, BUF_INIT_CAP);
         kvs_protocol(p, cmd_len, &wb);
         dynbuf_free(&wb);
 
-        p = end;
+        //移动指针和剩余长度
+        p += cmd_len;
+        remaining -= cmd_len;
     }
     kvs_free(buf);
+    printf("AOF load finished!\n");
 }
 
 void engine_reload(void) {
@@ -547,6 +555,7 @@ int main(int argc, char *argv[]) {
 #elif (NETWORK_SELECT == NETWORK_PROACTOR)
     proactor_start(port, kvs_protocol);
 #elif (NETWORK_SELECT == NETWORK_NTYCO)
+    ntyco_start(port, kvs_protocol);
 #endif
     dest_kvengine();
     return 0;

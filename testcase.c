@@ -238,6 +238,16 @@ char *resp_pack_request(char *msg){
 	return out_buf;
 
 }
+void common_testcase_04(int connfd){
+		
+		testcase(connfd, resp_pack_request("SET Teacher1 King1"), "+OK\r\n", "SET-Teacher");
+		testcase(connfd, resp_pack_request("SET Teacher2 King2"), "+OK\r\n", "SET-Teacher");
+		testcase(connfd, resp_pack_request("SET Teacher3 King3"), "+OK\r\n", "SET-Teacher");
+		testcase(connfd, resp_pack_request("SET Teacher4 King4"), "+OK\r\n", "SET-Teacher");
+		testcase(connfd, resp_pack_request("SET Teacher5 King5"), "+OK\r\n", "SET-Teacher");
+		testcase(connfd, resp_pack_request("SET Teacher6 King6"), "+OK\r\n", "SET-Teacher");
+		testcase(connfd, resp_pack_request("SET Teacher7 King7"), "+OK\r\n", "SET-Teacher");
+}
 
 void common_testcase_03(int connfd){
 		
@@ -434,6 +444,8 @@ printf("=================== KV Store Test Menu ===================\n"
 		common_testcase_02(connfd);
 	}else if(mode==3){
 		common_testcase_03(connfd);
+	}else if(mode==4){
+		common_testcase_04(connfd);
 	}
     return 0;
 }

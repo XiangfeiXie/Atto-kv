@@ -14,7 +14,8 @@
 
 #include<jemalloc/jemalloc.h>
 
-
+#define ENABLE_RDB 1       
+#define ENABLE_AOF 0
 
 #define NETWORK_REACTOR 	0
 #define NETWORK_PROACTOR	1
@@ -34,6 +35,8 @@
 #define ENABLE_SKIPTABLE	0
 
 
+
+
 // 协议处理回调（统一所有网络模型：io_uring / reactor / 协程）
 typedef int (*msg_handler)(char *msg, int len, DynBuf *write_buf);
 extern msg_handler kvs_handler;
@@ -50,6 +53,14 @@ typedef struct {
     size_t len;		//数据长度（大文件，二进制文件）
     long long expire;//过期时间戳
 } KVItem;
+
+
+typedef struct {
+	FILE *fp;
+}RdbSaveCtx;
+
+//引擎遍历函数回调
+typedef void (*kv_scan_cb)(const char *key, KVItem *item, void *priv);
 
 
 #if ENABLE_ARRAY
@@ -81,6 +92,10 @@ int kvs_array_mod(kvs_array_t *inst, const char *key, const KVItem*item);
 int kvs_array_exist(kvs_array_t *inst, const char *key);
 
 
+//rdb处理函数
+void kvs_array_scan(kvs_array_t *db, kv_scan_cb cb, void *priv);
+//清空数据（RDB 加载前用）
+void kvs_array_clear(kvs_array_t *db);
 
 #endif
 

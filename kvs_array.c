@@ -149,7 +149,7 @@ int kvs_array_mod(kvs_array_t *inst, const char *key, const KVItem*item) {
     kvs_free(old->value);
 
     // 复制新值
-    char* vcopy = malloc(item->len + 1);
+    char* vcopy = kvs_malloc(item->len + 1);
     memcpy(vcopy, item->value, item->len);
     vcopy[item->len] = 0;
 
@@ -168,6 +168,32 @@ int kvs_array_mod(kvs_array_t *inst, const char *key, const KVItem*item) {
 
 int kvs_array_exist(kvs_array_t *inst,const  char *key) {
 	return kvs_array_get(inst, key) ? 0 : 1;
+}
+
+// RDB 遍历所有数据
+void kvs_array_scan(kvs_array_t *inst, void (*cb)(const char*, KVItem*, void*), void *priv) {
+    if (!inst) return;
+    for (int i = 0; i < inst -> total; i++) {
+        kvs_array_item_t *it = &inst->table[i];
+        if (it->key) {
+            cb(it->key, it->item, priv);
+        }
+    }
+}
+
+// 清空整个 array（RDB 加载用）
+void kvs_array_clear(kvs_array_t *inst) {
+    if (!inst) return;
+    for (int i = 0; i < KVS_ARRAY_SIZE; i++) {
+        kvs_array_item_t *it = &inst->table[i];
+        if (it->key) {
+            kvs_free(it->key);
+            kvs_free(it->item->value);
+            kvs_free(it->item);
+            it->key = NULL;
+        }
+    }
+    inst->total = 0;
 }
 
 

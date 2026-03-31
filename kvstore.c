@@ -66,7 +66,7 @@ void dynbuf_free(DynBuf *db) {
 
 #define KVS_MAX_TOKENS   256     // ✅ 修改点5：统一宏名称（修复不匹配）
 //启动AOF
-#define ENABLE_AOF 1
+
 
 #if ENABLE_ARRAY
 extern kvs_array_t global_array;
@@ -95,7 +95,7 @@ void kvs_free(void *ptr) {
 // ✅ 修改点6：函数签名适配DynBuf（核心！）
 int kvs_filter_protocol(char **tokens, int count, DynBuf *wb);
 void kvs_flush_all();
-void rdb_save();
+void rdb_save(void);
 void aof_append(const char* resp_buf,int buf_len);
 void free_tokens(char** tokens,int count);
 
@@ -475,8 +475,142 @@ void kvs_flush_all() {
     mallctl("arenas.purge", NULL, NULL, NULL, 0);
 }
 
-void rdb_save(){}
-void rdb_load(){}
+static void rdb_save_callback(const char *key,KVItem*item,void*priv){
+    if(!key || !item) return ;
+
+    RdbSaveCtx *ctx = (RdbSaveCtx*) priv;
+    FILE *fp = ctx -> fp;
+    
+    //写入key
+    int klen = strlen(key);
+    fwrite(&klen,sizeof(int),1,fp);
+    fwrite(key,1,klen,fp);
+
+    //写入value
+    int vlen = item -> len;
+    fwrite(&vlen,sizeof(int),1,fp);
+    fwrite(item->value,1,vlen,fp);
+
+    //写入过期时间
+    fwrite(&item->expire,sizeof(long long),1,fp);
+}
+
+void rdb_save(void){
+
+    FILE*fp = fopen("dump.rdb","wb");
+    if(!fp) return ;
+
+    //头部
+    int magic = 0x524442;
+    int version = 1;
+    int db_num = 0;
+#if ENABLE_ARRAY
+    int key_count = global_array.total;           //统一宏处理
+#endif
+
+    fwrite(&magic, sizeof(int), 1, fp);
+    fwrite(&version, sizeof(int), 1, fp);
+    fwrite(&db_num, sizeof(int), 1, fp);
+    fwrite(&key_count, sizeof(int), 1, fp);
+
+
+    // 遍历所有引擎数据并写入
+    RdbSaveCtx ctx = {.fp = fp};
+
+#if (ENABLE_ARRAY)                         
+        kvs_array_scan(&global_array, rdb_save_callback, &ctx);  
+#endif
+#if (ENABLE_RBTREE)                  
+        kvs_rbtree_scan(&global_rbtree, rdb_save_callback, &ctx);
+#endif
+#if (ENABLE_HASH)                    
+        kvs_hash_scan(&global_hash, rdb_save_callback, &ctx);
+#endif   
+#if (ENABLE_SKIPTABLE)                
+        kvs_skiptable_scan(&global_skiptable, rdb_save_callback, &ctx); 
+#endif
+
+    fflush(fp);
+    fsync(fileno(fp));
+    fclose(fp);
+    printf("RDB saved success: dump.rdb\n");
+}
+void rdb_load(void) {
+    FILE *fp = fopen("dump.rdb", "rb");
+    if (!fp) {
+        printf("RDB: 打开文件失败\n");
+        return;
+    }
+    printf("RDB load start...\n"); // 加这个
+
+    int magic, version, db_num, key_count;
+    fread(&magic, sizeof(int), 1, fp);
+    fread(&version, sizeof(int), 1, fp);
+    fread(&db_num, sizeof(int), 1, fp);
+    fread(&key_count, sizeof(int), 1, fp);
+
+    if (magic != 0x524442) {
+        fclose(fp);
+        return;
+    }
+
+
+#if (ENABLE_ARRAY) 
+    kvs_array_clear(&global_array); 
+#endif 
+#if (ENABLE_RBTREE) 
+    kvs_rbtree_clear(&global_rbtree); 
+#endif 
+#if (ENABLE_HASH) 
+    kvs_hash_clear(&global_hash);
+#endif  
+#if (ENABLE_SKIPTABLE) 
+    kvs_skiptable_clear(&global_skiptable); 
+#endif 
+   
+
+    for (int i = 0; i < key_count; i++) {
+        int klen, vlen;
+        long long expire;
+
+        fread(&klen, sizeof(int), 1, fp);
+        char *key = (char*)kvs_malloc(klen + 1);
+        fread(key, 1, klen, fp);
+        key[klen] = 0;
+
+        fread(&vlen, sizeof(int), 1, fp);
+        char *val = (char*)kvs_malloc(vlen + 1);
+        fread(val, 1, vlen, fp);
+        val[vlen] = 0;
+
+        fread(&expire, sizeof(long long), 1, fp);
+
+        //  直接构建 KVItem 并插入引擎（不经过协议）
+        KVItem *item = create_kvitem(val, NULL);
+        item->expire = expire;
+
+        // 统一插入
+#if (ENABLE_ARRAY)
+            kvs_array_set(&global_array, key, item);
+#endif
+#if (ENABLE_RBTREE) 
+            kvs_rbtree_set(&global_rbtree, key, item);
+#endif
+#if (ENABLE_HASH) 
+            kvs_hash_set(&global_hash, key, item);
+#endif
+#if (ENABLE_SKIPTABLE) 
+            kvs_skiptable_set(&global_skiptable, key, item);
+#endif
+
+
+        kvs_free(key);
+        kvs_free(val);
+    }
+
+    fclose(fp);
+    printf("RDB load success!\n");
+}
 
 void aof_append(const char* resp_buf,int buf_len){
     FILE *fp = fopen("appendonly.aof","ab");
@@ -537,6 +671,8 @@ void engine_reload(void) {
     else if (access("dump.rdb", F_OK) == 0) {
         printf("Loading RDB...\n");
         rdb_load();
+    }else{
+        printf("Engine reload fail\n");
     }
 }
 

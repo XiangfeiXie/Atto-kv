@@ -459,19 +459,21 @@ void dest_kvengine(void) {
 #endif
 }
 
+// 正确：清空所有数据，保留引擎可用
 void kvs_flush_all() {
 #if ENABLE_ARRAY
-    kvs_array_destory(&global_array);
+    kvs_array_clear(&global_array);    // 清空数组数据
 #endif
 #if ENABLE_HASH
-    kvs_hash_destory(&global_hash);
+    kvs_hash_clear(&global_hash);      // 清空哈希表数据
 #endif
 #if ENABLE_RBTREE
-    kvs_rbtree_destory(&global_rbtree);
+    kvs_rbtree_clear(&global_rbtree);   // 清空红黑树数据
 #endif
 #if ENABLE_SKIPTABLE
-    kvs_skiptable_destroy(&global_skiptable);
+    kvs_skiptable_clear(&global_skiptable);  // 清空跳表数据
 #endif
+    // 只清理内存碎片，不销毁引擎
     mallctl("arenas.purge", NULL, NULL, NULL, 0);
 }
 

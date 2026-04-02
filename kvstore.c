@@ -9,6 +9,7 @@
 #include <sys/time.h>   // ✅ 修改点2：添加gettimeofday头文件
 #include <unistd.h>     // ✅ 修改点3：添加fsync/access头文件
 #include <fcntl.h>      // ✅ 修改点4：添加文件操作头文件
+#include "repl.h"
 
 // ==================== 动态缓冲区工具函数实现（放在这里，彻底解决链接问题） ====================
 void dynbuf_init(DynBuf *db, int init_cap) {
@@ -101,7 +102,8 @@ void free_tokens(char** tokens,int count);
 
 const char *command[] = {
     "SET", "GET", "DEL", "MOD", "EXIST",
-    "SAVE","FLUSHALL"
+    "SAVE","FLUSHALL",
+    "SLAVEOF", "PSYNC", "REPLCONF", "PING"  // 新增
 };
 
 enum {
@@ -114,6 +116,11 @@ enum {
 
     KVS_CMD_SAVE,
     KVS_CMD_FLUSHALL,
+
+    KVS_CMD_SLAVEOF,    // 新增：主从切换
+    KVS_CMD_PSYNC,      // 新增：同步
+    KVS_CMD_REPLCONF,   // 新增：配置
+    KVS_CMD_PING,       // 新增：心跳
 
     KVS_CMD_COUNT,
 };
@@ -220,12 +227,17 @@ int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
     // ✅ 修改点8：传入DynBuf，不再用固定数组
     kvs_filter_protocol(tokens, KVS_MAX_TOKENS, write_buf);
 
-    if(ENABLE_AOF){
-        if(strcmp(tokens[0],"SET") == 0 ||
-            strcmp(tokens[0],"DEL") == 0 ||
-            strcmp(tokens[0],"MOD") == 0 ){
-                aof_append(msg,length);
-            }
+    if (strcmp(tokens[0],"SET") == 0 ||
+        strcmp(tokens[0],"DEL") == 0 ||
+        strcmp(tokens[0],"MOD") == 0 )
+    {
+        if(ENABLE_AOF) aof_append(msg,length);
+        
+        // ✅ 调用复制层接口：同步给从机
+        if (repl_role == REPL_MASTER) {
+            repl_feed_backlog(msg, length);
+            repl_propagate(msg, length);
+        }
     }
 
     free_tokens(tokens,KVS_MAX_TOKENS);
@@ -411,6 +423,35 @@ int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
             dynbuf_append(wb, RESP_OK, strlen(RESP_OK));
             break;
 
+
+
+        case KVS_CMD_SLAVEOF: {
+            // 命令：SLAVEOF NO ONE → 切换主机
+            if (strcmp(tokens[1], "NO") == 0 && strcmp(tokens[2], "ONE") == 0) {
+                repl_switch_to_master();
+                dynbuf_append(wb, "+OK\r\n", 5);
+            } 
+            // 命令：SLAVEOF IP PORT → 切换从机
+            else {
+                char *ip = tokens[1];
+                int port = atoi(tokens[2]);
+                repl_switch_to_slave(ip, port);
+                dynbuf_append(wb, "+OK\r\n", 5);
+            }
+            break;
+        }
+
+        case KVS_CMD_PSYNC:
+        case KVS_CMD_REPLCONF:
+        case KVS_CMD_PING:
+            // ✅ 交给复制层处理
+            // repl_handle_command(tokens, count, wb);
+            break;
+
+
+
+        
+
         default:
             strcpy(temp_buf, "-ERR unknown command\r\n");
             dynbuf_append(wb, temp_buf, strlen(temp_buf));
@@ -545,6 +586,25 @@ void rdb_save(void){
     fsync(fileno(fp));
     fclose(fp);
     printf("RDB saved success: dump.rdb\n");
+}
+
+
+// 主机：异步RDB保存（Redis BGSAVE 实现）
+void rdb_save_async(void) {
+    pid_t pid = fork();
+    if (pid == -1) {
+        printf("fork失败，使用同步RDB\n");
+        rdb_save(); // 降级
+        return;
+    }
+    if (pid == 0) {
+        // 子进程：执行阻塞式RDB保存
+        rdb_save();
+        exit(0); // 完成后退出
+    } else {
+        // 父进程：直接返回，继续处理请求 ✅ 无阻塞
+        printf("主机异步RDB生成中，pid=%d\n", pid);
+    }
 }
 void rdb_load(void) {
     FILE *fp = fopen("dump.rdb", "rb");
@@ -697,6 +757,9 @@ int main(int argc, char *argv[]) {
     int port = atoi(argv[1]);
     init_kvengine();
     engine_reload();
+
+    repl_init();  // ✅ 初始化复制模块
+
 #if (NETWORK_SELECT == NETWORK_REACTOR)
     reactor_start(port, kvs_protocol);
 #elif (NETWORK_SELECT == NETWORK_PROACTOR)

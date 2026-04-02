@@ -10,6 +10,7 @@
 #include <unistd.h>     // ✅ 修改点3：添加fsync/access头文件
 #include <fcntl.h>      // ✅ 修改点4：添加文件操作头文件
 #include "repl.h"
+#include "repl_net.h"
 
 // ==================== 动态缓冲区工具函数实现（放在这里，彻底解决链接问题） ====================
 void dynbuf_init(DynBuf *db, int init_cap) {

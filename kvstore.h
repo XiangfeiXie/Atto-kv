@@ -53,6 +53,9 @@ int resp_try_parse_full_cmd(const char*buf ,int buflen);
 void rdb_save_async(void);
 void kvs_flush_all();
 void rdb_load(void);
+// RESP协议解析函数声明
+bool resp_unpack(const char *data, int len, char** out_commands);
+void free_tokens(char **tokens, int count);
 
 //value结构体负责存储值
 typedef struct {

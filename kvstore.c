@@ -475,10 +475,13 @@ int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
         }
 
         case KVS_CMD_PSYNC:
+            // 这里不处理，复制层会处理
+            break;
         case KVS_CMD_REPLCONF:
+            // 这里不处理，复制层会处理
+            break;
         case KVS_CMD_PING:
-            // ✅ 交给复制层处理
-            //repl_handle_command(tokens, count, wb);
+            dynbuf_append(wb, "+PONG\r\n", 7);
             break;
 
 

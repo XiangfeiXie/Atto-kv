@@ -126,33 +126,65 @@ enum {
     KVS_CMD_COUNT,
 };
 
-int resp_try_parse_full_cmd(const char*buf ,int buflen){
-	int idx = 0;
-	if(buflen<5 || buf[idx]!= '*') return -1;
+// int resp_try_parse_full_cmd(const char*buf ,int buflen){
+// 	int idx = 0;
+// 	if(buflen<5 || buf[idx]!= '*') return -1;
 
-	idx++;
-	int argc = 0;
-	while(idx < buflen && buf[idx]!='\r'){
-		argc = argc * 10 + (buf[idx] - '0');
-		idx++;
-	}
-	if(idx + 2 > buflen ) return 0;
-	idx += 2;
+// 	idx++;
+// 	int argc = 0;
+// 	while(idx < buflen && buf[idx]!='\r'){
+// 		argc = argc * 10 + (buf[idx] - '0');
+// 		idx++;
+// 	}
+// 	if(idx + 2 > buflen ) return 0;
+// 	idx += 2;
 
-	for(int i=0;i < argc ;i++){
-		if(idx + 1>=buflen || buf[idx] != '$') return -1;
-		idx++;
-		int slen = 0;
-		while(idx <buflen && buf[idx] != '\r'){
-			slen = slen * 10 + (buf[idx] - '0');
-			idx++;
-		}
-		if(idx + 2 >buflen) return 0;
-		idx+=2;
-		if(idx + slen +2 > buflen) return 0;
-		idx+=slen + 2;
-	}
-	return idx;
+// 	for(int i=0;i < argc ;i++){
+// 		if(idx + 1>=buflen || buf[idx] != '$') return -1;
+// 		idx++;
+// 		int slen = 0;
+// 		while(idx <buflen && buf[idx] != '\r'){
+// 			slen = slen * 10 + (buf[idx] - '0');
+// 			idx++;
+// 		}
+// 		if(idx + 2 >buflen) return 0;
+// 		idx+=2;
+// 		if(idx + slen +2 > buflen) return 0;
+// 		idx+=slen + 2;
+// 	}
+// 	return idx;
+// }
+int resp_try_parse_full_cmd(const char *buf, int buflen) {
+    int idx = 0;
+    if (buflen < 5 || buf[idx] != '*')
+        return -1;
+
+    idx++;
+    int argc = 0;
+    while (idx < buflen && buf[idx] != '\r') {
+        argc = argc * 10 + (buf[idx] - '0');
+        idx++;
+    }
+    if (idx + 2 > buflen) return 0;
+    idx += 2;
+
+    for (int i = 0; i < argc; i++) {
+        if (idx + 1 >= buflen || buf[idx] != '$')
+            return -1;
+        idx++;
+
+        int slen = 0;
+        while (idx < buflen && buf[idx] != '\r') {
+            slen = slen * 10 + (buf[idx] - '0');
+            idx++;
+        }
+        if (idx + 2 > buflen) return 0;
+        idx += 2;
+
+        if (idx + slen + 2 > buflen) return 0;
+        idx += slen + 2;
+    }
+    return idx;
 }
 
 bool resp_unpack(const char *data, int len, char** out_commands) {
@@ -446,7 +478,7 @@ int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
         case KVS_CMD_REPLCONF:
         case KVS_CMD_PING:
             // ✅ 交给复制层处理
-            // repl_handle_command(tokens, count, wb);
+            //repl_handle_command(tokens, count, wb);
             break;
 
 

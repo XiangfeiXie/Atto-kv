@@ -4,8 +4,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
-#include <errno.h>
-#include <fcntl.h>
 #include "server.h"
 
 #define EVENT_ACCEPT    0
@@ -89,14 +87,15 @@ int proactor_start(unsigned short port, msg_handler handler) {
                 set_event_accept(&ring, sockfd, (struct sockaddr*)&clientaddr, &len);
                 int connfd = cqe->res;
 
-                // ✅ 正确使用动态缓冲区
+                // ✅ 正确使用动态缓冲区 + 偏移指针（避免 memmove）
                 dynbuf_init(&g_clients[connfd].read_buf, KVS_NET_BUF_INIT);
                 dynbuf_init(&g_clients[connfd].write_buf, KVS_NET_BUF_INIT);
-                fcntl(connfd, F_SETFL, O_NONBLOCK);
+                g_clients[connfd].r_off = 0;
+                g_clients[connfd].w_off = 0;
 
                 set_event_recv(&ring, connfd,
-                    g_clients[connfd].read_buf.buf + g_clients[connfd].read_buf.len,
-                    g_clients[connfd].read_buf.cap - g_clients[connfd].read_buf.len);
+                    g_clients[connfd].read_buf.buf + g_clients[connfd].r_off + g_clients[connfd].read_buf.len,
+                    g_clients[connfd].read_buf.cap - (g_clients[connfd].r_off + g_clients[connfd].read_buf.len));
             }
             else if (result.event == EVENT_READ) {
                 int ret = cqe->res;
@@ -111,58 +110,16 @@ int proactor_start(unsigned short port, msg_handler handler) {
                 }
                 rb->len += ret;
 
-                /* 非阻塞补充：在 io_uring 一次读之后继续 recv 直到 EAGAIN，排空内核队列 */
-                int drain_abort = 0;
-                for (;;) {
-                    int remain = rb->cap - rb->len;
-                    if (remain <= 0) {
-                        char *new_buf = realloc(rb->buf, rb->cap * 2);
-                        if (!new_buf) {
-                            close(fd);
-                            dynbuf_free(rb);
-                            dynbuf_free(&c->write_buf);
-                            drain_abort = 1;
-                            break;
-                        }
-                        rb->buf = new_buf;
-                        rb->cap *= 2;
-                        remain = rb->cap - rb->len;
-                    }
-                    int n = recv(fd, rb->buf + rb->len, remain, MSG_DONTWAIT);
-                    if (n < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK)
-                            break;
-                        close(fd);
-                        dynbuf_free(rb);
-                        dynbuf_free(&c->write_buf);
-                        drain_abort = 1;
-                        break;
-                    }
-                    if (n == 0) {
-                        close(fd);
-                        dynbuf_free(rb);
-                        dynbuf_free(&c->write_buf);
-                        drain_abort = 1;
-                        break;
-                    }
-                    rb->len += n;
-                    if (n < remain)
-                        break;
-                }
-                if (drain_abort)
-                    continue;
-
                 DynBuf *wb = &c->write_buf;
                 dynbuf_clear(wb);
-
-                /* 游标批量解析 + 单次 memmove，同一读完成内多条命令合并一次 send */
-                kvs_drain_resp_commands_ex(rb, wb, kvs_handler);
+                c->w_off = 0;
+                kvs_drain_resp_commands_ex_off(rb, &c->r_off, wb, kvs_handler);
 
                 if (wb->len > 0)
-                    set_event_send(&ring, fd, wb->buf, wb->len);
+                    set_event_send(&ring, fd, wb->buf + c->w_off, wb->len);
 
                 // ✅ 自动扩容（关键修复）
-                if (rb->len + 1024 > rb->cap) {
+                if (c->r_off + rb->len + 1024 > rb->cap) {
                     char *new_buf = realloc(rb->buf, rb->cap * 2);
                     if (!new_buf) {
                         close(fd);
@@ -176,14 +133,14 @@ int proactor_start(unsigned short port, msg_handler handler) {
 
                 // ✅ 正确读取剩余空间
                 set_event_recv(&ring, fd,
-                    rb->buf + rb->len,
-                    rb->cap - rb->len);
+                    rb->buf + c->r_off + rb->len,
+                    rb->cap - (c->r_off + rb->len));
             }
             else if (result.event == EVENT_WRITE) {
                 struct conn *c = &g_clients[fd];
                 set_event_recv(&ring, fd,
-                    c->read_buf.buf + c->read_buf.len,
-                    c->read_buf.cap - c->read_buf.len);
+                    c->read_buf.buf + c->r_off + c->read_buf.len,
+                    c->read_buf.cap - (c->r_off + c->read_buf.len));
             }
         }
         io_uring_cq_advance(&ring, nready);

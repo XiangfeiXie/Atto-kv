@@ -41,6 +41,8 @@ struct conn {
 	int fd;
 	DynBuf read_buf;   // 动态读缓冲区（自带len，无需额外rlength）
 	DynBuf write_buf;  // 动态写缓冲区（自带len，无需额外wlength）
+	int r_off;         // 读缓冲已消费偏移（避免 memmove）
+	int w_off;         // 写缓冲已发送偏移（避免 memmove）
 
 	RCALLBACK send_callback;
 	union {
@@ -59,8 +61,10 @@ int resp_try_parse_full_cmd(const char *buf, int buflen);
 #ifndef KVS_NET_BUF_INIT
 #define KVS_NET_BUF_INIT 65536
 #endif
-int kvs_drain_resp_commands_ex(DynBuf *rb, DynBuf *wb, msg_handler h);
-int kvs_drain_resp_commands(DynBuf *rb, DynBuf *wb);
+
+/* 偏移指针版本：rb + r_off 表示有效数据起点，内部不做 memmove */
+int kvs_drain_resp_commands_ex_off(DynBuf *rb, int *r_off, DynBuf *wb, msg_handler h);
+int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb);
 #endif
 
 #endif

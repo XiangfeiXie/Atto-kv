@@ -19,7 +19,7 @@
 // extern msg_handler kvs_protocol;
 
 #define ENABLE_RDB 1       
-#define ENABLE_AOF 1
+#define ENABLE_AOF 0
 
 #define NETWORK_REACTOR 	0
 #define NETWORK_PROACTOR	1
@@ -53,10 +53,6 @@ int resp_try_parse_full_cmd(const char*buf ,int buflen);
 void rdb_save_async(void);
 void kvs_flush_all();
 void rdb_load(void);
-#if ENABLE_AOF
-void aof_init(void);
-void aof_shutdown(void);
-#endif
 // RESP协议解析函数声明
 bool resp_unpack(const char *data, int len, char** out_commands);
 void free_tokens(char **tokens, int count);

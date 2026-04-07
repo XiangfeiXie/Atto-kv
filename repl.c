@@ -236,6 +236,7 @@ void* repl_slave_thread(void *arg) {
     // 动态缓冲区（解决长文本）
     DynBuf recv_buf;
     dynbuf_init(&recv_buf, 4096);
+    int r_off = 0;
     DynBuf wb;
     dynbuf_init(&wb, BUF_INIT_CAP);
 
@@ -307,19 +308,21 @@ void* repl_slave_thread(void *arg) {
         }
         recv_buf.len += n;
 
-        // 流式解析完整命令
-        while (1) {
-            int cmd_len = resp_try_parse_full_cmd(recv_buf.buf, recv_buf.len);
+        /* 流式解析完整命令（偏移指针版，无 memmove） */
+        char *p = recv_buf.buf + r_off;
+        int remaining = recv_buf.len;
+        while (remaining > 0) {
+            int cmd_len = resp_try_parse_full_cmd(p, remaining);
             if (cmd_len <= 0) break;
-
             dynbuf_clear(&wb);
-            kvs_protocol(recv_buf.buf, cmd_len, &wb);
+            kvs_protocol(p, cmd_len, &wb);
             slave_offset += cmd_len;
-
-            // 移除已处理数据
-            memmove(recv_buf.buf, recv_buf.buf + cmd_len, recv_buf.len - cmd_len);
-            recv_buf.len -= cmd_len;
+            p += cmd_len;
+            remaining -= cmd_len;
+            r_off += cmd_len;
         }
+        recv_buf.len = remaining;
+        if (recv_buf.len == 0) r_off = 0;
 
         // 定时发送心跳ACK
         static long long last_ack = 0;

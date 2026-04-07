@@ -5,17 +5,12 @@
 #include <string.h>
 #include <stdbool.h>
 #include <assert.h>
-#include <errno.h>
 #include <malloc.h>
 #include <sys/time.h>   // ✅ 修改点2：添加gettimeofday头文件
 #include <unistd.h>     // ✅ 修改点3：添加fsync/access头文件
 #include <fcntl.h>      // ✅ 修改点4：添加文件操作头文件
 #include "repl.h"
 #include "repl_net.h"
-#if ENABLE_AOF
-#include <pthread.h>
-#include <time.h>
-#endif
 
 // ==================== 动态缓冲区工具函数实现（放在这里，彻底解决链接问题） ====================
 void dynbuf_init(DynBuf *db, int init_cap) {
@@ -98,182 +93,6 @@ void *kvs_malloc(size_t size) {
 void kvs_free(void *ptr) {
     return free(ptr);
 }
-
-#if ENABLE_AOF
-/* 后台 AOF：内存缓冲 + 批量 write，降低 open/write/fsync 次数；fdatasync 按时间间隔 */
-#define AOF_BUF_INIT        (256 * 1024)
-#define AOF_FLUSH_BYTES     (256 * 1024)
-#define AOF_WAIT_MS         100
-#define AOF_FSYNC_MS        1000
-
-static pthread_mutex_t aof_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t aof_cond = PTHREAD_COND_INITIALIZER;
-static pthread_t aof_thread;
-static volatile int aof_running;
-static DynBuf aof_pending;
-static int aof_fd = -1;
-static int aof_inited;
-static struct timespec aof_last_fsync;
-static int aof_have_fsync_ts;
-
-static void aof_ts_add_ms(struct timespec *ts, int ms)
-{
-    ts->tv_nsec += (long)ms * 1000000L;
-    while (ts->tv_nsec >= 1000000000L) {
-        ts->tv_sec++;
-        ts->tv_nsec -= 1000000000L;
-    }
-}
-
-static void *aof_worker(void *arg)
-{
-    (void)arg;
-    struct timespec abstime;
-
-    while (1) {
-        pthread_mutex_lock(&aof_mutex);
-        while (aof_pending.len == 0 && aof_running) {
-            clock_gettime(CLOCK_REALTIME, &abstime);
-            aof_ts_add_ms(&abstime, AOF_WAIT_MS);
-            pthread_cond_timedwait(&aof_cond, &aof_mutex, &abstime);
-        }
-        if (aof_pending.len == 0 && !aof_running) {
-            pthread_mutex_unlock(&aof_mutex);
-            break;
-        }
-
-        DynBuf flush;
-        memcpy(&flush, &aof_pending, sizeof(DynBuf));
-        dynbuf_init(&aof_pending, AOF_BUF_INIT);
-        pthread_mutex_unlock(&aof_mutex);
-
-        if (flush.len > 0 && aof_fd >= 0) {
-            ssize_t off = 0;
-            while (off < flush.len) {
-                ssize_t w = write(aof_fd, flush.buf + off, (size_t)(flush.len - off));
-                if (w < 0) {
-                    if (errno == EINTR)
-                        continue;
-                    perror("aof write");
-                    break;
-                }
-                if (w == 0)
-                    break;
-                off += w;
-            }
-
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            if (!aof_have_fsync_ts) {
-                aof_last_fsync = now;
-                aof_have_fsync_ts = 1;
-            } else {
-                long long ms = (now.tv_sec - aof_last_fsync.tv_sec) * 1000LL
-                    + (now.tv_nsec - aof_last_fsync.tv_nsec) / 1000000LL;
-                if (ms >= AOF_FSYNC_MS) {
-                    fdatasync(aof_fd);
-                    aof_last_fsync = now;
-                }
-            }
-            dynbuf_free(&flush);
-        } else {
-            dynbuf_free(&flush);
-        }
-    }
-    return NULL;
-}
-
-void aof_append(const char *resp_buf, int buf_len)
-{
-    if (!resp_buf || buf_len <= 0 || !aof_inited)
-        return;
-    pthread_mutex_lock(&aof_mutex);
-    if (dynbuf_append(&aof_pending, resp_buf, buf_len) != 0) {
-        pthread_mutex_unlock(&aof_mutex);
-        return;
-    }
-    if (aof_pending.len >= AOF_FLUSH_BYTES)
-        pthread_cond_signal(&aof_cond);
-    pthread_mutex_unlock(&aof_mutex);
-}
-
-void aof_init(void)
-{
-    if (aof_inited)
-        return;
-    dynbuf_init(&aof_pending, AOF_BUF_INIT);
-    aof_fd = open("appendonly.aof", O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (aof_fd < 0) {
-        perror("aof open");
-        dynbuf_free(&aof_pending);
-        memset(&aof_pending, 0, sizeof(aof_pending));
-        return;
-    }
-    aof_running = 1;
-    aof_have_fsync_ts = 0;
-    memset(&aof_last_fsync, 0, sizeof(aof_last_fsync));
-    if (pthread_create(&aof_thread, NULL, aof_worker, NULL) != 0) {
-        perror("aof pthread_create");
-        close(aof_fd);
-        aof_fd = -1;
-        dynbuf_free(&aof_pending);
-        memset(&aof_pending, 0, sizeof(aof_pending));
-        return;
-    }
-    aof_inited = 1;
-}
-
-void aof_shutdown(void)
-{
-    if (!aof_inited)
-        return;
-    pthread_mutex_lock(&aof_mutex);
-    aof_running = 0;
-    pthread_cond_broadcast(&aof_cond);
-    pthread_mutex_unlock(&aof_mutex);
-    pthread_join(aof_thread, NULL);
-
-    pthread_mutex_lock(&aof_mutex);
-    DynBuf tail;
-    memcpy(&tail, &aof_pending, sizeof(DynBuf));
-    dynbuf_init(&aof_pending, AOF_BUF_INIT);
-    pthread_mutex_unlock(&aof_mutex);
-
-    if (tail.len > 0 && aof_fd >= 0) {
-        ssize_t off = 0;
-        while (off < tail.len) {
-            ssize_t w = write(aof_fd, tail.buf + off, (size_t)(tail.len - off));
-            if (w < 0) {
-                if (errno == EINTR)
-                    continue;
-                perror("aof final write");
-                break;
-            }
-            if (w == 0)
-                break;
-            off += w;
-        }
-        dynbuf_free(&tail);
-        fdatasync(aof_fd);
-    } else {
-        dynbuf_free(&tail);
-    }
-
-    if (aof_fd >= 0) {
-        close(aof_fd);
-        aof_fd = -1;
-    }
-    dynbuf_free(&aof_pending);
-    memset(&aof_pending, 0, sizeof(aof_pending));
-    aof_inited = 0;
-}
-#else
-void aof_append(const char *resp_buf, int buf_len)
-{
-    (void)resp_buf;
-    (void)buf_len;
-}
-#endif /* ENABLE_AOF */
 
 // ✅ 修改点6：函数签名适配DynBuf（核心！）
 int kvs_filter_protocol(char **tokens, int count, DynBuf *wb);
@@ -430,8 +249,8 @@ int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
     if (msg == NULL || length <= 0 || write_buf == NULL)
         return -1;
 
-    /* 不在此清空 write_buf：同一 TCP 读缓冲区内多条命令（pipeline）需连续追加 RESP。
-     * 调用方在开启新一批输出前自行 dynbuf_clear。 */
+    /* 不在此清空 write_buf：网络层可能一次读取到多条命令（pipeline），需要连续追加响应。
+     * 调用方在开启新一批输出前自行 dynbuf_clear(write_buf)。 */
 
     char *tokens[KVS_MAX_TOKENS] = {0};
     bool ok = resp_unpack(msg, length, tokens);
@@ -458,29 +277,60 @@ int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
     return write_buf->len;
 }
 
-int kvs_drain_resp_commands_ex(DynBuf *rb, DynBuf *wb, msg_handler h) {
-    if (!rb || !rb->buf || !wb || !h)
+/* ===================== 批量解析（偏移指针版，避免 memmove） ===================== */
+static void dynbuf_compact_by_copy(DynBuf *rb, int *r_off)
+{
+    if (!rb || !rb->buf || !r_off)
+        return;
+    if (*r_off == 0 || rb->len <= 0)
+        return;
+
+    char *nb = (char *)malloc((size_t)rb->cap);
+    if (!nb)
+        return;
+    memcpy(nb, rb->buf + *r_off, (size_t)rb->len);
+    free(rb->buf);
+    rb->buf = nb;
+    *r_off = 0;
+}
+
+int kvs_drain_resp_commands_ex_off(DynBuf *rb, int *r_off, DynBuf *wb, msg_handler h)
+{
+    if (!rb || !rb->buf || !r_off || !wb || !h)
         return -1;
-    int off = 0;
+
     int ncmd = 0;
-    while (off < rb->len) {
-        int cmd_len = resp_try_parse_full_cmd(rb->buf + off, rb->len - off);
+    int off = *r_off;
+    int remaining = rb->len;
+
+    while (remaining > 0) {
+        int cmd_len = resp_try_parse_full_cmd(rb->buf + off, remaining);
         if (cmd_len <= 0)
             break;
         h(rb->buf + off, cmd_len, wb);
         off += cmd_len;
+        remaining -= cmd_len;
         ncmd++;
     }
-    if (off > 0) {
-        memmove(rb->buf, rb->buf + off, (size_t)(rb->len - off));
-        rb->len -= off;
+
+    *r_off = off;
+    rb->len = remaining;
+
+    if (rb->len == 0) {
+        *r_off = 0;
+    } else if (*r_off > (rb->cap / 2)) {
+        /* 及时回收已读数据：用 malloc+memcpy 进行一次性整理（避免 memmove）。 */
+        dynbuf_compact_by_copy(rb, r_off);
     }
+
     return ncmd;
 }
 
-int kvs_drain_resp_commands(DynBuf *rb, DynBuf *wb) {
-    return kvs_drain_resp_commands_ex(rb, wb, kvs_protocol);
+int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb)
+{
+    return kvs_drain_resp_commands_ex_off(rb, r_off, wb, kvs_protocol);
 }
+/* ============================================================================ */
 
 long long get_time_now(void){
 	struct timeval tv;
@@ -727,9 +577,6 @@ int init_kvengine(void) {
 }
 
 void dest_kvengine(void) {
-#if ENABLE_AOF
-    aof_shutdown();
-#endif
 #if ENABLE_ARRAY
     kvs_array_destory(&global_array);
 #endif
@@ -927,6 +774,18 @@ void rdb_load(void) {
     printf("RDB load success!\n");
 }
 
+void aof_append(const char* resp_buf,int buf_len){
+    FILE *fp = fopen("appendonly.aof","ab");
+    if (!fp) {
+        printf("AOF: 打开文件失败\n"); 
+        return;
+    }
+    fwrite(resp_buf,1,buf_len,fp);
+    fflush(fp);
+    fsync(fileno(fp));
+    fclose(fp);
+}
+
 void aof_reload(){
     FILE*fp = fopen("appendonly.aof","rb");
     if(!fp) return ;
@@ -989,9 +848,6 @@ int main(int argc, char *argv[]) {
     int port = atoi(argv[1]);
     init_kvengine();
     engine_reload();
-#if ENABLE_AOF
-    aof_init();
-#endif
 
     repl_init();  // ✅ 初始化复制模块
 

@@ -1,6 +1,5 @@
 #include <errno.h>
 #include <stdio.h>
-#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <string.h>
@@ -10,6 +9,7 @@
 #include <sys/epoll.h>
 #include <sys/time.h>
 #include <stdlib.h>
+#include <fcntl.h>
 
 
 #include "server.h"
@@ -23,16 +23,9 @@
 
 
 
-int accept_cb(int fd);
-int recv_cb(int fd);
-int send_cb(int fd);
-
-
-
-int epfd = 0;
-struct timeval begin;
-
 #if ENABLE_KVSTORE
+
+extern int epfd;
 static void conn_set_events(int fd, struct conn *c) {
 	uint32_t ev = EPOLLIN;
 	if (c->write_buf.len > 0)
@@ -42,7 +35,22 @@ static void conn_set_events(int fd, struct conn *c) {
 	e.data.fd = fd;
 	epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &e);
 }
+
+
 #endif
+
+
+
+int accept_cb(int fd);
+int recv_cb(int fd);
+int send_cb(int fd);
+
+
+
+int epfd = 0;
+struct timeval begin;
+
+
 
 struct conn conn_list[CONNECTION_SIZE] = {0};
 // fd
@@ -80,6 +88,8 @@ int event_register(int fd, int event) {
 
 	dynbuf_init(&conn_list[fd].read_buf, KVS_NET_BUF_INIT);
 	dynbuf_init(&conn_list[fd].write_buf, KVS_NET_BUF_INIT);
+	conn_list[fd].r_off = 0;
+	conn_list[fd].w_off = 0;
 
 	if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1)
 		perror("fcntl O_NONBLOCK");
@@ -110,20 +120,20 @@ int recv_cb(int fd) {
 
 	struct conn*c = &conn_list[fd];
 
-	/* 非阻塞下尽量排空内核接收队列：一次 epoll 可读可对应多次 recv，减少后续唤醒 */
+	/* 尽量多读：一次 EPOLLIN 对应多次 recv，写入到 (r_off + len) 之后 */
 	for (;;) {
-		int remain = c->read_buf.cap - c->read_buf.len;
+		int tail = c->r_off + c->read_buf.len;
+		int remain = c->read_buf.cap - tail;
 		if (remain <= 0) {
 			char *new_buf = realloc(c->read_buf.buf, c->read_buf.cap * 2);
-			if (!new_buf)
-				return -1;
+			if (!new_buf) return -1;
 			c->read_buf.buf = new_buf;
 			c->read_buf.cap *= 2;
-			remain = c->read_buf.cap - c->read_buf.len;
+			remain = c->read_buf.cap - tail;
 		}
 
-		int count = recv(fd, c->read_buf.buf + c->read_buf.len, remain, 0);
-		if (count < 0) {
+		int n = recv(fd, c->read_buf.buf + tail, remain, 0);
+		if (n < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK)
 				break;
 			dynbuf_free(&c->read_buf);
@@ -132,20 +142,22 @@ int recv_cb(int fd) {
 			epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
 			return -1;
 		}
-		if (count == 0) {
+		if (n == 0) {
 			dynbuf_free(&c->read_buf);
 			dynbuf_free(&c->write_buf);
 			close(fd);
 			epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
 			return 0;
 		}
-		c->read_buf.len += count;
-		if (count < remain)
+		c->read_buf.len += n;
+		if (n < remain)
 			break;
 	}
 
 #if ENABLE_KVSTORE
-	kvs_drain_resp_commands(&c->read_buf, &c->write_buf);
+	dynbuf_clear(&c->write_buf);
+	c->w_off = 0;
+	kvs_drain_resp_commands_off(&c->read_buf, &c->r_off, &c->write_buf);
 	conn_set_events(fd, c);
 #endif
 	return 0;
@@ -154,28 +166,32 @@ int recv_cb(int fd) {
 
 int send_cb(int fd) {
     struct conn *c = &conn_list[fd];
+	DynBuf *wb = &c->write_buf;
 
-    while (c->write_buf.len > 0) {
-        ssize_t n = send(fd, c->write_buf.buf, c->write_buf.len, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                break;
-            dynbuf_free(&c->read_buf);
-            dynbuf_free(&c->write_buf);
-            close(fd);
-            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-            return -1;
-        }
-        if (n == 0)
-            break;
-        memmove(c->write_buf.buf, c->write_buf.buf + n, c->write_buf.len - (int)n);
-        c->write_buf.len -= (int)n;
-    }
+	while (wb->len > 0) {
+		ssize_t n = send(fd, wb->buf + c->w_off, wb->len, MSG_NOSIGNAL);
+		if (n < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				break;
+			dynbuf_free(&c->read_buf);
+			dynbuf_free(&c->write_buf);
+			close(fd);
+			epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+			return -1;
+		}
+		if (n == 0) break;
+		c->w_off += (int)n;
+		wb->len -= (int)n;
+	}
+
+	if (wb->len == 0) {
+		c->w_off = 0;
+	}
 
 #if ENABLE_KVSTORE
-    conn_set_events(fd, c);
+	conn_set_events(fd, c);
 #endif
-    return 0;
+	return 0;
 }
 
 

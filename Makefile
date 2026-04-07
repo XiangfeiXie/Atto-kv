@@ -1,7 +1,7 @@
 
 CC = gcc
 FLAGS = -I ./NtyCo/core/ -L ./NtyCo/ -lntyco -lpthread -luring -ldl -ljemalloc -lpthread
-# 与 kvstore.h 中 ENABLE_* 保持一致，只编译已启用的存储引擎（否则类型未定义会编译失败）
+# 只编译已启用的引擎（kvstore.h 中 ENABLE_* 为 0 的引擎类型未定义，会导致编译失败）
 SRCS = kvstore.c ntyco.c proactor.c kvs_skiptable.c reactor.c repl.c repl_net.c
 TESTCASE_SRCS = testcase.c
 TARGET = kvstore

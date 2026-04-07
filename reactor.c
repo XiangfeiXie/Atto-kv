@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <stdio.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <string.h>
@@ -22,41 +23,6 @@
 
 
 
-#if ENABLE_KVSTORE
-
-int kvs_request(struct conn*c);
-int kvs_response(struct conn *c);
-
-int kvs_request(struct conn *c) {
-
-	//流式解析：循环解析
-	while(1){
-		//解析完整RESP命令
-		int cmd_len = resp_try_parse_full_cmd(c->read_buf.buf,c ->read_buf.len);
-		if(cmd_len <= 0) break;
-
-		//调用动态缓冲区版本kvs_protocol
-		kvs_protocol(c->read_buf.buf,cmd_len,&c->write_buf);
-
-		//移除已解析数据（动态缓冲区）
-		memmove(c->read_buf.buf,c->read_buf.buf + cmd_len,c->read_buf.len - cmd_len);
-		c->read_buf.len -= cmd_len;
-	}
-	return 0;
-
-}
-
-int kvs_response(struct conn *c) {
-
-	
-	return 0;
-}
-
-
-#endif
-
-
-
 int accept_cb(int fd);
 int recv_cb(int fd);
 int send_cb(int fd);
@@ -66,7 +32,17 @@ int send_cb(int fd);
 int epfd = 0;
 struct timeval begin;
 
-
+#if ENABLE_KVSTORE
+static void conn_set_events(int fd, struct conn *c) {
+	uint32_t ev = EPOLLIN;
+	if (c->write_buf.len > 0)
+		ev |= EPOLLOUT;
+	struct epoll_event e;
+	e.events = ev;
+	e.data.fd = fd;
+	epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &e);
+}
+#endif
 
 struct conn conn_list[CONNECTION_SIZE] = {0};
 // fd
@@ -102,8 +78,11 @@ int event_register(int fd, int event) {
 	conn_list[fd].r_action.recv_callback = recv_cb;
 	conn_list[fd].send_callback = send_cb;
 
-	dynbuf_init(&conn_list[fd].read_buf,BUF_INIT_CAP);
-	dynbuf_init(&conn_list[fd].write_buf,BUF_INIT_CAP);
+	dynbuf_init(&conn_list[fd].read_buf, KVS_NET_BUF_INIT);
+	dynbuf_init(&conn_list[fd].write_buf, KVS_NET_BUF_INIT);
+
+	if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1)
+		perror("fcntl O_NONBLOCK");
 
 	set_event(fd, event, 1);
 }
@@ -130,56 +109,73 @@ int accept_cb(int fd) {
 int recv_cb(int fd) {
 
 	struct conn*c = &conn_list[fd];
-	//计算动态缓冲区剩余空间
-	int remain = c->read_buf.cap - c->read_buf.len;
-	if(remain <= 0){
-		//自动扩容
-		char *new_buf = realloc(c->read_buf.buf,c->read_buf.cap*2);
-		if(!new_buf) return -1;
-		c->read_buf.buf = new_buf;
-		c->read_buf.cap *= 2;
-		remain = c->read_buf.cap - c->read_buf.len; 
-	}
 
-	//读取数据到动态缓冲区
-	int count = recv(fd,c->read_buf.buf + c->read_buf.len,remain,0);
-	if(count <= 0){
-		//关闭时释放动态缓冲区内存
-		dynbuf_free(&c->read_buf);
-		dynbuf_free(&c->write_buf);
-		close(fd);
-		epoll_ctl(epfd,EPOLL_CTL_DEL,fd,NULL);
-		return 0;
+	/* 非阻塞下尽量排空内核接收队列：一次 epoll 可读可对应多次 recv，减少后续唤醒 */
+	for (;;) {
+		int remain = c->read_buf.cap - c->read_buf.len;
+		if (remain <= 0) {
+			char *new_buf = realloc(c->read_buf.buf, c->read_buf.cap * 2);
+			if (!new_buf)
+				return -1;
+			c->read_buf.buf = new_buf;
+			c->read_buf.cap *= 2;
+			remain = c->read_buf.cap - c->read_buf.len;
+		}
+
+		int count = recv(fd, c->read_buf.buf + c->read_buf.len, remain, 0);
+		if (count < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				break;
+			dynbuf_free(&c->read_buf);
+			dynbuf_free(&c->write_buf);
+			close(fd);
+			epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+			return -1;
+		}
+		if (count == 0) {
+			dynbuf_free(&c->read_buf);
+			dynbuf_free(&c->write_buf);
+			close(fd);
+			epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+			return 0;
+		}
+		c->read_buf.len += count;
+		if (count < remain)
+			break;
 	}
-	c->read_buf.len += count;
 
 #if ENABLE_KVSTORE
-	kvs_request(c);
+	kvs_drain_resp_commands(&c->read_buf, &c->write_buf);
+	conn_set_events(fd, c);
 #endif
-	set_event(fd,EPOLLOUT,0);
-	return count;
+	return 0;
 }
 
 
 int send_cb(int fd) {
     struct conn *c = &conn_list[fd];
-    int count = 0;
 
-    if (c->write_buf.len > 0) {
-        count = send(fd, c->write_buf.buf, c->write_buf.len, 0);
-		//printf("[SEND] fd=%d, len=%d, buf: %.*s\n", fd, c->write_buf.len, c->write_buf.len, c->write_buf.buf);
-        if (count > 0) {
-            // 只移除已发送的数据，不全部清空
-            memmove(c->write_buf.buf, c->write_buf.buf + count, c->write_buf.len - count);
-            c->write_buf.len -= count;
+    while (c->write_buf.len > 0) {
+        ssize_t n = send(fd, c->write_buf.buf, c->write_buf.len, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+            dynbuf_free(&c->read_buf);
+            dynbuf_free(&c->write_buf);
+            close(fd);
+            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+            return -1;
         }
+        if (n == 0)
+            break;
+        memmove(c->write_buf.buf, c->write_buf.buf + n, c->write_buf.len - (int)n);
+        c->write_buf.len -= (int)n;
     }
 
-    // 数据发完再切回读事件
-    if (c->write_buf.len == 0)
-        set_event(fd, EPOLLIN, 0);
-
-    return count;
+#if ENABLE_KVSTORE
+    conn_set_events(fd, c);
+#endif
+    return 0;
 }
 
 

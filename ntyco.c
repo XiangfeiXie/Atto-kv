@@ -1,10 +1,8 @@
-
-
-
-
 #include "nty_coroutine.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
+#include <sys/socket.h>
 #include "server.h"
 #include "kvstore.h"
 
@@ -28,47 +26,49 @@ void server_reader(void*arg){
 	client.fd = fd;
 
 	//初始化动态缓冲区
-	dynbuf_init(&client.read_buf,BUF_INIT_CAP);
-	dynbuf_init(&client.write_buf,BUF_INIT_CAP);
+	dynbuf_init(&client.read_buf, KVS_NET_BUF_INIT);
+	dynbuf_init(&client.write_buf, KVS_NET_BUF_INIT);
 
-	while(1){
-		//临时接收缓冲区
-		char tmp[2096];
-		int ret = recv(fd,tmp,sizeof(tmp),0);
+	while (1) {
+		int remain = client.read_buf.cap - client.read_buf.len;
+		if (remain <= 0) {
+			char *nb = realloc(client.read_buf.buf, client.read_buf.cap * 2);
+			if (!nb) {
+				dynbuf_free(&client.read_buf);
+				dynbuf_free(&client.write_buf);
+				close(fd);
+				return;
+			}
+			client.read_buf.buf = nb;
+			client.read_buf.cap *= 2;
+			remain = client.read_buf.cap - client.read_buf.len;
+		}
 
-		if(ret <= 0){
-			//客户端断开，释放内存
+		/* 阻塞读：单次系统调用最多拉取 remain 字节，pipeline 下可一次带回多条命令 */
+		int ret = recv(fd, client.read_buf.buf + client.read_buf.len, remain, 0);
+		if (ret <= 0) {
 			dynbuf_free(&client.read_buf);
 			dynbuf_free(&client.write_buf);
 			close(fd);
-			break;
+			return;
 		}
+		client.read_buf.len += ret;
 
-		//动态扩容追加数据（支持无限长文本）
-		dynbuf_append(&client.read_buf,tmp,ret);
+		kvs_drain_resp_commands(&client.read_buf, &client.write_buf);
 
-		//流式解析RESP协议
-		while(1){
-			int cmd_len = resp_try_parse_full_cmd(client.read_buf.buf,client.read_buf.len);
-			if(cmd_len <= 0) break;
-
-			//调用统一KV协议处理
-			kvs_protocol(client.read_buf.buf,cmd_len,&client.write_buf);
-
-			//移除已解析命令
-			memmove(client.read_buf.buf,client.read_buf.buf + cmd_len,client.read_buf.len - cmd_len);
-			client.read_buf.len -= cmd_len;
-		}
-
-		//发送响应数据
-		if(client.write_buf.len > 0){
-			ssize_t count = send(fd,client.write_buf.buf,client.write_buf.len,0);
-			if (count > 0) {
-                memmove(client.write_buf.buf,
-                        client.write_buf.buf + count,
-                        client.write_buf.len - count);
-                client.write_buf.len -= count;
-            }
+		while (client.write_buf.len > 0) {
+			ssize_t count = send(fd, client.write_buf.buf, client.write_buf.len, MSG_NOSIGNAL);
+			if (count < 0) {
+				dynbuf_free(&client.read_buf);
+				dynbuf_free(&client.write_buf);
+				close(fd);
+				return;
+			}
+			if (count == 0)
+				break;
+			memmove(client.write_buf.buf, client.write_buf.buf + count,
+				client.write_buf.len - count);
+			client.write_buf.len -= (int)count;
 		}
 	}
 }

@@ -55,6 +55,12 @@ struct conn {
 // KV核心协议接口（正确声明）
 int kvs_protocol(char *msg, int len, DynBuf *write_buf);
 int resp_try_parse_full_cmd(const char *buf, int buflen);
+/* 网络层读缓冲初始大小（pipeline 批处理） */
+#ifndef KVS_NET_BUF_INIT
+#define KVS_NET_BUF_INIT 65536
+#endif
+int kvs_drain_resp_commands_ex(DynBuf *rb, DynBuf *wb, msg_handler h);
+int kvs_drain_resp_commands(DynBuf *rb, DynBuf *wb);
 #endif
 
 #endif

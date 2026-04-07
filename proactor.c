@@ -4,6 +4,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <fcntl.h>
 #include "server.h"
 
 #define EVENT_ACCEPT    0
@@ -88,8 +90,9 @@ int proactor_start(unsigned short port, msg_handler handler) {
                 int connfd = cqe->res;
 
                 // ✅ 正确使用动态缓冲区
-                dynbuf_init(&g_clients[connfd].read_buf, 4096);
-                dynbuf_init(&g_clients[connfd].write_buf, 4096);
+                dynbuf_init(&g_clients[connfd].read_buf, KVS_NET_BUF_INIT);
+                dynbuf_init(&g_clients[connfd].write_buf, KVS_NET_BUF_INIT);
+                fcntl(connfd, F_SETFL, O_NONBLOCK);
 
                 set_event_recv(&ring, connfd,
                     g_clients[connfd].read_buf.buf + g_clients[connfd].read_buf.len,
@@ -103,23 +106,57 @@ int proactor_start(unsigned short port, msg_handler handler) {
                 if (ret <= 0) {
                     close(fd);
                     dynbuf_free(rb);
+                    dynbuf_free(&c->write_buf);
                     continue;
                 }
                 rb->len += ret;
 
+                /* 非阻塞补充：在 io_uring 一次读之后继续 recv 直到 EAGAIN，排空内核队列 */
+                int drain_abort = 0;
+                for (;;) {
+                    int remain = rb->cap - rb->len;
+                    if (remain <= 0) {
+                        char *new_buf = realloc(rb->buf, rb->cap * 2);
+                        if (!new_buf) {
+                            close(fd);
+                            dynbuf_free(rb);
+                            dynbuf_free(&c->write_buf);
+                            drain_abort = 1;
+                            break;
+                        }
+                        rb->buf = new_buf;
+                        rb->cap *= 2;
+                        remain = rb->cap - rb->len;
+                    }
+                    int n = recv(fd, rb->buf + rb->len, remain, MSG_DONTWAIT);
+                    if (n < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK)
+                            break;
+                        close(fd);
+                        dynbuf_free(rb);
+                        dynbuf_free(&c->write_buf);
+                        drain_abort = 1;
+                        break;
+                    }
+                    if (n == 0) {
+                        close(fd);
+                        dynbuf_free(rb);
+                        dynbuf_free(&c->write_buf);
+                        drain_abort = 1;
+                        break;
+                    }
+                    rb->len += n;
+                    if (n < remain)
+                        break;
+                }
+                if (drain_abort)
+                    continue;
+
                 DynBuf *wb = &c->write_buf;
                 dynbuf_clear(wb);
 
-                /* 同一读事件内多条命令合并为一次写回（pipeline），避免覆盖 write_buf */
-                while (1) {
-                    int cmd_len = resp_try_parse_full_cmd(rb->buf, rb->len);
-                    if (cmd_len <= 0) break;
-
-                    kvs_handler(rb->buf, cmd_len, wb);
-
-                    memmove(rb->buf, rb->buf + cmd_len, rb->len - cmd_len);
-                    rb->len -= cmd_len;
-                }
+                /* 游标批量解析 + 单次 memmove，同一读完成内多条命令合并一次 send */
+                kvs_drain_resp_commands_ex(rb, wb, kvs_handler);
 
                 if (wb->len > 0)
                     set_event_send(&ring, fd, wb->buf, wb->len);
@@ -127,7 +164,12 @@ int proactor_start(unsigned short port, msg_handler handler) {
                 // ✅ 自动扩容（关键修复）
                 if (rb->len + 1024 > rb->cap) {
                     char *new_buf = realloc(rb->buf, rb->cap * 2);
-                    if (!new_buf) { close(fd); continue; }
+                    if (!new_buf) {
+                        close(fd);
+                        dynbuf_free(rb);
+                        dynbuf_free(wb);
+                        continue;
+                    }
                     rb->buf = new_buf;
                     rb->cap *= 2;
                 }

@@ -1,7 +1,8 @@
 
 CC = gcc
 FLAGS = -I ./NtyCo/core/ -L ./NtyCo/ -lntyco -lpthread -luring -ldl -ljemalloc -lpthread
-SRCS = kvstore.c ntyco.c proactor.c kvs_array.c kvs_rbtree.c kvs_hash.c kvs_skiptable.c reactor.c repl.c repl_net.c
+# 与 kvstore.h 中 ENABLE_* 保持一致，只编译已启用的存储引擎（否则类型未定义会编译失败）
+SRCS = kvstore.c ntyco.c proactor.c kvs_skiptable.c reactor.c repl.c repl_net.c
 TESTCASE_SRCS = testcase.c
 TARGET = kvstore
 SUBDIR = ./NtyCo/

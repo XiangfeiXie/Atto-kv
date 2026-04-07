@@ -107,22 +107,22 @@ int proactor_start(unsigned short port, msg_handler handler) {
                 }
                 rb->len += ret;
 
-                // ✅ 循环解析完整命令
+                DynBuf *wb = &c->write_buf;
+                dynbuf_clear(wb);
+
+                /* 同一读事件内多条命令合并为一次写回（pipeline），避免覆盖 write_buf */
                 while (1) {
                     int cmd_len = resp_try_parse_full_cmd(rb->buf, rb->len);
                     if (cmd_len <= 0) break;
 
-                    DynBuf *wb = &c->write_buf;
-                    wb->len = 0;
-
                     kvs_handler(rb->buf, cmd_len, wb);
 
-                    set_event_send(&ring, fd, wb->buf, wb->len);
-
-                    // ✅ 移除已处理数据
                     memmove(rb->buf, rb->buf + cmd_len, rb->len - cmd_len);
                     rb->len -= cmd_len;
                 }
+
+                if (wb->len > 0)
+                    set_event_send(&ring, fd, wb->buf, wb->len);
 
                 // ✅ 自动扩容（关键修复）
                 if (rb->len + 1024 > rb->cap) {

@@ -312,7 +312,7 @@ void* repl_slave_thread(void *arg) {
             int cmd_len = resp_try_parse_full_cmd(recv_buf.buf, recv_buf.len);
             if (cmd_len <= 0) break;
 
-            // 执行命令
+            dynbuf_clear(&wb);
             kvs_protocol(recv_buf.buf, cmd_len, &wb);
             slave_offset += cmd_len;
 

@@ -249,8 +249,8 @@ int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
     if (msg == NULL || length <= 0 || write_buf == NULL)
         return -1;
 
-    // 清空动态缓冲区
-    write_buf->len = 0;
+    /* 不在此清空 write_buf：同一 TCP 读缓冲区内多条命令（pipeline）需连续追加 RESP。
+     * 调用方在开启新一批输出前自行 dynbuf_clear。 */
 
     char *tokens[KVS_MAX_TOKENS] = {0};
     bool ok = resp_unpack(msg, length, tokens);

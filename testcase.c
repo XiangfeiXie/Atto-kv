@@ -12,6 +12,35 @@
 #define MAX_TOKENS   256     // 最多命令参数
 #define PIPELINE_BUF_SIZE (1024*1024)	//批量处理缓冲区
 
+/* 与 kvstore.c 一致：判断缓冲区是否已形成一条完整 RESP 数组命令 */
+static int resp_try_parse_full_cmd(const char *buf, int buflen) {
+	int idx = 0;
+	if (buflen < 5 || buf[idx] != '*')
+		return -1;
+	idx++;
+	int argc = 0;
+	while (idx < buflen && buf[idx] != '\r') {
+		argc = argc * 10 + (buf[idx] - '0');
+		idx++;
+	}
+	if (idx + 2 > buflen) return 0;
+	idx += 2;
+	for (int i = 0; i < argc; i++) {
+		if (idx + 1 >= buflen || buf[idx] != '$')
+			return -1;
+		idx++;
+		int slen = 0;
+		while (idx < buflen && buf[idx] != '\r') {
+			slen = slen * 10 + (buf[idx] - '0');
+			idx++;
+		}
+		if (idx + 2 > buflen) return 0;
+		idx += 2;
+		if (idx + slen + 2 > buflen) return 0;
+		idx += slen + 2;
+	}
+	return idx;
+}
 
 typedef enum{
 	MODE_INTERACTIVE,
@@ -21,6 +50,8 @@ typedef enum{
 ClientMode current_mode = MODE_INTERACTIVE;
 char*pipeline_buf = NULL;	//批量命令缓冲区
 int pipeline_len = 0;
+size_t pipeline_cap = PIPELINE_BUF_SIZE;
+int pipeline_ncmd = 0;		// pipeline 中缓存的命令条数（用于收齐响应）
 
 char* resp_pack_request(char *msg);
 
@@ -47,49 +78,74 @@ int recv_msg(int connfd, char *msg, int length) {
 //初始化批量缓冲区
 void pipeline_init(void){
 	if(!pipeline_buf){
-		pipeline_buf = malloc(PIPELINE_BUF_SIZE);
+		pipeline_buf = malloc(pipeline_cap);
 		pipeline_len = 0;
+		pipeline_ncmd = 0;
 	}
 }
 //向缓冲区添加命令
 void pipeline_append(int connfd,char *cmd){
+	(void)connfd;
 	pipeline_init();
 	char*resp = resp_pack_request(cmd);
-	int resp_len = strlen(resp);
+	int resp_len = (int)strlen(resp);
 
-	//缓冲区批量扩容
-	if(pipeline_len + resp_len >= PIPELINE_BUF_SIZE){
-		PIPELINE_BUF_SIZE*2;
-		pipeline_buf = realloc(pipeline_buf,PIPELINE_BUF_SIZE);
+	while ((size_t)pipeline_len + (size_t)resp_len >= pipeline_cap) {
+		pipeline_cap *= 2;
+		char *nb = realloc(pipeline_buf, pipeline_cap);
+		if (!nb) {
+			free(resp);
+			perror("realloc pipeline_buf");
+			return;
+		}
+		pipeline_buf = nb;
 	}
 
 	memcpy(pipeline_buf+pipeline_len,resp,resp_len);
 	pipeline_len +=resp_len;
+	pipeline_ncmd++;
 	free(resp);
 }
 //批量发送所有命令
 void pipeline_exec(int connfd){
-	if(pipeline_len == 0){
+	if(pipeline_len == 0 || pipeline_ncmd == 0){
 		printf("(empty pipeline)\n");
 		return ;
 	}
-	//批量发送
+	int expect = pipeline_ncmd;
 	send_msg(connfd,pipeline_buf,pipeline_len);
 
-	//批量接受所有响应（流式读取）
-	char recv_buf[BUF_LEN] = {0};
-	int total_recv =0;
-	while(total_recv<pipeline_len){
-		int n= recv_msg(connfd,recv_buf + total_recv,BUF_LEN-total_recv);
-		if(n <= 0) break;
+	char recv_buf[BUF_LEN];
+	int total_recv = 0;
+	int nresp = 0;
+
+	while (nresp < pipeline_ncmd && total_recv < (int)sizeof(recv_buf) - 1) {
+		int n = recv_msg(connfd, recv_buf + total_recv, (int)sizeof(recv_buf) - total_recv);
+		if (n <= 0)
+			break;
 		total_recv += n;
-		printf("%s",recv_buf + total_recv - n);
+
+		char *p = recv_buf;
+		int remaining = total_recv;
+		while (nresp < pipeline_ncmd && remaining > 0) {
+			int clen = resp_try_parse_full_cmd(p, remaining);
+			if (clen <= 0)
+				break;
+			printf("%.*s", clen, p);
+			p += clen;
+			remaining -= clen;
+			nresp++;
+		}
+		if (p != recv_buf) {
+			memmove(recv_buf, p, remaining);
+			total_recv = remaining;
+		}
 	}
 
-	//重置批量缓冲区
 	pipeline_len = 0;
+	pipeline_ncmd = 0;
 	current_mode = MODE_INTERACTIVE;
-	printf("\n(pipeline executed)\n");
+	printf("\n(pipeline executed, %d/%d replies)\n", nresp, expect);
 }
 
 //新增：-x长文本（交互模式）
@@ -370,6 +426,8 @@ void spe_test_free(int connfd){
 		if(strcmp(line,"PIPELINE")==0){
 			current_mode = MODE_PIPELINE;
 			pipeline_init();
+			pipeline_len = 0;
+			pipeline_ncmd = 0;
 			printf("Entering pipeline mode. Use EXEC to send.\n");
 			free(line);
 			continue;

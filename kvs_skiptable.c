@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include "kvstore.h"
+#include "server.h"
 
 kvs_skiptable_t global_skiptable;
 

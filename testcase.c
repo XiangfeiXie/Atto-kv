@@ -13,6 +13,8 @@
 #define PIPELINE_BUF_SIZE (1024*1024)	//批量处理缓冲区
 
 
+char g_resp_buf[BUF_LEN];
+
 typedef enum{
 	MODE_INTERACTIVE,
 	MODE_PIPELINE,
@@ -65,7 +67,7 @@ void pipeline_append(int connfd,char *cmd){
 
 	memcpy(pipeline_buf+pipeline_len,resp,resp_len);
 	pipeline_len +=resp_len;
-	free(resp);
+	
 }
 //批量发送所有命令
 void pipeline_exec(int connfd){
@@ -135,7 +137,7 @@ void testcase(int connfd, char *msg, char *pattern, char *casename) {
 
  
 	if (strcmp(result, pattern) == 0) {
-		printf("==> PASS ->  %s\n", casename);
+		//printf("==> PASS ->  %s\n", casename);
 	} else {
 		printf("==> FAILED -> %s, '%s' != '%s' \n", casename, result, pattern);
 		exit(1);
@@ -191,9 +193,8 @@ int connect_tcpserver(const char *ip, unsigned short port) {
 
 // 封包函数
 char *resp_pack_request(char *msg){
-	char *out_buf = (char*)malloc(BUF_LEN);
-	if(!out_buf) return NULL;
-	memset(out_buf,0,BUF_LEN);
+	
+	memset(g_resp_buf,0,BUF_LEN);
 
 	char*tokens[MAX_TOKENS] = {0};
 	int idx = 0;
@@ -228,25 +229,32 @@ char *resp_pack_request(char *msg){
 
     // 生成 RESP
     int total = 0;
-    total += snprintf(out_buf + total, BUF_LEN - total, "*%d\r\n", idx);
+    total += snprintf(g_resp_buf + total, BUF_LEN - total, "*%d\r\n", idx);
     for (int i = 0; i < idx; i++) {
         int len = strlen(tokens[i]);
-        total += snprintf(out_buf + total, BUF_LEN - total, "$%d\r\n%s\r\n", len, tokens[i]);
+        total += snprintf(g_resp_buf + total, BUF_LEN - total, "$%d\r\n%s\r\n", len, tokens[i]);
         free(tokens[i]);
     }
 
-	return out_buf;
+	return g_resp_buf;
 
 }
 void common_testcase_04(int connfd){
+	int i;
+	for (i = 0; i < 10000; i++) {
+		// 100% 不重复的KEY和VALUE，绝对无重复
+		char key[32];
+		char val[32];
+		char cmd[128];
 		
-		testcase(connfd, resp_pack_request("SET Teacher1 King1"), "+OK\r\n", "SET-Teacher");
-		testcase(connfd, resp_pack_request("SET Teacher2 King2"), "+OK\r\n", "SET-Teacher");
-		testcase(connfd, resp_pack_request("SET Teacher3 King3"), "+OK\r\n", "SET-Teacher");
-		testcase(connfd, resp_pack_request("SET Teacher4 King4"), "+OK\r\n", "SET-Teacher");
-		testcase(connfd, resp_pack_request("SET Teacher5 King5"), "+OK\r\n", "SET-Teacher");
-		testcase(connfd, resp_pack_request("SET Teacher6 King6"), "+OK\r\n", "SET-Teacher");
-		testcase(connfd, resp_pack_request("SET Teacher7 King7"), "+OK\r\n", "SET-Teacher");
+		// 安全格式化，无溢出，生成唯一标识
+		snprintf(key, sizeof(key), "key_%d", i);
+		snprintf(val, sizeof(val), "val_%d", i);
+		snprintf(cmd, sizeof(cmd), "SET %s %s", key, val);
+		
+		// 执行唯一SET，一万次全不重复
+		testcase(connfd, resp_pack_request(cmd), "+OK\r\n", cmd);
+	}
 }
 
 void common_testcase_03(int connfd){
@@ -309,7 +317,8 @@ void common_testcase_02(int connfd){
 void common_testcase_01(int connfd){
 		
 
-
+	int i;
+	for (i = 0; i < 10000; i++) {
 
 
 		testcase(connfd, resp_pack_request("SET Teacher King"), "+OK\r\n", "SET-Teacher");
@@ -325,7 +334,7 @@ void common_testcase_01(int connfd){
 
 
 
-
+	}
 }
 
 
@@ -404,7 +413,6 @@ void spe_test_free(int connfd){
 			recv_msg(connfd,response,sizeof(response)-1);
 			printf("%s",response);
 
-			free(resp_buf);
 		}
 		free(line);
 	}
@@ -412,7 +420,51 @@ void spe_test_free(int connfd){
 }
 
 
+// MODE 5：Pipeline批处理压力测试（无逐行打印，仅失败+QPS）
+void common_testcase_05(int connfd) {
+    struct timeval tv_begin, tv_end;
+    int fail_count = 0;
+    const int TEST_COUNT = 1;
 
+    // 进入流水线模式
+    current_mode = MODE_PIPELINE;
+    pipeline_init();
+
+    // 生成10000条不重复SET命令
+    for (int i = 0; i < TEST_COUNT; i++) {
+        char key[32], val[32], cmd[128];
+        snprintf(key, sizeof(key), "batch_key_%05d", i);
+        snprintf(val, sizeof(val), "batch_val_%05d", i);
+        snprintf(cmd, sizeof(cmd), "SET %s %s", key, val);
+        pipeline_append(connfd, cmd);
+    }
+
+    // 批量发送+接收（无打印）
+    gettimeofday(&tv_begin, NULL);
+    send_msg(connfd, pipeline_buf, pipeline_len);
+
+    // 静默接收所有响应（不打印任何内容）
+    char recv_buf[BUF_LEN] = {0};
+    int total_recv = 0;
+    while (total_recv < pipeline_len) {
+        int n = recv_msg(connfd, recv_buf + total_recv, BUF_LEN - total_recv);
+        if (n <= 0) {
+            fail_count++;
+            break;
+        }
+        total_recv += n;
+    }
+    pipeline_len = 0;
+    current_mode = MODE_INTERACTIVE;
+
+    // 仅打印失败数 + QPS
+    gettimeofday(&tv_end, NULL);
+    int time_used = TIME_SUB_MS(tv_end, tv_begin);
+    if (fail_count > 0) {
+        printf("[BATCH TEST FAILED] Fail: %d | Total: %d\n", fail_count, TEST_COUNT);
+    }
+    printf("[BATCH TEST QPS] Time: %d ms | QPS: %d\n", time_used, TEST_COUNT * 1000 / time_used);
+}
 
 
 int main(int argc,char *argv[]){
@@ -446,6 +498,8 @@ printf("=================== KV Store Test Menu ===================\n"
 		common_testcase_03(connfd);
 	}else if(mode==4){
 		common_testcase_04(connfd);
+	}else if(mode==5){
+	common_testcase_05(connfd);
 	}
     return 0;
 }

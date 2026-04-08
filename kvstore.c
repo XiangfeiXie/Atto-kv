@@ -126,34 +126,7 @@ enum {
     KVS_CMD_COUNT,
 };
 
-// int resp_try_parse_full_cmd(const char*buf ,int buflen){
-// 	int idx = 0;
-// 	if(buflen<5 || buf[idx]!= '*') return -1;
 
-// 	idx++;
-// 	int argc = 0;
-// 	while(idx < buflen && buf[idx]!='\r'){
-// 		argc = argc * 10 + (buf[idx] - '0');
-// 		idx++;
-// 	}
-// 	if(idx + 2 > buflen ) return 0;
-// 	idx += 2;
-
-// 	for(int i=0;i < argc ;i++){
-// 		if(idx + 1>=buflen || buf[idx] != '$') return -1;
-// 		idx++;
-// 		int slen = 0;
-// 		while(idx <buflen && buf[idx] != '\r'){
-// 			slen = slen * 10 + (buf[idx] - '0');
-// 			idx++;
-// 		}
-// 		if(idx + 2 >buflen) return 0;
-// 		idx+=2;
-// 		if(idx + slen +2 > buflen) return 0;
-// 		idx+=slen + 2;
-// 	}
-// 	return idx;
-// }
 int resp_try_parse_full_cmd(const char *buf, int buflen) {
     int idx = 0;
     if (buflen < 5 || buf[idx] != '*')
@@ -274,6 +247,28 @@ int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
     }
 
     free_tokens(tokens,KVS_MAX_TOKENS);
+    return write_buf->len;
+}
+// 管道批处理总入口（网络层调用这个，才能执行你的批处理逻辑）
+// 🔥 修正：批量协议处理入口（100% 匹配 msg_handler 函数指针）
+int kvs_protocol_batch(char *msg, int len, DynBuf *write_buf) {
+    // 静态变量：维护连接的读偏移（批量解析核心）
+    static int read_offset = 0;
+    DynBuf read_buf;
+
+    // 初始化临时读缓冲区
+    dynbuf_init(&read_buf, BUF_INIT_CAP);
+    dynbuf_append(&read_buf, msg, len);
+
+    // 清空写缓冲区，批量写入响应
+    dynbuf_clear(write_buf);
+
+    // 调用核心批量解析函数（循环解析所有命令）
+    kvs_drain_resp_commands_off(&read_buf, &read_offset, write_buf);
+
+    // 释放临时缓冲区
+    dynbuf_free(&read_buf);
+
     return write_buf->len;
 }
 
@@ -847,16 +842,16 @@ int main(int argc, char *argv[]) {
     }
     int port = atoi(argv[1]);
     init_kvengine();
-    engine_reload();
+    // engine_reload();
 
-    repl_init();  // ✅ 初始化复制模块
+    // repl_init();  // ✅ 初始化复制模块
 
 #if (NETWORK_SELECT == NETWORK_REACTOR)
-    reactor_start(port, kvs_protocol);
+    reactor_start(port, kvs_protocol_batch);
 #elif (NETWORK_SELECT == NETWORK_PROACTOR)
-    proactor_start(port, kvs_protocol);
+    proactor_start(port, kvs_protocol_batch);
 #elif (NETWORK_SELECT == NETWORK_NTYCO)
-    ntyco_start(port, kvs_protocol);
+    ntyco_start(port, kvs_protocol_batch);
 #endif
     dest_kvengine();
     return 0;

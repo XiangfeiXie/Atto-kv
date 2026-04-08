@@ -125,15 +125,15 @@ int kvs_array_del(kvs_array_t *inst,const  char *key) {
         if (!it->key) continue;
 
         if (strcmp(it->key, key) == 0) {
-            free(it->key);
-            free(it->item -> value);
+            kvs_free(it->key);
+            kvs_free(it->item->value);
+            kvs_free(it->item);
             it->key = NULL;
             inst->total--;
             return 0;
         }
     }
     return 1;
-
 }
 
 

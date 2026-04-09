@@ -104,7 +104,8 @@ void free_tokens(char** tokens,int count);
 const char *command[] = {
     "SET", "GET", "DEL", "MOD", "EXIST",
     "SAVE","FLUSHALL",
-    "SLAVEOF", "PSYNC", "REPLCONF", "PING"  // 新增
+    "SLAVEOF", "PSYNC", "REPLCONF", "PING",
+    "ECHO"  // 新增
 };
 
 enum {
@@ -122,6 +123,8 @@ enum {
     KVS_CMD_PSYNC,      // 新增：同步
     KVS_CMD_REPLCONF,   // 新增：配置
     KVS_CMD_PING,       // 新增：心跳
+
+    KVS_CMD_ECHO,
 
     KVS_CMD_COUNT,
 };
@@ -427,23 +430,6 @@ int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
             break;
     }
 
-        // ===================== 新增：ECHO 命令处理 =====================
-    if (strcmp(tokens[0], "ECHO") == 0) {
-        // ECHO 格式：*2\r\n$4\r\nECHO\r\n$len\r\nmessage\r\n
-        if (count >= 2) {
-            // 正确 RESP 回复：原样返回内容 $len\r\nmsg\r\n
-            char temp_buf[128];
-            sprintf(temp_buf, "$%zu\r\n", strlen(tokens[1]));
-            dynbuf_append(wb, temp_buf, strlen(temp_buf));
-            dynbuf_append(wb, tokens[1], strlen(tokens[1]));
-            dynbuf_append(wb, "\r\n", 2);
-        } else {
-            // 参数不足，返回错误
-            dynbuf_append(wb, "-ERR wrong number of arguments for 'echo' command\r\n", 50);
-        }
-        return wb->len;
-    }
-    // ==============================================================
 
     char *key = tokens[1];
     KVItem *item = NULL;
@@ -605,7 +591,17 @@ int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
         case KVS_CMD_PING:
             dynbuf_append(wb, "+PONG\r\n", 7);
             break;
-
+            
+        case KVS_CMD_ECHO:
+            if (count >= 2) {
+                sprintf(temp_buf, "$%zu\r\n", strlen(tokens[1]));
+                dynbuf_append(wb, temp_buf, strlen(temp_buf));
+                dynbuf_append(wb, tokens[1], strlen(tokens[1]));
+                dynbuf_append(wb, "\r\n", 2);
+            } else {
+                dynbuf_append(wb, "-ERR wrong number of arguments for 'echo' command\r\n", 50);
+            }
+            break;
 
 
         
@@ -914,9 +910,9 @@ int main(int argc, char *argv[]) {
     }
     int port = atoi(argv[1]);
     init_kvengine();
-    engine_reload();
+    // engine_reload();
 
-    repl_init();  // ✅ 初始化复制模块
+    // repl_init();  // ✅ 初始化复制模块
 
 #if (NETWORK_SELECT == NETWORK_REACTOR)
     reactor_start(port, kvs_protocol_batch);

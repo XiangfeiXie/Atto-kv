@@ -25,7 +25,7 @@ static void conn_set_events(int fd, struct conn *c) {
 	uint32_t ev = EPOLLIN;
 	if (c->write_buf.len > 0){
 		ev |= EPOLLOUT;
-		printf("=== conn_set_events: 设置 EPOLLOUT，write_buf.len=%d ===\n", c->write_buf.len);
+		//printf("=== conn_set_events: 设置 EPOLLOUT，write_buf.len=%d ===\n", c->write_buf.len);
 	}
 	struct epoll_event e;
 	e.events = ev;
@@ -173,7 +173,7 @@ int r_init_server(unsigned short port) {
 	// 🔥 修复2：设置端口复用
 	int opt = 1;
 	setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-	setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+	// setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
 	struct sockaddr_in servaddr;
 	servaddr.sin_family = AF_INET;
@@ -214,7 +214,7 @@ int reactor_start(unsigned short port, msg_handler handler) {
 
 			// 🔥 修复5：处理错误事件，避免连接卡死
 			if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-				printf("=== 连接 %d 异常关闭 ===\n", connfd);
+				// printf("=== 连接 %d 异常关闭 ===\n", connfd);
 				dynbuf_free(&conn_list[connfd].read_buf);
 				dynbuf_free(&conn_list[connfd].write_buf);
 				close(connfd);

@@ -19,13 +19,13 @@
 // extern msg_handler kvs_protocol;
 
 #define ENABLE_RDB 1       
-#define ENABLE_AOF 1
+#define ENABLE_AOF 0
 
 #define NETWORK_REACTOR 	0
 #define NETWORK_PROACTOR	1
 #define NETWORK_NTYCO		2
 
-#define NETWORK_SELECT		NETWORK_PROACTOR
+#define NETWORK_SELECT		NETWORK_REACTOR
 #define ENABLE_JEMALLOC 1
 //初始缓冲区大小
 #define BUF_INIT_CAP			4096
@@ -34,8 +34,8 @@
 #define KVS_MAX_TOKENS		256
 
 #define ENABLE_ARRAY		0
-#define ENABLE_RBTREE		0
-#define ENABLE_HASH			1
+#define ENABLE_RBTREE		1
+#define ENABLE_HASH			0
 #define ENABLE_SKIPTABLE	0
 
 

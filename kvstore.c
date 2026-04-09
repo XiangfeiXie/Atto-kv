@@ -309,62 +309,71 @@ int kvs_drain_resp_commands_ex_off(DynBuf *rb, int *r_off, DynBuf *wb, msg_handl
     int off = *r_off;
     int remaining = rb->len;
 
-    while (remaining > 0) {
+    // 🔥 修复2：检查 off 是否越界，越界则强制重置
+    if (off < 0 || off >= rb->cap) {
+        printf("=== DRAIN: 警告！off=%d 越界，强制重置 off=0, rb->len=0 ===\n", off);
+        off = 0;
+        remaining = 0;
+        rb->len = 0;
+        *r_off = 0;
+        return 0;
+    }
 
+    printf("=== DRAIN: 进入循环，初始 off=%d, remaining=%d, rb->cap=%d ===\n", off, remaining, rb->cap);
+
+    while (remaining > 0) {
         // ===================== 新增：跳过开头空白字符 =====================
-        // 跳过 \r、\n、空格，直到遇到非空白字符
         while (remaining > 0 && (rb->buf[off] == '\r' || rb->buf[off] == '\n' || rb->buf[off] == ' ')) {
             off++;
             remaining--;
         }
-        if (remaining <= 0) break; // 跳完空白后没数据了，直接退出
+        if (remaining <= 0) break;
         // ==================================================================
-        // 尝试解析一条完整 RESP 命令
+        
+        // 🔥 再次检查 off 是否越界
+        if (off < 0 || off >= rb->cap) {
+            printf("=== DRAIN: 警告！off=%d 越界，强制退出 ===\n", off);
+            break;
+        }
+
         int cmd_len = resp_try_parse_full_cmd(rb->buf + off, remaining);
         
         printf("=== DEBUG: off=%d, remaining=%d, cmd_len=%d ===\n", off, remaining, cmd_len);
 
         if (cmd_len > 0) {
-            // ✅ 解析成功：正常处理命令
             h(rb->buf + off, cmd_len, wb);
             off += cmd_len;
             remaining -= cmd_len;
             ncmd++;
         } else if (cmd_len == 0) {
-            // ⏸️ 命令不完整：等待下一次 recv，跳出循环
             break;
         } else {
-            // ❌ 解析失败（协议错误）：生成错误回复并跳过错误数据
-            // 1. 生成标准 RESP 错误回复
-            dynbuf_append(wb, "-ERR invalid RESP protocol\r\n", 28);
+            // 🔥 修复3：改进错误处理，找到下一个 '*' 作为新的命令开头
+            printf("=== DRAIN: 解析错误，跳过垃圾数据，寻找下一个 '*' ===\n");
             
-            // 2. 策略：跳过当前错误字节（避免死循环）
-            // 这里选择跳过 1 字节，你也可以选择清空整个缓冲区
-            off += 1;
-            remaining -= 1;
+            int skip = 1;
+            while (skip < remaining && (off + skip) < rb->cap && rb->buf[off + skip] != '*') {
+                skip++;
+            }
             
-            // 可选：如果想直接清空缓冲区并断开连接，用下面这段：
-            // off = rb->len;
-            // remaining = 0;
+            if (skip >= remaining || (off + skip) >= rb->cap) {
+                skip = remaining;
+            }
+            
+            off += skip;
+            remaining -= skip;
         }
     }
+
+    printf("=== DRAIN: 退出循环，最终 off=%d, remaining=%d, ncmd=%d, wb->len=%d ===\n", 
+           off, remaining, ncmd, wb->len);
 
     // 更新偏移量和缓冲区长度
     *r_off = off;
     rb->len = remaining;
 
-    // 缓冲区清空时重置偏移
-    if (rb->len == 0) {
-        *r_off = 0;
-    } 
-    // 已读数据超过一半容量时，压缩缓冲区
-    else if (*r_off > (rb->cap / 2)) {
-        dynbuf_compact_by_copy(rb, r_off);
-    }
-
     return ncmd;
 }
-
 int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb)
 {
     return kvs_drain_resp_commands_ex_off(rb, r_off, wb, kvs_protocol);
@@ -408,6 +417,7 @@ void free_kvitem(KVItem*item){
 // 新：int kvs_filter_protocol(char **tokens, int count, DynBuf *wb)
 // ======================================================================
 int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
+    printf("=== FILTER: 处理命令 %s，进入时 wb->len=%d ===\n", tokens[0], wb->len);
     if (tokens[0] == NULL || count == 0 || wb == NULL)
         return -1;
 

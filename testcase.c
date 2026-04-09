@@ -420,52 +420,6 @@ void spe_test_free(int connfd){
 }
 
 
-// MODE 5：Pipeline批处理压力测试（无逐行打印，仅失败+QPS）
-void common_testcase_05(int connfd) {
-    struct timeval tv_begin, tv_end;
-    int fail_count = 0;
-    const int TEST_COUNT = 1;
-
-    // 进入流水线模式
-    current_mode = MODE_PIPELINE;
-    pipeline_init();
-
-    // 生成10000条不重复SET命令
-    for (int i = 0; i < TEST_COUNT; i++) {
-        char key[32], val[32], cmd[128];
-        snprintf(key, sizeof(key), "batch_key_%05d", i);
-        snprintf(val, sizeof(val), "batch_val_%05d", i);
-        snprintf(cmd, sizeof(cmd), "SET %s %s", key, val);
-        pipeline_append(connfd, cmd);
-    }
-
-    // 批量发送+接收（无打印）
-    gettimeofday(&tv_begin, NULL);
-    send_msg(connfd, pipeline_buf, pipeline_len);
-
-    // 静默接收所有响应（不打印任何内容）
-    char recv_buf[BUF_LEN] = {0};
-    int total_recv = 0;
-    while (total_recv < pipeline_len) {
-        int n = recv_msg(connfd, recv_buf + total_recv, BUF_LEN - total_recv);
-        if (n <= 0) {
-            fail_count++;
-            break;
-        }
-        total_recv += n;
-    }
-    pipeline_len = 0;
-    current_mode = MODE_INTERACTIVE;
-
-    // 仅打印失败数 + QPS
-    gettimeofday(&tv_end, NULL);
-    int time_used = TIME_SUB_MS(tv_end, tv_begin);
-    if (fail_count > 0) {
-        printf("[BATCH TEST FAILED] Fail: %d | Total: %d\n", fail_count, TEST_COUNT);
-    }
-    printf("[BATCH TEST QPS] Time: %d ms | QPS: %d\n", time_used, TEST_COUNT * 1000 / time_used);
-}
-
 
 int main(int argc,char *argv[]){
 
@@ -498,8 +452,6 @@ printf("=================== KV Store Test Menu ===================\n"
 		common_testcase_03(connfd);
 	}else if(mode==4){
 		common_testcase_04(connfd);
-	}else if(mode==5){
-	common_testcase_05(connfd);
 	}
     return 0;
 }

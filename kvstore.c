@@ -311,7 +311,7 @@ int kvs_drain_resp_commands_ex_off(DynBuf *rb, int *r_off, DynBuf *wb, msg_handl
 
     // 🔥 修复2：检查 off 是否越界，越界则强制重置
     if (off < 0 || off >= rb->cap) {
-        printf("=== DRAIN: 警告！off=%d 越界，强制重置 off=0, rb->len=0 ===\n", off);
+        //printf("=== DRAIN: 警告！off=%d 越界，强制重置 off=0, rb->len=0 ===\n", off);
         off = 0;
         remaining = 0;
         rb->len = 0;
@@ -319,7 +319,7 @@ int kvs_drain_resp_commands_ex_off(DynBuf *rb, int *r_off, DynBuf *wb, msg_handl
         return 0;
     }
 
-    printf("=== DRAIN: 进入循环，初始 off=%d, remaining=%d, rb->cap=%d ===\n", off, remaining, rb->cap);
+    //printf("=== DRAIN: 进入循环，初始 off=%d, remaining=%d, rb->cap=%d ===\n", off, remaining, rb->cap);
 
     while (remaining > 0) {
         // ===================== 新增：跳过开头空白字符 =====================
@@ -332,13 +332,13 @@ int kvs_drain_resp_commands_ex_off(DynBuf *rb, int *r_off, DynBuf *wb, msg_handl
         
         // 🔥 再次检查 off 是否越界
         if (off < 0 || off >= rb->cap) {
-            printf("=== DRAIN: 警告！off=%d 越界，强制退出 ===\n", off);
+            //printf("=== DRAIN: 警告！off=%d 越界，强制退出 ===\n", off);
             break;
         }
 
         int cmd_len = resp_try_parse_full_cmd(rb->buf + off, remaining);
         
-        printf("=== DEBUG: off=%d, remaining=%d, cmd_len=%d ===\n", off, remaining, cmd_len);
+        //printf("=== DEBUG: off=%d, remaining=%d, cmd_len=%d ===\n", off, remaining, cmd_len);
 
         if (cmd_len > 0) {
             h(rb->buf + off, cmd_len, wb);
@@ -349,7 +349,7 @@ int kvs_drain_resp_commands_ex_off(DynBuf *rb, int *r_off, DynBuf *wb, msg_handl
             break;
         } else {
             // 🔥 修复3：改进错误处理，找到下一个 '*' 作为新的命令开头
-            printf("=== DRAIN: 解析错误，跳过垃圾数据，寻找下一个 '*' ===\n");
+            //printf("=== DRAIN: 解析错误，跳过垃圾数据，寻找下一个 '*' ===\n");
             
             int skip = 1;
             while (skip < remaining && (off + skip) < rb->cap && rb->buf[off + skip] != '*') {
@@ -365,8 +365,8 @@ int kvs_drain_resp_commands_ex_off(DynBuf *rb, int *r_off, DynBuf *wb, msg_handl
         }
     }
 
-    printf("=== DRAIN: 退出循环，最终 off=%d, remaining=%d, ncmd=%d, wb->len=%d ===\n", 
-           off, remaining, ncmd, wb->len);
+    //printf("=== DRAIN: 退出循环，最终 off=%d, remaining=%d, ncmd=%d, wb->len=%d ===\n", 
+       //    off, remaining, ncmd, wb->len);
 
     // 更新偏移量和缓冲区长度
     *r_off = off;
@@ -417,7 +417,7 @@ void free_kvitem(KVItem*item){
 // 新：int kvs_filter_protocol(char **tokens, int count, DynBuf *wb)
 // ======================================================================
 int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
-    printf("=== FILTER: 处理命令 %s，进入时 wb->len=%d ===\n", tokens[0], wb->len);
+    //printf("=== FILTER: 处理命令 %s，进入时 wb->len=%d ===\n", tokens[0], wb->len);
     if (tokens[0] == NULL || count == 0 || wb == NULL)
         return -1;
 

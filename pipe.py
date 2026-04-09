@@ -1,6 +1,6 @@
 # 生成 10000 条 SET 命令的 RESP 格式文件
 with open("batch_commands.txt", "wb") as f:
-    for i in range(1000):
+    for i in range(10000):
         # 命令：SET key{i} value{i}
         # RESP 格式：*3\r\n$3\r\nSET\r\n$4\r\nkey0\r\n$6\r\nvalue0\r\n
         key = f"key{i}".encode()

@@ -129,32 +129,45 @@ enum {
 
 int resp_try_parse_full_cmd(const char *buf, int buflen) {
     int idx = 0;
-    if (buflen < 5 || buf[idx] != '*')
-        return -1;
+
+    // 修复：分开判断协议错误和数据不足
+    if (buflen < 1) return 0; // 空数据，不完整
+    if (buf[idx] != '*') return -1; // 协议错误，不是RESP数组
+    if (buflen < 5) return 0; // 长度不足，不完整
 
     idx++;
     int argc = 0;
     while (idx < buflen && buf[idx] != '\r') {
+        // 新增：非数字字符，协议错误
+        if (buf[idx] < '0' || buf[idx] > '9') return -1;
         argc = argc * 10 + (buf[idx] - '0');
         idx++;
     }
-    if (idx + 2 > buflen) return 0;
+    if (idx + 2 > buflen) return 0; // 没收到\r\n，不完整
     idx += 2;
 
+    // 新增：参数数量非法，协议错误
+    if (argc <= 0 || argc > KVS_MAX_TOKENS) return -1;
+
     for (int i = 0; i < argc; i++) {
-        if (idx + 1 >= buflen || buf[idx] != '$')
-            return -1;
+        // 修复：分开判断数据不足和协议错误
+        if (idx + 1 >= buflen) return 0; // 长度不足，不完整
+        if (buf[idx] != '$') return -1; // 协议错误，不是字符串
         idx++;
 
         int slen = 0;
         while (idx < buflen && buf[idx] != '\r') {
+            // 新增：非数字字符，协议错误
+            if (buf[idx] < '0' || buf[idx] > '9') return -1;
             slen = slen * 10 + (buf[idx] - '0');
             idx++;
         }
-        if (idx + 2 > buflen) return 0;
+        if (idx + 2 > buflen) return 0; // 没收到\r\n，不完整
         idx += 2;
 
-        if (idx + slen + 2 > buflen) return 0;
+        // 新增：字符串长度非法，协议错误
+        if (slen < 0) return -1;
+        if (idx + slen + 2 > buflen) return 0; // 内容没收全，不完整
         idx += slen + 2;
     }
     return idx;
@@ -222,15 +235,14 @@ int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
     if (msg == NULL || length <= 0 || write_buf == NULL)
         return -1;
 
-    /* 不在此清空 write_buf：网络层可能一次读取到多条命令（pipeline），需要连续追加响应。
-     * 调用方在开启新一批输出前自行 dynbuf_clear(write_buf)。 */
-
     char *tokens[KVS_MAX_TOKENS] = {0};
     bool ok = resp_unpack(msg, length, tokens);
-    if (!ok)
+    if (!ok) {
+        // 修复：解析失败时，生成标准错误回复
+        dynbuf_append(write_buf, "-ERR invalid RESP protocol\r\n", 28);
         return -1;
+    }
 
-    // ✅ 修改点8：传入DynBuf，不再用固定数组
     kvs_filter_protocol(tokens, KVS_MAX_TOKENS, write_buf);
 
     if (strcmp(tokens[0],"SET") == 0 ||
@@ -239,7 +251,6 @@ int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
     {
         if(ENABLE_AOF) aof_append(msg,length);
         
-        // ✅ 调用复制层接口：同步给从机
         if (repl_role == REPL_MASTER) {
             repl_feed_backlog(msg, length);
             repl_propagate(msg, length);
@@ -299,22 +310,55 @@ int kvs_drain_resp_commands_ex_off(DynBuf *rb, int *r_off, DynBuf *wb, msg_handl
     int remaining = rb->len;
 
     while (remaining > 0) {
+
+        // ===================== 新增：跳过开头空白字符 =====================
+        // 跳过 \r、\n、空格，直到遇到非空白字符
+        while (remaining > 0 && (rb->buf[off] == '\r' || rb->buf[off] == '\n' || rb->buf[off] == ' ')) {
+            off++;
+            remaining--;
+        }
+        if (remaining <= 0) break; // 跳完空白后没数据了，直接退出
+        // ==================================================================
+        // 尝试解析一条完整 RESP 命令
         int cmd_len = resp_try_parse_full_cmd(rb->buf + off, remaining);
-        if (cmd_len <= 0)
+        
+        printf("=== DEBUG: off=%d, remaining=%d, cmd_len=%d ===\n", off, remaining, cmd_len);
+
+        if (cmd_len > 0) {
+            // ✅ 解析成功：正常处理命令
+            h(rb->buf + off, cmd_len, wb);
+            off += cmd_len;
+            remaining -= cmd_len;
+            ncmd++;
+        } else if (cmd_len == 0) {
+            // ⏸️ 命令不完整：等待下一次 recv，跳出循环
             break;
-        h(rb->buf + off, cmd_len, wb);
-        off += cmd_len;
-        remaining -= cmd_len;
-        ncmd++;
+        } else {
+            // ❌ 解析失败（协议错误）：生成错误回复并跳过错误数据
+            // 1. 生成标准 RESP 错误回复
+            dynbuf_append(wb, "-ERR invalid RESP protocol\r\n", 28);
+            
+            // 2. 策略：跳过当前错误字节（避免死循环）
+            // 这里选择跳过 1 字节，你也可以选择清空整个缓冲区
+            off += 1;
+            remaining -= 1;
+            
+            // 可选：如果想直接清空缓冲区并断开连接，用下面这段：
+            // off = rb->len;
+            // remaining = 0;
+        }
     }
 
+    // 更新偏移量和缓冲区长度
     *r_off = off;
     rb->len = remaining;
 
+    // 缓冲区清空时重置偏移
     if (rb->len == 0) {
         *r_off = 0;
-    } else if (*r_off > (rb->cap / 2)) {
-        /* 及时回收已读数据：用 malloc+memcpy 进行一次性整理（避免 memmove）。 */
+    } 
+    // 已读数据超过一半容量时，压缩缓冲区
+    else if (*r_off > (rb->cap / 2)) {
         dynbuf_compact_by_copy(rb, r_off);
     }
 
@@ -372,6 +416,24 @@ int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
         if (strcmp(tokens[0], command[cmd]) == 0)
             break;
     }
+
+        // ===================== 新增：ECHO 命令处理 =====================
+    if (strcmp(tokens[0], "ECHO") == 0) {
+        // ECHO 格式：*2\r\n$4\r\nECHO\r\n$len\r\nmessage\r\n
+        if (count >= 2) {
+            // 正确 RESP 回复：原样返回内容 $len\r\nmsg\r\n
+            char temp_buf[128];
+            sprintf(temp_buf, "$%zu\r\n", strlen(tokens[1]));
+            dynbuf_append(wb, temp_buf, strlen(temp_buf));
+            dynbuf_append(wb, tokens[1], strlen(tokens[1]));
+            dynbuf_append(wb, "\r\n", 2);
+        } else {
+            // 参数不足，返回错误
+            dynbuf_append(wb, "-ERR wrong number of arguments for 'echo' command\r\n", 50);
+        }
+        return wb->len;
+    }
+    // ==============================================================
 
     char *key = tokens[1];
     KVItem *item = NULL;

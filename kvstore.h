@@ -19,13 +19,13 @@
 // extern msg_handler kvs_protocol;
 
 #define ENABLE_RDB 1       
-#define ENABLE_AOF 0
+#define ENABLE_AOF 1
 
 #define NETWORK_REACTOR 	0
 #define NETWORK_PROACTOR	1
 #define NETWORK_NTYCO		2
 
-#define NETWORK_SELECT		NETWORK_NTYCO
+#define NETWORK_SELECT		NETWORK_PROACTOR
 #define ENABLE_JEMALLOC 1
 //初始缓冲区大小
 #define BUF_INIT_CAP			4096
@@ -35,8 +35,8 @@
 
 #define ENABLE_ARRAY		0
 #define ENABLE_RBTREE		0
-#define ENABLE_HASH			0
-#define ENABLE_SKIPTABLE	1
+#define ENABLE_HASH			1
+#define ENABLE_SKIPTABLE	0
 
 
 
@@ -51,6 +51,7 @@ extern int ntyco_start(unsigned short port, msg_handler handler);
 long long get_time_now(void);
 int resp_try_parse_full_cmd(const char*buf ,int buflen);
 void rdb_save_async(void);
+void rdb_save(void);
 void kvs_flush_all();
 void rdb_load(void);
 // RESP协议解析函数声明

@@ -914,9 +914,9 @@ int main(int argc, char *argv[]) {
     }
     int port = atoi(argv[1]);
     init_kvengine();
-    // engine_reload();
+    engine_reload();
 
-    // repl_init();  // ✅ 初始化复制模块
+    repl_init();  // ✅ 初始化复制模块
 
 #if (NETWORK_SELECT == NETWORK_REACTOR)
     reactor_start(port, kvs_protocol_batch);

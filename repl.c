@@ -113,7 +113,8 @@ void repl_propagate(const char *cmd, int len) {
 // Redis标准：发送RDB全量同步 + 补发增量命令
 static void repl_send_rdb_full_sync(int slave_fd) {
     long long old_offset = master_offset;
-    rdb_save_async();
+    // rdb_save_async();
+    rdb_save();
 
     FILE *fp = fopen("dump.rdb", "rb");
     if (!fp) return;

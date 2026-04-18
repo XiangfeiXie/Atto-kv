@@ -11,6 +11,7 @@
 #include <fcntl.h>      // ✅ 修改点4：添加文件操作头文件
 #include "repl.h"
 #include "repl_net.h"
+#include "persistence.h"
 
 // ==================== 动态缓冲区工具函数实现（放在这里，彻底解决链接问题） ====================
 void dynbuf_init(DynBuf *db, int init_cap) {
@@ -252,8 +253,8 @@ int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
         strcmp(tokens[0],"DEL") == 0 ||
         strcmp(tokens[0],"MOD") == 0 )
     {
-        if(ENABLE_AOF) aof_append(msg,length);
-        
+        if(ENABLE_AOF) aof_async_append(msg, length);  /* 异步入队，不阻塞主线程 */
+
         if (repl_role == REPL_MASTER) {
             repl_feed_backlog(msg, length);
             repl_propagate(msg, length);
@@ -555,7 +556,7 @@ int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
             break;
 
         case KVS_CMD_SAVE:
-            rdb_save();
+            rdb_save_async_uring();   /* fork + io_uring，主线程零阻塞 */
             dynbuf_append(wb, RESP_OK, strlen(RESP_OK));
             break;
 
@@ -890,14 +891,14 @@ void aof_reload(){
 
 void engine_reload(void) {
     if (ENABLE_AOF && access("appendonly.aof", F_OK) == 0) {
-        printf("Loading AOF...\n");
-        aof_reload();
-    } 
+        printf("Loading AOF (mmap)...\n");
+        aof_reload_mmap();
+    }
     else if (access("dump.rdb", F_OK) == 0) {
-        printf("Loading RDB...\n");
-        rdb_load();
-    }else{
-        printf("Engine reload fail\n");
+        printf("Loading RDB (mmap)...\n");
+        rdb_load_mmap();
+    } else {
+        printf("Engine reload: no persistence file\n");
     }
 }
 
@@ -910,7 +911,8 @@ int main(int argc, char *argv[]) {
     }
     int port = atoi(argv[1]);
     init_kvengine();
-    // engine_reload();
+    engine_reload();                              /* mmap 加速加载 */
+    if (ENABLE_AOF) aof_async_init("appendonly.aof");  /* 启动 AOF 后台写线程 */
 
     // repl_init();  // ✅ 初始化复制模块
 
@@ -921,6 +923,7 @@ int main(int argc, char *argv[]) {
 #elif (NETWORK_SELECT == NETWORK_NTYCO)
     ntyco_start(port, kvs_protocol_batch);
 #endif
+    if (ENABLE_AOF) aof_async_shutdown();   /* 退出前 flush AOF 队列 */
     dest_kvengine();
     return 0;
 }

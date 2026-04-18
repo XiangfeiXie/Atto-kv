@@ -19,7 +19,7 @@
 // extern msg_handler kvs_protocol;
 
 #define ENABLE_RDB 1       
-#define ENABLE_AOF 0
+#define ENABLE_AOF 1
 
 #define NETWORK_REACTOR 	0
 #define NETWORK_PROACTOR	1

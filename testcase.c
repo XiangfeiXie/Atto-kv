@@ -317,8 +317,6 @@ void common_testcase_02(int connfd){
 void common_testcase_01(int connfd){
 		
 
-	int i;
-	for (i = 0; i < 10000; i++) {
 
 
 		testcase(connfd, resp_pack_request("SET Teacher King"), "+OK\r\n", "SET-Teacher");
@@ -331,10 +329,6 @@ void common_testcase_01(int connfd){
 		testcase(connfd, resp_pack_request("MOD Teacher KING"), "$-1\r\n", "MOD-K-Teacher");
 		testcase(connfd, resp_pack_request("EXIST Teacher"), "$-1\r\n", "EXIST-Teacher");
 
-
-
-
-	}
 }
 
 

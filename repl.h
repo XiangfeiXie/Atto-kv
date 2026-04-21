@@ -11,7 +11,7 @@
 
 #define MAX_SLAVES          16
 #define REPL_BACKLOG_SIZE   (1024 * 1024)  // 1MB，和Redis一样固定大小
-#define REPL_LISTEN_PORT    6380
+/* REPL_LISTEN_PORT removed: use kvs_config.replport at runtime */
 #define REPL_PING_INTERVAL  1000
 
 // 从节点信息结构体

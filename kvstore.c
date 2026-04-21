@@ -71,21 +71,10 @@ void dynbuf_free(DynBuf *db) {
 //启动AOF
 
 
-#if ENABLE_ARRAY
-extern kvs_array_t global_array;
-#endif
-
-#if ENABLE_RBTREE
-extern kvs_rbtree_t global_rbtree;
-#endif
-
-#if ENABLE_HASH
-extern kvs_hash_t global_hash;
-#endif
-
-#if ENABLE_SKIPTABLE
+extern kvs_array_t    global_array;
+extern kvs_rbtree_t   global_rbtree;
+extern kvs_hash_t     global_hash;
 extern kvs_skiptable_t global_skiptable;
-#endif
 
 void *kvs_malloc(size_t size) {
     return malloc(size);
@@ -443,18 +432,10 @@ int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
 
     switch(cmd) {
         case KVS_CMD_SET:
-#if ENABLE_ARRAY
-            ret = kvs_array_set(&global_array, key,item);
-#endif
-#if ENABLE_RBTREE
-            ret = kvs_rbtree_set(&global_rbtree, key,item);
-#endif
-#if ENABLE_HASH
-            ret = kvs_hash_set(&global_hash, key,item);
-#endif
-#if ENABLE_SKIPTABLE
-            ret = kvs_skiptable_set(&global_skiptable, key,item);
-#endif
+            if      (kvs_config.engine == ENGINE_ARRAY)     ret = kvs_array_set(&global_array, key, item);
+            else if (kvs_config.engine == ENGINE_RBTREE)    ret = kvs_rbtree_set(&global_rbtree, key, item);
+            else if (kvs_config.engine == ENGINE_HASH)      ret = kvs_hash_set(&global_hash, key, item);
+            else if (kvs_config.engine == ENGINE_SKIPTABLE) ret = kvs_skiptable_set(&global_skiptable, key, item);
             if (ret < 0) {
                 strcpy(temp_buf, RESP_ERROR);
             } else if (ret == 0) {
@@ -467,18 +448,10 @@ int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
 
         case KVS_CMD_GET: {
             KVItem *result = NULL;
-#if ENABLE_ARRAY
-            result = kvs_array_get(&global_array, key);
-#endif
-#if ENABLE_RBTREE
-            result = kvs_rbtree_get(&global_rbtree, key);
-#endif
-#if ENABLE_HASH
-            result = kvs_hash_get(&global_hash, key);
-#endif
-#if ENABLE_SKIPTABLE
-            result = kvs_skiptable_get(&global_skiptable, key);
-#endif
+            if      (kvs_config.engine == ENGINE_ARRAY)     result = kvs_array_get(&global_array, key);
+            else if (kvs_config.engine == ENGINE_RBTREE)    result = kvs_rbtree_get(&global_rbtree, key);
+            else if (kvs_config.engine == ENGINE_HASH)      result = kvs_hash_get(&global_hash, key);
+            else if (kvs_config.engine == ENGINE_SKIPTABLE) result = kvs_skiptable_get(&global_skiptable, key);
             if (result == NULL) {
                 dynbuf_append(wb, RESP_NIL, strlen(RESP_NIL));
             } else {
@@ -492,18 +465,10 @@ int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
         }
 
         case KVS_CMD_DEL:
-#if ENABLE_ARRAY
-            ret = kvs_array_del(&global_array, key);
-#endif
-#if ENABLE_RBTREE
-            ret = kvs_rbtree_del(&global_rbtree, key);
-#endif
-#if ENABLE_HASH
-            ret = kvs_hash_del(&global_hash, key);
-#endif
-#if ENABLE_SKIPTABLE
-            ret = kvs_skiptable_del(&global_skiptable, key);
-#endif
+            if      (kvs_config.engine == ENGINE_ARRAY)     ret = kvs_array_del(&global_array, key);
+            else if (kvs_config.engine == ENGINE_RBTREE)    ret = kvs_rbtree_del(&global_rbtree, key);
+            else if (kvs_config.engine == ENGINE_HASH)      ret = kvs_hash_del(&global_hash, key);
+            else if (kvs_config.engine == ENGINE_SKIPTABLE) ret = kvs_skiptable_del(&global_skiptable, key);
             if (ret < 0) {
                 dynbuf_append(wb, RESP_ERROR, strlen(RESP_ERROR));
             } else if (ret == 0) {
@@ -514,18 +479,10 @@ int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
             break;
 
         case KVS_CMD_MOD:
-#if ENABLE_ARRAY
-            ret = kvs_array_mod(&global_array,key,item);
-#endif
-#if ENABLE_RBTREE
-            ret = kvs_rbtree_mod(&global_rbtree, key,item);
-#endif
-#if ENABLE_HASH
-            ret = kvs_hash_mod(&global_hash, key,item);
-#endif
-#if ENABLE_SKIPTABLE
-            ret = kvs_skiptable_mod(&global_skiptable, key,item);
-#endif
+            if      (kvs_config.engine == ENGINE_ARRAY)     ret = kvs_array_mod(&global_array, key, item);
+            else if (kvs_config.engine == ENGINE_RBTREE)    ret = kvs_rbtree_mod(&global_rbtree, key, item);
+            else if (kvs_config.engine == ENGINE_HASH)      ret = kvs_hash_mod(&global_hash, key, item);
+            else if (kvs_config.engine == ENGINE_SKIPTABLE) ret = kvs_skiptable_mod(&global_skiptable, key, item);
             if (ret < 0) {
                 dynbuf_append(wb, RESP_ERROR, strlen(RESP_ERROR));
             } else if (ret == 0) {
@@ -536,18 +493,10 @@ int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
             break;
 
         case KVS_CMD_EXIST:
-#if ENABLE_ARRAY
-            ret = kvs_array_exist(&global_array, key);
-#endif
-#if ENABLE_RBTREE
-            ret = kvs_rbtree_exist(&global_rbtree, key);
-#endif
-#if ENABLE_HASH
-            ret = kvs_hash_exist(&global_hash, key);
-#endif
-#if ENABLE_SKIPTABLE
-            ret = kvs_skiptable_exist(&global_skiptable, key);
-#endif
+            if      (kvs_config.engine == ENGINE_ARRAY)     ret = kvs_array_exist(&global_array, key);
+            else if (kvs_config.engine == ENGINE_RBTREE)    ret = kvs_rbtree_exist(&global_rbtree, key);
+            else if (kvs_config.engine == ENGINE_HASH)      ret = kvs_hash_exist(&global_hash, key);
+            else if (kvs_config.engine == ENGINE_SKIPTABLE) ret = kvs_skiptable_exist(&global_skiptable, key);
             if (ret == 0) {
                 dynbuf_append(wb, RESP_EXIST, strlen(RESP_EXIST));
             } else {
@@ -621,54 +570,39 @@ int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
 }
 
 int init_kvengine(void) {
-#if ENABLE_ARRAY
-    memset(&global_array, 0, sizeof(kvs_array_t));
-    kvs_array_create(&global_array);
-#endif
-#if ENABLE_RBTREE
-    memset(&global_rbtree, 0, sizeof(kvs_rbtree_t));
-    kvs_rbtree_create(&global_rbtree);
-#endif
-#if ENABLE_HASH
-    memset(&global_hash, 0, sizeof(kvs_hash_t));
-    kvs_hash_create(&global_hash);
-#endif
-#if ENABLE_SKIPTABLE
-    memset(&global_skiptable, 0, sizeof(kvs_skiptable_t));
-    kvs_skiptable_create(&global_skiptable);
-#endif
+    if (kvs_config.engine == ENGINE_ARRAY) {
+        printf("Using array engine\n");
+        memset(&global_array, 0, sizeof(kvs_array_t));
+        kvs_array_create(&global_array);
+    } else if (kvs_config.engine == ENGINE_RBTREE) {
+        printf("Using rbtree engine\n");
+        memset(&global_rbtree, 0, sizeof(kvs_rbtree_t));
+        kvs_rbtree_create(&global_rbtree);
+    } else if (kvs_config.engine == ENGINE_HASH) {
+        printf("Using hash engine\n");
+        memset(&global_hash, 0, sizeof(kvs_hash_t));
+        kvs_hash_create(&global_hash);
+    } else if (kvs_config.engine == ENGINE_SKIPTABLE) {
+        printf("Using skiptable engine\n");
+        memset(&global_skiptable, 0, sizeof(kvs_skiptable_t));
+        kvs_skiptable_create(&global_skiptable);
+    }
     return 0;
 }
 
 void dest_kvengine(void) {
-#if ENABLE_ARRAY
-    kvs_array_destory(&global_array);
-#endif
-#if ENABLE_RBTREE
-    kvs_rbtree_destory(&global_rbtree);
-#endif
-#if ENABLE_HASH
-    kvs_hash_destory(&global_hash);
-#endif
-#if ENABLE_SKIPTABLE
-    kvs_skiptable_destroy(&global_skiptable);
-#endif
+    if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_destory(&global_array);
+    else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_destory(&global_rbtree);
+    else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_destory(&global_hash);
+    else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_destroy(&global_skiptable);
 }
 
 // 正确：清空所有数据，保留引擎可用
 void kvs_flush_all() {
-#if ENABLE_ARRAY
-    kvs_array_clear(&global_array);    // 清空数组数据
-#endif
-#if ENABLE_HASH
-    kvs_hash_clear(&global_hash);      // 清空哈希表数据
-#endif
-#if ENABLE_RBTREE
-    kvs_rbtree_clear(&global_rbtree);   // 清空红黑树数据
-#endif
-#if ENABLE_SKIPTABLE
-    kvs_skiptable_clear(&global_skiptable);  // 清空跳表数据
-#endif
+    if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_clear(&global_array);
+    else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_clear(&global_hash);
+    else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_clear(&global_rbtree);
+    else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_clear(&global_skiptable);
     // 只清理内存碎片，不销毁引擎
     mallctl("arenas.purge", NULL, NULL, NULL, 0);
 }
@@ -702,18 +636,11 @@ void rdb_save(void){
     int magic = 0x524442;
     int version = 1;
     int db_num = 0;
-#if ENABLE_ARRAY
-    int key_count = global_array.total;           //统一宏处理
-#endif
-#if ENABLE_RBTREE
-    int key_count = global_rbtree.total;           //统一宏处理
-#endif
-#if ENABLE_HASH
-    int key_count = global_hash.count;           //统一宏处理
-#endif
-#if ENABLE_SKIPTABLE
-    int key_count = global_skiptable.skl->total;
-#endif
+    int key_count = 0;
+    if      (kvs_config.engine == ENGINE_ARRAY)     key_count = global_array.total;
+    else if (kvs_config.engine == ENGINE_RBTREE)    key_count = global_rbtree.total;
+    else if (kvs_config.engine == ENGINE_HASH)      key_count = global_hash.count;
+    else if (kvs_config.engine == ENGINE_SKIPTABLE) key_count = global_skiptable.skl->total;
 
     fwrite(&magic, sizeof(int), 1, fp);
     fwrite(&version, sizeof(int), 1, fp);
@@ -724,18 +651,10 @@ void rdb_save(void){
     // 遍历所有引擎数据并写入
     RdbSaveCtx ctx = {.fp = fp};
 
-#if (ENABLE_ARRAY)                         
-        kvs_array_scan(&global_array, rdb_save_callback, &ctx);  
-#endif
-#if (ENABLE_RBTREE)                  
-        kvs_rbtree_scan(&global_rbtree, rdb_save_callback, &ctx);
-#endif
-#if (ENABLE_HASH)                    
-        kvs_hash_scan(&global_hash, rdb_save_callback, &ctx);
-#endif   
-#if (ENABLE_SKIPTABLE)                
-        kvs_skiptable_scan(&global_skiptable, rdb_save_callback, &ctx); 
-#endif
+    if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_scan(&global_array, rdb_save_callback, &ctx);
+    else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_scan(&global_rbtree, rdb_save_callback, &ctx);
+    else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_scan(&global_hash, rdb_save_callback, &ctx);
+    else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_scan(&global_skiptable, rdb_save_callback, &ctx);
 
     fflush(fp);
     fsync(fileno(fp));
@@ -781,18 +700,10 @@ void rdb_load(void) {
     }
 
 
-#if (ENABLE_ARRAY) 
-    kvs_array_clear(&global_array); 
-#endif 
-#if (ENABLE_RBTREE) 
-    kvs_rbtree_clear(&global_rbtree); 
-#endif 
-#if (ENABLE_HASH) 
-    kvs_hash_clear(&global_hash);
-#endif  
-#if (ENABLE_SKIPTABLE) 
-    kvs_skiptable_clear(&global_skiptable); 
-#endif 
+    if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_clear(&global_array);
+    else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_clear(&global_rbtree);
+    else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_clear(&global_hash);
+    else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_clear(&global_skiptable);
    
 
     for (int i = 0; i < key_count; i++) {
@@ -816,18 +727,10 @@ void rdb_load(void) {
         item->expire = expire;
 
         // 统一插入
-#if (ENABLE_ARRAY)
-            kvs_array_set(&global_array, key, item);
-#endif
-#if (ENABLE_RBTREE) 
-            kvs_rbtree_set(&global_rbtree, key, item);
-#endif
-#if (ENABLE_HASH) 
-            kvs_hash_set(&global_hash, key, item);
-#endif
-#if (ENABLE_SKIPTABLE) 
-            kvs_skiptable_set(&global_skiptable, key, item);
-#endif
+        if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_set(&global_array, key, item);
+        else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_set(&global_rbtree, key, item);
+        else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_set(&global_hash, key, item);
+        else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_set(&global_skiptable, key, item);
 
 
         kvs_free(key);
@@ -893,8 +796,7 @@ void engine_reload(void) {
     if (ENABLE_AOF && access("appendonly.aof", F_OK) == 0) {
         printf("Loading AOF (mmap)...\n");
         aof_reload_mmap();
-    }
-    else if (access("dump.rdb", F_OK) == 0) {
+    } else if (ENABLE_RDB && access("dump.rdb", F_OK) == 0) {
         printf("Loading RDB (mmap)...\n");
         rdb_load_mmap();
     } else {
@@ -903,27 +805,28 @@ void engine_reload(void) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        printf("====================== KV Store Start ======================\n");
-        printf("			./kvstore 端口号		        		\n");
-        printf("==========================================================\n");
-        return -1;
-    }
-    int port = atoi(argv[1]);
+    const char *conf_path = (argc >= 2) ? argv[1] : "kvstore.conf";
+    config_load(conf_path);
+    config_print();
+
     init_kvengine();
-    engine_reload();                              /* mmap 加速加载 */
-    if (ENABLE_AOF) aof_async_init("appendonly.aof");  /* 启动 AOF 后台写线程 */
+    engine_reload();
+    if (ENABLE_AOF) aof_async_init("appendonly.aof");
 
-    // repl_init();  // ✅ 初始化复制模块
+    if (kvs_config.role == ROLE_SLAVE && kvs_config.masterip[0] != '\0') {
+        repl_switch_to_slave(kvs_config.masterip, kvs_config.masterport);
+    } else {
+        repl_init();
+    }
 
-#if (NETWORK_SELECT == NETWORK_REACTOR)
-    reactor_start(port, kvs_protocol_batch);
-#elif (NETWORK_SELECT == NETWORK_PROACTOR)
-    proactor_start(port, kvs_protocol_batch);
-#elif (NETWORK_SELECT == NETWORK_NTYCO)
-    ntyco_start(port, kvs_protocol_batch);
-#endif
-    if (ENABLE_AOF) aof_async_shutdown();   /* 退出前 flush AOF 队列 */
+    if (kvs_config.network_model == NET_REACTOR)
+        reactor_start(kvs_config.port, kvs_protocol_batch);
+    else if (kvs_config.network_model == NET_PROACTOR)
+        proactor_start(kvs_config.port, kvs_protocol_batch);
+    else if (kvs_config.network_model == NET_NTYCO)
+        ntyco_start(kvs_config.port, kvs_protocol_batch);
+
+    if (ENABLE_AOF) aof_async_shutdown();
     dest_kvengine();
     return 0;
 }

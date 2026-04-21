@@ -36,18 +36,10 @@
 #include <liburing.h>
 
 /* ========================= 引擎数据访问（与 kvstore.c 保持一致） ========================= */
-#if ENABLE_ARRAY
-extern kvs_array_t global_array;
-#endif
-#if ENABLE_RBTREE
-extern kvs_rbtree_t global_rbtree;
-#endif
-#if ENABLE_HASH
-extern kvs_hash_t global_hash;
-#endif
-#if ENABLE_SKIPTABLE
+extern kvs_array_t    global_array;
+extern kvs_rbtree_t   global_rbtree;
+extern kvs_hash_t     global_hash;
 extern kvs_skiptable_t global_skiptable;
-#endif
 
 /* 由 kvstore.c 提供 */
 KVItem* create_kvitem(char *value_str, char *expire_str);
@@ -326,36 +318,20 @@ static void rdb_save_child(void) {
     int version = 1;
     int db_num = 0;
     int key_count = 0;
-#if ENABLE_ARRAY
-    key_count = global_array.total;
-#endif
-#if ENABLE_RBTREE
-    key_count = global_rbtree.total;
-#endif
-#if ENABLE_HASH
-    key_count = global_hash.count;
-#endif
-#if ENABLE_SKIPTABLE
-    key_count = global_skiptable.skl->total;
-#endif
+    if      (kvs_config.engine == ENGINE_ARRAY)     key_count = global_array.total;
+    else if (kvs_config.engine == ENGINE_RBTREE)    key_count = global_rbtree.total;
+    else if (kvs_config.engine == ENGINE_HASH)      key_count = global_hash.count;
+    else if (kvs_config.engine == ENGINE_SKIPTABLE) key_count = global_skiptable.skl->total;
 
     rdb_buf_put(&b, &magic, sizeof(int));
     rdb_buf_put(&b, &version, sizeof(int));
     rdb_buf_put(&b, &db_num, sizeof(int));
     rdb_buf_put(&b, &key_count, sizeof(int));
 
-#if ENABLE_ARRAY
-    kvs_array_scan(&global_array, rdb_save_callback_buf, &b);
-#endif
-#if ENABLE_RBTREE
-    kvs_rbtree_scan(&global_rbtree, rdb_save_callback_buf, &b);
-#endif
-#if ENABLE_HASH
-    kvs_hash_scan(&global_hash, rdb_save_callback_buf, &b);
-#endif
-#if ENABLE_SKIPTABLE
-    kvs_skiptable_scan(&global_skiptable, rdb_save_callback_buf, &b);
-#endif
+    if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_scan(&global_array, rdb_save_callback_buf, &b);
+    else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_scan(&global_rbtree, rdb_save_callback_buf, &b);
+    else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_scan(&global_hash, rdb_save_callback_buf, &b);
+    else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_scan(&global_skiptable, rdb_save_callback_buf, &b);
 
     /* 2) 写临时文件 + rename，保证原子性 */
     const char *tmp = "dump.rdb.tmp";
@@ -452,18 +428,10 @@ void rdb_load_mmap(void) {
         goto out;
     }
 
-#if ENABLE_ARRAY
-    kvs_array_clear(&global_array);
-#endif
-#if ENABLE_RBTREE
-    kvs_rbtree_clear(&global_rbtree);
-#endif
-#if ENABLE_HASH
-    kvs_hash_clear(&global_hash);
-#endif
-#if ENABLE_SKIPTABLE
-    kvs_skiptable_clear(&global_skiptable);
-#endif
+    if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_clear(&global_array);
+    else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_clear(&global_rbtree);
+    else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_clear(&global_hash);
+    else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_clear(&global_skiptable);
 
     for (int i = 0; i < key_count; i++) {
         int klen = 0, vlen = 0;
@@ -485,18 +453,10 @@ void rdb_load_mmap(void) {
         KVItem *item = create_kvitem(val, NULL);
         if (item) item->expire = expire;
 
-#if ENABLE_ARRAY
-        kvs_array_set(&global_array, key, item);
-#endif
-#if ENABLE_RBTREE
-        kvs_rbtree_set(&global_rbtree, key, item);
-#endif
-#if ENABLE_HASH
-        kvs_hash_set(&global_hash, key, item);
-#endif
-#if ENABLE_SKIPTABLE
-        kvs_skiptable_set(&global_skiptable, key, item);
-#endif
+        if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_set(&global_array, key, item);
+        else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_set(&global_rbtree, key, item);
+        else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_set(&global_hash, key, item);
+        else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_set(&global_skiptable, key, item);
         kvs_free(key);
         kvs_free(val);
     }

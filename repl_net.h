@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <sys/socket.h>
 
-#define REPL_PORT 6380  // 主从复制专用端口（和业务端口分离）
+/* REPL_PORT removed: use kvs_config.replport at runtime */
 
 // 复制网络初始化（主机监听复制端口）
 int repl_net_init(int port);

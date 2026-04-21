@@ -190,8 +190,8 @@ void repl_handle_replconf(char **tokens, DynBuf *wb) {
 
 // 主机复制线程
 void* repl_master_thread(void *arg) {
-    repl_listen_fd = repl_net_init(REPL_LISTEN_PORT);
-    printf("✅ 主机复制线程启动 端口=%d\n", REPL_LISTEN_PORT);
+    repl_listen_fd = repl_net_init(kvs_config.replport);
+    printf("✅ 主机复制线程启动 端口=%d\n", kvs_config.replport);
 
     while (1) {
         int slave_fd = repl_net_accept(repl_listen_fd);
@@ -227,7 +227,7 @@ void* repl_master_thread(void *arg) {
 
 // 从机复制线程
 void* repl_slave_thread(void *arg) {
-    repl_master_fd = repl_net_connect(repl_master_ip, REPL_LISTEN_PORT);
+    repl_master_fd = repl_net_connect(repl_master_ip, kvs_config.replport);
     if (repl_master_fd < 0) {
         printf("❌ 连接主机失败\n");
         repl_switch_to_master();

@@ -37,6 +37,7 @@
 typedef struct {
     int  port;            /* listening port, default 6379               */
     int  loglevel;        /* LOG_DEBUG / INFO / WARN / ERROR            */
+    int  repl_enabled;    /* 0: disable replication; 1: enable          */
     int  role;            /* ROLE_MASTER / ROLE_SLAVE                   */
     char masterip[64];    /* master IP when role == ROLE_SLAVE          */
     int  masterport;      /* master replication port, default 6380      */

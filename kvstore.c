@@ -254,7 +254,7 @@ int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
 
         if (cmd_ok && ENABLE_AOF) aof_async_append(msg, length);
 
-        if (cmd_ok && repl_role == REPL_MASTER) {
+        if (cmd_ok && kvs_config.repl_enabled && repl_role == REPL_MASTER) {
             repl_feed_backlog(msg, length);
             repl_propagate(msg, length);
         }
@@ -527,6 +527,10 @@ int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
 
 
         case KVS_CMD_SLAVEOF: {
+            if (!kvs_config.repl_enabled) {
+                dynbuf_append(wb, "-ERR replication disabled in config\r\n", 38);
+                break;
+            }
             // 命令：SLAVEOF NO ONE → 切换主机
             if (strcmp(tokens[1], "NO") == 0 && strcmp(tokens[2], "ONE") == 0) {
                 repl_switch_to_master();
@@ -823,10 +827,14 @@ int main(int argc, char *argv[]) {
     engine_reload();
     if (ENABLE_AOF) aof_async_init("appendonly.aof");
 
-    if (kvs_config.role == ROLE_SLAVE && kvs_config.masterip[0] != '\0') {
-        repl_switch_to_slave(kvs_config.masterip, kvs_config.masterport);
+    if (kvs_config.repl_enabled) {
+        if (kvs_config.role == ROLE_SLAVE && kvs_config.masterip[0] != '\0') {
+            repl_switch_to_slave(kvs_config.masterip, kvs_config.masterport);
+        } else {
+            repl_init();
+        }
     } else {
-        repl_init();
+        printf("[REPL] replication disabled by config\n");
     }
 
     if (kvs_config.network_model == NET_REACTOR)

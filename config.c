@@ -10,6 +10,7 @@ KvsConfig kvs_config;
 void config_default(void) {
     kvs_config.port          = 6379;
     kvs_config.loglevel      = LOG_INFO;
+    kvs_config.repl_enabled  = 0;
     kvs_config.role          = ROLE_MASTER;
     memset(kvs_config.masterip, 0, sizeof(kvs_config.masterip));
     kvs_config.masterport    = 6380;
@@ -76,6 +77,15 @@ int config_load(const char *path) {
             else if (strcasecmp(val, "error") == 0) kvs_config.loglevel = LOG_ERROR;
             else printf("[CONFIG] line %d: unknown loglevel '%s'\n", lineno, val);
 
+        } else if (strcasecmp(key, "replication") == 0) {
+            if      (strcasecmp(val, "on")  == 0 || strcasecmp(val, "yes") == 0 ||
+                     strcasecmp(val, "1")   == 0 || strcasecmp(val, "true") == 0)
+                kvs_config.repl_enabled = 1;
+            else if (strcasecmp(val, "off") == 0 || strcasecmp(val, "no")  == 0 ||
+                     strcasecmp(val, "0")   == 0 || strcasecmp(val, "false") == 0)
+                kvs_config.repl_enabled = 0;
+            else printf("[CONFIG] line %d: unknown replication '%s'\n", lineno, val);
+
         } else if (strcasecmp(key, "mode") == 0) {
             if      (strcasecmp(val, "master") == 0) kvs_config.role = ROLE_MASTER;
             else if (strcasecmp(val, "slave")  == 0) kvs_config.role = ROLE_SLAVE;
@@ -125,16 +135,17 @@ void config_print(void) {
     static const char *log_names[]     = {"debug", "info", "warn", "error"};
     static const char *engine_names[]  = {"array", "rbtree", "hash", "skiptable"};
 
-    printf("[CONFIG] port=%d  loglevel=%s  mode=%s  persistence=%s  network=%s  engine=%s  replport=%d\n",
+    printf("[CONFIG] port=%d  loglevel=%s  replication=%s  mode=%s  persistence=%s  network=%s  engine=%s  replport=%d\n",
            kvs_config.port,
            log_names[kvs_config.loglevel],
+           kvs_config.repl_enabled ? "on" : "off",
            kvs_config.role == ROLE_MASTER ? "master" : "slave",
            persist_names[kvs_config.persist_mode],
            net_names[kvs_config.network_model],
            engine_names[kvs_config.engine],
            kvs_config.replport);
 
-    if (kvs_config.role == ROLE_SLAVE)
+    if (kvs_config.repl_enabled && kvs_config.role == ROLE_SLAVE)
         printf("[CONFIG] masterip=%s  masterport=%d\n",
                kvs_config.masterip, kvs_config.masterport);
 }

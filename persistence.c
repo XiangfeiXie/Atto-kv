@@ -73,6 +73,31 @@ static struct {
     .cond = PTHREAD_COND_INITIALIZER,
 };
 
+/* pthread_atfork handlers: ensure child never inherits a locked g_aof.mtx
+ * and that the child's AOF resources are cleaned up before RDB scan. */
+static void aof_atfork_prepare(void) {
+    /* Lock before fork so the AOF worker is not mid-append. */
+    pthread_mutex_lock(&g_aof.mtx);
+}
+static void aof_atfork_parent(void) {
+    pthread_mutex_unlock(&g_aof.mtx);
+}
+static void aof_atfork_child(void) {
+    /* Unlock the mutex we inherited from the prepare handler.
+     * The AOF worker thread does not exist in the child, so close
+     * the AOF fd to prevent accidental double-writes.  We intentionally
+     * do NOT call io_uring_queue_exit here: the ring may have in-flight
+     * kernel operations from the parent's worker thread; trying to drain
+     * or close the ring in the child can hang.  The ring_fd and mmaped
+     * memory are released automatically when the child exits. */
+    pthread_mutex_unlock(&g_aof.mtx);
+    if (g_aof.fd >= 0) { close(g_aof.fd); g_aof.fd = -1; }
+    g_aof.ring_inited = 0;  /* mark uninitialized so child won't use it */
+    g_aof.head    = NULL;
+    g_aof.tail    = NULL;
+    g_aof.running = 0;
+}
+
 /* 后台线程：消费队列 + io_uring 批量写 */
 static void *aof_worker(void *arg) {
     (void)arg;
@@ -184,6 +209,11 @@ int aof_async_init(const char *path) {
         g_aof.running = 0;
         return -1;
     }
+
+    /* Register fork handlers once: lock AOF queue in parent before fork so
+     * the child never inherits g_aof.mtx in a locked state. */
+    pthread_atfork(aof_atfork_prepare, aof_atfork_parent, aof_atfork_child);
+
     printf("[AOF] async writer started (uring depth=%d)\n", AOF_URING_DEPTH);
     return 0;
 }
@@ -350,10 +380,18 @@ static void rdb_save_child(void) {
     printf("[RDB] saved via io_uring, %zu bytes\n", b.len);
 }
 
+/* Track the currently running BGSAVE child so we never run two at once. */
+static volatile pid_t g_rdb_child_pid = 0;
+
 /* SIGCHLD 处理：回收已完成的 BGSAVE 子进程，避免僵尸 */
 static void rdb_sigchld(int signo) {
     (void)signo;
-    while (waitpid(-1, NULL, WNOHANG) > 0) { }
+    pid_t pid;
+    int   status;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        if (pid == g_rdb_child_pid)
+            g_rdb_child_pid = 0;  /* slot is free for next BGSAVE */
+    }
 }
 
 void rdb_save_async_uring(void) {
@@ -367,18 +405,28 @@ void rdb_save_async_uring(void) {
         installed = 1;
     }
 
+    /* Reject concurrent saves: one child at a time. */
+    if (g_rdb_child_pid > 0) {
+        printf("[RDB] BGSAVE already in progress (pid=%d), skipping\n",
+               (int)g_rdb_child_pid);
+        return;
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         fprintf(stderr, "[RDB] fork failed, fallback sync\n");
-        rdb_save_child(); /* 退化为当前进程直接写（仍 uring 提交，但会短暂占用主线程） */
+        rdb_save_child();
         return;
     }
     if (pid == 0) {
-        /* 子进程 */
+        /* 子进程: flush stdio so printf output is not lost with _exit */
         rdb_save_child();
+        fflush(stdout);
+        fflush(stderr);
         _exit(0);
     }
     /* 父进程立即返回 —— 主线程零阻塞 */
+    g_rdb_child_pid = pid;
     printf("[RDB] BGSAVE started, child pid=%d\n", (int)pid);
 }
 

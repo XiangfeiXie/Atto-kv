@@ -41,7 +41,12 @@ int config_load(const char *path) {
     if (!fp) {
         printf("[CONFIG] '%s' not found, using defaults\n", path);
         return -1;
+    } else {
+        // 【新增】确认文件成功打开
+        printf("[CONFIG] Success: Loading config from '%s'\n", path); 
     }
+
+
 
     char line[256];
     int  lineno = 0;

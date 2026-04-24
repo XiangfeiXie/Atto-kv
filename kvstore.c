@@ -236,15 +236,25 @@ int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
         return -1;
     }
 
+    int pre_len = write_buf->len;
     kvs_filter_protocol(tokens, KVS_MAX_TOKENS, write_buf);
 
     if (strcmp(tokens[0],"SET") == 0 ||
         strcmp(tokens[0],"DEL") == 0 ||
         strcmp(tokens[0],"MOD") == 0 )
     {
-        if(ENABLE_AOF) aof_async_append(msg, length);  /* 异步入队，不阻塞主线程 */
+        /* Only persist/propagate when the operation actually succeeded.
+         * Responses starting with '-' are errors; "$-1\r\n" means key
+         * not found (DEL/MOD on non-existent key).  Neither should be
+         * replayed from the AOF or forwarded to replicas. */
+        const char *resp = write_buf->buf + pre_len;
+        int rlen = write_buf->len - pre_len;
+        int cmd_ok = (rlen > 0 && resp[0] != '-' &&
+                      !(rlen >= 5 && strncmp(resp, "$-1\r\n", 5) == 0));
 
-        if (repl_role == REPL_MASTER) {
+        if (cmd_ok && ENABLE_AOF) aof_async_append(msg, length);
+
+        if (cmd_ok && repl_role == REPL_MASTER) {
             repl_feed_backlog(msg, length);
             repl_propagate(msg, length);
         }

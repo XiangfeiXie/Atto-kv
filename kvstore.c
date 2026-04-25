@@ -11,6 +11,7 @@
 #include <fcntl.h>      // ✅ 修改点4：添加文件操作头文件
 #include "repl.h"
 #include "repl_net.h"
+#include "rdma_repl.h"
 #include "persistence.h"
 
 // ==================== 动态缓冲区工具函数实现（放在这里，彻底解决链接问题） ====================
@@ -834,7 +835,23 @@ int main(int argc, char *argv[]) {
             repl_init();
         }
     } else {
-        printf("[REPL] replication disabled by config\n");
+        printf("[REPL] legacy replication disabled by config\n");
+    }
+
+    /* --- RDMA-based full-sync (libfabric / Soft-RoCE).
+     * Isolated from the legacy replication above: if the user enables
+     * both, they run side-by-side but never interact. In development
+     * stage only full sync is implemented. */
+    if (kvs_config.rdma_repl_enabled) {
+        if (kvs_config.rdma_role == ROLE_MASTER) {
+            rdma_repl_master_start();
+        } else {
+            if (rdma_repl_slave_run() != 0)
+                fprintf(stderr, "[RDMA-REPL] slave full-sync failed; "
+                                "continuing with local state\n");
+        }
+    } else {
+        printf("[RDMA-REPL] rdma replication disabled by config\n");
     }
 
     if (kvs_config.network_model == NET_REACTOR)

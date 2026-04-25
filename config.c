@@ -18,6 +18,15 @@ void config_default(void) {
     kvs_config.network_model = NET_REACTOR;
     kvs_config.engine        = ENGINE_RBTREE;
     kvs_config.replport      = 6380;
+
+    /* RDMA (libfabric) full-sync — disabled by default */
+    kvs_config.rdma_repl_enabled = 0;
+    kvs_config.rdma_role         = ROLE_MASTER;
+    strncpy(kvs_config.rdma_bind_ip,   "0.0.0.0",   sizeof(kvs_config.rdma_bind_ip)   - 1);
+    kvs_config.rdma_bind_port    = 2100;
+    strncpy(kvs_config.rdma_master_ip, "127.0.0.1", sizeof(kvs_config.rdma_master_ip) - 1);
+    kvs_config.rdma_master_port  = 2100;
+    strncpy(kvs_config.rdma_provider,  "tcp",       sizeof(kvs_config.rdma_provider)  - 1);
 }
 
 /* Strip trailing whitespace / newlines in-place */
@@ -114,6 +123,38 @@ int config_load(const char *path) {
             else if (strcasecmp(val, "skiptable") == 0) kvs_config.engine = ENGINE_SKIPTABLE;
             else printf("[CONFIG] line %d: unknown engine '%s'\n", lineno, val);
 
+        } else if (strcasecmp(key, "rdma_repl") == 0) {
+            if      (strcasecmp(val, "on")  == 0 || strcasecmp(val, "yes") == 0 ||
+                     strcasecmp(val, "1")   == 0 || strcasecmp(val, "true") == 0)
+                kvs_config.rdma_repl_enabled = 1;
+            else if (strcasecmp(val, "off") == 0 || strcasecmp(val, "no")  == 0 ||
+                     strcasecmp(val, "0")   == 0 || strcasecmp(val, "false") == 0)
+                kvs_config.rdma_repl_enabled = 0;
+            else printf("[CONFIG] line %d: unknown rdma_repl '%s'\n", lineno, val);
+
+        } else if (strcasecmp(key, "rdma_role") == 0) {
+            if      (strcasecmp(val, "master") == 0) kvs_config.rdma_role = ROLE_MASTER;
+            else if (strcasecmp(val, "slave")  == 0) kvs_config.rdma_role = ROLE_SLAVE;
+            else printf("[CONFIG] line %d: unknown rdma_role '%s'\n", lineno, val);
+
+        } else if (strcasecmp(key, "rdma_bind_ip") == 0) {
+            strncpy(kvs_config.rdma_bind_ip, val, sizeof(kvs_config.rdma_bind_ip) - 1);
+            kvs_config.rdma_bind_ip[sizeof(kvs_config.rdma_bind_ip) - 1] = '\0';
+
+        } else if (strcasecmp(key, "rdma_bind_port") == 0) {
+            kvs_config.rdma_bind_port = atoi(val);
+
+        } else if (strcasecmp(key, "rdma_master_ip") == 0) {
+            strncpy(kvs_config.rdma_master_ip, val, sizeof(kvs_config.rdma_master_ip) - 1);
+            kvs_config.rdma_master_ip[sizeof(kvs_config.rdma_master_ip) - 1] = '\0';
+
+        } else if (strcasecmp(key, "rdma_master_port") == 0) {
+            kvs_config.rdma_master_port = atoi(val);
+
+        } else if (strcasecmp(key, "rdma_provider") == 0) {
+            strncpy(kvs_config.rdma_provider, val, sizeof(kvs_config.rdma_provider) - 1);
+            kvs_config.rdma_provider[sizeof(kvs_config.rdma_provider) - 1] = '\0';
+
         } else if (strcasecmp(key, "network") == 0) {
             if      (strcasecmp(val, "reactor")  == 0) kvs_config.network_model = NET_REACTOR;
             else if (strcasecmp(val, "proactor") == 0) kvs_config.network_model = NET_PROACTOR;
@@ -148,4 +189,17 @@ void config_print(void) {
     if (kvs_config.repl_enabled && kvs_config.role == ROLE_SLAVE)
         printf("[CONFIG] masterip=%s  masterport=%d\n",
                kvs_config.masterip, kvs_config.masterport);
+
+    printf("[CONFIG] rdma_repl=%s  rdma_role=%s  rdma_provider=%s\n",
+           kvs_config.rdma_repl_enabled ? "on" : "off",
+           kvs_config.rdma_role == ROLE_MASTER ? "master" : "slave",
+           kvs_config.rdma_provider);
+    if (kvs_config.rdma_repl_enabled) {
+        if (kvs_config.rdma_role == ROLE_MASTER)
+            printf("[CONFIG] rdma_bind=%s:%d\n",
+                   kvs_config.rdma_bind_ip, kvs_config.rdma_bind_port);
+        else
+            printf("[CONFIG] rdma_master=%s:%d\n",
+                   kvs_config.rdma_master_ip, kvs_config.rdma_master_port);
+    }
 }

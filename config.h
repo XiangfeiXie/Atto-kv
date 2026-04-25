@@ -45,6 +45,17 @@ typedef struct {
     int  network_model;   /* NET_REACTOR / NET_PROACTOR / NET_NTYCO     */
     int  engine;          /* ENGINE_ARRAY/RBTREE/HASH/SKIPTABLE          */
     int  replport;        /* replication listen port, default 6380       */
+
+    /* ---- RDMA-based full-sync (libfabric / Soft-RoCE) ----
+     * Independent from the legacy TCP replication above.
+     * Currently implements full-sync only; incremental sync TBD. */
+    int  rdma_repl_enabled;   /* 0: disable; 1: enable                   */
+    int  rdma_role;           /* ROLE_MASTER / ROLE_SLAVE                */
+    char rdma_bind_ip[64];    /* master: local bind IP (e.g. 0.0.0.0)    */
+    int  rdma_bind_port;      /* master: libfabric listen port           */
+    char rdma_master_ip[64];  /* slave:  master IP to connect            */
+    int  rdma_master_port;    /* slave:  master port to connect          */
+    char rdma_provider[32];   /* libfabric provider: verbs | tcp | ...   */
 } KvsConfig;
 
 extern KvsConfig kvs_config;

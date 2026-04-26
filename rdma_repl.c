@@ -133,11 +133,23 @@ static struct fi_info *rdma_build_hints(void) {
     if (!hints) return NULL;
     hints->caps                   = FI_MSG;
     hints->ep_attr->type          = FI_EP_MSG;
-    hints->mode                   = FI_CONTEXT;
-    /* Do NOT force MR mode bits: let the provider advertise whatever
-     * it really needs (verbs/Soft-RoCE → FI_MR_LOCAL; tcp/sockets → 0).
-     * We still call fi_mr_reg() on every buffer; for providers that
-     * don't require MR it's effectively a no-op but remains valid. */
+    /* hints->mode = 0: do NOT restrict mode bits in hints.
+     * libfabric 1.17 verbs provider (vrb_check_hints) unconditionally checks
+     * that the application declares FI_MR_LOCAL support via EITHER:
+     *   a) hints->mode & FI_LOCAL_MR  (deprecated pre-1.5 API), or
+     *   b) hints->domain_attr->mr_mode & FI_MR_LOCAL  (current API).
+     * Setting mode=0 disables the legacy mode filter; setting
+     * domain_attr->mr_mode = FI_MR_LOCAL satisfies (b) and also passes
+     * the standard fi_getinfo domain-attr match (verbs has FI_MR_LOCAL
+     * in its mr_mode, so the subset check passes).
+     * Our code already satisfies FI_MR_LOCAL at runtime: fi_mr_reg() is
+     * called on every buffer and fi_mr_desc() is passed to fi_send/recv. */
+    hints->mode                         = 0;
+    /* libfabric 1.17 ofi_check_mr_mode strips FI_MR_VIRT_ADDR/FI_MR_PROV_KEY
+     * via OFI_MR_BASIC_MAP and then requires the remaining bits to be
+     * declared in hints.  For the verbs/Soft-RoCE provider those are
+     * FI_MR_LOCAL | FI_MR_ALLOCATED. */
+    hints->domain_attr->mr_mode         = FI_MR_LOCAL | FI_MR_ALLOCATED;
     if (kvs_config.rdma_provider[0] &&
         strcasecmp(kvs_config.rdma_provider, "auto") != 0) {
         hints->fabric_attr->prov_name = strdup(kvs_config.rdma_provider);
@@ -147,7 +159,7 @@ static struct fi_info *rdma_build_hints(void) {
 
 /* Blocking CQ wait for exactly one completion. */
 static int rdma_wait_cq(struct fid_cq *cq) {
-    struct fi_cq_msg_entry ce;
+    struct fi_cq_data_entry ce;
     for (;;) {
         ssize_t r = fi_cq_sread(cq, &ce, 1, NULL, -1);
         if (r == 1) return 0;
@@ -194,7 +206,7 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
 
     /* 1) Build domain, CQ, endpoint for this client */
     struct fi_cq_attr cq_attr = {0};
-    cq_attr.format   = FI_CQ_FORMAT_MSG;
+    cq_attr.format   = FI_CQ_FORMAT_DATA;
     cq_attr.wait_obj = FI_WAIT_UNSPEC;
 
     RDMA_CHK(fi_domain(fabric, client_info, &domain, NULL), "fi_domain");
@@ -286,7 +298,7 @@ static void *rdma_master_thread(void *arg) {
     char service[16];
     snprintf(service, sizeof(service), "%d", kvs_config.rdma_bind_port);
 
-    int rc = fi_getinfo(FI_VERSION(1, 12),
+    int rc = fi_getinfo(FI_VERSION(1, 17),
                         kvs_config.rdma_bind_ip, service,
                         FI_SOURCE, hints, &info);
     if (rc) {
@@ -382,7 +394,7 @@ int rdma_repl_slave_run(void) {
     char service[16];
     snprintf(service, sizeof(service), "%d", kvs_config.rdma_master_port);
 
-    int rc = fi_getinfo(FI_VERSION(1, 11),
+    int rc = fi_getinfo(FI_VERSION(1, 17),
                         kvs_config.rdma_master_ip, service,
                         0, hints, &info);
     if (rc) {
@@ -397,7 +409,7 @@ int rdma_repl_slave_run(void) {
     struct fi_eq_attr eq_attr = {0};
     eq_attr.wait_obj = FI_WAIT_UNSPEC;
     struct fi_cq_attr cq_attr = {0};
-    cq_attr.format   = FI_CQ_FORMAT_MSG;
+    cq_attr.format   = FI_CQ_FORMAT_DATA;
     cq_attr.wait_obj = FI_WAIT_UNSPEC;
 
     RDMA_CHK(fi_fabric(info->fabric_attr, &fabric, NULL), "fi_fabric");

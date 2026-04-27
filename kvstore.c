@@ -225,6 +225,18 @@ void free_tokens(char **tokens,int count ){
 // 原：int kvs_protocol(char *msg, int length, char *response)
 // 新：int kvs_protocol(char *msg, int length, DynBuf *write_buf)
 // ======================================================================
+/* USDT-style probe point for eBPF incremental replication.
+ * __attribute__((noinline)) prevents the compiler from folding this
+ * into the caller; the uprobe in ebpf_incr.bpf.c attaches here.
+ * Called ONLY after kvs_protocol() confirms the write succeeded,
+ * so the BPF program captures (msg, length) from argument registers
+ * without needing any success/failure logic of its own.            */
+__attribute__((noinline))
+void kvs_rdma_incr_probe(const char *msg, int length)
+{
+    (void)msg; (void)length;
+}
+
 int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
     if (msg == NULL || length <= 0 || write_buf == NULL)
         return -1;
@@ -242,7 +254,8 @@ int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
 
     if (strcmp(tokens[0],"SET") == 0 ||
         strcmp(tokens[0],"DEL") == 0 ||
-        strcmp(tokens[0],"MOD") == 0 )
+        strcmp(tokens[0],"MOD") == 0 ||
+        strcmp(tokens[0],"FLUSHALL") == 0 )
     {
         /* Only persist/propagate when the operation actually succeeded.
          * Responses starting with '-' are errors; "$-1\r\n" means key
@@ -259,6 +272,10 @@ int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
             repl_feed_backlog(msg, length);
             repl_propagate(msg, length);
         }
+
+        /* eBPF USDT probe: captured by uprobe in ebpf_incr.bpf.c.
+         * Fires only on successful writes; carries raw RESP bytes. */
+        if (cmd_ok) kvs_rdma_incr_probe(msg, length);
     }
 
     free_tokens(tokens,KVS_MAX_TOKENS);

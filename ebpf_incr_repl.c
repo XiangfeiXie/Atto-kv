@@ -150,13 +150,22 @@ static int slave_send_frame_locked(struct slave_conn *s, const char *msg,
     if (r != 0)
         return -1;
 
+    int waits = 0;
+    const int max_waits = 5;
     for (;;) {
         struct fi_cq_data_entry ce;
         ssize_t cr = fi_cq_sread(s->cq, &ce, 1, NULL, 2000);
         if (cr == 1)
             return 0;
-        if (cr == -FI_EAGAIN)
+        if (cr == -FI_EAGAIN) {
+            waits++;
+            if (waits >= max_waits) {
+                fprintf(stderr,
+                        "[INCR-REPL] send completion timeout on incremental link\n");
+                return -1;
+            }
             continue;
+        }
         if (cr == -FI_EAVAIL) {
             struct fi_cq_err_entry ee = {0};
             fi_cq_readerr(s->cq, &ee, 0);

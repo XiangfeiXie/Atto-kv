@@ -54,9 +54,16 @@ int on_kvs_rdma_incr_probe(struct pt_regs *ctx)
      * on the same register without an intermediate u32 copy.         */
     long raw_len = (long)PT_REGS_PARM2(ctx);
 
-    /* Reject zero/negative and oversized commands */
-    if (raw_len <= 0 || raw_len > INCR_MAX_CMD)
+    /* Reject zero/negative and oversized commands.
+     * Oversized commands are counted as dropped so userspace can
+     * fail-closed and force a clean re-sync. */
+    if (raw_len <= 0)
         return 0;
+    if (raw_len > INCR_MAX_CMD) {
+        if (st)
+            __sync_fetch_and_add(&st->dropped, 1);
+        return 0;
+    }
 
     /* Reserve a fixed-size slot from the ring buffer */
     struct incr_event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);

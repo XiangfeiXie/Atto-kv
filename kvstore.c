@@ -9,6 +9,7 @@
 #include <sys/time.h>   // ✅ 修改点2：添加gettimeofday头文件
 #include <unistd.h>     // ✅ 修改点3：添加fsync/access头文件
 #include <fcntl.h>      // ✅ 修改点4：添加文件操作头文件
+#include <signal.h>     // 用于 SIGPIPE 忽略（防止从机断连导致主机崩溃）
 #include "repl.h"
 #include "repl_net.h"
 #include "rdma_repl.h"
@@ -837,6 +838,7 @@ void engine_reload(void) {
 }
 
 int main(int argc, char *argv[]) {
+    signal(SIGPIPE, SIG_IGN);   /* 防止从机断连时 send() 触发 SIGPIPE 杀死进程 */
     const char *conf_path = (argc >= 2) ? argv[1] : "kvstore.conf";
     config_load(conf_path);
     config_print();

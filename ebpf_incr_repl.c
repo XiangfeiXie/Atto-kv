@@ -90,7 +90,7 @@ static int slave_send_frame_locked(struct slave_conn *s, const char *msg,
     uint64_t cmd_len = (uint64_t)len;
 
     /* Send length header (8 bytes, host byte order — same machine arch) */
-    ssize_t n = send(s->fd, &cmd_len, sizeof(cmd_len), 0);
+    ssize_t n = send(s->fd, &cmd_len, sizeof(cmd_len), MSG_NOSIGNAL);
     if (n != (ssize_t)sizeof(cmd_len))
         return -1;
 
@@ -98,7 +98,7 @@ static int slave_send_frame_locked(struct slave_conn *s, const char *msg,
     size_t remain = (size_t)len;
     const char *p = msg;
     while (remain > 0) {
-        n = send(s->fd, p, remain, 0);
+        n = send(s->fd, p, remain, MSG_NOSIGNAL);
         if (n <= 0)
             return -1;
         p += n;

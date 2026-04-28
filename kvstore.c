@@ -855,11 +855,10 @@ int main(int argc, char *argv[]) {
         printf("[REPL] legacy replication disabled by config\n");
     }
 
-    /* --- RDMA-based full-sync (libfabric / Soft-RoCE).
-     * Isolated from the legacy replication above: if the user enables
-     * both, they run side-by-side but never interact. In development
-     * stage only full sync is implemented. */
-    if (kvs_config.rdma_repl_enabled) {
+    /* --- RDMA + eBPF 主从同步（新模式，与旧 TCP 复制相互独立）.
+     * rdma_sync 是总开关，rdma_repl 为兼容保留。
+     * 全量同步走 RDMA (libfabric)，增量同步由 eBPF 捕获经 TCP 传输。 */
+    if (kvs_config.rdma_sync_enabled || kvs_config.rdma_repl_enabled) {
         if (kvs_config.rdma_role == ROLE_MASTER) {
             rdma_repl_master_start();
         } else {

@@ -20,6 +20,7 @@ void config_default(void) {
     kvs_config.replport      = 6380;
 
     /* RDMA (libfabric) full-sync — disabled by default */
+    kvs_config.rdma_sync_enabled = 0;
     kvs_config.rdma_repl_enabled = 0;
     kvs_config.rdma_role         = ROLE_MASTER;
     strncpy(kvs_config.rdma_bind_ip,   "0.0.0.0",   sizeof(kvs_config.rdma_bind_ip)   - 1);
@@ -124,6 +125,15 @@ int config_load(const char *path) {
             else if (strcasecmp(val, "skiptable") == 0) kvs_config.engine = ENGINE_SKIPTABLE;
             else printf("[CONFIG] line %d: unknown engine '%s'\n", lineno, val);
 
+        } else if (strcasecmp(key, "rdma_sync") == 0) {
+            if      (strcasecmp(val, "on")  == 0 || strcasecmp(val, "yes") == 0 ||
+                     strcasecmp(val, "1")   == 0 || strcasecmp(val, "true") == 0)
+                kvs_config.rdma_sync_enabled = 1;
+            else if (strcasecmp(val, "off") == 0 || strcasecmp(val, "no")  == 0 ||
+                     strcasecmp(val, "0")   == 0 || strcasecmp(val, "false") == 0)
+                kvs_config.rdma_sync_enabled = 0;
+            else printf("[CONFIG] line %d: unknown rdma_sync '%s'\n", lineno, val);
+
         } else if (strcasecmp(key, "rdma_repl") == 0) {
             if      (strcasecmp(val, "on")  == 0 || strcasecmp(val, "yes") == 0 ||
                      strcasecmp(val, "1")   == 0 || strcasecmp(val, "true") == 0)
@@ -194,11 +204,12 @@ void config_print(void) {
         printf("[CONFIG] masterip=%s  masterport=%d\n",
                kvs_config.masterip, kvs_config.masterport);
 
-    printf("[CONFIG] rdma_repl=%s  rdma_role=%s  rdma_provider=%s\n",
+    printf("[CONFIG] rdma_sync=%s  rdma_repl=%s  rdma_role=%s  rdma_provider=%s\n",
+           kvs_config.rdma_sync_enabled ? "on" : "off",
            kvs_config.rdma_repl_enabled ? "on" : "off",
            kvs_config.rdma_role == ROLE_MASTER ? "master" : "slave",
            kvs_config.rdma_provider);
-    if (kvs_config.rdma_repl_enabled) {
+    if (kvs_config.rdma_sync_enabled || kvs_config.rdma_repl_enabled) {
         if (kvs_config.rdma_role == ROLE_MASTER)
             printf("[CONFIG] rdma_bind=%s:%d\n",
                    kvs_config.rdma_bind_ip, kvs_config.rdma_bind_port);

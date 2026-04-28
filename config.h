@@ -46,10 +46,11 @@ typedef struct {
     int  engine;          /* ENGINE_ARRAY/RBTREE/HASH/SKIPTABLE          */
     int  replport;        /* replication listen port, default 6380       */
 
-    /* ---- RDMA-based full-sync (libfabric / Soft-RoCE) ----
-     * Independent from the legacy TCP replication above.
-     * Currently implements full-sync only; incremental sync TBD. */
-    int  rdma_repl_enabled;   /* 0: disable; 1: enable                   */
+    /* ---- RDMA + eBPF 主从同步总开关 ---- */
+    int  rdma_sync_enabled;   /* 0: disable; 1: enable (RDMA 全量 + eBPF 增量) */
+
+    /* ---- RDMA-based full-sync (libfabric / Soft-RoCE) ---- */
+    int  rdma_repl_enabled;   /* 子开关: 0: disable; 1: enable (仅当 rdma_sync 启用时生效) */
     int  rdma_role;           /* ROLE_MASTER / ROLE_SLAVE                */
     char rdma_bind_ip[64];    /* master: local bind IP (e.g. 0.0.0.0)    */
     int  rdma_bind_port;      /* master: libfabric listen port           */

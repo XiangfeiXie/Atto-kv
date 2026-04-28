@@ -56,6 +56,9 @@ typedef struct {
     char rdma_master_ip[64];  /* slave:  master IP to connect            */
     int  rdma_master_port;    /* slave:  master port to connect          */
     char rdma_provider[32];   /* libfabric provider: verbs | tcp | ...   */
+
+    /* ---- Incremental sync TCP (代替增量同步的 RDMA) ---- */
+    int  incr_port;            /* ebpf incr TCP listener port, default 6382 */
 } KvsConfig;
 
 extern KvsConfig kvs_config;

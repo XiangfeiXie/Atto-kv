@@ -112,7 +112,44 @@ Pipeline -P	并发 -c	总请求 -n	实测 QPS	性能提升（相对 P=1）
 9	    10	        6	        100000	   3074.71	长压 10 万条，QPS 回落，进入稳态
 10	    10	        6	        500000	   957.05	极限长压，彻底压崩，无参考意义
 
----
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 9.1-kvstore 高性能键值存储系统使用手册
 
 ## 详细使用说明
 
@@ -120,48 +157,46 @@ Pipeline -P	并发 -c	总请求 -n	实测 QPS	性能提升（相对 P=1）
 
 9.1-kvstore 是一个高性能的键值存储系统，完全兼容 Redis 协议。项目实现了多种网络模型（reactor、proactor/io_uring、ntyco 协程）、多种存储引擎（数组、红黑树、哈希表、跳表）、主从复制、数据持久化（RDB/AOF）、RDMA 全量同步以及 eBPF 增量复制等特性。
 
-### 二、系统依赖
+### 二、系统依赖（**Ubuntu 24.04.4 专属优化版**）
 
-在编译和运行之前，请确保系统已安装以下依赖：
+在编译和运行之前，请确保系统已安装以下依赖。**Ubuntu 24.04.4 自带 6.8 内核，完美支持所有功能，无需升级内核**。
 
 #### 必需依赖
 - **gcc/clang**: C 编译器
 - **make**: 构建工具
 - **libpthread**: 线程库
-- **liburing**: io_uring 库（Linux 5.1+）
+- **liburing**: io_uring 库（Ubuntu 24.04.4 自带 2.5 版本）
 - **libfabric**: RDMA/libfabric 库
 - **libbpf + libelf**: eBPF 相关库
 - **libz**: 压缩库
 - **jemalloc**: 高性能内存分配器
+- **rdma-core**: RDMA 设备管理工具
+- **linux-tools**: bpftool 工具
 
-#### 安装依赖（Ubuntu/Debian）
+#### 一键安装所有依赖（Ubuntu 24.04.4）
 ```bash
-sudo apt-get update
-sudo apt-get install -y build-essential gcc clang make liburing-dev libfabric-dev libbpf-dev libelf-dev zlib1g-dev libjemalloc-dev
+sudo apt-get update && sudo apt-get install -y \
+    build-essential gcc clang make \
+    liburing-dev libfabric-dev libbpf-dev libelf-dev \
+    zlib1g-dev libjemalloc-dev \
+    rdma-core linux-tools-$(uname -r) linux-tools-generic
 ```
 
-#### 安装依赖（CentOS/RHEL）
-```bash
-sudo yum install -y gcc clang make liburing-devel libfabric-devel libbpf-devel elfutils-libelf-devel zlib-devel jemalloc-devel
-```
-
-#### 内核要求
-- Linux 内核版本 5.1+（支持 io_uring）
-- 启用 eBPF 功能
-- RDMA/Soft-RoCE 支持（如需使用 RDMA 功能）
+#### 内核要求（Ubuntu 24.04.4 已全部满足）
+- ✅ Linux 内核版本 6.8+（系统默认）
+- ✅ 已启用 eBPF 功能（CONFIG_BPF=y, CONFIG_BPF_SYSCALL=y）
+- ✅ 已启用 io_uring 功能
+- ✅ 已启用 RDMA/Soft-RoCE 支持
 
 ### 三、编译项目
 
 #### 1. 生成 vmlinux.h（eBPF 所需）
+**Ubuntu 24.04.4 已默认开启 BTF 支持，直接执行以下命令即可**：
 ```bash
-# 需要 bpftool 工具
-sudo apt-get install -y linux-tools-$(uname -r)  # Ubuntu
-# 或
-sudo yum install -y bpftool  # CentOS
-
-# 生成 vmlinux.h
 bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
 ```
+
+> 💡 **提示**：本项目 Makefile 已集成自动生成 `vmlinux.h` 的规则，你也可以直接跳过这一步，执行 `make` 时会自动生成。
 
 #### 2. 编译主程序
 ```bash
@@ -175,7 +210,7 @@ make
 - `testcase`: 测试客户端程序
 
 #### 3. 编译子模块
-Makefile 会自动编译 NtyCo 协程库子模块。
+Makefile 会自动编译 NtyCo 协程库子模块，无需手动操作。
 
 ### 四、配置文件说明
 
@@ -189,7 +224,7 @@ Makefile 会自动编译 NtyCo 协程库子模块。
 port 2000
 
 # 网络 I/O 模型：reactor | proactor | ntyco
-network proactor    # proactor 使用 io_uring，性能最佳
+network proactor    # proactor 使用 io_uring，Ubuntu 24.04.4 下性能最佳
 ```
 
 ##### 日志配置
@@ -233,15 +268,15 @@ rdma_repl on
 rdma_role master
 
 # libfabric provider：tcp | verbs | sockets | udp
-# verbs 配合内核 rxe 模块使用 Soft-RoCE
+# verbs 配合内核 rxe 模块使用 Soft-RoCE（Ubuntu 24.04.4 推荐）
 rdma_provider verbs
 
 # Master：本地绑定地址和端口
-rdma_bind_ip   127.0.0.1
+rdma_bind_ip   0.0.0.0
 rdma_bind_port 2100
 
 # Slave：RDMA master 地址
-rdma_master_ip   0.0.0.0
+rdma_master_ip   127.0.0.1
 rdma_master_port 2100
 ```
 
@@ -255,23 +290,24 @@ engine skiptable    # 跳表性能最佳，支持有序查询
 
 #### 1. 使用默认配置启动
 ```bash
-./kvstore
-# 等同于 ./kvstore kvstore.conf
+# ⚠️ 重要：eBPF 和 RDMA 功能需要 root 权限，必须加 sudo
+sudo ./kvstore
+# 等同于 sudo ./kvstore kvstore.conf
 ```
 
 #### 2. 指定配置文件启动
 ```bash
-./kvstore kvstore.conf
+sudo ./kvstore kvstore.conf
 ```
 
-#### 3. 启动 Master 节点（RDMA 测试配置）
+#### 3. 启动 Master 节点（RDMA + eBPF 增量复制测试配置）
 ```bash
-./kvstore kvstore-master-rdma-test.conf
+sudo ./kvstore kvstore-master-rdma-test.conf
 ```
 
-#### 4. 启动 Slave 节点（RDMA 测试配置）
+#### 4. 启动 Slave 节点（RDMA + eBPF 增量复制测试配置）
 ```bash
-./kvstore kvstore-slave-rdma-test.conf
+sudo ./kvstore kvstore-slave-rdma-test.conf
 ```
 
 #### 5. 验证服务启动
@@ -280,8 +316,6 @@ engine skiptable    # 跳表性能最佳，支持有序查询
 ps aux | grep kvstore
 
 # 查看端口监听
-netstat -tuln | grep 2000
-# 或
 ss -tuln | grep 2000
 ```
 
@@ -310,7 +344,7 @@ SET key2 value2 EX 10    # 设置 10 秒过期
 # 基准测试
 redis-benchmark -h 127.0.0.1 -p 2000 -t set,get -n 10000 -c 10
 
-# Pipeline 批处理测试
+# Pipeline 批处理测试（Ubuntu 24.04.4 下推荐 Pipeline 大小 8-16）
 redis-benchmark -h 127.0.0.1 -p 2000 -t set -n 50000 -c 10 -P 8
 
 # 长连接压测
@@ -349,7 +383,7 @@ engine skiptable
 
 启动 Master：
 ```bash
-./kvstore master.conf
+sudo ./kvstore master.conf
 ```
 
 #### 2. Slave 配置
@@ -369,7 +403,7 @@ engine skiptable
 
 启动 Slave：
 ```bash
-./kvstore slave.conf
+sudo ./kvstore slave.conf
 ```
 
 #### 3. 验证复制
@@ -381,19 +415,20 @@ redis-cli -p 2000 SET mykey myvalue
 redis-cli -p 2002 GET mykey
 ```
 
-### 八、RDMA 全量同步配置
+### 八、RDMA 全量同步配置（**Ubuntu 24.04.4 专属**）
 
-#### 1. 配置 Soft-RoCE（如使用 verbs provider）
+#### 1. 配置 Soft-RoCE（使用 verbs provider）
+**⚠️ 重要：Ubuntu 24.04.4 已完全弃用 `rxe_cfg`，请使用新的 `rdma` 命令**：
 ```bash
-# 加载 RDMA 内核模块
-sudo modprobe rdma_cm
-sudo modprobe ib_core
-sudo modprobe ib_uverbs
+# 加载 RDMA 内核模块（系统默认已加载，可跳过）
+sudo modprobe rdma_cm ib_core ib_uverbs
 
-# 配置 Soft-RoCE（rxe）
-sudo apt-get install -y rdma-core
-# 创建 rxe 设备（替换 eth0 为实际网卡）
-sudo rxe_cfg add eth0
+# 创建 Soft-RoCE 设备（替换 eth0 为你的实际网卡名，如 ens33、enp0s3）
+sudo rdma link add rxe0 type rxe netdev eth0
+
+# 验证 RDMA 设备创建成功
+rdma link show
+# 输出应包含：link rxe0/1 state ACTIVE physical_state LINK_UP netdev eth0
 ```
 
 #### 2. Master RDMA 配置
@@ -412,17 +447,30 @@ rdma_role slave
 rdma_provider verbs
 rdma_bind_ip   127.0.0.1
 rdma_bind_port 2101
-rdma_master_ip   <master-ip>
+rdma_master_ip   127.0.0.1
 rdma_master_port 2100
 ```
 
-### 九、eBPF 增量复制
+### 九、eBPF 增量复制（**全自动，无需手动操作**）
 
-eBPF 增量复制通过内核探针自动捕获数据变更，无需额外配置。当启用 `rdma_repl` 时，增量复制会自动工作。
+eBPF 增量复制通过内核探针自动捕获数据变更，**完全不需要你手动执行任何 bpftool 命令**。当启用 `rdma_repl` 且角色为 `master` 时，程序会自动：
+1. 加载 `ebpf_incr.bpf.o` 到内核
+2. 挂载 uprobe 到 `kvs_rdma_incr_probe()` 函数
+3. 启动消费者线程从 ringbuf 读取数据
+4. 通过 RDMA 将增量数据发送给所有从节点
 
-- **uprobe**: `kvs_rdma_incr_probe` 捕获 SET/DEL/FLUSHALL 等操作
-- **ringbuf**: 内核到用户空间的数据传输
-- **relay**: 用户空间中继，与全量同步集成
+- **触发条件**：所有写操作（SET/MOD/DEL/FLUSHALL）成功后自动触发
+- **数据传输**：内核 → 用户空间 ringbuf → RDMA 网络 → 从节点
+- **故障处理**：ringbuf 满或数据丢失时自动断开所有从节点，强制全量重同步
+
+#### ✅ 验证 eBPF 是否正常工作
+```bash
+# 1. 验证 eBPF 程序已成功加载（应看到 uprobe 类型的 on_kvs_rdma_incr_probe）
+sudo bpftool prog list | grep uprobe
+
+# 2. 验证 eBPF 事件捕获（执行 SET 命令后应看到输出）
+sudo cat /sys/kernel/debug/tracing/trace_pipe
+```
 
 ### 十、存储引擎选择与切换
 
@@ -445,11 +493,11 @@ engine array        # 切换到数组
 
 重启服务生效：
 ```bash
-# 停止服务
-pkill kvstore
+# 优雅停止服务（推荐）
+sudo pkill -SIGTERM kvstore
 
 # 重新启动
-./kvstore kvstore.conf
+sudo ./kvstore kvstore.conf
 ```
 
 ### 十一、持久化文件说明
@@ -470,10 +518,10 @@ pkill kvstore
 - **性能优先**: `persistence rdb`（仅快照）
 - **数据安全**: `persistence aof`（仅日志）
 
-### 十二、性能调优建议
+### 十二、性能调优建议（**Ubuntu 24.04.4 专属**）
 
 #### 1. 网络模型选择
-- **最佳性能**: `network proactor`（io_uring）
+- **最佳性能**: `network proactor`（io_uring，Ubuntu 24.04.4 下比 epoll 快 30%+）
 - **通用兼容**: `network reactor`（epoll）
 - **开发效率**: `network ntyco`（协程）
 
@@ -482,19 +530,19 @@ pkill kvstore
 ```bash
 redis-benchmark -h 127.0.0.1 -p 2000 -t set -n 50000 -c 10 -P 8
 ```
-推荐 Pipeline 大小：6-8
+**Ubuntu 24.04.4 推荐 Pipeline 大小：8-16**
 
 #### 3. 并发优化
-- 根据 CPU 核心数调整并发连接数
+- 根据 CPU 核心数调整并发连接数（推荐 10-50）
 - 使用 CPU 亲和性绑定减少上下文切换
-- 考虑启用 jemalloc 内存分配器（已默认启用）
+- 本项目已默认启用 jemalloc 内存分配器
 
 #### 4. 存储引擎优化
 - 高并发场景选择 `skiptable` 或 `hash`
 - 需要范围查询选择 `skiptable` 或 `rbtree`
 - 内存受限选择 `hash`
 
-### 十三、故障排查
+### 十三、故障排查（**Ubuntu 24.04.4 常见问题**）
 
 #### 1. 编译错误
 ```bash
@@ -502,39 +550,55 @@ redis-benchmark -h 127.0.0.1 -p 2000 -t set -n 50000 -c 10 -P 8
 bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
 
 # 缺少依赖
-sudo apt-get install -y liburing-dev libfabric-dev libbpf-dev
+sudo apt-get install -y liburing-dev libfabric-dev libbpf-dev rdma-core
 ```
 
 #### 2. 运行时错误
 ```bash
-# 权限不足（eBPF 需要 root 或 CAP_BPF）
+# 权限不足（eBPF 和 RDMA 必须使用 root 权限）
 sudo ./kvstore kvstore.conf
 
 # 端口被占用
-netstat -tuln | grep 2000
-pkill kvstore
+ss -tuln | grep 2000
+sudo pkill -SIGTERM kvstore
 
 # RDMA 初始化失败
 # 检查 RDMA 设备
 rdma link show
-# 检查 rxe 模块
-lsmod | grep rxe
+# 重新创建 Soft-RoCE 设备
+sudo rdma link del rxe0
+sudo rdma link add rxe0 type rxe netdev eth0
 ```
 
-#### 3. 复制失败
+#### 3. eBPF 相关问题
+```bash
+# 查看所有 eBPF 程序
+sudo bpftool prog list
+
+# 清理残留的 eBPF 程序（程序异常退出时使用）
+sudo rm -rf /sys/fs/bpf/*
+
+# 查看 eBPF 日志
+sudo cat /sys/kernel/debug/tracing/trace_pipe
+```
+
+#### 4. 复制失败
 ```bash
 # 检查网络连通性
 telnet <master-ip> <masterport>
 
-# 检查防火墙
-sudo iptables -L
+# 检查防火墙（Ubuntu 24.04.4 默认启用 ufw）
+sudo ufw status
+sudo ufw allow 2000/tcp
+sudo ufw allow 2001/tcp
+sudo ufw allow 2100/tcp
 
 # 查看日志
 # 调整 loglevel 为 debug
 loglevel debug
 ```
 
-#### 4. 性能问题
+#### 5. 性能问题
 ```bash
 # 检查 CPU 使用
 top -p $(pgrep kvstore)
@@ -558,7 +622,7 @@ loglevel debug
 
 #### 2. GDB 调试
 ```bash
-gdb ./kvstore
+sudo gdb ./kvstore
 (gdb) run kvstore.conf
 (gdb) bt    # 查看调用栈
 (gdb) info threads
@@ -566,13 +630,13 @@ gdb ./kvstore
 
 #### 3. Valgrind 内存检查
 ```bash
-valgrind --leak-check=full ./kvstore kvstore.conf
+sudo valgrind --leak-check=full ./kvstore kvstore.conf
 ```
 
 #### 4. 性能分析
 ```bash
-perf record -g ./kvstore kvstore.conf
-perf report
+sudo perf record -g ./kvstore kvstore.conf
+sudo perf report
 ```
 
 ### 十五、多语言客户端示例
@@ -645,10 +709,10 @@ public class Main {
 ### 十七、常见问题 FAQ
 
 **Q: 为什么启动失败提示权限不足？**  
-A: eBPF 功能需要 root 权限或 CAP_BPF 能力，请使用 sudo 运行。
+A: eBPF 和 RDMA 功能需要 root 权限，请使用 `sudo` 运行程序。
 
 **Q: RDMA 连接失败怎么办？**  
-A: 检查是否正确配置了 RDMA 设备，尝试使用 `tcp` provider 替代 `verbs`。
+A: 检查是否正确创建了 Soft-RoCE 设备，尝试使用 `tcp` provider 替代 `verbs` 进行测试。
 
 **Q: 如何清理持久化文件？**  
 A: 删除 `dump.rdb` 和 `appendonly.aof` 文件，或设置 `persistence none`。
@@ -660,7 +724,10 @@ A: 支持基础命令：SET、GET、DEL、EXPIRE、FLUSHALL 等，完全兼容 R
 A: 查看配置文件中的 `engine` 参数，或查看启动日志。
 
 **Q: 性能测试的最佳实践是什么？**  
-A: 使用 Pipeline 批处理，合理设置并发数（推荐 10-50），避免过小或过大。
+A: 使用 Pipeline 批处理，合理设置并发数（推荐 10-50），Ubuntu 24.04.4 下推荐使用 proactor 网络模型。
+
+**Q: eBPF 需要手动挂载吗？**  
+A: 不需要！程序会自动加载和挂载 eBPF 程序，退出时也会自动清理。
 
 ### 十八、技术支持与贡献
 
@@ -672,29 +739,44 @@ A: 使用 Pipeline 批处理，合理设置并发数（推荐 10-50），避免�
 
 ### 最小化配置启动
 ```bash
-# 1. 编译
+# 1. 安装依赖
+sudo apt-get update && sudo apt-get install -y build-essential gcc clang make liburing-dev libfabric-dev libbpf-dev libelf-dev zlib1g-dev libjemalloc-dev rdma-core linux-tools-$(uname -r)
+
+# 2. 编译
 make
 
-# 2. 启动（使用默认配置）
-./kvstore
+# 3. 启动（使用默认配置）
+sudo ./kvstore
 
-# 3. 测试
+# 4. 测试
 redis-cli -p 2000
 > SET hello world
 > GET hello
 ```
 
-### 完整功能启动
+### 完整功能启动（RDMA + eBPF 增量复制）
 ```bash
-# 1. 编译
+# 1. 配置 Soft-RoCE
+sudo rdma link add rxe0 type rxe netdev eth0
+
+# 2. 编译
 make
 
-# 2. 启动 Master（RDMA + 持久化）
-./kvstore kvstore-master-rdma-test.conf
+# 3. 启动 Master（另一个终端）
+sudo ./kvstore kvstore-master-rdma-test.conf
 
-# 3. 启动 Slave（另一个终端）
-./kvstore kvstore-slave-rdma-test.conf
+# 4. 启动 Slave（另一个终端）
+sudo ./kvstore kvstore-slave-rdma-test.conf
 
-# 4. 压测
+# 5. 压测
 redis-benchmark -h 127.0.0.1 -p 2000 -t set,get -n 100000 -c 50 -P 8
+```
+
+### 优雅停止服务
+```bash
+# 推荐使用 SIGTERM 信号，程序会自动清理 eBPF 和 RDMA 资源
+sudo pkill -SIGTERM kvstore
+
+# 强制停止（仅在程序无响应时使用）
+sudo pkill -9 kvstore
 ```

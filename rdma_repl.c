@@ -38,6 +38,10 @@
 #include <rdma/fi_eq.h>
 #include <rdma/fi_errno.h>
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 /* -------- engine access (defined in the engine *.c files) -------- */
 extern kvs_array_t     global_array;
 extern kvs_rbtree_t    global_rbtree;
@@ -47,19 +51,8 @@ extern kvs_skiptable_t global_skiptable;
 /* -------- helpers from kvstore.c -------- */
 extern int   kvs_protocol(char *msg, int len, DynBuf *write_buf);
 
-/* 1 if eBPF incremental module started successfully, 0 otherwise */
-static int g_ebpf_ok = 0;
-
-/* ---- Slave-side incremental recv context ---- */
-#define INCR_RECV_BUF_SZ  ((size_t)(sizeof(uint64_t) + INCR_MAX_CMD))
-
-struct slave_incr_ctx {
-    struct fid_ep     *ep;
-    struct fid_cq     *cq;
-    struct fid_domain *domain;
-    struct fid_mr     *recv_mr;
-    uint8_t           *recv_buf;  /* INCR_RECV_BUF_SZ bytes */
-};
+/* Incremental sync is now TCP-based (handled by ebpf_incr_repl.c).
+ * Full sync over RDMA remains unchanged.                          */
 
 /* ========================================================== */
 /* 1. RESP SERIALIZATION (master side)                        */
@@ -243,7 +236,6 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
     struct fid_mr       *mr_hdr = NULL, *mr_buf = NULL;
     DynBuf payload = {0};
     int rc = -1;
-    uint64_t incr_start_seq = 0;
 
     /* 1) Build domain, CQ, endpoint for this client */
     struct fi_cq_attr cq_attr = {0};
@@ -269,17 +261,6 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
         }
     }
     printf("[RDMA-REPL] master: slave connected, starting full sync\n");
-
-    if (g_ebpf_ok) {
-        if (!ebpf_incr_master_healthy() ||
-            ebpf_incr_get_seq(&incr_start_seq) != 0) {
-            fprintf(stderr,
-                    "[RDMA-REPL] incremental stream unhealthy; "
-                    "fallback to full-sync session\n");
-            g_ebpf_ok = 0;
-            incr_start_seq = 0;
-        }
-    }
 
     /* 3) Serialize whole dataset to an in-memory RESP stream */
     dynbuf_init(&payload, 64 * 1024);
@@ -325,27 +306,8 @@ fail:
     CLOSE_FID(mr_hdr);
     dynbuf_free(&payload);
 
-    if (rc == 0 && g_ebpf_ok && ebpf_incr_master_healthy()) {
-        /* Transfer connection ownership to the incremental sync module.
-         * The module will fi_shutdown/close these when slave disconnects. */
-        uint64_t catchup_seq = incr_start_seq + 1;
-        if (ebpf_incr_add_slave(ep, cq, domain, catchup_seq) == 0) {
-            ep = NULL;
-            cq = NULL;
-            domain = NULL;
-            printf("[RDMA-REPL] master: connection handed to incr module "
-                   "(catch-up from seq=%" PRIu64 ")\n", catchup_seq);
-        } else {
-            fprintf(stderr,
-                    "[RDMA-REPL] incr add_slave failed; "
-                    "closing session for clean re-sync\n");
-            fi_shutdown(ep, 0);
-            rc = -1;
-        }
-    } else {
-        /* Error path, or eBPF unavailable: close normally */
-        if (rc == 0) fi_shutdown(ep, 0);
-    }
+    /* Close the RDMA connection — incr sync happens over TCP separately */
+    if (rc == 0) fi_shutdown(ep, 0);
 
     CLOSE_FID(ep);
     CLOSE_FID(cq);
@@ -392,10 +354,9 @@ static void *rdma_master_thread(void *arg) {
     RDMA_CHK(fi_pep_bind(pep, &eq->fid, 0),               "fi_pep_bind");
     RDMA_CHK(fi_listen(pep),                              "fi_listen");
 
-    /* Start eBPF incremental sync module (non-fatal if unavailable) */
-    if (ebpf_incr_master_start() == 0) {
-        g_ebpf_ok = 1;
-    } else {
+    /* Start eBPF incremental sync module + TCP incr listener
+     * (non-fatal if unavailable — full sync still works via RDMA) */
+    if (ebpf_incr_master_start() != 0) {
         fprintf(stderr, "[RDMA-REPL] eBPF incr sync unavailable "
                         "(full sync only)\n");
     }
@@ -454,49 +415,59 @@ int rdma_repl_master_start(void) {
 }
 
 /* ========================================================== */
-/* 6. SLAVE: incremental recv thread (runs after full sync)   */
+/* 6. SLAVE: TCP incremental recv thread (runs after full sync)
+ *     Reads wire frames: [uint64_t cmd_len][cmd_len bytes]
+ *     cmd_len = 0 → disconnect sentinel                        */
 /* ========================================================== */
 
-static void *incr_slave_recv_thread(void *arg)
+static void *incr_tcp_slave_recv_thread(void *arg)
 {
-    struct slave_incr_ctx *ctx = (struct slave_incr_ctx *)arg;
+    int fd = (int)(intptr_t)arg;
     int applied = 0;
+    char *buf = (char *)malloc((size_t)INCR_MAX_CMD);
+    if (!buf) {
+        fprintf(stderr, "[RDMA-REPL] slave incr: OOM for recv buf\n");
+        close(fd);
+        return NULL;
+    }
 
-    printf("[RDMA-REPL] slave: incremental recv thread started\n");
+    printf("[RDMA-REPL] slave: TCP incremental recv thread started\n");
 
     for (;;) {
-        /* Pre-post recv buffer before waiting */
-        struct fi_context recv_ctx;
-        ssize_t r = fi_recv(ctx->ep, ctx->recv_buf, INCR_RECV_BUF_SZ,
-                            fi_mr_desc(ctx->recv_mr), 0, &recv_ctx);
-        if (r != 0) {
-            fprintf(stderr, "[RDMA-REPL] slave incr: fi_recv: %s\n",
-                    fi_strerror((int)-r));
+        uint64_t cmd_len = 0;
+        ssize_t n = recv(fd, &cmd_len, sizeof(cmd_len), MSG_WAITALL);
+        if (n <= 0) {
+            fprintf(stderr, "[RDMA-REPL] slave incr: connection closed (recv len)\n");
             break;
         }
-
-        /* Wait for recv completion */
-        if (rdma_wait_cq(ctx->cq) < 0) break;
-
-        /* Parse wire frame: [uint64_t cmd_len | cmd bytes] */
-        uint64_t cmd_len = 0;
-        memcpy(&cmd_len, ctx->recv_buf, sizeof(uint64_t));
 
         if (cmd_len == 0) {
             printf("[RDMA-REPL] slave incr: received disconnect sentinel\n");
             break;
         }
         if (cmd_len > INCR_MAX_CMD) {
-            fprintf(stderr, "[RDMA-REPL] slave incr: oversized cmd %" PRIu64
-                    ", aborting\n", cmd_len);
+            fprintf(stderr, "[RDMA-REPL] slave incr: oversized cmd %" PRIu64 "\n",
+                    cmd_len);
             break;
+        }
+
+        /* Read the full RESP command payload */
+        size_t remain = (size_t)cmd_len;
+        char *p = buf;
+        while (remain > 0) {
+            n = recv(fd, p, remain, MSG_WAITALL);
+            if (n <= 0) {
+                fprintf(stderr, "[RDMA-REPL] slave incr: recv payload failed\n");
+                goto done;
+            }
+            p += n;
+            remain -= (size_t)n;
         }
 
         /* Apply the RESP command through the normal command path */
         DynBuf wb;
         dynbuf_init(&wb, 256);
-        kvs_protocol((char *)(ctx->recv_buf + sizeof(uint64_t)),
-                     (int)cmd_len, &wb);
+        kvs_protocol(buf, (int)cmd_len, &wb);
         dynbuf_free(&wb);
         applied++;
 
@@ -504,17 +475,11 @@ static void *incr_slave_recv_thread(void *arg)
             printf("[RDMA-REPL] slave incr: applied cmd #%d\n", applied);
     }
 
+done:
     printf("[RDMA-REPL] slave incr: thread exiting, applied %d commands\n",
            applied);
-
-    /* Cleanup: all resources owned by this thread */
-    fi_shutdown(ctx->ep, 0);
-    CLOSE_FID(ctx->recv_mr);
-    CLOSE_FID(ctx->ep);
-    CLOSE_FID(ctx->cq);
-    CLOSE_FID(ctx->domain);
-    free(ctx->recv_buf);
-    free(ctx);
+    free(buf);
+    close(fd);
     return NULL;
 }
 
@@ -619,73 +584,68 @@ int rdma_repl_slave_run(void) {
         kvs_flush_all();
     }
 
-    /* Full sync done — release the payload MRs and buffer.
-     * Keep ep/cq/domain alive for the incremental recv thread. */
+    /* Full sync done via RDMA — close RDMA resources now.
+     * Incremental sync will use a separate TCP connection. */
     CLOSE_FID(mr_buf);
     CLOSE_FID(mr_hdr);
     if (payload) { kvs_free(payload); payload = NULL; }
 
-    /* Allocate a new recv buffer for the incremental message loop */
-    struct slave_incr_ctx *ictx =
-        (struct slave_incr_ctx *)calloc(1, sizeof(*ictx));
-    if (!ictx) {
-        fprintf(stderr, "[RDMA-REPL] slave: OOM for incr ctx\n");
-        fi_shutdown(ep, 0);
-        rc_ret = 0;   /* full sync succeeded; incr is best-effort */
-        goto fail;
+    /* Close the RDMA connection — incr is handled over TCP */
+    fi_shutdown(ep, 0);
+    CLOSE_FID(ep);
+    CLOSE_FID(cq);
+    CLOSE_FID(domain);
+    CLOSE_FID(eq);
+    CLOSE_FID(fabric);
+    if (info)  fi_freeinfo(info);
+    if (hints) fi_freeinfo(hints);
+    info = NULL; hints = NULL;
+
+    /* ---- Connect to master's TCP incr port for incremental sync ---- */
+    int incr_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (incr_fd < 0) {
+        fprintf(stderr, "[RDMA-REPL] slave: incr socket() failed: %s\n",
+                strerror(errno));
+        return 0;   /* full sync ok; incr is best-effort */
     }
 
-    ictx->recv_buf = (uint8_t *)malloc(INCR_RECV_BUF_SZ);
-    if (!ictx->recv_buf) {
-        fprintf(stderr, "[RDMA-REPL] slave: OOM for incr recv_buf\n");
-        free(ictx);
-        fi_shutdown(ep, 0);
-        rc_ret = 0;
-        goto fail;
-    }
-    memset(ictx->recv_buf, 0, INCR_RECV_BUF_SZ);
+    struct sockaddr_in incr_addr;
+    memset(&incr_addr, 0, sizeof(incr_addr));
+    incr_addr.sin_family = AF_INET;
+    incr_addr.sin_port = htons((uint16_t)kvs_config.incr_port);
+    inet_pton(AF_INET, kvs_config.rdma_master_ip, &incr_addr.sin_addr);
 
-    {
-        int rc = rdma_mr_reg(domain, ictx->recv_buf, INCR_RECV_BUF_SZ,
-                             FI_RECV, &ictx->recv_mr);
-        if (rc) {
-            fprintf(stderr, "[RDMA-REPL] slave: fi_mr_reg incr: %s\n",
-                    fi_strerror(-rc));
-            free(ictx->recv_buf);
-            free(ictx);
-            fi_shutdown(ep, 0);
-            rc_ret = 0;
-            goto fail;
-        }
+    if (connect(incr_fd, (struct sockaddr *)&incr_addr, sizeof(incr_addr)) < 0) {
+        fprintf(stderr, "[RDMA-REPL] slave: incr connect(%s:%d) failed: %s\n",
+                kvs_config.rdma_master_ip, kvs_config.incr_port,
+                strerror(errno));
+        close(incr_fd);
+        return 0;   /* full sync ok; incr is best-effort */
     }
 
-    ictx->ep     = ep;
-    ictx->cq     = cq;
-    ictx->domain = domain;
+    printf("[RDMA-REPL] slave: connected to master incr TCP %s:%d\n",
+           kvs_config.rdma_master_ip, kvs_config.incr_port);
 
-    /* Thread owns ep/cq/domain/recv_mr/recv_buf — don't close in fail: */
-    ep = NULL; cq = NULL; domain = NULL;
-
+    /* Spawn TCP incremental recv thread */
     {
         pthread_t tid;
-        if (pthread_create(&tid, NULL, incr_slave_recv_thread, ictx)) {
+        if (pthread_create(&tid, NULL, incr_tcp_slave_recv_thread,
+                           (void *)(intptr_t)incr_fd) != 0) {
             fprintf(stderr, "[RDMA-REPL] slave: pthread_create incr: %s\n",
                     strerror(errno));
-            /* Undo: reclaim resources the thread would have owned */
-            CLOSE_FID(ictx->recv_mr);
-            free(ictx->recv_buf);
-            free(ictx);
+            close(incr_fd);
         } else {
             pthread_detach(tid);
-            printf("[RDMA-REPL] slave: incremental recv thread spawned\n");
+            printf("[RDMA-REPL] slave: TCP incremental recv thread spawned\n");
         }
     }
-    rc_ret = 0;
+
+    return 0;
 
 fail:
-    CLOSE_FID(mr_buf);    /* no-op if already closed above */
+    CLOSE_FID(mr_buf);
     CLOSE_FID(mr_hdr);
-    CLOSE_FID(ep);        /* no-op if NULL (owned by incr thread) */
+    CLOSE_FID(ep);
     CLOSE_FID(cq);
     CLOSE_FID(domain);
     CLOSE_FID(eq);

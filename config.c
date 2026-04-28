@@ -27,6 +27,7 @@ void config_default(void) {
     strncpy(kvs_config.rdma_master_ip, "127.0.0.1", sizeof(kvs_config.rdma_master_ip) - 1);
     kvs_config.rdma_master_port  = 2100;
     strncpy(kvs_config.rdma_provider,  "tcp",       sizeof(kvs_config.rdma_provider)  - 1);
+    kvs_config.incr_port = 6382;
 }
 
 /* Strip trailing whitespace / newlines in-place */
@@ -155,6 +156,9 @@ int config_load(const char *path) {
             strncpy(kvs_config.rdma_provider, val, sizeof(kvs_config.rdma_provider) - 1);
             kvs_config.rdma_provider[sizeof(kvs_config.rdma_provider) - 1] = '\0';
 
+        } else if (strcasecmp(key, "incr_port") == 0) {
+            kvs_config.incr_port = atoi(val);
+
         } else if (strcasecmp(key, "network") == 0) {
             if      (strcasecmp(val, "reactor")  == 0) kvs_config.network_model = NET_REACTOR;
             else if (strcasecmp(val, "proactor") == 0) kvs_config.network_model = NET_PROACTOR;
@@ -201,5 +205,6 @@ void config_print(void) {
         else
             printf("[CONFIG] rdma_master=%s:%d\n",
                    kvs_config.rdma_master_ip, kvs_config.rdma_master_port);
+        printf("[CONFIG] incr_port=%d\n", kvs_config.incr_port);
     }
 }

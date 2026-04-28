@@ -471,8 +471,8 @@ static void *incr_tcp_slave_recv_thread(void *arg)
         dynbuf_free(&wb);
         applied++;
 
-        if (applied % 100 == 0 || applied <= 10)
-            printf("[RDMA-REPL] slave incr: applied cmd #%d\n", applied);
+        //if (applied % 100 == 0 || applied <= 10)
+            //printf("[RDMA-REPL] slave incr: applied cmd #%d\n", applied);
     }
 
 done:

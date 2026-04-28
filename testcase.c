@@ -241,20 +241,134 @@ char *resp_pack_request(char *msg){
 }
 void common_testcase_04(int connfd){
 	int i;
+
+	struct timeval tv_begin;
+	gettimeofday(&tv_begin, NULL);
+
+	printf("===== Inserting 10000 unique keys =====\n");
+
 	for (i = 0; i < 10000; i++) {
-		// 100% 不重复的KEY和VALUE，绝对无重复
 		char key[32];
 		char val[32];
 		char cmd[128];
-		
-		// 安全格式化，无溢出，生成唯一标识
+
 		snprintf(key, sizeof(key), "key_%d", i);
 		snprintf(val, sizeof(val), "val_%d", i);
 		snprintf(cmd, sizeof(cmd), "SET %s %s", key, val);
-		
-		// 执行唯一SET，一万次全不重复
+
 		testcase(connfd, resp_pack_request(cmd), "+OK\r\n", cmd);
+
+		if ((i + 1) % 1000 == 0) {
+			printf("  inserted %d keys...\n", i + 1);
+		}
 	}
+
+	struct timeval tv_end;
+	gettimeofday(&tv_end, NULL);
+	int time_used = TIME_SUB_MS(tv_end, tv_begin);
+
+	printf("===== Insert complete: 10000 keys in %dms =====\n", time_used);
+}
+
+void common_testcase_05(int connfd){
+	int i;
+
+	struct timeval tv_begin;
+	gettimeofday(&tv_begin, NULL);
+
+	printf("===== Verifying 10000 keys from testcase 04 =====\n");
+
+	for (i = 0; i < 10000; i++) {
+		char key[32];
+		char val[32];
+		char cmd[128];
+		char expected[64];
+
+		snprintf(key, sizeof(key), "key_%d", i);
+		snprintf(val, sizeof(val), "val_%d", i);
+		snprintf(cmd, sizeof(cmd), "GET %s", key);
+		snprintf(expected, sizeof(expected), "$%d\r\n%s\r\n",
+			 (int)strlen(val), val);
+
+		testcase(connfd, resp_pack_request(cmd), expected, cmd);
+
+		if ((i + 1) % 1000 == 0) {
+			printf("  verified %d keys...\n", i + 1);
+		}
+	}
+
+	struct timeval tv_end;
+	gettimeofday(&tv_end, NULL);
+	int time_used = TIME_SUB_MS(tv_end, tv_begin);
+
+	printf("===== Verification complete: 10000 keys matched in %dms =====\n",
+	       time_used);
+}
+
+void common_testcase_06(int connfd){
+	int i;
+
+	struct timeval tv_begin;
+	gettimeofday(&tv_begin, NULL);
+
+	printf("===== Inserting 10000 unique keys (batch 2) =====\n");
+
+	for (i = 0; i < 10000; i++) {
+		char key[32];
+		char val[32];
+		char cmd[128];
+
+		snprintf(key, sizeof(key), "key2_%d", i);
+		snprintf(val, sizeof(val), "val2_%d", i);
+		snprintf(cmd, sizeof(cmd), "SET %s %s", key, val);
+
+		testcase(connfd, resp_pack_request(cmd), "+OK\r\n", cmd);
+
+		if ((i + 1) % 1000 == 0) {
+			printf("  inserted %d keys (batch 2)...\n", i + 1);
+		}
+	}
+
+	struct timeval tv_end;
+	gettimeofday(&tv_end, NULL);
+	int time_used = TIME_SUB_MS(tv_end, tv_begin);
+
+	printf("===== Insert complete (batch 2): 10000 keys in %dms =====\n", time_used);
+}
+
+void common_testcase_07(int connfd){
+	int i;
+
+	struct timeval tv_begin;
+	gettimeofday(&tv_begin, NULL);
+
+	printf("===== Verifying 10000 keys from testcase 06 =====\n");
+
+	for (i = 0; i < 10000; i++) {
+		char key[32];
+		char val[32];
+		char cmd[128];
+		char expected[64];
+
+		snprintf(key, sizeof(key), "key2_%d", i);
+		snprintf(val, sizeof(val), "val2_%d", i);
+		snprintf(cmd, sizeof(cmd), "GET %s", key);
+		snprintf(expected, sizeof(expected), "$%d\r\n%s\r\n",
+			 (int)strlen(val), val);
+
+		testcase(connfd, resp_pack_request(cmd), expected, cmd);
+
+		if ((i + 1) % 1000 == 0) {
+			printf("  verified %d keys (batch 2)...\n", i + 1);
+		}
+	}
+
+	struct timeval tv_end;
+	gettimeofday(&tv_end, NULL);
+	int time_used = TIME_SUB_MS(tv_end, tv_begin);
+
+	printf("===== Verification complete (batch 2): 10000 keys matched in %dms =====\n",
+	       time_used);
 }
 
 void common_testcase_03(int connfd){
@@ -423,8 +537,11 @@ printf("=================== KV Store Test Menu ===================\n"
        "  MODE 0        spe_test_free(connfd);    		     	  \n"
        "  MODE 1        common_testcase_01(connfd);		     	  \n"
        "  MODE 2        common_testcase_02(connfd);		     	  \n"
-       "  MODE 3        common_testcase_03(connfd);               \n"
-	   "  MODE 4        skiptable_testcase(connfd);		     	  \n"
+       "  MODE 3  common_testcase_03  Simple SET+GET              \n"
+       "  MODE 4  common_testcase_04  Insert 10000 unique keys    \n"
+       "  MODE 5  common_testcase_05  Verify 10000 keys from (4)  \n"
+       "  MODE 6  common_testcase_06  Insert 10000 keys (batch 2)  \n"
+       "  MODE 7  common_testcase_07  Verify 10000 keys from (6)  \n"
        "==========================================================\n");
 		return -1;
 	}
@@ -446,6 +563,12 @@ printf("=================== KV Store Test Menu ===================\n"
 		common_testcase_03(connfd);
 	}else if(mode==4){
 		common_testcase_04(connfd);
+	}else if(mode==5){
+		common_testcase_05(connfd);
+	}else if(mode==6){
+		common_testcase_06(connfd);
+	}else if(mode==7){
+		common_testcase_07(connfd);
 	}
     return 0;
 }

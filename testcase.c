@@ -242,12 +242,14 @@ char *resp_pack_request(char *msg){
 void common_testcase_04(int connfd){
 	int i;
 
+	int count = 50000;
+	
 	struct timeval tv_begin;
 	gettimeofday(&tv_begin, NULL);
 
-	printf("===== Inserting 10000 unique keys =====\n");
+	printf("===== Inserting %d unique keys =====\n", count);
 
-	for (i = 0; i < 10000; i++) {
+	for (i = 0; i < count; i++) {
 		char key[32];
 		char val[32];
 		char cmd[128];
@@ -267,18 +269,19 @@ void common_testcase_04(int connfd){
 	gettimeofday(&tv_end, NULL);
 	int time_used = TIME_SUB_MS(tv_end, tv_begin);
 
-	printf("===== Insert complete: 10000 keys in %dms =====\n", time_used);
+	printf("===== Insert complete: %d keys in %dms =====\n", count, time_used);
 }
 
 void common_testcase_05(int connfd){
 	int i;
 
+	int count = 50000;
 	struct timeval tv_begin;
 	gettimeofday(&tv_begin, NULL);
 
-	printf("===== Verifying 10000 keys from testcase 04 =====\n");
+	printf("===== Verifying %d keys from testcase 04 =====\n", count);
 
-	for (i = 0; i < 10000; i++) {
+	for (i = 0; i < count; i++) {
 		char key[32];
 		char val[32];
 		char cmd[128];
@@ -301,19 +304,21 @@ void common_testcase_05(int connfd){
 	gettimeofday(&tv_end, NULL);
 	int time_used = TIME_SUB_MS(tv_end, tv_begin);
 
-	printf("===== Verification complete: 10000 keys matched in %dms =====\n",
+	printf("===== Verification complete: %d keys matched in %dms =====\n",count,
 	       time_used);
 }
 
 void common_testcase_06(int connfd){
 	int i;
 
+	int count = 10000;
+
 	struct timeval tv_begin;
 	gettimeofday(&tv_begin, NULL);
 
-	printf("===== Inserting 10000 unique keys (batch 2) =====\n");
+	printf("===== Inserting %d unique keys (batch 2) =====\n", count);
 
-	for (i = 0; i < 10000; i++) {
+	for (i = 0; i < count; i++) {
 		char key[32];
 		char val[32];
 		char cmd[128];
@@ -333,18 +338,20 @@ void common_testcase_06(int connfd){
 	gettimeofday(&tv_end, NULL);
 	int time_used = TIME_SUB_MS(tv_end, tv_begin);
 
-	printf("===== Insert complete (batch 2): 10000 keys in %dms =====\n", time_used);
+	printf("===== Insert complete (batch 2): %d keys in %dms =====\n", count, time_used);
 }
 
 void common_testcase_07(int connfd){
 	int i;
 
+	int count = 10000;
+
 	struct timeval tv_begin;
 	gettimeofday(&tv_begin, NULL);
 
-	printf("===== Verifying 10000 keys from testcase 06 =====\n");
+	printf("===== Verifying %d keys from testcase 06 =====\n", count);
 
-	for (i = 0; i < 10000; i++) {
+	for (i = 0; i < count; i++) {
 		char key[32];
 		char val[32];
 		char cmd[128];
@@ -367,8 +374,8 @@ void common_testcase_07(int connfd){
 	gettimeofday(&tv_end, NULL);
 	int time_used = TIME_SUB_MS(tv_end, tv_begin);
 
-	printf("===== Verification complete (batch 2): 10000 keys matched in %dms =====\n",
-	       time_used);
+	printf("===== Verification complete (batch 2): %d keys matched in %dms =====\n",
+	       count, time_used);
 }
 
 void common_testcase_03(int connfd){

@@ -75,7 +75,7 @@ typedef struct kvs_array_item_s {
 	KVItem	*item;
 } kvs_array_item_t;
 
-#define KVS_ARRAY_SIZE		1024
+#define KVS_ARRAY_SIZE		65536
 
 typedef struct kvs_array_s {
 	kvs_array_item_t *table;

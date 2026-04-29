@@ -26,7 +26,7 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
-#define INCR_BACKLOG_CAP 4096
+#define INCR_BACKLOG_CAP 1024
 
 struct slave_conn {
     int fd;         /* TCP socket fd, -1 if inactive */

@@ -18,8 +18,8 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-#define INCR_MAX_CMD  8192
-#define RINGBUF_SIZE  (2 * 1024 * 1024)   /* 2 MB */
+#define INCR_MAX_CMD  65536
+#define RINGBUF_SIZE  (8 * 1024 * 1024)   /* 8 MB */
 
 struct incr_event {
     __u32 length;

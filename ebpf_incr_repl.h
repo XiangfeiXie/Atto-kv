@@ -5,7 +5,7 @@
 
 /* Maximum RESP command size captured by BPF.
  * Must match the definition in ebpf_incr.bpf.c.                    */
-#define INCR_MAX_CMD   8192
+#define INCR_MAX_CMD   65536
 
 /* Wire frame layout (over TCP):
  *   [ uint64_t cmd_len ][ cmd_len bytes of RESP command ]

@@ -77,9 +77,20 @@ int proactor_start(unsigned short port, msg_handler handler) {
     set_event_accept(&ring, sockfd, (struct sockaddr*)&clientaddr, &len);
 
     while (1) {
-        io_uring_submit(&ring);
         struct io_uring_cqe *cqes[128];
         int nready = io_uring_peek_batch_cqe(&ring, cqes, 128);
+
+        if (nready == 0) {
+            /* No completions — submit pending SQEs and sleep until one arrives.
+             * This eliminates the busy-wait that would otherwise consume 100% CPU. */
+            int ret = io_uring_submit_and_wait(&ring, 1);
+            if (ret < 0) {
+                if (ret == -EINTR)  continue;
+                break;
+            }
+            nready = io_uring_peek_batch_cqe(&ring, cqes, 128);
+            if (nready <= 0) continue;
+        }
 
         for (int i = 0; i < nready; i++) {
             struct io_uring_cqe *cqe = cqes[i];

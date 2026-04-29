@@ -372,60 +372,73 @@ void common_testcase_07(int connfd){
 }
 
 void common_testcase_03(int connfd){
-		
+		int i;
+		int count = 10000;
 
+		printf("===== Waiting for keys to expire (sleep 6s) =====\n");
+		sleep(6);
 
+		struct timeval tv_begin;
+		gettimeofday(&tv_begin, NULL);
 
+		printf("===== Verifying %d keys have expired =====\n", count);
 
-		testcase(connfd, resp_pack_request("SET Teacher King 2"), "+OK\r\n", "SET-Teacher");
-		sleep(1);
-		testcase(connfd, resp_pack_request("GET Teacher"), "$4\r\nKing\r\n", "GET-King-Teacher");
-		sleep(1);
-		testcase(connfd, resp_pack_request("GET Teacher"), "$4\r\nKing\r\n", "GET-King-Teacher");
-		// testcase(connfd, resp_pack_request("MOD Teacher Darren"), "+OK\r\n", "MOD-D-Teacher");
-		// testcase(connfd, resp_pack_request("GET Teacher"),"$6\r\nDarren\r\n", "GET-Darren-Teacher");
-		// testcase(connfd, resp_pack_request("EXIST Teacher"), ":1\r\n", "EXIST-Teacher");
-		// testcase(connfd, resp_pack_request("DEL Teacher"), "+OK\r\n", "DEL-Teacher");
-		// testcase(connfd, resp_pack_request("GET Teacher"), ":0\r\n", "GET-K-Teacher");
-		// testcase(connfd, resp_pack_request("MOD Teacher KING"), ":0\r\n", "MOD-K-Teacher");
-		// testcase(connfd, resp_pack_request("EXIST Teacher"), ":0\r\n", "EXIST-Teacher");
+		for (i = 0; i < count; i++) {
+			char key[64];
+			char cmd[256];
 
+			snprintf(key, sizeof(key), "ttl_key_%d", i);
+			snprintf(cmd, sizeof(cmd), "GET %s", key);
 
+			testcase(connfd, resp_pack_request(cmd), "$-1\r\n", cmd);
 
+			if ((i + 1) % 1000 == 0) {
+				printf("  verified %d keys...\n", i + 1);
+			}
+		}
 
+		struct timeval tv_end;
+		gettimeofday(&tv_end, NULL);
+		int time_used = TIME_SUB_MS(tv_end, tv_begin);
 
-}
+		printf("===== Verification complete: %d keys expired in %dms =====\n",
+		       count, time_used);
+	}
 
 
 void common_testcase_02(int connfd){
-		
-	int count = 10000;
-	int i = 0;
+		int i;
+		int count = 10000;
+		int ttl_sec = 5;  // 5 秒超时
 
-	struct timeval tv_begin;
-	gettimeofday(&tv_begin, NULL);
+		struct timeval tv_begin;
+		gettimeofday(&tv_begin, NULL);
 
-	for (i = 0;i < count;i ++) {
+		printf("===== Inserting %d keys with %ds TTL =====\n", count, ttl_sec);
 
-		testcase(connfd, resp_pack_request("SET Teacher King 10"), "+OK\r\n", "SET-Teacher");
-		testcase(connfd, resp_pack_request("GET Teacher"), "$4\r\nKing\r\n", "GET-King-Teacher");
-		testcase(connfd, resp_pack_request("MOD Teacher Darren"), "+OK\r\n", "MOD-D-Teacher");
-		testcase(connfd, resp_pack_request("GET Teacher"),"$6\r\nDarren\r\n", "GET-Darren-Teacher");
-		testcase(connfd, resp_pack_request("EXIST Teacher"), ":1\r\n", "EXIST-Teacher");
-		testcase(connfd, resp_pack_request("DEL Teacher"), "+OK\r\n", "DEL-Teacher");
-		testcase(connfd, resp_pack_request("GET Teacher"), "$-1\r\n", "GET-K-Teacher");
-		testcase(connfd, resp_pack_request("MOD Teacher KING"), "$-1\r\n", "MOD-K-Teacher");
-		testcase(connfd, resp_pack_request("EXIST Teacher"), "$-1\r\n", "EXIST-Teacher");
+		for (i = 0; i < count; i++) {
+			char key[64];
+			char val[64];
+			char cmd[256];
 
+			snprintf(key, sizeof(key), "ttl_key_%d", i);
+			snprintf(val, sizeof(val), "ttl_val_%d", i);
+			snprintf(cmd, sizeof(cmd), "SET %s %s %d", key, val, ttl_sec);
+
+			testcase(connfd, resp_pack_request(cmd), "+OK\r\n", cmd);
+
+			if ((i + 1) % 1000 == 0) {
+				printf("  inserted %d keys...\n", i + 1);
+			}
+		}
+
+		struct timeval tv_end;
+		gettimeofday(&tv_end, NULL);
+		int time_used = TIME_SUB_MS(tv_end, tv_begin);
+
+		printf("===== Insert complete: %d keys with %ds TTL in %dms =====\n",
+		       count, ttl_sec, time_used);
 	}
-
-	struct timeval tv_end;
-	gettimeofday(&tv_end, NULL);
-
-	int time_used = TIME_SUB_MS(tv_end, tv_begin); // ms
-
-	printf("skiptable testcase --> time_used: %d, qps: %d\n", time_used, 90000 * 1000 / time_used);
-}
 
 
 void common_testcase_01(int connfd){
@@ -536,8 +549,8 @@ printf("=================== KV Store Test Menu ===================\n"
        "  		./kvstore 192.168.30.128	2000 mode			  \n"
        "  MODE 0        spe_test_free(connfd);    		     	  \n"
        "  MODE 1        common_testcase_01(connfd);		     	  \n"
-       "  MODE 2        common_testcase_02(connfd);		     	  \n"
-       "  MODE 3  common_testcase_03  Simple SET+GET              \n"
+       "  MODE 2  common_testcase_02  Insert 10000 keys with TTL    \n"
+       "  MODE 3  common_testcase_03  Verify TTL keys expired     \n"
        "  MODE 4  common_testcase_04  Insert 10000 unique keys    \n"
        "  MODE 5  common_testcase_05  Verify 10000 keys from (4)  \n"
        "  MODE 6  common_testcase_06  Insert 10000 keys (batch 2)  \n"

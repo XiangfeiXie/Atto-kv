@@ -242,7 +242,7 @@ char *resp_pack_request(char *msg){
 void common_testcase_04(int connfd){
 	int i;
 
-	int count = 10000;
+	int count = 50000;
 	
 	struct timeval tv_begin;
 	gettimeofday(&tv_begin, NULL);
@@ -275,7 +275,7 @@ void common_testcase_04(int connfd){
 void common_testcase_05(int connfd){
 	int i;
 
-	int count = 10000;
+	int count = 50000;
 	struct timeval tv_begin;
 	gettimeofday(&tv_begin, NULL);
 
@@ -311,7 +311,7 @@ void common_testcase_05(int connfd){
 void common_testcase_06(int connfd){
 	int i;
 
-	int count = 10000;
+	int count = 50000;
 
 	struct timeval tv_begin;
 	gettimeofday(&tv_begin, NULL);
@@ -344,7 +344,7 @@ void common_testcase_06(int connfd){
 void common_testcase_07(int connfd){
 	int i;
 
-	int count = 10000;
+	int count = 50000;
 
 	struct timeval tv_begin;
 	gettimeofday(&tv_begin, NULL);

@@ -10,14 +10,9 @@ KvsConfig kvs_config;
 void config_default(void) {
     kvs_config.port          = 6379;
     kvs_config.loglevel      = LOG_INFO;
-    kvs_config.repl_enabled  = 0;
-    kvs_config.role          = ROLE_MASTER;
-    memset(kvs_config.masterip, 0, sizeof(kvs_config.masterip));
-    kvs_config.masterport    = 6380;
     kvs_config.persist_mode  = PERSIST_BOTH;
     kvs_config.network_model = NET_REACTOR;
     kvs_config.engine        = ENGINE_RBTREE;
-    kvs_config.replport      = 6380;
 
     /* RDMA (libfabric) full-sync — disabled by default */
     kvs_config.rdma_sync_enabled = 0;
@@ -88,35 +83,12 @@ int config_load(const char *path) {
             else if (strcasecmp(val, "error") == 0) kvs_config.loglevel = LOG_ERROR;
             else printf("[CONFIG] line %d: unknown loglevel '%s'\n", lineno, val);
 
-        } else if (strcasecmp(key, "replication") == 0) {
-            if      (strcasecmp(val, "on")  == 0 || strcasecmp(val, "yes") == 0 ||
-                     strcasecmp(val, "1")   == 0 || strcasecmp(val, "true") == 0)
-                kvs_config.repl_enabled = 1;
-            else if (strcasecmp(val, "off") == 0 || strcasecmp(val, "no")  == 0 ||
-                     strcasecmp(val, "0")   == 0 || strcasecmp(val, "false") == 0)
-                kvs_config.repl_enabled = 0;
-            else printf("[CONFIG] line %d: unknown replication '%s'\n", lineno, val);
-
-        } else if (strcasecmp(key, "mode") == 0) {
-            if      (strcasecmp(val, "master") == 0) kvs_config.role = ROLE_MASTER;
-            else if (strcasecmp(val, "slave")  == 0) kvs_config.role = ROLE_SLAVE;
-            else printf("[CONFIG] line %d: unknown mode '%s'\n", lineno, val);
-
-        } else if (strcasecmp(key, "masterip") == 0) {
-            strncpy(kvs_config.masterip, val, sizeof(kvs_config.masterip) - 1);
-
-        } else if (strcasecmp(key, "masterport") == 0) {
-            kvs_config.masterport = atoi(val);
-
         } else if (strcasecmp(key, "persistence") == 0) {
             if      (strcasecmp(val, "none") == 0) kvs_config.persist_mode = PERSIST_NONE;
             else if (strcasecmp(val, "rdb")  == 0) kvs_config.persist_mode = PERSIST_RDB;
             else if (strcasecmp(val, "aof")  == 0) kvs_config.persist_mode = PERSIST_AOF;
             else if (strcasecmp(val, "both") == 0) kvs_config.persist_mode = PERSIST_BOTH;
             else printf("[CONFIG] line %d: unknown persistence '%s'\n", lineno, val);
-
-        } else if (strcasecmp(key, "replport") == 0) {
-            kvs_config.replport = atoi(val);
 
         } else if (strcasecmp(key, "engine") == 0) {
             if      (strcasecmp(val, "array")     == 0) kvs_config.engine = ENGINE_ARRAY;
@@ -190,19 +162,12 @@ void config_print(void) {
     static const char *log_names[]     = {"debug", "info", "warn", "error"};
     static const char *engine_names[]  = {"array", "rbtree", "hash", "skiptable"};
 
-    printf("[CONFIG] port=%d  loglevel=%s  replication=%s  mode=%s  persistence=%s  network=%s  engine=%s  replport=%d\n",
+    printf("[CONFIG] port=%d  loglevel=%s  persistence=%s  network=%s  engine=%s\n",
            kvs_config.port,
            log_names[kvs_config.loglevel],
-           kvs_config.repl_enabled ? "on" : "off",
-           kvs_config.role == ROLE_MASTER ? "master" : "slave",
            persist_names[kvs_config.persist_mode],
            net_names[kvs_config.network_model],
-           engine_names[kvs_config.engine],
-           kvs_config.replport);
-
-    if (kvs_config.repl_enabled && kvs_config.role == ROLE_SLAVE)
-        printf("[CONFIG] masterip=%s  masterport=%d\n",
-               kvs_config.masterip, kvs_config.masterport);
+           engine_names[kvs_config.engine]);
 
     printf("[CONFIG] rdma_sync=%s  rdma_repl=%s  rdma_role=%s  rdma_provider=%s\n",
            kvs_config.rdma_sync_enabled ? "on" : "off",

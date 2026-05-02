@@ -10,8 +10,6 @@
 #include <unistd.h>     // ✅ 修改点3：添加fsync/access头文件
 #include <fcntl.h>      // ✅ 修改点4：添加文件操作头文件
 #include <signal.h>     // 用于 SIGPIPE 忽略（防止从机断连导致主机崩溃）
-#include "repl.h"
-#include "repl_net.h"
 #include "rdma_repl.h"
 #include "persistence.h"
 
@@ -94,7 +92,7 @@ void free_tokens(char** tokens,int count);
 const char *command[] = {
     "SET", "GET", "DEL", "MOD", "EXIST",
     "SAVE","FLUSHALL",
-    "SLAVEOF", "PSYNC", "REPLCONF", "PING",
+    "PING",
     "ECHO"  // 新增
 };
 
@@ -109,9 +107,6 @@ enum {
     KVS_CMD_SAVE,
     KVS_CMD_FLUSHALL,
 
-    KVS_CMD_SLAVEOF,    // 新增：主从切换
-    KVS_CMD_PSYNC,      // 新增：同步
-    KVS_CMD_REPLCONF,   // 新增：配置
     KVS_CMD_PING,       // 新增：心跳
 
     KVS_CMD_ECHO,
@@ -266,11 +261,6 @@ int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
                       !(rlen >= 5 && strncmp(resp, "$-1\r\n", 5) == 0));
 
         if (cmd_ok && ENABLE_AOF) aof_async_append(msg, length);
-
-        if (cmd_ok && kvs_config.repl_enabled && repl_role == REPL_MASTER) {
-            repl_feed_backlog(msg, length);
-            repl_propagate(msg, length);
-        }
 
         /* eBPF USDT probe: captured by uprobe in ebpf_incr.bpf.c.
          * Fires only on successful writes; carries raw RESP bytes. */
@@ -543,32 +533,6 @@ int kvs_filter_protocol(char **tokens, int count, DynBuf *wb) {
 
 
 
-        case KVS_CMD_SLAVEOF: {
-            if (!kvs_config.repl_enabled) {
-                dynbuf_append(wb, "-ERR replication disabled in config\r\n", 38);
-                break;
-            }
-            // 命令：SLAVEOF NO ONE → 切换主机
-            if (strcmp(tokens[1], "NO") == 0 && strcmp(tokens[2], "ONE") == 0) {
-                repl_switch_to_master();
-                dynbuf_append(wb, "+OK\r\n", 5);
-            } 
-            // 命令：SLAVEOF IP PORT → 切换从机
-            else {
-                char *ip = tokens[1];
-                int port = atoi(tokens[2]);
-                repl_switch_to_slave(ip, port);
-                dynbuf_append(wb, "+OK\r\n", 5);
-            }
-            break;
-        }
-
-        case KVS_CMD_PSYNC:
-            // 这里不处理，复制层会处理
-            break;
-        case KVS_CMD_REPLCONF:
-            // 这里不处理，复制层会处理
-            break;
         case KVS_CMD_PING:
             dynbuf_append(wb, "+PONG\r\n", 7);
             break;
@@ -660,17 +624,7 @@ int main(int argc, char *argv[]) {
     engine_reload();
     if (ENABLE_AOF) aof_async_init("appendonly.aof");
 
-    if (kvs_config.repl_enabled) {
-        if (kvs_config.role == ROLE_SLAVE && kvs_config.masterip[0] != '\0') {
-            repl_switch_to_slave(kvs_config.masterip, kvs_config.masterport);
-        } else {
-            repl_init();
-        }
-    } else {
-        printf("[REPL] legacy replication disabled by config\n");
-    }
-
-    /* --- RDMA + eBPF 主从同步（新模式，与旧 TCP 复制相互独立）.
+    /* --- RDMA + eBPF 主从同步.
      * rdma_sync 是总开关，rdma_repl 为兼容保留。
      * 全量同步走 RDMA (libfabric)，增量同步由 eBPF 捕获经 TCP 传输。 */
     if (kvs_config.rdma_sync_enabled || kvs_config.rdma_repl_enabled) {

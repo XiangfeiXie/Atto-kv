@@ -14,7 +14,7 @@
 
 
 #include<jemalloc/jemalloc.h>
-#include "repl.h"
+/* old TCP repl removed; use rdma_repl.h + ebpf_incr_repl.h instead */
 
 
 // extern msg_handler kvs_protocol;

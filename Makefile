@@ -6,7 +6,7 @@ FLAGS = -I ./NtyCo/core/ -L ./NtyCo/ -lntyco -lpthread -luring -ldl \
         -ljemalloc -lfabric -lpthread -lbpf -lelf -lz
 
 SRCS = kvstore.c ntyco.c proactor.c kvs_array.c kvs_rbtree.c kvs_hash.c \
-       kvs_skiptable.c reactor.c repl.c repl_net.c rdma_repl.c \
+       kvs_skiptable.c reactor.c rdma_repl.c \
        persistence.c config.c ebpf_incr_repl.c
 
 TESTCASE_SRCS = testcase.c

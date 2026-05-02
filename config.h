@@ -37,14 +37,9 @@
 typedef struct {
     int  port;            /* listening port, default 6379               */
     int  loglevel;        /* LOG_DEBUG / INFO / WARN / ERROR            */
-    int  repl_enabled;    /* 0: disable replication; 1: enable          */
-    int  role;            /* ROLE_MASTER / ROLE_SLAVE                   */
-    char masterip[64];    /* master IP when role == ROLE_SLAVE          */
-    int  masterport;      /* master replication port, default 6380      */
     int  persist_mode;    /* PERSIST_NONE / RDB / AOF / BOTH            */
     int  network_model;   /* NET_REACTOR / NET_PROACTOR / NET_NTYCO     */
     int  engine;          /* ENGINE_ARRAY/RBTREE/HASH/SKIPTABLE          */
-    int  replport;        /* replication listen port, default 6380       */
 
     /* ---- RDMA + eBPF 主从同步总开关 ---- */
     int  rdma_sync_enabled;   /* 0: disable; 1: enable (RDMA 全量 + eBPF 增量) */

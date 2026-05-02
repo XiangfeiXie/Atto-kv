@@ -46,4 +46,7 @@ $(TESTCASE): $(TESTCASE_SRCS)
 clean:
 	rm -rf $(OBJS) $(TARGET) $(TESTCASE) $(BPF_OBJ)
 
+clear:
+	rm -rf dump.rdb appendonly.aof
+
 

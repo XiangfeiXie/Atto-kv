@@ -1,0 +1,9 @@
+# Build artifacts (make clean)
+*.o
+kvstore
+testcase
+
+# Persistence data files (make clear)
+dump.rdb
+dump.rdb.tmp
+appendonly.aof

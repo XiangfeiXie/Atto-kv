@@ -1,5 +1,6 @@
 #include "repl.h"
 #include "repl_net.h"
+#include "persistence.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -113,8 +114,7 @@ void repl_propagate(const char *cmd, int len) {
 // Redis标准：发送RDB全量同步 + 补发增量命令
 static void repl_send_rdb_full_sync(int slave_fd) {
     long long old_offset = master_offset;
-    // rdb_save_async();
-    rdb_save();
+    rdb_save_sync();
 
     FILE *fp = fopen("dump.rdb", "rb");
     if (!fp) return;
@@ -285,7 +285,7 @@ void* repl_slave_thread(void *arg) {
 
         // 加载RDB
         kvs_flush_all();
-        rdb_load();
+        rdb_load_mmap();
         printf("✅ 全量同步完成，进入增量同步\n");
     }
 

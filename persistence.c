@@ -340,7 +340,7 @@ static void rdb_write_uring(int fd, const char *data, size_t total) {
     fsync(fd);
 }
 
-static void rdb_save_child(void) {
+void rdb_save_sync(void) {
     /* 1) 序列化到内存 buffer */
     rdb_buf_t b = {0};
 
@@ -415,12 +415,12 @@ void rdb_save_async_uring(void) {
     pid_t pid = fork();
     if (pid < 0) {
         fprintf(stderr, "[RDB] fork failed, fallback sync\n");
-        rdb_save_child();
+        rdb_save_sync();
         return;
     }
     if (pid == 0) {
         /* 子进程: flush stdio so printf output is not lost with _exit */
-        rdb_save_child();
+        rdb_save_sync();
         fflush(stdout);
         fflush(stderr);
         _exit(0);

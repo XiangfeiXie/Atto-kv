@@ -19,6 +19,8 @@ void aof_async_shutdown(void);
 /* AOF 异步写：主线程入队（拷贝一次，零阻塞 IO） */
 void aof_async_append(const char *buf, int len);
 
+/* RDB：同步 io_uring 写（repl 全量同步等需要等待完成的场景） */
+void rdb_save_sync(void);
 /* RDB：fork + io_uring 批量写，主线程不阻塞 */
 void rdb_save_async_uring(void);
 

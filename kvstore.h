@@ -43,10 +43,7 @@ extern int proactor_start(unsigned short port, msg_handler handler);
 extern int ntyco_start(unsigned short port, msg_handler handler);
 long long get_time_now(void);
 int resp_try_parse_full_cmd(const char *buf, int buflen);
-void rdb_save_async(void);
-void rdb_save(void);
 void kvs_flush_all();
-void rdb_load(void);
 bool resp_unpack(const char *data, int len, char **out_commands);
 void free_tokens(char **tokens, int count);
 
@@ -56,10 +53,6 @@ typedef struct {
     size_t     len;      //数据长度（大文件，二进制文件）
     long long  expire;   //过期时间戳
 } KVItem;
-
-typedef struct {
-	FILE *fp;
-} RdbSaveCtx;
 
 //引擎遍历函数回调
 typedef void (*kv_scan_cb)(const char *key, KVItem *item, void *priv);

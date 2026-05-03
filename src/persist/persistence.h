@@ -10,10 +10,24 @@
  * - aof_async_append：主线程调用，零阻塞入队，由后台线程 + io_uring 落盘
  * - rdb_save_async_uring：主线程 fork，子进程用 io_uring 批量写 RDB
  * - rdb_load_mmap / aof_reload_mmap：mmap 加载，避免逐次 read 拷贝
+ * - persist_set_basedir：设置项目根目录，所有持久化路径从此解析
  * ========================================================= */
 
+/* 设置项目根目录（由 main() 在启动时调用一次）。
+ * 传入 argv[0]，内部解析为项目根目录。
+ * 所有持久化文件（build/dump.rdb, build/appendonly.aof 等）的路径
+ * 都从此目录解析，确保不受 CWD 变化影响。 */
+void persist_set_basedir(const char *argv0);
+
+/* 持久化文件相对路径常量 */
+#define AOF_REL  "build/appendonly.aof"
+#define RDB_REL  "build/dump.rdb"
+
+/* 将相对路径拼接到项目根目录，返回静态 buffer（调用方不可 free） */
+const char *persist_path(const char *rel);
+
 /* AOF 异步写：初始化后台线程 & io_uring */
-int  aof_async_init(const char *path);
+int  aof_async_init(void);
 /* AOF 异步写：优雅关闭，等待队列落盘 */
 void aof_async_shutdown(void);
 /* AOF 异步写：主线程入队（拷贝一次，零阻塞 IO） */

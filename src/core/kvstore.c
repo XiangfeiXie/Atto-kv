@@ -603,10 +603,10 @@ void kvs_flush_all() {
 }
 
 void engine_reload(void) {
-    if (ENABLE_AOF && access("appendonly.aof", F_OK) == 0) {
+    if (ENABLE_AOF && access(persist_path(AOF_REL), F_OK) == 0) {
         printf("Loading AOF (mmap)...\n");
         aof_reload_mmap();
-    } else if (ENABLE_RDB && access("dump.rdb", F_OK) == 0) {
+    } else if (ENABLE_RDB && access(persist_path(RDB_REL), F_OK) == 0) {
         printf("Loading RDB (mmap)...\n");
         rdb_load_mmap();
     } else {
@@ -616,13 +616,14 @@ void engine_reload(void) {
 
 int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN);   /* 防止从机断连时 send() 触发 SIGPIPE 杀死进程 */
-    const char *conf_path = (argc >= 2) ? argv[1] : "kvstore.conf";
+    persist_set_basedir(argv[0]); /* 解析项目根目录，所有持久化路径从此出发 */
+    const char *conf_path = (argc >= 2) ? argv[1] : "conf/kvstore.conf";
     config_load(conf_path);
     config_print();
 
     init_kvengine();
     engine_reload();
-    if (ENABLE_AOF) aof_async_init("appendonly.aof");
+    if (ENABLE_AOF) aof_async_init();
 
     /* --- RDMA + eBPF 主从同步.
      * rdma_sync 是唯一总开关。

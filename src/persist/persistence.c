@@ -29,11 +29,76 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <libgen.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <liburing.h>
+
+/* ── 项目根目录：由 persist_set_basedir 在启动时设置 ── */
+static char  g_basedir[1024] = ".";
+static int   g_basedir_set = 0;
+
+#define RDB_TMP  "build/dump.rdb.tmp"
+
+/* 将相对路径拼接到项目根目录上，返回静态 buffer */
+const char *persist_path(const char *rel) {
+    static char buf[1024];
+    int n = snprintf(buf, sizeof(buf), "%s/%s", g_basedir, rel);
+    if (n < 0 || (size_t)n >= sizeof(buf)) return rel; /* 截断时回退到相对路径 */
+    return buf;
+}
+
+void persist_set_basedir(const char *argv0) {
+    if (g_basedir_set) return;
+
+    /* 1) 解析二进制真实路径 */
+    char binpath[1024] = {0};
+    if (argv0 && argv0[0] == '/') {
+        /* 绝对路径：直接使用 */
+        strncpy(binpath, argv0, sizeof(binpath) - 1);
+    } else if (argv0) {
+        /* 相对路径：用 /proc/self/exe 兜底 */
+        ssize_t n = readlink("/proc/self/exe", binpath, sizeof(binpath) - 1);
+        if (n <= 0 && realpath(argv0, binpath) == NULL) {
+            /* 最后尝试：getcwd + argv0 */
+            if (getcwd(binpath, sizeof(binpath) - 1)) {
+                size_t blen = strlen(binpath);
+                snprintf(binpath + blen, sizeof(binpath) - blen - 1, "/%s", argv0);
+            }
+        }
+    } else {
+        ssize_t n = readlink("/proc/self/exe", binpath, sizeof(binpath) - 1);
+        if (n > 0) binpath[n] = '\0';
+    }
+
+    /* 2) 取二进制所在目录 */
+    char *d = dirname(binpath);
+
+    /* 3) 如果所在目录名为 build，则项目根目录为上一级；
+     *    否则项目根目录就是二进制所在目录（就地构建）。 */
+    char *dname = basename(d); /* 注意：basename 可能修改 d */
+    /* dirname 可能修改 binpath，所以重新构造 */
+    char dircopy[1024];
+    strncpy(dircopy, binpath, sizeof(dircopy) - 1);
+    dircopy[sizeof(dircopy) - 1] = '\0';
+    char *dd = dirname(dircopy);
+    char *dn = strrchr(dd, '/');
+    if (dn) dn++; else dn = dd;
+
+    if (strcmp(dn, "build") == 0) {
+        /* project_root = parent of build/ */
+        char *last = strrchr(dd, '/');
+        if (last) *last = '\0';
+        strncpy(g_basedir, dd, sizeof(g_basedir) - 1);
+    } else {
+        strncpy(g_basedir, dd, sizeof(g_basedir) - 1);
+    }
+
+    g_basedir[sizeof(g_basedir) - 1] = '\0';
+    g_basedir_set = 1;
+}
 
 /* ========================= 引擎数据访问（与 kvstore.c 保持一致） ========================= */
 extern kvs_array_t    global_array;
@@ -182,9 +247,10 @@ static void *aof_worker(void *arg) {
     return NULL;
 }
 
-int aof_async_init(const char *path) {
+int aof_async_init(void) {
     if (g_aof.fd >= 0) return 0; /* 已初始化 */
 
+    const char *path = persist_path(AOF_REL);
     g_aof.fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (g_aof.fd < 0) {
         fprintf(stderr, "[AOF] open %s failed: %s\n", path, strerror(errno));
@@ -364,7 +430,8 @@ void rdb_save_sync(void) {
     else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_scan(&global_skiptable, rdb_save_callback_buf, &b);
 
     /* 2) 写临时文件 + rename，保证原子性 */
-    const char *tmp = "dump.rdb.tmp";
+    const char *tmp = persist_path(RDB_TMP);
+    const char *dst = persist_path(RDB_REL);
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         fprintf(stderr, "[RDB] open tmp failed: %s\n", strerror(errno));
@@ -374,7 +441,7 @@ void rdb_save_sync(void) {
 
     rdb_write_uring(fd, b.buf, b.len);
     close(fd);
-    rename(tmp, "dump.rdb");
+    rename(tmp, dst);
 
     free(b.buf);
     printf("[RDB] saved via io_uring, %zu bytes\n", b.len);
@@ -442,7 +509,7 @@ static const char *mread(const char *p, const char *end, void *out, size_t n) {
 }
 
 void rdb_load_mmap(void) {
-    int fd = open("dump.rdb", O_RDONLY);
+    int fd = open(persist_path(RDB_REL), O_RDONLY);
     if (fd < 0) {
         printf("[RDB] open failed\n");
         return;
@@ -515,7 +582,7 @@ out:
 }
 
 void aof_reload_mmap(void) {
-    int fd = open("appendonly.aof", O_RDONLY);
+    int fd = open(persist_path(AOF_REL), O_RDONLY);
     if (fd < 0) return;
     struct stat st;
     if (fstat(fd, &st) < 0 || st.st_size <= 0) { close(fd); return; }

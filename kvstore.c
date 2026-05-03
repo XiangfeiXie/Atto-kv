@@ -625,9 +625,9 @@ int main(int argc, char *argv[]) {
     if (ENABLE_AOF) aof_async_init("appendonly.aof");
 
     /* --- RDMA + eBPF 主从同步.
-     * rdma_sync 是总开关，rdma_repl 为兼容保留。
+     * rdma_sync 是唯一总开关。
      * 全量同步走 RDMA (libfabric)，增量同步由 eBPF 捕获经 TCP 传输。 */
-    if (kvs_config.rdma_sync_enabled || kvs_config.rdma_repl_enabled) {
+    if (kvs_config.rdma_sync_enabled) {
         if (kvs_config.rdma_role == ROLE_MASTER) {
             rdma_repl_master_start();
         } else {

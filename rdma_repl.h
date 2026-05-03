@@ -4,11 +4,8 @@
 /* ===================================================================
  * RDMA-based full synchronization over libfabric (Soft-RoCE capable)
  *
- * Scope (development stage):
- *   - Full sync only. Incremental sync is NOT implemented here and
- *     is intentionally left to a future module.
- *   - Completely independent from the legacy TCP replication in repl.c;
- *     the two subsystems are isolated via config flags.
+ *   - Full sync only. Incremental sync is handled by ebpf_incr_repl.
+ *   - Controlled by kvs_config.rdma_sync_enabled (single master switch).
  *
  * Protocol on the wire (single FI_EP_MSG connection):
  *   1. master  -> slave : uint64_t payload_len  (little-endian host order)

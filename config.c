@@ -10,13 +10,12 @@ KvsConfig kvs_config;
 void config_default(void) {
     kvs_config.port          = 6379;
     kvs_config.loglevel      = LOG_INFO;
-    kvs_config.persist_mode  = PERSIST_BOTH;
+    kvs_config.persist_mode  = PERSIST_AOF;
     kvs_config.network_model = NET_REACTOR;
     kvs_config.engine        = ENGINE_RBTREE;
 
     /* RDMA (libfabric) full-sync — disabled by default */
     kvs_config.rdma_sync_enabled = 0;
-    kvs_config.rdma_repl_enabled = 0;
     kvs_config.rdma_role         = ROLE_MASTER;
     strncpy(kvs_config.rdma_bind_ip,   "0.0.0.0",   sizeof(kvs_config.rdma_bind_ip)   - 1);
     kvs_config.rdma_bind_port    = 2100;
@@ -87,7 +86,6 @@ int config_load(const char *path) {
             if      (strcasecmp(val, "none") == 0) kvs_config.persist_mode = PERSIST_NONE;
             else if (strcasecmp(val, "rdb")  == 0) kvs_config.persist_mode = PERSIST_RDB;
             else if (strcasecmp(val, "aof")  == 0) kvs_config.persist_mode = PERSIST_AOF;
-            else if (strcasecmp(val, "both") == 0) kvs_config.persist_mode = PERSIST_BOTH;
             else printf("[CONFIG] line %d: unknown persistence '%s'\n", lineno, val);
 
         } else if (strcasecmp(key, "engine") == 0) {
@@ -105,15 +103,6 @@ int config_load(const char *path) {
                      strcasecmp(val, "0")   == 0 || strcasecmp(val, "false") == 0)
                 kvs_config.rdma_sync_enabled = 0;
             else printf("[CONFIG] line %d: unknown rdma_sync '%s'\n", lineno, val);
-
-        } else if (strcasecmp(key, "rdma_repl") == 0) {
-            if      (strcasecmp(val, "on")  == 0 || strcasecmp(val, "yes") == 0 ||
-                     strcasecmp(val, "1")   == 0 || strcasecmp(val, "true") == 0)
-                kvs_config.rdma_repl_enabled = 1;
-            else if (strcasecmp(val, "off") == 0 || strcasecmp(val, "no")  == 0 ||
-                     strcasecmp(val, "0")   == 0 || strcasecmp(val, "false") == 0)
-                kvs_config.rdma_repl_enabled = 0;
-            else printf("[CONFIG] line %d: unknown rdma_repl '%s'\n", lineno, val);
 
         } else if (strcasecmp(key, "rdma_role") == 0) {
             if      (strcasecmp(val, "master") == 0) kvs_config.rdma_role = ROLE_MASTER;
@@ -157,7 +146,7 @@ int config_load(const char *path) {
 }
 
 void config_print(void) {
-    static const char *persist_names[] = {"none", "rdb", "aof", "both"};
+    static const char *persist_names[] = {"none", "rdb", "aof"};
     static const char *net_names[]     = {"reactor", "proactor", "ntyco"};
     static const char *log_names[]     = {"debug", "info", "warn", "error"};
     static const char *engine_names[]  = {"array", "rbtree", "hash", "skiptable"};
@@ -169,12 +158,11 @@ void config_print(void) {
            net_names[kvs_config.network_model],
            engine_names[kvs_config.engine]);
 
-    printf("[CONFIG] rdma_sync=%s  rdma_repl=%s  rdma_role=%s  rdma_provider=%s\n",
+    printf("[CONFIG] rdma_sync=%s  rdma_role=%s  rdma_provider=%s\n",
            kvs_config.rdma_sync_enabled ? "on" : "off",
-           kvs_config.rdma_repl_enabled ? "on" : "off",
            kvs_config.rdma_role == ROLE_MASTER ? "master" : "slave",
            kvs_config.rdma_provider);
-    if (kvs_config.rdma_sync_enabled || kvs_config.rdma_repl_enabled) {
+    if (kvs_config.rdma_sync_enabled) {
         if (kvs_config.rdma_role == ROLE_MASTER)
             printf("[CONFIG] rdma_bind=%s:%d\n",
                    kvs_config.rdma_bind_ip, kvs_config.rdma_bind_port);

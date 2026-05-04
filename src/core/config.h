@@ -2,8 +2,7 @@
 #define __KVS_CONFIG_H__
 
 /* =========================================================
- * Runtime configuration module
- * Loaded once at startup from a .conf file; no recompile needed.
+ * Runtime configuration — loaded from .conf at startup.
  * ========================================================= */
 
 /* --- Log levels --- */
@@ -21,7 +20,6 @@
 #define PERSIST_NONE  0
 #define PERSIST_RDB   1
 #define PERSIST_AOF   2
-/* PERSIST_BOTH removed — "aof" now implies RDB + AOF both enabled */
 
 /* --- Replication roles --- */
 #define ROLE_MASTER  0
@@ -35,33 +33,36 @@
 
 /* ---- Config struct ---- */
 typedef struct {
-    int  port;            /* listening port, default 6379               */
-    int  loglevel;        /* LOG_DEBUG / INFO / WARN / ERROR            */
-    int  persist_mode;    /* PERSIST_NONE / RDB / AOF (AOF implies RDB too) */
-    int  network_model;   /* NET_REACTOR / NET_PROACTOR / NET_NTYCO     */
-    int  engine;          /* ENGINE_ARRAY/RBTREE/HASH/SKIPTABLE          */
+    /* Service */
+    int  port;
+    int  loglevel;
+    int  persist_mode;
+    int  network_model;
+    int  engine;
 
-    /* ---- RDMA + eBPF 主从同步总开关 ---- */
-    int  rdma_sync_enabled;   /* 0: disable; 1: enable (RDMA 全量 + eBPF 增量) */
-    int  rdma_role;           /* ROLE_MASTER / ROLE_SLAVE                */
-    char rdma_bind_ip[64];    /* master: local bind IP (e.g. 0.0.0.0)    */
-    int  rdma_bind_port;      /* master: libfabric listen port           */
-    char rdma_master_ip[64];  /* slave:  master IP to connect            */
-    int  rdma_master_port;    /* slave:  master port to connect          */
-    char rdma_provider[32];   /* libfabric provider: verbs | tcp | ...   */
+    /* Replication master switch */
+    int  rdma_sync_enabled;
+    int  rdma_role;
+    char rdma_provider[32];
 
-    /* ---- Incremental sync TCP (代替增量同步的 RDMA) ---- */
-    int  incr_port;            /* ebpf incr TCP listener port, default 6382 */
+    /* Master only: RDMA fullsync listen address */
+    char rdma_listen_ip[64];
+    int  rdma_listen_port;
+
+    /* Slave only: RDMA fullsync connect target */
+    char rdma_master_ip[64];
+    int  rdma_master_port;
+
+    /* Both: TCP incremental sync port */
+    int  incr_port;
 } KvsConfig;
 
 extern KvsConfig kvs_config;
 
-int  config_load(const char *path);  /* load from file; returns 0 OK, -1 missing */
-void config_default(void);           /* fill all fields with safe defaults        */
-void config_print(void);             /* print active config to stdout             */
+int  config_load(const char *path);
+void config_print(void);
 
 /* ---- Runtime feature flags ---- */
-/* aof mode enables both RDB and AOF; rdb mode enables RDB only */
 #define ENABLE_RDB \
     (kvs_config.persist_mode == PERSIST_RDB  || kvs_config.persist_mode == PERSIST_AOF)
 #define ENABLE_AOF \

@@ -1,15 +1,18 @@
 /* =======================================================================
  * ebpf_incr_repl.c  —  User-space eBPF loader + TCP incremental sender
+ *                       + Fullsync state machine coordinator
  *
- * Changes from RDMA version:
- *   - Slave connections use TCP sockets instead of RDMA (libfabric)
- *   - No RDMA memory registration, CQ polling, or completion handling
- *   - TCP listener thread accepts incoming incr connections
- *   - Wire format unchanged: [uint64_t cmd_len][cmd_len bytes]
- *     (cmd_len = 0 is the graceful-disconnect sentinel)
+ * Architecture:
+ *   - Consumer thread polls eBPF ring buffer, assigns seq, manages backlog
+ *   - Fullsync state machine: IDLE → INPROGRESS → CATCHUP → IDLE
+ *   - During fullsync (INPROGRESS/CATCHUP): events go to backlog only
+ *   - Normal mode (IDLE): events sent directly to all connected slaves
+ *   - Per-slave output buffer: memcpy under lock, TCP send outside lock
+ *   - TCP listener accepts slave connections with INCR_SYNC handshake
  * ======================================================================= */
 
 #include "ebpf_incr_repl.h"
+#include "server.h"
 #include "config.h"
 
 #include <errno.h>
@@ -26,45 +29,61 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
-#define INCR_BACKLOG_CAP 1024
-
-struct slave_conn {
-    int fd;         /* TCP socket fd, -1 if inactive */
-    int active;
-};
-
+/* --- backlog --- */
 struct backlog_record {
     uint64_t seq;
     uint32_t length;
     char     msg[INCR_MAX_CMD];
 };
 
+/* --- per-slave connection with output buffer --- */
+struct slave_conn {
+    int    fd;
+    int    active;
+    DynBuf out_buf;   /* framed data [len][payload]... waiting to be sent */
+};
+
+/* --- BPF stats (mirrors kernel side) --- */
 struct incr_stats {
     uint64_t emitted;
     uint64_t dropped;
 };
 
-static struct slave_conn    g_slaves[INCR_MAX_SLAVES];
-static struct backlog_record g_backlog[INCR_BACKLOG_CAP];
-static size_t               g_backlog_start = 0;
-static size_t               g_backlog_count = 0;
-static uint64_t             g_seq           = 0;
-static int                  g_stream_healthy = 1;
-static pthread_mutex_t      g_mu = PTHREAD_MUTEX_INITIALIZER;
+/* ================================================================
+ * Global state
+ * ================================================================ */
 
-static struct bpf_object   *g_obj = NULL;
-static struct bpf_link     *g_link = NULL;
-static struct ring_buffer  *g_rb = NULL;
-static pthread_t            g_tid;
-static volatile int         g_running = 0;
-static int                  g_tid_started = 0;
-static int                  g_stats_fd = -1;
-static uint64_t             g_last_dropped = 0;
+static struct slave_conn      g_slaves[INCR_MAX_SLAVES];
+static struct backlog_record  g_backlog[INCR_BACKLOG_CAP];
+static size_t                 g_backlog_start = 0;
+static size_t                 g_backlog_count = 0;
+static uint64_t               g_seq           = 0;
+static int                    g_stream_healthy = 1;
+static pthread_mutex_t        g_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Fullsync state machine (written by RDMA thread, read by consumer) */
+static volatile int           g_fullsync_status = FULLSYNC_IDLE;
+static volatile uint64_t      g_fullsync_base_seq = 0;
+
+/* eBPF resources */
+static struct bpf_object     *g_obj = NULL;
+static struct bpf_link       *g_link = NULL;
+static struct ring_buffer    *g_rb = NULL;
+static pthread_t              g_tid;
+static volatile int           g_running = 0;
+static int                    g_tid_started = 0;
+static int                    g_stats_fd = -1;
+static int                    g_global_seq_fd = -1;
+static uint64_t               g_last_dropped = 0;
 
 /* TCP listener */
-static int                  g_listen_fd = -1;
-static pthread_t            g_listen_tid;
-static int                  g_listen_tid_started = 0;
+static int                    g_listen_fd = -1;
+static pthread_t              g_listen_tid;
+static int                    g_listen_tid_started = 0;
+
+/* ================================================================
+ * Helpers
+ * ================================================================ */
 
 static void slave_close_locked(struct slave_conn *s)
 {
@@ -74,36 +93,51 @@ static void slave_close_locked(struct slave_conn *s)
         close(s->fd);
         s->fd = -1;
     }
+    if (s->out_buf.buf) {
+        dynbuf_free(&s->out_buf);
+    }
     s->active = 0;
 }
 
-/* Send one frame over TCP: [uint64_t len][len bytes].
- * Returns 0 on success, -1 on failure (caller should close slave). */
-static int slave_send_frame_locked(struct slave_conn *s, const char *msg,
-                                   uint32_t len)
+/* Append framed data [uint64_t len][len bytes] to slave output buffer.
+ * Only does memcpy — no syscall. Caller holds g_mu. */
+static int slave_buffer_append_locked(struct slave_conn *s,
+                                      const char *msg, uint32_t len)
 {
     if (!s || !s->active || s->fd < 0)
         return -1;
     if (!msg || len == 0 || len > INCR_MAX_CMD)
         return -1;
 
+    if (!s->out_buf.buf)
+        dynbuf_init(&s->out_buf, INCR_SEND_BUF);
+
     uint64_t cmd_len = (uint64_t)len;
-
-    /* Send length header (8 bytes, host byte order — same machine arch) */
-    ssize_t n = send(s->fd, &cmd_len, sizeof(cmd_len), MSG_NOSIGNAL);
-    if (n != (ssize_t)sizeof(cmd_len))
+    if (dynbuf_append(&s->out_buf, (const char *)&cmd_len, sizeof(cmd_len)) != 0)
         return -1;
+    if (dynbuf_append(&s->out_buf, msg, (int)len) != 0)
+        return -1;
+    return 0;
+}
 
-    /* Send payload */
-    size_t remain = (size_t)len;
-    const char *p = msg;
+/* Flush slave output buffer via TCP send. Caller does NOT hold g_mu. */
+static int slave_flush(struct slave_conn *s)
+{
+    if (!s || !s->active || s->fd < 0)
+        return -1;
+    if (!s->out_buf.buf || s->out_buf.len == 0)
+        return 0;
+
+    size_t remain = (size_t)s->out_buf.len;
+    const char *p = s->out_buf.buf;
     while (remain > 0) {
-        n = send(s->fd, p, remain, MSG_NOSIGNAL);
+        ssize_t n = send(s->fd, p, remain, MSG_NOSIGNAL);
         if (n <= 0)
             return -1;
         p += n;
         remain -= (size_t)n;
     }
+    dynbuf_clear(&s->out_buf);
     return 0;
 }
 
@@ -116,12 +150,13 @@ static void backlog_append_locked(const struct incr_event *e, uint64_t seq)
         g_backlog_count++;
     }
 
-    g_backlog[idx].seq = seq;
+    g_backlog[idx].seq    = seq;
     g_backlog[idx].length = e->length;
     memcpy(g_backlog[idx].msg, e->msg, e->length);
 }
 
-/* Replay all backlog records (start_seq=0 replay everything). */
+/* Replay backlog records with seq >= start_seq to a single slave.
+ * Caller holds g_mu. */
 static int replay_backlog_locked(struct slave_conn *s, uint64_t start_seq)
 {
     if (g_backlog_count == 0)
@@ -132,7 +167,7 @@ static int replay_backlog_locked(struct slave_conn *s, uint64_t start_seq)
         struct backlog_record *rec = &g_backlog[idx];
         if (rec->seq < start_seq)
             continue;
-        if (slave_send_frame_locked(s, rec->msg, rec->length) != 0)
+        if (slave_buffer_append_locked(s, rec->msg, rec->length) != 0)
             return -1;
     }
     return 0;
@@ -167,6 +202,58 @@ static void check_stats_health(void)
         pthread_mutex_unlock(&g_mu);
     }
 }
+
+/* ================================================================
+ * Fullsync coordination API (called from RDMA master thread)
+ * ================================================================ */
+
+uint64_t ebpf_incr_read_global_seq(void)
+{
+    if (g_global_seq_fd < 0)
+        return g_seq;
+    uint32_t zero = 0;
+    uint64_t val  = 0;
+    if (bpf_map_lookup_elem(g_global_seq_fd, &zero, &val) != 0)
+        return g_seq;
+    return val;
+}
+
+uint64_t ebpf_incr_fullsync_begin(void)
+{
+    uint64_t base = ebpf_incr_read_global_seq();
+    g_fullsync_base_seq = base;
+    g_fullsync_status   = FULLSYNC_INPROGRESS;
+    printf("[INCR-REPL] fullsync begin: base_seq=%llu, status=INPROGRESS\n",
+           (unsigned long long)base);
+    return base;
+}
+
+void ebpf_incr_fullsync_send_done(void)
+{
+    g_fullsync_status = FULLSYNC_CATCHUP;
+    printf("[INCR-REPL] fullsync send done: status=CATCHUP (base_seq=%llu)\n",
+           (unsigned long long)g_fullsync_base_seq);
+}
+
+void ebpf_incr_fullsync_finish(void)
+{
+    g_fullsync_status = FULLSYNC_IDLE;
+    printf("[INCR-REPL] fullsync finish: status=IDLE\n");
+}
+
+int ebpf_incr_fullsync_status(void)
+{
+    return g_fullsync_status;
+}
+
+uint64_t ebpf_incr_fullsync_base_seq(void)
+{
+    return g_fullsync_base_seq;
+}
+
+/* ================================================================
+ * Health / slave management
+ * ================================================================ */
 
 int ebpf_incr_master_healthy(void)
 {
@@ -204,20 +291,30 @@ int ebpf_incr_add_slave(int tcp_fd, uint64_t start_seq)
     }
 
     struct slave_conn *s = &g_slaves[slot];
-    s->fd = tcp_fd;
+    memset(s, 0, sizeof(*s));
+    s->fd     = tcp_fd;
     s->active = 1;
 
+    /* Replay backlog from start_seq */
     if (replay_backlog_locked(s, start_seq) != 0) {
         slave_close_locked(s);
         pthread_mutex_unlock(&g_mu);
         return -1;
     }
 
-    printf("[INCR-REPL] slave registered in slot %d (catch-up from seq=%llu)\n",
+    printf("[INCR-REPL] slave registered slot=%d, catch-up from seq=%llu\n",
            slot, (unsigned long long)start_seq);
     pthread_mutex_unlock(&g_mu);
+
+    /* Flush backlog replay outside lock */
+    slave_flush(s);
+
     return 0;
 }
+
+/* ================================================================
+ * Consumer: ring buffer → backlog → slaves
+ * ================================================================ */
 
 static int on_incr_event(void *ctx, void *data, size_t sz)
 {
@@ -228,6 +325,8 @@ static int on_incr_event(void *ctx, void *data, size_t sz)
     if (!e || e->length == 0 || e->length > INCR_MAX_CMD)
         return 0;
 
+    uint64_t seq = e->seq;
+
     pthread_mutex_lock(&g_mu);
 
     if (!g_stream_healthy) {
@@ -235,22 +334,43 @@ static int on_incr_event(void *ctx, void *data, size_t sz)
         return 0;
     }
 
-    uint64_t seq = ++g_seq;
+    /* Track latest seq */
+    if (seq > g_seq)
+        g_seq = seq;
+
+    /* Always append to backlog (for future slave catch-up) */
     backlog_append_locked(e, seq);
 
-    for (int i = 0; i < INCR_MAX_SLAVES; i++) {
-        struct slave_conn *s = &g_slaves[i];
-        if (!s->active)
-            continue;
+    /* In normal mode: buffer to all slaves for lock-free send */
+    if (g_fullsync_status == FULLSYNC_IDLE) {
+        for (int i = 0; i < INCR_MAX_SLAVES; i++) {
+            struct slave_conn *s = &g_slaves[i];
+            if (!s->active)
+                continue;
+            if (slave_buffer_append_locked(s, e->msg, e->length) != 0) {
+                fprintf(stderr, "[INCR-REPL] buffer failed slot %d, closing\n", i);
+                slave_close_locked(s);
+            }
+        }
+    }
+    /* INPROGRESS / CATCHUP: only append to backlog, no direct send */
 
-        if (slave_send_frame_locked(s, e->msg, e->length) != 0) {
-            fprintf(stderr, "[INCR-REPL] send failed on slot %d, closing slave\n",
-                    i);
-            slave_close_locked(s);
+    pthread_mutex_unlock(&g_mu);
+
+    /* Flush outside lock so slow slaves don't block the ring buffer */
+    if (g_fullsync_status == FULLSYNC_IDLE) {
+        for (int i = 0; i < INCR_MAX_SLAVES; i++) {
+            struct slave_conn *s = &g_slaves[i];
+            if (!s->active)
+                continue;
+            if (slave_flush(s) != 0) {
+                pthread_mutex_lock(&g_mu);
+                slave_close_locked(s);
+                pthread_mutex_unlock(&g_mu);
+            }
         }
     }
 
-    pthread_mutex_unlock(&g_mu);
     return 0;
 }
 
@@ -275,9 +395,32 @@ static void *consumer_thread(void *arg)
     return NULL;
 }
 
-/* TCP listener thread: accepts incr connections from slaves.
- * Each accepted connection is registered via ebpf_incr_add_slave(fd, 0)
- * which replays the entire backlog before entering live streaming. */
+/* ================================================================
+ * TCP incr listener
+ * ================================================================ */
+
+/* Read a line (up to \n) from a TCP socket. Simple byte-at-a-time
+ * read with a small timeout assumption. Returns length or -1. */
+static int tcp_read_line(int fd, char *buf, int max_len)
+{
+    int pos = 0;
+    while (pos < max_len - 1) {
+        char c;
+        ssize_t n = recv(fd, &c, 1, 0);
+        if (n <= 0)
+            return -1;
+        if (c == '\n') {
+            /* Strip trailing \r if present */
+            if (pos > 0 && buf[pos - 1] == '\r')
+                pos--;
+            buf[pos] = '\0';
+            return pos;
+        }
+        buf[pos++] = c;
+    }
+    return -1; /* line too long */
+}
+
 static void *tcp_listener_thread(void *arg)
 {
     (void)arg;
@@ -302,17 +445,53 @@ static void *tcp_listener_thread(void *arg)
         printf("[INCR-REPL] incr connection from %s:%d\n", peer,
                ntohs(addr.sin_port));
 
-        /* Register with start_seq=0: replay entire backlog */
-        if (ebpf_incr_add_slave(fd, 0) != 0) {
-            fprintf(stderr, "[INCR-REPL] failed to register incr slave from %s\n",
+        /* Read INCR_SYNC <base_seq> handshake line */
+        char line[256];
+        int line_len = tcp_read_line(fd, line, (int)sizeof(line));
+        if (line_len <= 0) {
+            fprintf(stderr, "[INCR-REPL] failed to read INCR_SYNC handshake "
+                    "from %s\n", peer);
+            close(fd);
+            continue;
+        }
+
+        uint64_t slave_seq = 0;
+        int is_sync = 0;
+        if (strncmp(line, INCR_SYNC_CMD, strlen(INCR_SYNC_CMD)) == 0) {
+            is_sync = 1;
+            slave_seq = strtoull(line + strlen(INCR_SYNC_CMD), NULL, 10);
+        }
+
+        printf("[INCR-REPL] slave %s handshake: %s seq=%llu\n",
+               peer, is_sync ? "INCR_SYNC" : "LEGACY",
+               (unsigned long long)slave_seq);
+
+        /* Register slave with seq-based catchup.
+         * If INCR_SYNC: replay backlog from slave_seq.
+         * If no handshake (legacy): replay from 0 (entire backlog). */
+        if (ebpf_incr_add_slave(fd, slave_seq) != 0) {
+            fprintf(stderr, "[INCR-REPL] failed to register slave from %s\n",
                     peer);
             close(fd);
+            continue;
+        }
+
+        /* If we were in CATCHUP state and the slave sent INCR_SYNC
+         * with our base_seq, the catchup is complete. */
+        if (is_sync &&
+            g_fullsync_status == FULLSYNC_CATCHUP &&
+            slave_seq == g_fullsync_base_seq) {
+            ebpf_incr_fullsync_finish();
         }
     }
 
     printf("[INCR-REPL] TCP incr listener stopped\n");
     return NULL;
 }
+
+/* ================================================================
+ * Master start / stop
+ * ================================================================ */
 
 int ebpf_incr_master_start(void)
 {
@@ -350,6 +529,16 @@ int ebpf_incr_master_start(void)
         goto err_close;
     }
 
+    /* Open global_seq map fd for reading current seq from userspace */
+    struct bpf_map *seq_map = bpf_object__find_map_by_name(g_obj, "global_seq");
+    if (seq_map) {
+        g_global_seq_fd = bpf_map__fd(seq_map);
+    } else {
+        fprintf(stderr, "[INCR-REPL] map 'global_seq' not found, "
+                "using user-space fallback\n");
+        g_global_seq_fd = -1;
+    }
+
     g_rb = ring_buffer__new(bpf_map__fd(rb_map), on_incr_event, NULL, NULL);
     if (!g_rb) {
         fprintf(stderr, "[INCR-REPL] ring_buffer__new failed\n");
@@ -376,11 +565,18 @@ int ebpf_incr_master_start(void)
 
     /* Initialize state */
     pthread_mutex_lock(&g_mu);
-    g_backlog_start = 0;
-    g_backlog_count = 0;
-    g_seq = 0;
-    g_stream_healthy = 1;
-    g_last_dropped = 0;
+    g_backlog_start    = 0;
+    g_backlog_count    = 0;
+    g_seq              = 0;
+    g_stream_healthy   = 1;
+    g_last_dropped     = 0;
+    g_fullsync_status  = FULLSYNC_IDLE;
+    g_fullsync_base_seq = 0;
+    for (int i = 0; i < INCR_MAX_SLAVES; i++) {
+        g_slaves[i].fd     = -1;
+        g_slaves[i].active = 0;
+        memset(&g_slaves[i].out_buf, 0, sizeof(DynBuf));
+    }
     pthread_mutex_unlock(&g_mu);
 
     /* Start consumer thread */
@@ -396,7 +592,6 @@ int ebpf_incr_master_start(void)
     g_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (g_listen_fd < 0) {
         fprintf(stderr, "[INCR-REPL] socket() failed: %s\n", strerror(errno));
-        /* non-fatal: BPF/consumer still works, but incr connections disabled */
         goto done;
     }
 
@@ -405,9 +600,9 @@ int ebpf_incr_master_start(void)
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
+    addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons((uint16_t)kvs_config.incr_port);
+    addr.sin_port        = htons((uint16_t)kvs_config.incr_port);
 
     if (bind(g_listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         fprintf(stderr, "[INCR-REPL] bind(port=%d) failed: %s\n",
@@ -430,7 +625,8 @@ int ebpf_incr_master_start(void)
     }
 
 done:
-    printf("[INCR-REPL] incremental sync module ready (TCP transport)\n");
+    printf("[INCR-REPL] incremental sync module ready (seq in eBPF, "
+           "fullsync state machine active)\n");
     return 0;
 
 err_link:
@@ -445,7 +641,8 @@ err_rb:
         g_rb = NULL;
     }
 err_close:
-    g_stats_fd = -1;
+    g_stats_fd       = -1;
+    g_global_seq_fd  = -1;
     if (g_obj) {
         bpf_object__close(g_obj);
         g_obj = NULL;
@@ -473,6 +670,7 @@ void ebpf_incr_stop(void)
     }
 
     pthread_mutex_lock(&g_mu);
+    g_fullsync_status = FULLSYNC_IDLE;
     for (int i = 0; i < INCR_MAX_SLAVES; i++)
         slave_close_locked(&g_slaves[i]);
     pthread_mutex_unlock(&g_mu);
@@ -489,5 +687,6 @@ void ebpf_incr_stop(void)
         bpf_object__close(g_obj);
         g_obj = NULL;
     }
-    g_stats_fd = -1;
+    g_stats_fd       = -1;
+    g_global_seq_fd  = -1;
 }

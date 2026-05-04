@@ -1,19 +1,20 @@
 /* ===================================================================
  * rdma_repl.c  -  Full-sync over libfabric (Soft-RoCE / verbs / tcp)
+ *                 with fork() for COW-consistent engine snapshot.
  *
- * Implements requirement:
- *   1. Keep legacy replication intact but OFF by default; this module
- *      is fully isolated from repl.c and is toggled via kvs_config.
- *   2. Only the *full* sync phase is implemented here. Incremental
- *      propagation is NOT handled.
- *   3. Master serializes the whole dataset into an in-memory buffer
- *      using the Redis RESP protocol (one SET per key), then ships
- *      the buffer via libfabric. The slave deserializes in memory
- *      by replaying the commands through the existing kvs_protocol().
+ * Master:
+ *   Listens for RDMA connections. On accept:
+ *     1. Reads eBPF global_seq → base_seq (fullsync cut point)
+ *     2. Signals incr thread: status = INPROGRESS (pause direct send)
+ *     3. fork()
+ *     4. Child: serializes engine (COW snapshot) → pipe → _exit
+ *     5. Parent: reads pipe, sends [base_seq|payload_len|payload] via RDMA
+ *     6. Signals incr thread: status = CATCHUP
+ *     7. Slave later connects TCP incr, sends INCR_SYNC, catches up
  *
- * Wire protocol on the MSG endpoint:
- *     master -> slave :  [uint64_t payload_len]
- *     master -> slave :  [payload_len bytes of RESP stream]
+ * Slave:
+ *   Connects to master RDMA, receives fullsync_header + payload.
+ *   Reconstructs state, then connects TCP incr with INCR_SYNC <base_seq>.
  * =================================================================== */
 
 #include "rdma_repl.h"
@@ -39,6 +40,7 @@
 #include <rdma/fi_errno.h>
 
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -51,14 +53,10 @@ extern kvs_skiptable_t global_skiptable;
 /* -------- helpers from kvstore.c -------- */
 extern int   kvs_protocol(char *msg, int len, DynBuf *write_buf);
 
-/* Incremental sync is now TCP-based (handled by ebpf_incr_repl.c).
- * Full sync over RDMA remains unchanged.                          */
-
 /* ========================================================== */
-/* 1. RESP SERIALIZATION (master side)                        */
+/* 1. RESP SERIALIZATION (used by master in child process)    */
 /* ========================================================== */
 
-/* Append a RESP bulk string header "$<len>\r\n" + raw bytes + "\r\n" */
 static void resp_append_bulk(DynBuf *out, const char *data, int len) {
     char hdr[32];
     int n = snprintf(hdr, sizeof(hdr), "$%d\r\n", len);
@@ -67,19 +65,16 @@ static void resp_append_bulk(DynBuf *out, const char *data, int len) {
     dynbuf_append(out, "\r\n", 2);
 }
 
-/* Per-key callback: emit a full "SET key value" RESP command */
 static void rdma_serialize_cb(const char *key, KVItem *item, void *priv) {
     if (!key || !item) return;
     DynBuf *out = (DynBuf *)priv;
 
-    /* *3\r\n$3\r\nSET\r\n$<klen>\r\n<key>\r\n$<vlen>\r\n<val>\r\n */
     dynbuf_append(out, "*3\r\n", 4);
     resp_append_bulk(out, "SET", 3);
     resp_append_bulk(out, key, (int)strlen(key));
     resp_append_bulk(out, item->value, (int)item->len);
 }
 
-/* Walk the active engine and produce a RESP command stream. */
 static void rdma_serialize_dataset(DynBuf *out) {
     if      (kvs_config.engine == ENGINE_ARRAY)
         kvs_array_scan(&global_array, rdma_serialize_cb, out);
@@ -166,23 +161,8 @@ static struct fi_info *rdma_build_hints(void) {
     if (!hints) return NULL;
     hints->caps                   = FI_MSG;
     hints->ep_attr->type          = FI_EP_MSG;
-    /* hints->mode = 0: do NOT restrict mode bits in hints.
-     * libfabric 1.17 verbs provider (vrb_check_hints) unconditionally checks
-     * that the application declares FI_MR_LOCAL support via EITHER:
-     *   a) hints->mode & FI_LOCAL_MR  (deprecated pre-1.5 API), or
-     *   b) hints->domain_attr->mr_mode & FI_MR_LOCAL  (current API).
-     * Setting mode=0 disables the legacy mode filter; setting
-     * domain_attr->mr_mode = FI_MR_LOCAL satisfies (b) and also passes
-     * the standard fi_getinfo domain-attr match (verbs has FI_MR_LOCAL
-     * in its mr_mode, so the subset check passes).
-     * Our code already satisfies FI_MR_LOCAL at runtime: fi_mr_reg() is
-     * called on every buffer and fi_mr_desc() is passed to fi_send/recv. */
-    hints->mode                         = 0;
-    /* libfabric 1.17 ofi_check_mr_mode strips FI_MR_VIRT_ADDR/FI_MR_PROV_KEY
-     * via OFI_MR_BASIC_MAP and then requires the remaining bits to be
-     * declared in hints.  For the verbs/Soft-RoCE provider those are
-     * FI_MR_LOCAL | FI_MR_ALLOCATED. */
-    hints->domain_attr->mr_mode         = FI_MR_LOCAL | FI_MR_ALLOCATED;
+    hints->mode                   = 0;
+    hints->domain_attr->mr_mode   = FI_MR_LOCAL | FI_MR_ALLOCATED;
     if (kvs_config.rdma_provider[0] &&
         strcasecmp(kvs_config.rdma_provider, "auto") != 0) {
         hints->fabric_attr->prov_name = strdup(kvs_config.rdma_provider);
@@ -190,7 +170,6 @@ static struct fi_info *rdma_build_hints(void) {
     return hints;
 }
 
-/* Blocking CQ wait for exactly one completion. */
 static int rdma_wait_cq(struct fid_cq *cq) {
     struct fi_cq_data_entry ce;
     for (;;) {
@@ -209,7 +188,6 @@ static int rdma_wait_cq(struct fid_cq *cq) {
     }
 }
 
-/* Blocking EQ wait for a single CM event; returns the event id. */
 static int rdma_wait_eq(struct fid_eq *eq, uint32_t *event,
                         struct fi_eq_cm_entry *entry, size_t entry_size) {
     ssize_t r = fi_eq_sread(eq, event, entry, entry_size, -1, 0);
@@ -223,21 +201,34 @@ static int rdma_wait_eq(struct fid_eq *eq, uint32_t *event,
     return 0;
 }
 
-/* ========================================================== */
-/* 4. MASTER: per-slave session                               */
-/* ========================================================== */
+/* ==========================================================
+ * 4. MASTER: fork-based fullsync session
+ *
+ * Child process (after fork):
+ *   - Has COW snapshot of the entire engine
+ *   - Serializes engine → pipe
+ *   - _exit(0)
+ *
+ * Parent process (RDMA listener thread):
+ *   - Reads serialized data from pipe
+ *   - Sends [base_seq|payload_len|payload] via RDMA
+ *   - Coordinates with incremental thread state machine
+ * ========================================================== */
 
 static int rdma_master_serve_one(struct fid_fabric *fabric,
                                  struct fid_eq     *eq,
-                                 struct fi_info    *client_info) {
+                                 struct fi_info    *client_info)
+{
     struct fid_domain   *domain = NULL;
     struct fid_ep       *ep     = NULL;
     struct fid_cq       *cq     = NULL;
     struct fid_mr       *mr_hdr = NULL, *mr_buf = NULL;
-    DynBuf payload = {0};
-    int rc = -1;
+    char   *payload_buf = NULL;
+    pid_t  child_pid    = -1;
+    int    pipefd[2]    = {-1, -1};
+    int    rc           = -1;
 
-    /* 1) Build domain, CQ, endpoint for this client */
+    /* 1) Build domain, CQ, endpoint */
     struct fi_cq_attr cq_attr = {0};
     cq_attr.format   = FI_CQ_FORMAT_DATA;
     cq_attr.wait_obj = FI_WAIT_UNSPEC;
@@ -262,56 +253,175 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
     }
     printf("[RDMA-REPL] master: slave connected, starting full sync\n");
 
-    /* 3) Serialize whole dataset to an in-memory RESP stream */
-    dynbuf_init(&payload, 64 * 1024);
-    rdma_serialize_dataset(&payload);
-    uint64_t payload_len = (uint64_t)payload.len;
-    printf("[RDMA-REPL] master: serialized %" PRIu64 " bytes\n", payload_len);
+    /* 3) Begin fullsync: read eBPF global_seq, set status=INPROGRESS */
+    uint64_t base_seq = ebpf_incr_fullsync_begin();
 
-    /* 4) Register MRs and ship header + body */
-    RDMA_CHK(rdma_mr_reg(domain, &payload_len, sizeof(payload_len),
-                         FI_SEND, &mr_hdr), "mr_reg hdr");
+    /* 4) Create pipe for child→parent data transfer.
+     *    The child serializes the engine (COW snapshot) and writes to pipe.
+     *    The parent reads and sends via RDMA. */
+    if (pipe(pipefd) != 0) {
+        fprintf(stderr, "[RDMA-REPL] pipe() failed: %s\n", strerror(errno));
+        ebpf_incr_fullsync_finish();  /* revert to IDLE */
+        goto fail;
+    }
+
+    child_pid = fork();
+    if (child_pid < 0) {
+        fprintf(stderr, "[RDMA-REPL] fork() failed: %s\n", strerror(errno));
+        close(pipefd[0]);
+        close(pipefd[1]);
+        ebpf_incr_fullsync_finish();
+        goto fail;
+    }
+
+    if (child_pid == 0) {
+        /* ============================================================
+         * CHILD PROCESS: COW snapshot of engine at fork() moment.
+         * Only async-signal-safe operations here (no malloc in theory,
+         * but jemalloc is fork-safe and we _exit immediately after).
+         * ============================================================ */
+        close(pipefd[0]);  /* close read end */
+
+        DynBuf payload;
+        dynbuf_init(&payload, 64 * 1024);
+        rdma_serialize_dataset(&payload);
+
+        uint64_t p_len = (uint64_t)payload.len;
+        printf("[RDMA-REPL] child: serialized %" PRIu64 " bytes, "
+               "base_seq=%" PRIu64 "\n", p_len, base_seq);
+
+        /* Write payload_len then payload to pipe */
+        ssize_t wn;
+        wn = write(pipefd[1], &p_len, sizeof(p_len));
+        (void)wn;
+        if (p_len > 0) {
+            wn = write(pipefd[1], payload.buf, (size_t)p_len);
+            (void)wn;
+        }
+
+        dynbuf_free(&payload);
+        close(pipefd[1]);
+        _exit(0);
+    }
+
+    /* ============================================================
+     * PARENT PROCESS: read serialized data from child, send via RDMA
+     * ============================================================ */
+    close(pipefd[1]);  /* close write end */
+
+    /* Read payload_len + payload from the pipe */
+    uint64_t payload_len = 0;
+    ssize_t rn = read(pipefd[0], &payload_len, sizeof(payload_len));
+    if (rn != (ssize_t)sizeof(payload_len)) {
+        fprintf(stderr, "[RDMA-REPL] failed to read payload_len from pipe\n");
+        close(pipefd[0]);
+        goto wait_child;
+    }
+
     if (payload_len > 0) {
-        RDMA_CHK(rdma_mr_reg(domain, payload.buf, payload_len,
+        payload_buf = (char *)kvs_malloc((size_t)payload_len);
+        if (!payload_buf) {
+            fprintf(stderr, "[RDMA-REPL] OOM for payload (%" PRIu64 " bytes)\n",
+                    payload_len);
+            close(pipefd[0]);
+            goto wait_child;
+        }
+
+        size_t remain = (size_t)payload_len;
+        char  *p      = payload_buf;
+        while (remain > 0) {
+            rn = read(pipefd[0], p, remain);
+            if (rn <= 0) {
+                fprintf(stderr, "[RDMA-REPL] pipe read failed\n");
+                kvs_free(payload_buf);
+                payload_buf = NULL;
+                close(pipefd[0]);
+                goto wait_child;
+            }
+            p      += rn;
+            remain -= (size_t)rn;
+        }
+    }
+    close(pipefd[0]);
+    pipefd[0] = -1;
+
+    printf("[RDMA-REPL] master: received %" PRIu64 " bytes from child\n",
+           payload_len);
+
+    /* 5) Send [base_seq][payload_len][payload] via RDMA */
+    struct fullsync_header hdr;
+    hdr.base_seq    = base_seq;
+    hdr.payload_len = payload_len;
+
+    RDMA_CHK(rdma_mr_reg(domain, &hdr, sizeof(hdr),
+                         FI_SEND, &mr_hdr), "mr_reg hdr");
+    if (payload_len > 0 && payload_buf) {
+        RDMA_CHK(rdma_mr_reg(domain, payload_buf, (size_t)payload_len,
                              FI_SEND, &mr_buf), "mr_reg buf");
     }
 
+    /* Send header */
     {
         struct fi_context ctx;
-        ssize_t sr = fi_send(ep, &payload_len, sizeof(payload_len),
+        ssize_t sr = fi_send(ep, &hdr, sizeof(hdr),
                              fi_mr_desc(mr_hdr), 0, &ctx);
-        if (sr) { fprintf(stderr, "[RDMA-REPL] fi_send hdr: %s\n",
-                          fi_strerror((int)-sr)); goto fail; }
+        if (sr) {
+            fprintf(stderr, "[RDMA-REPL] fi_send hdr: %s\n",
+                    fi_strerror((int)-sr));
+            goto fail;
+        }
         if (rdma_wait_cq(cq) < 0) goto fail;
     }
 
-    if (payload_len > 0) {
-        /* Single message: relies on ep_attr->max_msg_size which is very
-         * large for tcp / verbs. For a first milestone this is fine; a
-         * future improvement is to chunk at max_msg_size boundaries. */
+    /* Send payload */
+    if (payload_len > 0 && payload_buf) {
         struct fi_context ctx;
-        ssize_t sr = fi_send(ep, payload.buf, payload_len,
+        ssize_t sr = fi_send(ep, payload_buf, (size_t)payload_len,
                              fi_mr_desc(mr_buf), 0, &ctx);
-        if (sr) { fprintf(stderr, "[RDMA-REPL] fi_send buf: %s\n",
-                          fi_strerror((int)-sr)); goto fail; }
+        if (sr) {
+            fprintf(stderr, "[RDMA-REPL] fi_send buf: %s\n",
+                    fi_strerror((int)-sr));
+            goto fail;
+        }
         if (rdma_wait_cq(cq) < 0) goto fail;
     }
 
-    printf("[RDMA-REPL] master: full sync shipped\n");
+    printf("[RDMA-REPL] master: full sync shipped (base_seq=%" PRIu64 ", "
+           "payload=%" PRIu64 " bytes)\n", base_seq, payload_len);
     rc = 0;
 
+wait_child:
+    /* Reap child process */
+    if (child_pid > 0) {
+        int wstatus;
+        waitpid(child_pid, &wstatus, 0);
+    }
+
+    /* Transition incremental thread to CATCHUP.
+     * Consumer has been buffering events to backlog during INPROGRESS.
+     * Now the slave will connect TCP incr, send INCR_SYNC <base_seq>,
+     * and receive backlog catchup. */
+    if (rc == 0) {
+        ebpf_incr_fullsync_send_done();
+    } else {
+        /* Fullsync failed — revert to IDLE so normal streaming resumes */
+        ebpf_incr_fullsync_finish();
+    }
+
 fail:
-    /* Always release full-sync-only resources */
+    /* Release fullsync resources */
     CLOSE_FID(mr_buf);
     CLOSE_FID(mr_hdr);
-    dynbuf_free(&payload);
+    if (payload_buf) { kvs_free(payload_buf); payload_buf = NULL; }
 
-    /* Close the RDMA connection — incr sync happens over TCP separately */
-    if (rc == 0) fi_shutdown(ep, 0);
+    /* Close the RDMA connection; incr sync happens over TCP */
+    if (rc == 0 && ep) fi_shutdown(ep, 0);
 
     CLOSE_FID(ep);
     CLOSE_FID(cq);
     CLOSE_FID(domain);
+    if (pipefd[0] >= 0) close(pipefd[0]);
+    if (pipefd[1] >= 0) close(pipefd[1]);
     return rc;
 }
 
@@ -331,10 +441,10 @@ static void *rdma_master_thread(void *arg) {
     if (!hints) { fprintf(stderr, "[RDMA-REPL] alloc hints failed\n"); return NULL; }
 
     char service[16];
-    snprintf(service, sizeof(service), "%d", kvs_config.rdma_bind_port);
+    snprintf(service, sizeof(service), "%d", kvs_config.rdma_listen_port);
 
     int rc = fi_getinfo(FI_VERSION(1, 17),
-                        kvs_config.rdma_bind_ip, service,
+                        kvs_config.rdma_listen_ip, service,
                         FI_SOURCE, hints, &info);
     if (rc) {
         fprintf(stderr, "[RDMA-REPL] fi_getinfo (master) failed: %s\n",
@@ -343,7 +453,7 @@ static void *rdma_master_thread(void *arg) {
     }
     printf("[RDMA-REPL] master: using provider '%s' on %s:%s\n",
            info->fabric_attr->prov_name,
-           kvs_config.rdma_bind_ip, service);
+           kvs_config.rdma_listen_ip, service);
 
     struct fi_eq_attr eq_attr = {0};
     eq_attr.wait_obj = FI_WAIT_UNSPEC;
@@ -354,8 +464,10 @@ static void *rdma_master_thread(void *arg) {
     RDMA_CHK(fi_pep_bind(pep, &eq->fid, 0),               "fi_pep_bind");
     RDMA_CHK(fi_listen(pep),                              "fi_listen");
 
-    /* Start eBPF incremental sync module + TCP incr listener
-     * (non-fatal if unavailable — full sync still works via RDMA) */
+    /* Start eBPF incremental sync module + TCP incr listener.
+     * This must be running BEFORE we accept any slave connections,
+     * because the master thread calls ebpf_incr_fullsync_begin()
+     * which reads the eBPF global_seq map. */
     if (ebpf_incr_master_start() != 0) {
         fprintf(stderr, "[RDMA-REPL] eBPF incr sync unavailable "
                         "(full sync only)\n");
@@ -365,7 +477,6 @@ static void *rdma_master_thread(void *arg) {
 
     /* Main accept loop */
     for (;;) {
-        /* Buffer big enough to carry the connreq + tail data */
         uint8_t buf[sizeof(struct fi_eq_cm_entry) + 256];
         struct fi_eq_cm_entry *entry = (struct fi_eq_cm_entry *)buf;
         uint32_t event;
@@ -382,10 +493,8 @@ static void *rdma_master_thread(void *arg) {
             }
             continue;
         }
-        if (event != FI_CONNREQ) {
-            /* Could be a FI_SHUTDOWN from a previous session; ignore. */
+        if (event != FI_CONNREQ)
             continue;
-        }
 
         struct fi_info *client_info = entry->info;
         if (rdma_master_serve_one(fabric, eq, client_info) != 0)
@@ -414,11 +523,11 @@ int rdma_repl_master_start(void) {
     return 0;
 }
 
-/* ========================================================== */
-/* 6. SLAVE: TCP incremental recv thread (runs after full sync)
- *     Reads wire frames: [uint64_t cmd_len][cmd_len bytes]
- *     cmd_len = 0 → disconnect sentinel                        */
-/* ========================================================== */
+/* ==========================================================
+ * 6. SLAVE: TCP incremental recv thread
+ *    Reads wire frames: [uint64_t cmd_len][cmd_len bytes]
+ *    cmd_len = 0 → disconnect sentinel
+ * ========================================================== */
 
 static void *incr_tcp_slave_recv_thread(void *arg)
 {
@@ -437,7 +546,8 @@ static void *incr_tcp_slave_recv_thread(void *arg)
         uint64_t cmd_len = 0;
         ssize_t n = recv(fd, &cmd_len, sizeof(cmd_len), MSG_WAITALL);
         if (n <= 0) {
-            fprintf(stderr, "[RDMA-REPL] slave incr: connection closed (recv len)\n");
+            fprintf(stderr, "[RDMA-REPL] slave incr: connection closed "
+                    "(recv len)\n");
             break;
         }
 
@@ -451,7 +561,6 @@ static void *incr_tcp_slave_recv_thread(void *arg)
             break;
         }
 
-        /* Read the full RESP command payload */
         size_t remain = (size_t)cmd_len;
         char *p = buf;
         while (remain > 0) {
@@ -464,15 +573,11 @@ static void *incr_tcp_slave_recv_thread(void *arg)
             remain -= (size_t)n;
         }
 
-        /* Apply the RESP command through the normal command path */
         DynBuf wb;
         dynbuf_init(&wb, 256);
         kvs_protocol(buf, (int)cmd_len, &wb);
         dynbuf_free(&wb);
         applied++;
-
-        //if (applied % 100 == 0 || applied <= 10)
-            //printf("[RDMA-REPL] slave incr: applied cmd #%d\n", applied);
     }
 
 done:
@@ -483,9 +588,17 @@ done:
     return NULL;
 }
 
-/* ========================================================== */
-/* 7. SLAVE: full-sync receiver + spawn incremental thread    */
-/* ========================================================== */
+/* ==========================================================
+ * 7. SLAVE: full-sync receiver + spawn incremental thread
+ *
+ * Wire protocol:
+ *   1. master → slave: struct fullsync_header (16 bytes)
+ *      [ uint64_t base_seq | uint64_t payload_len ]
+ *   2. master → slave: payload_len bytes of RESP SET stream
+ *
+ * After full sync, slave connects TCP incr and sends:
+ *   INCR_SYNC <base_seq>\r\n
+ * ========================================================== */
 
 int rdma_repl_slave_run(void) {
     struct fi_info    *hints  = NULL, *info = NULL;
@@ -496,8 +609,11 @@ int rdma_repl_slave_run(void) {
     struct fid_ep     *ep     = NULL;
     struct fid_mr     *mr_hdr = NULL, *mr_buf = NULL;
     char   *payload  = NULL;
-    uint64_t payload_len = 0;
-    int rc_ret = -1;
+    struct fullsync_header fshdr;
+    uint64_t base_seq    = 0;
+    int    rc_ret        = -1;
+
+    memset(&fshdr, 0, sizeof(fshdr));
 
     hints = rdma_build_hints();
     if (!hints) return -1;
@@ -532,15 +648,18 @@ int rdma_repl_slave_run(void) {
     RDMA_CHK(fi_ep_bind(ep, &cq->fid, FI_SEND | FI_RECV), "ep bind cq");
     RDMA_CHK(fi_enable(ep),                               "fi_enable");
 
-    /* Pre-post header recv BEFORE connecting so no race is possible */
-    RDMA_CHK(rdma_mr_reg(domain, &payload_len, sizeof(payload_len),
+    /* Pre-post header recv BEFORE connecting */
+    RDMA_CHK(rdma_mr_reg(domain, &fshdr, sizeof(fshdr),
                          FI_RECV, &mr_hdr), "mr_reg hdr");
     {
         struct fi_context ctx;
-        ssize_t r = fi_recv(ep, &payload_len, sizeof(payload_len),
+        ssize_t r = fi_recv(ep, &fshdr, sizeof(fshdr),
                             fi_mr_desc(mr_hdr), 0, &ctx);
-        if (r) { fprintf(stderr, "[RDMA-REPL] fi_recv hdr: %s\n",
-                         fi_strerror((int)-r)); goto fail; }
+        if (r) {
+            fprintf(stderr, "[RDMA-REPL] fi_recv hdr: %s\n",
+                    fi_strerror((int)-r));
+            goto fail;
+        }
     }
 
     /* Connect + wait CONNECTED */
@@ -550,32 +669,39 @@ int rdma_repl_slave_run(void) {
         struct fi_eq_cm_entry entry;
         if (rdma_wait_eq(eq, &event, &entry, sizeof(entry)) < 0) goto fail;
         if (event != FI_CONNECTED) {
-            fprintf(stderr, "[RDMA-REPL] slave: expected FI_CONNECTED got %u\n", event);
+            fprintf(stderr, "[RDMA-REPL] slave: expected FI_CONNECTED got %u\n",
+                    event);
             goto fail;
         }
     }
     printf("[RDMA-REPL] slave: connected, awaiting full sync\n");
 
-    /* Wait for header completion */
+    /* Wait for header */
     if (rdma_wait_cq(cq) < 0) goto fail;
-    printf("[RDMA-REPL] slave: incoming payload = %" PRIu64 " bytes\n",
-           payload_len);
+    base_seq             = fshdr.base_seq;
+    uint64_t payload_len = fshdr.payload_len;
+
+    printf("[RDMA-REPL] slave: fullsync header — base_seq=%" PRIu64 ", "
+           "payload=%" PRIu64 " bytes\n", base_seq, payload_len);
 
     if (payload_len > 0) {
         payload = (char *)kvs_malloc((size_t)payload_len);
         if (!payload) { fprintf(stderr, "[RDMA-REPL] oom\n"); goto fail; }
 
-        RDMA_CHK(rdma_mr_reg(domain, payload, payload_len,
+        RDMA_CHK(rdma_mr_reg(domain, payload, (size_t)payload_len,
                              FI_RECV, &mr_buf), "mr_reg buf");
 
         struct fi_context ctx;
-        ssize_t r = fi_recv(ep, payload, payload_len,
+        ssize_t r = fi_recv(ep, payload, (size_t)payload_len,
                             fi_mr_desc(mr_buf), 0, &ctx);
-        if (r) { fprintf(stderr, "[RDMA-REPL] fi_recv buf: %s\n",
-                         fi_strerror((int)-r)); goto fail; }
+        if (r) {
+            fprintf(stderr, "[RDMA-REPL] fi_recv buf: %s\n",
+                    fi_strerror((int)-r));
+            goto fail;
+        }
         if (rdma_wait_cq(cq) < 0) goto fail;
 
-        /* Clean local state before reconstruction so we mirror the master */
+        /* Clean local state and reconstruct from the RESP stream */
         kvs_flush_all();
         int n = rdma_apply_resp_stream(payload, (size_t)payload_len);
         printf("[RDMA-REPL] slave: applied %d commands from full sync\n", n);
@@ -584,13 +710,11 @@ int rdma_repl_slave_run(void) {
         kvs_flush_all();
     }
 
-    /* Full sync done via RDMA — close RDMA resources now.
-     * Incremental sync will use a separate TCP connection. */
+    /* Full sync done — close RDMA resources */
     CLOSE_FID(mr_buf);
     CLOSE_FID(mr_hdr);
     if (payload) { kvs_free(payload); payload = NULL; }
 
-    /* Close the RDMA connection — incr is handled over TCP */
     fi_shutdown(ep, 0);
     CLOSE_FID(ep);
     CLOSE_FID(cq);
@@ -601,18 +725,18 @@ int rdma_repl_slave_run(void) {
     if (hints) fi_freeinfo(hints);
     info = NULL; hints = NULL;
 
-    /* ---- Connect to master's TCP incr port for incremental sync ---- */
+    /* ---- Connect to master's TCP incr port with INCR_SYNC handshake ---- */
     int incr_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (incr_fd < 0) {
         fprintf(stderr, "[RDMA-REPL] slave: incr socket() failed: %s\n",
                 strerror(errno));
-        return 0;   /* full sync ok; incr is best-effort */
+        return 0;
     }
 
     struct sockaddr_in incr_addr;
     memset(&incr_addr, 0, sizeof(incr_addr));
     incr_addr.sin_family = AF_INET;
-    incr_addr.sin_port = htons((uint16_t)kvs_config.incr_port);
+    incr_addr.sin_port   = htons((uint16_t)kvs_config.incr_port);
     inet_pton(AF_INET, kvs_config.rdma_master_ip, &incr_addr.sin_addr);
 
     if (connect(incr_fd, (struct sockaddr *)&incr_addr, sizeof(incr_addr)) < 0) {
@@ -620,11 +744,24 @@ int rdma_repl_slave_run(void) {
                 kvs_config.rdma_master_ip, kvs_config.incr_port,
                 strerror(errno));
         close(incr_fd);
-        return 0;   /* full sync ok; incr is best-effort */
+        return 0;
     }
 
-    printf("[RDMA-REPL] slave: connected to master incr TCP %s:%d\n",
-           kvs_config.rdma_master_ip, kvs_config.incr_port);
+    /* Send INCR_SYNC <base_seq> handshake so the master knows
+     * where to start the backlog catchup. */
+    char sync_line[256];
+    int sync_len = snprintf(sync_line, sizeof(sync_line),
+                            INCR_SYNC_CMD " %" PRIu64 "\r\n", base_seq);
+    if (send(incr_fd, sync_line, (size_t)sync_len, MSG_NOSIGNAL) != sync_len) {
+        fprintf(stderr, "[RDMA-REPL] slave: INCR_SYNC send failed: %s\n",
+                strerror(errno));
+        close(incr_fd);
+        return 0;
+    }
+
+    printf("[RDMA-REPL] slave: connected to master incr TCP %s:%d, "
+           "sent INCR_SYNC %" PRIu64 "\n",
+           kvs_config.rdma_master_ip, kvs_config.incr_port, base_seq);
 
     /* Spawn TCP incremental recv thread */
     {

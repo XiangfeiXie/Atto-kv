@@ -73,3 +73,46 @@ Replaced four fragmented storage engines (array, rbtree, hash, skiplist) with a 
 - KEYS / SCAN commands
 - Blocking commands (BLPOP, etc.)
 - Lua scripting support
+
+---
+
+## 2026-05-05 — Refactoring: Code Reorganization
+
+### Motivation
+
+`kvstore.c` had grown to 412 lines spanning 6 responsibilities (dynbuf, RESP parser, dispatch, drain loop, lifecycle, main). `server.h` mixed network-layer types with KV protocol declarations. As the project prepares for Phase 3 (LIST/SET/ZSET/HASH types), cleaner module boundaries were needed.
+
+### Changes
+
+**New files — utility layer:**
+- `src/util/dynbuf.h` + `src/util/dynbuf.c` — `DynBuf` struct + `dynbuf_init/append/cat/clear/free`, moved from `server.h` and `kvstore.c`
+
+**New files — protocol layer:**
+- `src/core/protocol.h` + `src/core/protocol.c` — `kvs_token_t`, `TOKEN_EQ`, `KVS_MAX_TOKENS`, `resp_parse_slices()`, RESP static fragments, `kvs_drain_resp_commands_off()`, `kvs_protocol()`, `kvs_protocol_batch()`, all moved from `kvstore.h` and `kvstore.c`
+
+**Cleaned up:**
+- `src/core/server.h` — Now network-only: `conn` struct, `RCALLBACK`, `msg_handler`, `KVS_NET_BUF_INIT`. Includes `dynbuf.h` for `DynBuf`.
+- `src/core/kvstore.h` — Now API surface only: `kvs_dispatch`, `g_dict`, `KVItem`, engine lifecycle declarations. Includes `protocol.h`.
+- `src/core/kvstore.c` — Reduced from 412 → ~220 lines: only `main()`, `kvs_dispatch()`, `init/destroy/flush/reload`, `KVItem` helpers.
+- `src/net/proactor.c` — Added `#include "protocol.h"`
+- `src/repl/rdma_repl.c` — Removed redundant `extern kvs_protocol` declaration
+- `CMakeLists.txt` — Added `src/util` to sources and include paths
+
+### Result
+
+```
+src/
+├── util/    dynbuf.h/c      ← 动态缓冲区（零依赖工具模块）
+├── core/
+│   ├── server.h             ← 连接管理（纯网络层）
+│   ├── protocol.h/c         ← RESP 解析 + 帧切分
+│   ├── config.h/c           ← 配置加载
+│   └── kvstore.h/c          ← 命令分发 + 生命周期 + main
+├── engine/  kv_dict.h/c     ← 统一存储引擎
+├── type/    kv_type_string.* ← STRING 类型
+├── net/     reactor/proactor/ntyco
+├── persist/ persistence.*
+└── repl/   rdma_repl.* + ebpf_incr_repl.*
+```
+
+Each module has a single, well-defined responsibility. Zero behavioral changes — all functional regression tests pass.

@@ -47,9 +47,6 @@
 
 /* g_dict is declared in kvstore.h, defined in kvstore.c */
 
-/* -------- helpers from kvstore.c -------- */
-extern int   kvs_protocol(char *msg, int len, DynBuf *write_buf);
-
 /* ========================================================== */
 /* 1. libfabric PLUMBING                                      */
 /* ========================================================== */

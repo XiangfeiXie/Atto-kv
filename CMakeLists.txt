@@ -27,9 +27,14 @@ add_custom_command(
 add_custom_target(ntyco DEPENDS ${NTYCO_LIB})
 
 # ── Source files ──────────────────────────────────────────────────────
+set(UTIL_SRCS
+    src/util/dynbuf.c
+)
+
 set(CORE_SRCS
     src/core/kvstore.c
     src/core/config.c
+    src/core/protocol.c
 )
 
 set(ENGINE_SRCS
@@ -56,6 +61,7 @@ set(REPL_SRCS
 )
 
 set(KVSTORE_SRCS
+    ${UTIL_SRCS}
     ${CORE_SRCS}
     ${ENGINE_SRCS}
     ${TYPE_SRCS}
@@ -68,6 +74,7 @@ set(KVSTORE_SRCS
 add_executable(kvstore ${KVSTORE_SRCS})
 
 target_include_directories(kvstore PRIVATE
+    src/util
     src/core
     src/engine
     src/type

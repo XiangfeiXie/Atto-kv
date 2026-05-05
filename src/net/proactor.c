@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include "server.h"
+#include "protocol.h"
 
 #define EVENT_ACCEPT    0
 #define EVENT_READ      1

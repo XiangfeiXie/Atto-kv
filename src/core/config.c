@@ -16,7 +16,6 @@ static void config_default(void) {
     kvs_config.loglevel      = LOG_INFO;
     kvs_config.persist_mode  = PERSIST_AOF;
     kvs_config.network_model = NET_REACTOR;
-    kvs_config.engine        = ENGINE_RBTREE;
 
     kvs_config.rdma_sync_enabled = 0;
     kvs_config.rdma_role         = ROLE_MASTER;
@@ -110,13 +109,6 @@ int config_load(const char *path) {
             else if (strcasecmp(val, "ntyco")    == 0) kvs_config.network_model = NET_NTYCO;
             else printf("[CONFIG] line %d: unknown network '%s'\n", lineno, val);
 
-        } else if (strcasecmp(key, "engine") == 0) {
-            if      (strcasecmp(val, "array")     == 0) kvs_config.engine = ENGINE_ARRAY;
-            else if (strcasecmp(val, "rbtree")    == 0) kvs_config.engine = ENGINE_RBTREE;
-            else if (strcasecmp(val, "hash")      == 0) kvs_config.engine = ENGINE_HASH;
-            else if (strcasecmp(val, "skiptable") == 0) kvs_config.engine = ENGINE_SKIPTABLE;
-            else printf("[CONFIG] line %d: unknown engine '%s'\n", lineno, val);
-
         } else if (strcasecmp(key, "persistence") == 0) {
             if      (strcasecmp(val, "none") == 0) kvs_config.persist_mode = PERSIST_NONE;
             else if (strcasecmp(val, "rdb")  == 0) kvs_config.persist_mode = PERSIST_RDB;
@@ -171,20 +163,18 @@ void config_print(void) {
     static const char *persist[] = {"none", "rdb", "aof"};
     static const char *netmod[]  = {"reactor", "proactor", "ntyco"};
     static const char *lognames[]= {"debug", "info", "warn", "error"};
-    static const char *engines[] = {"array", "rbtree", "hash", "skiptable"};
 
     const char *role = (kvs_config.rdma_role == ROLE_MASTER) ? "MASTER" : "SLAVE";
 
     printf("\n"
            "========================================\n"
-           "  KVStore 9.1 — Configuration\n"
+           "  KVStore 10.0 — Configuration\n"
            "========================================\n"
            "  Service   : 0.0.0.0:%-5d  loglevel=%s\n"
-           "  Engine    : %-10s  persistence=%s\n"
+           "  Engine    : dict        persistence=%s\n"
            "  Network   : %s\n",
            kvs_config.port,
            lognames[kvs_config.loglevel],
-           engines[kvs_config.engine],
            persist[kvs_config.persist_mode],
            netmod[kvs_config.network_model]);
 

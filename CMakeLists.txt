@@ -33,10 +33,11 @@ set(CORE_SRCS
 )
 
 set(ENGINE_SRCS
-    src/engine/kvs_array.c
-    src/engine/kvs_rbtree.c
-    src/engine/kvs_hash.c
-    src/engine/kvs_skiptable.c
+    src/engine/kv_dict.c
+)
+
+set(TYPE_SRCS
+    src/type/kv_type_string.c
 )
 
 set(NET_SRCS
@@ -57,6 +58,7 @@ set(REPL_SRCS
 set(KVSTORE_SRCS
     ${CORE_SRCS}
     ${ENGINE_SRCS}
+    ${TYPE_SRCS}
     ${NET_SRCS}
     ${PERSIST_SRCS}
     ${REPL_SRCS}
@@ -68,6 +70,7 @@ add_executable(kvstore ${KVSTORE_SRCS})
 target_include_directories(kvstore PRIVATE
     src/core
     src/engine
+    src/type
     src/net
     src/persist
     src/repl

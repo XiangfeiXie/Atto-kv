@@ -45,11 +45,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-/* -------- engine access (defined in the engine *.c files) -------- */
-extern kvs_array_t     global_array;
-extern kvs_rbtree_t    global_rbtree;
-extern kvs_hash_t      global_hash;
-extern kvs_skiptable_t global_skiptable;
+/* g_dict is declared in kvstore.h, defined in kvstore.c */
 
 /* -------- helpers from kvstore.c -------- */
 extern int   kvs_protocol(char *msg, int len, DynBuf *write_buf);

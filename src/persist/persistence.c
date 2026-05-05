@@ -101,10 +101,7 @@ void persist_set_basedir(const char *argv0) {
 }
 
 /* ========================= 引擎数据访问（与 kvstore.c 保持一致） ========================= */
-extern kvs_array_t    global_array;
-extern kvs_rbtree_t   global_rbtree;
-extern kvs_hash_t     global_hash;
-extern kvs_skiptable_t global_skiptable;
+/* g_dict is declared in kvstore.h, defined in kvstore.c */
 
 /* 由 kvstore.c 提供 */
 KVItem* create_kvitem(char *value_str, char *expire_str);
@@ -346,50 +343,58 @@ static void rdb_buf_put(rdb_buf_t *b, const void *p, size_t n) {
     b->len += n;
 }
 
-static void rdb_save_callback_buf(const char *key, KVItem *item, void *priv) {
-    if (!key || !item) return;
+/* Serialize one dict entry to RDB binary format (appends to rdb_buf_t). */
+static void rdb_save_callback_buf(kv_entry_t *e, void *priv) {
+    if (!e) return;
     rdb_buf_t *b = (rdb_buf_t *)priv;
-    int klen = (int)strlen(key);
-    int vlen = (int)item->len;
+    const char *key = entry_key(e);
+    int klen = (int)e->key_len;
+    int vlen = (int)entry_payload_len(e);
+    long long expire = e->expire;
     rdb_buf_put(b, &klen, sizeof(int));
-    rdb_buf_put(b, key, klen);
+    rdb_buf_put(b, key, (size_t)klen);
     rdb_buf_put(b, &vlen, sizeof(int));
-    rdb_buf_put(b, item->value, vlen);
-    rdb_buf_put(b, &item->expire, sizeof(long long));
+    rdb_buf_put(b, entry_payload(e), (size_t)vlen);
+    rdb_buf_put(b, &expire, sizeof(long long));
 }
 
-/* Same RDB binary format, but appends to a DynBuf (for fullsync). */
-static void rdb_serialize_cb_dynbuf(const char *key, KVItem *item, void *priv) {
-    if (!key || !item) return;
+/* Same RDB binary format, appends to a DynBuf (for RDMA fullsync). */
+static void rdb_serialize_cb_dynbuf(kv_entry_t *e, void *priv) {
+    if (!e) return;
     DynBuf *out = (DynBuf *)priv;
-    int klen = (int)strlen(key);
-    int vlen = (int)item->len;
+    const char *key = entry_key(e);
+    int klen = (int)e->key_len;
+    int vlen = (int)entry_payload_len(e);
+    long long expire = e->expire;
     dynbuf_append(out, (const char *)&klen, sizeof(int));
     dynbuf_append(out, key, klen);
     dynbuf_append(out, (const char *)&vlen, sizeof(int));
-    dynbuf_append(out, item->value, vlen);
-    dynbuf_append(out, (const char *)&item->expire, sizeof(long long));
+    dynbuf_append(out, entry_payload(e), vlen);
+    dynbuf_append(out, (const char *)&expire, sizeof(long long));
+}
+
+/* Iterate all dict entries, calling cb for each. */
+static void dict_scan(kv_dict_t *d, void (*cb)(kv_entry_t *e, void *priv), void *priv) {
+    kv_iter_t *it = dict_iter_new(d, 1);
+    if (!it) return;
+    kv_entry_t *e;
+    while ((e = dict_iter_next(it)) != NULL)
+        cb(e, priv);
+    dict_iter_free(it);
 }
 
 void rdb_serialize_to_buf(DynBuf *out) {
     int magic = 0x524442;
     int version = 1;
     int db_num = 0;
-    int key_count = 0;
-    if      (kvs_config.engine == ENGINE_ARRAY)     key_count = global_array.total;
-    else if (kvs_config.engine == ENGINE_RBTREE)    key_count = global_rbtree.total;
-    else if (kvs_config.engine == ENGINE_HASH)      key_count = global_hash.count;
-    else if (kvs_config.engine == ENGINE_SKIPTABLE) key_count = global_skiptable.skl->total;
+    int key_count = (int)dict_count(&g_dict);
 
     dynbuf_append(out, (const char *)&magic,     sizeof(int));
     dynbuf_append(out, (const char *)&version,   sizeof(int));
     dynbuf_append(out, (const char *)&db_num,    sizeof(int));
     dynbuf_append(out, (const char *)&key_count, sizeof(int));
 
-    if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_scan(&global_array, rdb_serialize_cb_dynbuf, out);
-    else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_scan(&global_rbtree, rdb_serialize_cb_dynbuf, out);
-    else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_scan(&global_hash, rdb_serialize_cb_dynbuf, out);
-    else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_scan(&global_skiptable, rdb_serialize_cb_dynbuf, out);
+    dict_scan(&g_dict, rdb_serialize_cb_dynbuf, out);
 }
 
 /* 子进程：使用 io_uring 将整个 buffer 分块写入，最后 fsync */
@@ -447,21 +452,14 @@ void rdb_save_sync(void) {
     int magic = 0x524442;
     int version = 1;
     int db_num = 0;
-    int key_count = 0;
-    if      (kvs_config.engine == ENGINE_ARRAY)     key_count = global_array.total;
-    else if (kvs_config.engine == ENGINE_RBTREE)    key_count = global_rbtree.total;
-    else if (kvs_config.engine == ENGINE_HASH)      key_count = global_hash.count;
-    else if (kvs_config.engine == ENGINE_SKIPTABLE) key_count = global_skiptable.skl->total;
+    int key_count = (int)dict_count(&g_dict);
 
     rdb_buf_put(&b, &magic, sizeof(int));
     rdb_buf_put(&b, &version, sizeof(int));
     rdb_buf_put(&b, &db_num, sizeof(int));
     rdb_buf_put(&b, &key_count, sizeof(int));
 
-    if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_scan(&global_array, rdb_save_callback_buf, &b);
-    else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_scan(&global_rbtree, rdb_save_callback_buf, &b);
-    else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_scan(&global_hash, rdb_save_callback_buf, &b);
-    else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_scan(&global_skiptable, rdb_save_callback_buf, &b);
+    dict_scan(&g_dict, rdb_save_callback_buf, &b);
 
     /* 2) 写临时文件 + rename，保证原子性 */
     const char *tmp = persist_path(RDB_TMP);
@@ -561,10 +559,7 @@ int rdb_load_from_buf(const char *buf, size_t len) {
         return -1;
     }
 
-    if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_clear(&global_array);
-    else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_clear(&global_rbtree);
-    else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_clear(&global_hash);
-    else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_clear(&global_skiptable);
+    dict_clear(&g_dict);
 
     for (int i = 0; i < key_count; i++) {
         int klen = 0, vlen = 0;
@@ -572,46 +567,29 @@ int rdb_load_from_buf(const char *buf, size_t len) {
 
         if (!(p = mread(p, end, &klen, sizeof(int)))) break;
         if (p + klen > end) break;
-
-        char key_buf[256];
-        char *key = key_buf;
-        int key_on_heap = 0;
-        if (klen >= (int)sizeof(key_buf)) {
-            key = (char *)kvs_malloc((size_t)klen + 1);
-            key_on_heap = 1;
-        }
-        memcpy(key, p, (size_t)klen);
-        key[klen] = '\0';
+        const char *ks = p;  /* key data starts here */
         p += klen;
 
-        if (!(p = mread(p, end, &vlen, sizeof(int)))) {
-            if (key_on_heap) kvs_free(key);
-            break;
-        }
-        if (p + vlen > end) {
-            if (key_on_heap) kvs_free(key);
-            break;
-        }
+        if (!(p = mread(p, end, &vlen, sizeof(int)))) break;
+        if (p + vlen > end) break;
 
-        KVItem *item = create_kvitem_len(p, vlen);
+        /* Build entry data: [type=STRING][encoding=RAW][value] */
+        uint32_t dlen = (uint32_t)(2 + vlen);
+        char *data = (char *)malloc((size_t)dlen);
+        data[0] = (char)KV_TYPE_STRING;
+        data[1] = (char)KV_ENCODING_RAW;
+        memcpy(data + 2, p, (size_t)vlen);
         p += vlen;
 
         if (!(p = mread(p, end, &expire, sizeof(long long)))) {
-            if (item) free_kvitem(item);
-            if (key_on_heap) kvs_free(key);
+            free(data);
             break;
         }
-        if (item) item->expire = expire;
 
-        if (item) {
-            if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_set(&global_array, key, item);
-            else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_set(&global_rbtree, key, item);
-            else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_set(&global_hash, key, item);
-            else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_set(&global_skiptable, key, item);
-            free_kvitem(item);
-        }
-
-        if (key_on_heap) kvs_free(key);
+        uint64_t h = kv_hash((const uint8_t *)ks, (uint32_t)klen);
+        kv_entry_t *e = dict_add(&g_dict, ks, (uint32_t)klen, data, dlen, h);
+        if (e && expire) e->expire = expire;
+        free(data);
     }
 
     printf("[RDB] buf load: %d keys, %zu bytes\n", key_count, len);

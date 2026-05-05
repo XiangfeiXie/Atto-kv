@@ -25,12 +25,6 @@
 #define ROLE_MASTER  0
 #define ROLE_SLAVE   1
 
-/* --- Storage engines --- */
-#define ENGINE_ARRAY     0
-#define ENGINE_RBTREE    1
-#define ENGINE_HASH      2
-#define ENGINE_SKIPTABLE 3
-
 /* ---- Config struct ---- */
 typedef struct {
     /* Service */
@@ -38,7 +32,6 @@ typedef struct {
     int  loglevel;
     int  persist_mode;
     int  network_model;
-    int  engine;
 
     /* Replication master switch */
     int  rdma_sync_enabled;

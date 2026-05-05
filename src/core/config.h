@@ -32,6 +32,7 @@ typedef struct {
     int  loglevel;
     int  persist_mode;
     int  network_model;
+    int  maxclients;
 
     /* Replication master switch */
     int  rdma_sync_enabled;

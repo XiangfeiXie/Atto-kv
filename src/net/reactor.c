@@ -14,23 +14,42 @@
 #include "server.h"
 #include "kvstore.h"
 
-#define CONNECTION_SIZE			1024
-#define MAX_PORTS				20
+#define MAX_PORTS  20
 
 #define TIME_SUB_MS(tv1, tv2)  ((tv1.tv_sec - tv2.tv_sec) * 1000 + (tv1.tv_usec - tv2.tv_usec) / 1000)
 
+/* ── Dynamic connection pool ── */
+static struct conn *conn_pool = NULL;
+static int          conn_pool_size = 0;
+
 #if ENABLE_KVSTORE
 extern int epfd;
+
+/* ── Blocked-connection timeout stub (Phase 7) ── */
+static int block_nearest_timeout(void) {
+    /* Phase 7 will scan conn_pool for the nearest block_until_ms
+       and return (block_until_ms - now_ms), clamped to >= 0.
+       Returns -1 when no connections are blocked. */
+    return -1;
+}
+
+/* ── Lazy event mask update: only epoll_ctl when mask actually changed ── */
 static void conn_set_events(int fd, struct conn *c) {
-	uint32_t ev = EPOLLIN;
-	if (c->write_buf.len > 0){
-		ev |= EPOLLOUT;
-		//printf("=== conn_set_events: 设置 EPOLLOUT，write_buf.len=%d ===\n", c->write_buf.len);
-	}
-	struct epoll_event e;
-	e.events = ev;
-	e.data.fd = fd;
-	epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &e);
+    uint32_t ev = EPOLLIN;
+    if (c->write_buf.len > 0)
+        ev |= EPOLLOUT;
+    /* Phase 7: blocked connections drop EPOLLIN */
+    if (c->blocked)
+        ev &= ~EPOLLIN;
+
+    if (ev == c->cur_events)
+        return;                      /* no change — skip syscall */
+    c->cur_events = ev;
+
+    struct epoll_event e;
+    e.events = ev;
+    e.data.fd = fd;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &e);
 }
 #endif
 
@@ -40,195 +59,227 @@ int send_cb(int fd);
 
 int epfd = 0;
 struct timeval begin;
-struct conn conn_list[CONNECTION_SIZE] = {0};
 
 int set_event(int fd, int event, int flag) {
-	if (flag) {
-		struct epoll_event ev;
-		ev.events = event;
-		ev.data.fd = fd;
-		epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
-	} else {
-		struct epoll_event ev;
-		ev.events = event;
-		ev.data.fd = fd;
-		epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-	}
+    if (flag) {
+        struct epoll_event ev;
+        ev.events = event;
+        ev.data.fd = fd;
+        epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+    } else {
+        struct epoll_event ev;
+        ev.events = event;
+        ev.data.fd = fd;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+    }
 }
 
 int event_register(int fd, int event) {
-	if (fd < 0) return -1;
+    if (fd < 0) return -1;
+    if (fd >= conn_pool_size) {
+        fprintf(stderr, "[reactor] fd %d exceeds maxclients %d\n", fd, conn_pool_size);
+        close(fd);
+        return -1;
+    }
 
-	conn_list[fd].fd = fd;
-	conn_list[fd].r_action.recv_callback = recv_cb;
-	conn_list[fd].send_callback = send_cb;
+    conn_pool[fd].fd = fd;
+    conn_pool[fd].active = 1;
+    conn_pool[fd].cur_events = (uint32_t)event;
+    conn_pool[fd].r_action.recv_callback = recv_cb;
+    conn_pool[fd].send_callback = send_cb;
 
-	// 🔥 修复1：彻底释放旧缓冲区，重新初始化
-	dynbuf_free(&conn_list[fd].read_buf);
-	dynbuf_free(&conn_list[fd].write_buf);
-	dynbuf_init(&conn_list[fd].read_buf, KVS_NET_BUF_INIT);
-	dynbuf_init(&conn_list[fd].write_buf, KVS_NET_BUF_INIT);
-	conn_list[fd].r_off = 0;  // 🔥 强制重置 r_off
-	conn_list[fd].w_off = 0;  // 🔥 强制重置 w_off
+    dynbuf_free(&conn_pool[fd].read_buf);
+    dynbuf_free(&conn_pool[fd].write_buf);
+    dynbuf_init(&conn_pool[fd].read_buf, KVS_NET_BUF_INIT);
+    dynbuf_init(&conn_pool[fd].write_buf, KVS_NET_BUF_INIT);
+    conn_pool[fd].r_off = 0;
+    conn_pool[fd].w_off = 0;
 
-	if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1)
-		perror("fcntl O_NONBLOCK");
+    if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1)
+        perror("fcntl O_NONBLOCK");
 
-	set_event(fd, event, 1);
+    set_event(fd, event, 1);
+    return 0;
+}
+
+/* ── Release a connection slot ── */
+static void conn_release(int fd) {
+    if (fd < 0 || fd >= conn_pool_size) return;
+    struct conn *c = &conn_pool[fd];
+    dynbuf_free(&c->read_buf);
+    dynbuf_free(&c->write_buf);
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+    close(fd);
+    memset(c, 0, sizeof(*c));
 }
 
 int accept_cb(int fd) {
-	struct sockaddr_in clientaddr;
-	socklen_t len = sizeof(clientaddr);
+    struct sockaddr_in clientaddr;
+    socklen_t len = sizeof(clientaddr);
 
-	int clientfd = accept(fd, (struct sockaddr*)&clientaddr, &len);
-	if (clientfd < 0) {
-		printf("accept errno: %d --> %s\n", errno, strerror(errno));
-		return -1;
-	}
-	
-	event_register(clientfd, EPOLLIN);
-	return 0;
+    int clientfd = accept(fd, (struct sockaddr*)&clientaddr, &len);
+    if (clientfd < 0) {
+        printf("accept errno: %d --> %s\n", errno, strerror(errno));
+        return -1;
+    }
+
+    event_register(clientfd, EPOLLIN);
+    return 0;
 }
 
 int recv_cb(int fd) {
-	struct conn* c = &conn_list[fd];
+    if (fd < 0 || fd >= conn_pool_size) return -1;
+    struct conn* c = &conn_pool[fd];
+    int eof = 0;
 
-	/* 尽量多读：一次 EPOLLIN 对应多次 recv，写入到 (r_off + len) 之后 */
-	for (;;) {
-		int tail = c->r_off + c->read_buf.len;
-		int remain = c->read_buf.cap - tail;
-		if (remain <= 0) {
-			char *new_buf = realloc(c->read_buf.buf, c->read_buf.cap * 2);
-			if (!new_buf) return -1;
-			c->read_buf.buf = new_buf;
-			c->read_buf.cap *= 2;
-			remain = c->read_buf.cap - tail;
-		}
+    for (;;) {
+        int tail = c->r_off + c->read_buf.len;
+        int remain = c->read_buf.cap - tail;
+        if (remain <= 0) {
+            char *new_buf = realloc(c->read_buf.buf, c->read_buf.cap * 2);
+            if (!new_buf) return -1;
+            c->read_buf.buf = new_buf;
+            c->read_buf.cap *= 2;
+            remain = c->read_buf.cap - tail;
+        }
 
-		int n = recv(fd, c->read_buf.buf + tail, remain, 0);
-		if (n < 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-				break;
-			dynbuf_free(&c->read_buf);
-			dynbuf_free(&c->write_buf);
-			close(fd);
-			epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-			return -1;
-		}
-		if (n == 0) {
-			dynbuf_free(&c->read_buf);
-			dynbuf_free(&c->write_buf);
-			close(fd);
-			epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-			return 0;
-		}
-		c->read_buf.len += n;
-	}
+        int n = recv(fd, c->read_buf.buf + tail, remain, 0);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+            conn_release(fd);
+            return -1;
+        }
+        if (n == 0) { eof = 1; break; }
+        c->read_buf.len += n;
+    }
 
 #if ENABLE_KVSTORE
-	// 🔥 确认：这里没有 dynbuf_clear(&c->write_buf)！
-	c->w_off = 0;
-	kvs_drain_resp_commands_off(&c->read_buf, &c->r_off, &c->write_buf);
-	conn_set_events(fd, c);
+    c->w_off = 0;
+    kvs_drain_resp_commands_off(&c->read_buf, &c->r_off, &c->write_buf);
+    conn_set_events(fd, c);
 #endif
-	return 0;
+
+    /* Defer close until response is sent, or close immediately if idle */
+    if (eof && c->write_buf.len == 0) {
+        conn_release(fd);
+        return -1;
+    }
+    return 0;
 }
 
 int send_cb(int fd) {
-    struct conn *c = &conn_list[fd];
-	DynBuf *wb = &c->write_buf;
+    if (fd < 0 || fd >= conn_pool_size) return -1;
+    struct conn *c = &conn_pool[fd];
+    DynBuf *wb = &c->write_buf;
 
-	while (wb->len > 0) {
-		ssize_t n = send(fd, wb->buf + c->w_off, wb->len, MSG_NOSIGNAL);
-		if (n < 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-				break;
-			dynbuf_free(&c->read_buf);
-			dynbuf_free(&c->write_buf);
-			close(fd);
-			epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-			return -1;
-		}
-		if (n == 0) break;
-		c->w_off += (int)n;
-		wb->len -= (int)n;
-	}
+    while (wb->len > 0) {
+        ssize_t n = send(fd, wb->buf + c->w_off, wb->len, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+            conn_release(fd);
+            return -1;
+        }
+        if (n == 0) break;
+        c->w_off += (int)n;
+        wb->len -= (int)n;
+    }
 
-	if (wb->len == 0) {
-		c->w_off = 0;
-		// 🔥 确认：发完所有数据后，清空 write_buf
-		dynbuf_clear(wb);
-	}
+    if (wb->len == 0) {
+        c->w_off = 0;
+        dynbuf_clear(wb);
+    }
 
 #if ENABLE_KVSTORE
-	conn_set_events(fd, c);
+    conn_set_events(fd, c);
 #endif
-	return 0;
+    return 0;
 }
 
 int r_init_server(unsigned short port) {
-	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
 
-	// 🔥 修复2：设置端口复用
-	int opt = 1;
-	setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-	// setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    int opt = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-	struct sockaddr_in servaddr;
-	servaddr.sin_family = AF_INET;
-	servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-	servaddr.sin_port = htons(port);
+    struct sockaddr_in servaddr;
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_port = htons(port);
 
-	if (-1 == bind(sockfd, (struct sockaddr*)&servaddr, sizeof(struct sockaddr))) {
-		printf("bind failed: %s\n", strerror(errno));
-		return -1;
-	}
+    if (-1 == bind(sockfd, (struct sockaddr*)&servaddr, sizeof(struct sockaddr))) {
+        printf("bind failed: %s\n", strerror(errno));
+        return -1;
+    }
 
-	listen(sockfd, 1024); // 🔥 修复3：放大 listen backlog
-	return sockfd;
+    listen(sockfd, SOMAXCONN);
+    return sockfd;
 }
 
 int reactor_start(unsigned short port, msg_handler handler) {
-	(void)handler;
+    (void)handler;
 
-	epfd = epoll_create(1024); // 🔥 修复4：放大 epoll 初始大小
+    conn_pool_size = kvs_config.maxclients;
+    conn_pool = (struct conn *)calloc((size_t)conn_pool_size, sizeof(struct conn));
+    if (!conn_pool) {
+        fprintf(stderr, "[reactor] failed to allocate conn pool for %d clients\n",
+                conn_pool_size);
+        return -1;
+    }
+    printf("[reactor] conn pool: %d slots (%zu MB)\n",
+           conn_pool_size,
+           (sizeof(struct conn) * (size_t)conn_pool_size) / (1024 * 1024));
 
-	int i = 0;
-	for (i = 0; i < MAX_PORTS; i++) {
-		int sockfd = r_init_server(port + i);
-		conn_list[sockfd].fd = sockfd;
-		conn_list[sockfd].r_action.recv_callback = accept_cb;
-		set_event(sockfd, EPOLLIN, 1);
-	}
+    epfd = epoll_create(1024);
 
-	gettimeofday(&begin, NULL);
+    int i = 0;
+    for (i = 0; i < MAX_PORTS; i++) {
+        int sockfd = r_init_server(port + i);
+        if (sockfd < 0) {
+            fprintf(stderr, "[reactor] failed to bind port %d, skipping\n", port + i);
+            continue;
+        }
+        conn_pool[sockfd].fd = sockfd;
+        conn_pool[sockfd].active = 1;
+        conn_pool[sockfd].r_action.recv_callback = accept_cb;
+        set_event(sockfd, EPOLLIN, 1);
+    }
 
-	while (1) {
-		struct epoll_event events[1024] = {0};
-		int nready = epoll_wait(epfd, events, 1024, -1);
+    gettimeofday(&begin, NULL);
 
-		int i = 0;
-		for (i = 0; i < nready; i++) {
-			int connfd = events[i].data.fd;
+    struct epoll_event events[1024];
 
-			// 🔥 修复5：处理错误事件，避免连接卡死
-			if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-				// printf("=== 连接 %d 异常关闭 ===\n", connfd);
-				dynbuf_free(&conn_list[connfd].read_buf);
-				dynbuf_free(&conn_list[connfd].write_buf);
-				close(connfd);
-				epoll_ctl(epfd, EPOLL_CTL_DEL, connfd, NULL);
-				continue;
-			}
+    while (1) {
+        int timeout_ms = block_nearest_timeout();  /* -1 in Phase 0, dynamic in Phase 7 */
+        int nready = epoll_wait(epfd, events, 1024, timeout_ms);
 
-			if (events[i].events & EPOLLIN) {
-				conn_list[connfd].r_action.recv_callback(connfd);
-			} 
+        /* Phase 7: check blocked-connection timeouts here when timeout_ms == 0
+           (i.e. epoll_wait returned due to timeout, not an event) */
 
-			if (events[i].events & EPOLLOUT) {
-				conn_list[connfd].send_callback(connfd);
-			}
-		}
-	}
+        for (i = 0; i < nready; i++) {
+            int connfd = events[i].data.fd;
+
+            if (events[i].events & (EPOLLERR | EPOLLHUP)) {
+                if (connfd >= 0 && connfd < conn_pool_size)
+                    conn_release(connfd);
+                continue;
+            }
+
+            if (connfd < 0 || connfd >= conn_pool_size)
+                continue;
+
+            struct conn *c = &conn_pool[connfd];
+            if (!c->active)
+                continue;
+
+            if (events[i].events & EPOLLIN) {
+                c->r_action.recv_callback(connfd);
+            }
+
+            if (events[i].events & EPOLLOUT) {
+                c->send_callback(connfd);
+            }
+        }
+    }
 }

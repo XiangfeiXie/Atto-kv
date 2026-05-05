@@ -16,6 +16,7 @@ static void config_default(void) {
     kvs_config.loglevel      = LOG_INFO;
     kvs_config.persist_mode  = PERSIST_AOF;
     kvs_config.network_model = NET_REACTOR;
+    kvs_config.maxclients    = 10000;
 
     kvs_config.rdma_sync_enabled = 0;
     kvs_config.rdma_role         = ROLE_MASTER;
@@ -103,6 +104,11 @@ int config_load(const char *path) {
             else if (strcasecmp(val, "error") == 0) kvs_config.loglevel = LOG_ERROR;
             else printf("[CONFIG] line %d: unknown loglevel '%s'\n", lineno, val);
 
+        } else if (strcasecmp(key, "maxclients") == 0) {
+            kvs_config.maxclients = atoi(val);
+            if (kvs_config.maxclients < 64)  kvs_config.maxclients = 64;
+            if (kvs_config.maxclients > 65536) kvs_config.maxclients = 65536;
+
         } else if (strcasecmp(key, "network") == 0) {
             if      (strcasecmp(val, "reactor")  == 0) kvs_config.network_model = NET_REACTOR;
             else if (strcasecmp(val, "proactor") == 0) kvs_config.network_model = NET_PROACTOR;
@@ -170,11 +176,12 @@ void config_print(void) {
            "========================================\n"
            "  KVStore 10.0 — Configuration\n"
            "========================================\n"
-           "  Service   : 0.0.0.0:%-5d  loglevel=%s\n"
+           "  Service   : 0.0.0.0:%-5d  loglevel=%s  maxclients=%d\n"
            "  Engine    : dict        persistence=%s\n"
            "  Network   : %s\n",
            kvs_config.port,
            lognames[kvs_config.loglevel],
+           kvs_config.maxclients,
            persist[kvs_config.persist_mode],
            netmod[kvs_config.network_model]);
 

@@ -1,6 +1,7 @@
 #ifndef __SERVER_H__
 #define __SERVER_H__
 
+#include <stdint.h>
 #include "dynbuf.h"
 
 #define ENABLE_HTTP      0
@@ -16,8 +17,14 @@ struct conn {
     int fd;
     DynBuf read_buf;
     DynBuf write_buf;
-    int r_off;         /* read buffer consumed offset (avoids memmove) */
-    int w_off;         /* write buffer sent offset (avoids memmove) */
+    int r_off;              /* read buffer consumed offset (avoids memmove) */
+    int w_off;              /* write buffer sent offset (avoids memmove) */
+    int active;             /* slot is in use (dynamic pool) */
+    uint32_t cur_events;    /* cached epoll mask (lazy MOD optimization) */
+
+    /* Phase 7 blocking command support (zero-init, unused for now) */
+    int       blocked;          /* 0=normal, 1=waiting for data */
+    long long block_until_ms;   /* absolute wake-up timestamp */
 
     RCALLBACK send_callback;
     union {

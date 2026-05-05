@@ -12,7 +12,7 @@ TOTAL=0
 #   Outer: printf '%s.' keeps \n after it
 send() {
     local result
-    result=$(echo -ne "$1\r\n" | nc -q0 $HOST $PORT 2>/dev/null; echo .)
+    result=$(echo -ne "$1\r\n" | nc -w2 $HOST $PORT 2>/dev/null; echo .)
     printf '%s.' "${result%.}"
 }
 
@@ -137,7 +137,7 @@ echo "=== Part 3: 200-element Quicklist ==="
     for i in $(seq 0 199); do
         printf "*3\r\n\$5\r\nRPUSH\r\n\$5\r\nqlist\r\n\$9\r\nitem_%04d\r\n" $i
     done
-} | nc -q0 $HOST $PORT > /dev/null 2>&1
+} | nc -w2 $HOST $PORT > /dev/null 2>&1
 
 r=$(send "*2\r\n\$4\r\nLLEN\r\n\$5\r\nqlist")
 check "LLEN qlist" $':200\r\n' "$r"

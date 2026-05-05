@@ -197,4 +197,9 @@ void kvs_skiptable_clear(kvs_skiptable_t *db);
 void *kvs_malloc(size_t size);
 void kvs_free(void *ptr);
 
+/* kvstore.c */
+KVItem* create_kvitem(char *value_str, char *expire_str);
+KVItem* create_kvitem_len(const char *value, int vlen);
+void free_kvitem(KVItem *item);
+
 #endif

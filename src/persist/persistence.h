@@ -2,6 +2,7 @@
 #define __PERSISTENCE_H__
 
 #include <stddef.h>
+#include "server.h"
 
 /* =========================================================
  * 持久化模块：AOF / RDB 异步化 + io_uring 写入 + mmap 加载
@@ -41,5 +42,12 @@ void rdb_save_async_uring(void);
 /* mmap 加载：避免逐条 fread 的系统调用开销 */
 void rdb_load_mmap(void);
 void aof_reload_mmap(void);
+
+/* RDB 二进制序列化 → DynBuf（全量同步用，纯内存，不写盘） */
+void rdb_serialize_to_buf(DynBuf *out);
+
+/* RDB 二进制反序列化 ← 内存 buffer（全量同步用）
+ * 返回加载的 key 数量，失败返回 -1 */
+int rdb_load_from_buf(const char *buf, size_t len);
 
 #endif

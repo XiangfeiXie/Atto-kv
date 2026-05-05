@@ -398,20 +398,24 @@ long long get_time_now(void){
 
 KVItem* create_kvitem(char*value_str,char*expire_str){
     if(!value_str) return NULL;
-
-    KVItem*item = (KVItem*)kvs_malloc(sizeof(KVItem));
-    memset(item,0,sizeof(KVItem));
-
-    item->len = strlen(value_str);
-    item->value = (char*)kvs_malloc(item->len + 1);
-    memcpy(item->value,value_str,item->len);
-    item->value[item->len] = 0;
-
-    item->expire = 0;
-    if(expire_str){
-        int  sec = atoi(expire_str);
-        item->expire = get_time_now() + (long long)sec*1000;
+    int vlen = (int)strlen(value_str);
+    KVItem *item = create_kvitem_len(value_str, vlen);
+    if (item && expire_str) {
+        int sec = atoi(expire_str);
+        item->expire = get_time_now() + (long long)sec * 1000;
     }
+    return item;
+}
+
+KVItem* create_kvitem_len(const char *value, int vlen) {
+    if (!value || vlen < 0) return NULL;
+    KVItem *item = (KVItem*)kvs_malloc(sizeof(KVItem));
+    memset(item, 0, sizeof(KVItem));
+    item->len = (size_t)vlen;
+    item->value = (char*)kvs_malloc((size_t)vlen + 1);
+    memcpy(item->value, value, (size_t)vlen);
+    item->value[vlen] = '\0';
+    item->expire = 0;
     return item;
 }
 

@@ -22,6 +22,7 @@
 #include "config.h"
 #include "server.h"
 #include "ebpf_incr_repl.h"
+#include "persistence.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,70 +55,7 @@ extern kvs_skiptable_t global_skiptable;
 extern int   kvs_protocol(char *msg, int len, DynBuf *write_buf);
 
 /* ========================================================== */
-/* 1. RESP SERIALIZATION (used by master in child process)    */
-/* ========================================================== */
-
-static void resp_append_bulk(DynBuf *out, const char *data, int len) {
-    char hdr[32];
-    int n = snprintf(hdr, sizeof(hdr), "$%d\r\n", len);
-    dynbuf_append(out, hdr, n);
-    dynbuf_append(out, data, len);
-    dynbuf_append(out, "\r\n", 2);
-}
-
-static void rdma_serialize_cb(const char *key, KVItem *item, void *priv) {
-    if (!key || !item) return;
-    DynBuf *out = (DynBuf *)priv;
-
-    dynbuf_append(out, "*3\r\n", 4);
-    resp_append_bulk(out, "SET", 3);
-    resp_append_bulk(out, key, (int)strlen(key));
-    resp_append_bulk(out, item->value, (int)item->len);
-}
-
-static void rdma_serialize_dataset(DynBuf *out) {
-    if      (kvs_config.engine == ENGINE_ARRAY)
-        kvs_array_scan(&global_array, rdma_serialize_cb, out);
-    else if (kvs_config.engine == ENGINE_RBTREE)
-        kvs_rbtree_scan(&global_rbtree, rdma_serialize_cb, out);
-    else if (kvs_config.engine == ENGINE_HASH)
-        kvs_hash_scan(&global_hash, rdma_serialize_cb, out);
-    else if (kvs_config.engine == ENGINE_SKIPTABLE)
-        kvs_skiptable_scan(&global_skiptable, rdma_serialize_cb, out);
-}
-
-/* ========================================================== */
-/* 2. RESP DESERIALIZATION (slave side)                       */
-/* ========================================================== */
-
-static int rdma_apply_resp_stream(const char *buf, size_t len) {
-    const char *p = buf;
-    size_t remaining = len;
-    int applied = 0;
-
-    while (remaining > 0) {
-        int cmd_len = resp_try_parse_full_cmd(p, (int)remaining);
-        if (cmd_len <= 0) {
-            if (remaining != 0)
-                printf("[RDMA-REPL] trailing %zu bytes could not be parsed\n",
-                       remaining);
-            break;
-        }
-
-        DynBuf wb;
-        dynbuf_init(&wb, BUF_INIT_CAP);
-        kvs_protocol((char *)p, cmd_len, &wb);
-        dynbuf_free(&wb);
-
-        p += cmd_len;
-        remaining -= (size_t)cmd_len;
-        applied++;
-    }
-    return applied;
-}
-
-/* ========================================================== */
-/* 3. libfabric PLUMBING                                      */
+/* 1. libfabric PLUMBING                                      */
 /* ========================================================== */
 
 #define RDMA_CHK(call, msg) do {                                    \
@@ -202,7 +140,7 @@ static int rdma_wait_eq(struct fid_eq *eq, uint32_t *event,
 }
 
 /* ==========================================================
- * 4. MASTER: fork-based fullsync session
+ * 2. MASTER: fork-based fullsync session
  *
  * Child process (after fork):
  *   - Has COW snapshot of the entire engine
@@ -284,7 +222,7 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
 
         DynBuf payload;
         dynbuf_init(&payload, 64 * 1024);
-        rdma_serialize_dataset(&payload);
+        rdb_serialize_to_buf(&payload);
 
         uint64_t p_len = (uint64_t)payload.len;
         printf("[RDMA-REPL] child: serialized %" PRIu64 " bytes, "
@@ -426,7 +364,7 @@ fail:
 }
 
 /* ========================================================== */
-/* 5. MASTER: listener thread                                 */
+/* 3. MASTER: listener thread                                 */
 /* ========================================================== */
 
 static void *rdma_master_thread(void *arg) {
@@ -524,7 +462,7 @@ int rdma_repl_master_start(void) {
 }
 
 /* ==========================================================
- * 6. SLAVE: TCP incremental recv thread
+ * 4. SLAVE: TCP incremental recv thread
  *    Reads wire frames: [uint64_t cmd_len][cmd_len bytes]
  *    cmd_len = 0 → disconnect sentinel
  * ========================================================== */
@@ -589,7 +527,7 @@ done:
 }
 
 /* ==========================================================
- * 7. SLAVE: full-sync receiver + spawn incremental thread
+ * 5. SLAVE: full-sync receiver + spawn incremental thread
  *
  * Wire protocol:
  *   1. master → slave: struct fullsync_header (16 bytes)
@@ -701,10 +639,11 @@ int rdma_repl_slave_run(void) {
         }
         if (rdma_wait_cq(cq) < 0) goto fail;
 
-        /* Clean local state and reconstruct from the RESP stream */
-        kvs_flush_all();
-        int n = rdma_apply_resp_stream(payload, (size_t)payload_len);
-        printf("[RDMA-REPL] slave: applied %d commands from full sync\n", n);
+        /* Clean local state and reconstruct from RDB binary stream.
+         * rdb_load_from_buf() clears the engine internally. */
+        int n = rdb_load_from_buf(payload, (size_t)payload_len);
+        printf("[RDMA-REPL] slave: loaded %d keys from fullsync (rdb binary)\n",
+               n);
     } else {
         printf("[RDMA-REPL] slave: master is empty, nothing to apply\n");
         kvs_flush_all();

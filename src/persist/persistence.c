@@ -358,6 +358,40 @@ static void rdb_save_callback_buf(const char *key, KVItem *item, void *priv) {
     rdb_buf_put(b, &item->expire, sizeof(long long));
 }
 
+/* Same RDB binary format, but appends to a DynBuf (for fullsync). */
+static void rdb_serialize_cb_dynbuf(const char *key, KVItem *item, void *priv) {
+    if (!key || !item) return;
+    DynBuf *out = (DynBuf *)priv;
+    int klen = (int)strlen(key);
+    int vlen = (int)item->len;
+    dynbuf_append(out, (const char *)&klen, sizeof(int));
+    dynbuf_append(out, key, klen);
+    dynbuf_append(out, (const char *)&vlen, sizeof(int));
+    dynbuf_append(out, item->value, vlen);
+    dynbuf_append(out, (const char *)&item->expire, sizeof(long long));
+}
+
+void rdb_serialize_to_buf(DynBuf *out) {
+    int magic = 0x524442;
+    int version = 1;
+    int db_num = 0;
+    int key_count = 0;
+    if      (kvs_config.engine == ENGINE_ARRAY)     key_count = global_array.total;
+    else if (kvs_config.engine == ENGINE_RBTREE)    key_count = global_rbtree.total;
+    else if (kvs_config.engine == ENGINE_HASH)      key_count = global_hash.count;
+    else if (kvs_config.engine == ENGINE_SKIPTABLE) key_count = global_skiptable.skl->total;
+
+    dynbuf_append(out, (const char *)&magic,     sizeof(int));
+    dynbuf_append(out, (const char *)&version,   sizeof(int));
+    dynbuf_append(out, (const char *)&db_num,    sizeof(int));
+    dynbuf_append(out, (const char *)&key_count, sizeof(int));
+
+    if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_scan(&global_array, rdb_serialize_cb_dynbuf, out);
+    else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_scan(&global_rbtree, rdb_serialize_cb_dynbuf, out);
+    else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_scan(&global_hash, rdb_serialize_cb_dynbuf, out);
+    else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_scan(&global_skiptable, rdb_serialize_cb_dynbuf, out);
+}
+
 /* 子进程：使用 io_uring 将整个 buffer 分块写入，最后 fsync */
 static void rdb_write_uring(int fd, const char *data, size_t total) {
     const size_t CHUNK = 1 * 1024 * 1024; /* 1MB/SQE */
@@ -508,6 +542,82 @@ static const char *mread(const char *p, const char *end, void *out, size_t n) {
     return p + n;
 }
 
+/* In-memory RDB loader: parses the same binary format as rdb_load_mmap()
+ * but operates on a buffer already in memory (no file, no mmap).
+ * Used by the slave fullsync path — data arrives via RDMA and is loaded
+ * directly without any disk I/O or RESP text parsing. */
+int rdb_load_from_buf(const char *buf, size_t len) {
+    const char *p   = buf;
+    const char *end = buf + len;
+
+    int magic = 0, version = 0, db_num = 0, key_count = 0;
+    if (!(p = mread(p, end, &magic,     sizeof(int)))) return -1;
+    if (!(p = mread(p, end, &version,   sizeof(int)))) return -1;
+    if (!(p = mread(p, end, &db_num,    sizeof(int)))) return -1;
+    if (!(p = mread(p, end, &key_count, sizeof(int)))) return -1;
+
+    if (magic != 0x524442) {
+        printf("[RDB] buf load: magic mismatch (0x%x)\n", magic);
+        return -1;
+    }
+
+    if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_clear(&global_array);
+    else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_clear(&global_rbtree);
+    else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_clear(&global_hash);
+    else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_clear(&global_skiptable);
+
+    for (int i = 0; i < key_count; i++) {
+        int klen = 0, vlen = 0;
+        long long expire = 0;
+
+        if (!(p = mread(p, end, &klen, sizeof(int)))) break;
+        if (p + klen > end) break;
+
+        char key_buf[256];
+        char *key = key_buf;
+        int key_on_heap = 0;
+        if (klen >= (int)sizeof(key_buf)) {
+            key = (char *)kvs_malloc((size_t)klen + 1);
+            key_on_heap = 1;
+        }
+        memcpy(key, p, (size_t)klen);
+        key[klen] = '\0';
+        p += klen;
+
+        if (!(p = mread(p, end, &vlen, sizeof(int)))) {
+            if (key_on_heap) kvs_free(key);
+            break;
+        }
+        if (p + vlen > end) {
+            if (key_on_heap) kvs_free(key);
+            break;
+        }
+
+        KVItem *item = create_kvitem_len(p, vlen);
+        p += vlen;
+
+        if (!(p = mread(p, end, &expire, sizeof(long long)))) {
+            if (item) free_kvitem(item);
+            if (key_on_heap) kvs_free(key);
+            break;
+        }
+        if (item) item->expire = expire;
+
+        if (item) {
+            if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_set(&global_array, key, item);
+            else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_set(&global_rbtree, key, item);
+            else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_set(&global_hash, key, item);
+            else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_set(&global_skiptable, key, item);
+            free_kvitem(item);
+        }
+
+        if (key_on_heap) kvs_free(key);
+    }
+
+    printf("[RDB] buf load: %d keys, %zu bytes\n", key_count, len);
+    return key_count;
+}
+
 void rdb_load_mmap(void) {
     int fd = open(persist_path(RDB_REL), O_RDONLY);
     if (fd < 0) {
@@ -526,58 +636,10 @@ void rdb_load_mmap(void) {
         printf("[RDB] mmap failed: %s\n", strerror(errno));
         return;
     }
-    /* 提示内核顺序读 —— 预读加速 */
     madvise(base, fsz, MADV_SEQUENTIAL);
 
-    const char *p = base;
-    const char *end = base + fsz;
+    rdb_load_from_buf(base, fsz);
 
-    int magic = 0, version = 0, db_num = 0, key_count = 0;
-    if (!(p = mread(p, end, &magic,     sizeof(int)))) goto out;
-    if (!(p = mread(p, end, &version,   sizeof(int)))) goto out;
-    if (!(p = mread(p, end, &db_num,    sizeof(int)))) goto out;
-    if (!(p = mread(p, end, &key_count, sizeof(int)))) goto out;
-
-    if (magic != 0x524442) {
-        printf("[RDB] magic mismatch\n");
-        goto out;
-    }
-
-    if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_clear(&global_array);
-    else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_clear(&global_rbtree);
-    else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_clear(&global_hash);
-    else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_clear(&global_skiptable);
-
-    for (int i = 0; i < key_count; i++) {
-        int klen = 0, vlen = 0;
-        long long expire = 0;
-        if (!(p = mread(p, end, &klen, sizeof(int)))) break;
-        if (p + klen > end) break;
-
-        char *key = (char *)kvs_malloc(klen + 1);
-        memcpy(key, p, klen); key[klen] = 0; p += klen;
-
-        if (!(p = mread(p, end, &vlen, sizeof(int)))) { kvs_free(key); break; }
-        if (p + vlen > end) { kvs_free(key); break; }
-
-        char *val = (char *)kvs_malloc(vlen + 1);
-        memcpy(val, p, vlen); val[vlen] = 0; p += vlen;
-
-        if (!(p = mread(p, end, &expire, sizeof(long long)))) { kvs_free(key); kvs_free(val); break; }
-
-        KVItem *item = create_kvitem(val, NULL);
-        if (item) item->expire = expire;
-
-        if      (kvs_config.engine == ENGINE_ARRAY)     kvs_array_set(&global_array, key, item);
-        else if (kvs_config.engine == ENGINE_RBTREE)    kvs_rbtree_set(&global_rbtree, key, item);
-        else if (kvs_config.engine == ENGINE_HASH)      kvs_hash_set(&global_hash, key, item);
-        else if (kvs_config.engine == ENGINE_SKIPTABLE) kvs_skiptable_set(&global_skiptable, key, item);
-        kvs_free(key);
-        kvs_free(val);
-    }
-
-    printf("[RDB] mmap load done: %d keys, %zu bytes\n", key_count, fsz);
-out:
     munmap(base, fsz);
 }
 

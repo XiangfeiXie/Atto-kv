@@ -343,18 +343,45 @@ static void rdb_buf_put(rdb_buf_t *b, const void *p, size_t n) {
     b->len += n;
 }
 
+#include "kv_dict.h"
+
+/* Forward declaration — quicklist flattening helper (in kv_type_list.c) */
+extern int list_flatten_to_packed(kv_entry_t *e, char **out_data, uint32_t *out_len);
+
 /* Serialize one dict entry to RDB binary format (appends to rdb_buf_t). */
 static void rdb_save_callback_buf(kv_entry_t *e, void *priv) {
     if (!e) return;
     rdb_buf_t *b = (rdb_buf_t *)priv;
     const char *key = entry_key(e);
     int klen = (int)e->key_len;
-    int vlen = (int)entry_payload_len(e);
+    int dlen;
+    const char *data_ptr;
+    char *flat_buf = NULL;
+
+    /* Quicklist LIST entries contain raw pointers — flatten to packed */
+    if (entry_type(e) == KV_TYPE_LIST &&
+        entry_encoding(e) == KV_ENCODING_QUICKLIST) {
+        uint32_t flat_len = 0;
+        if (list_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
+            dlen     = (int)flat_len;
+            data_ptr = flat_buf;
+        } else {
+            dlen     = (int)e->val_len;
+            data_ptr = e->data;  /* fallback, but pointers will be garbage */
+        }
+    } else {
+        dlen     = (int)e->val_len;
+        data_ptr = e->data;
+    }
+
     long long expire = e->expire;
     rdb_buf_put(b, &klen, sizeof(int));
     rdb_buf_put(b, key, (size_t)klen);
-    rdb_buf_put(b, &vlen, sizeof(int));
-    rdb_buf_put(b, entry_payload(e), (size_t)vlen);
+    rdb_buf_put(b, &dlen, sizeof(int));
+    rdb_buf_put(b, data_ptr, (size_t)dlen);
+
+    free(flat_buf);
+
     rdb_buf_put(b, &expire, sizeof(long long));
 }
 
@@ -364,12 +391,33 @@ static void rdb_serialize_cb_dynbuf(kv_entry_t *e, void *priv) {
     DynBuf *out = (DynBuf *)priv;
     const char *key = entry_key(e);
     int klen = (int)e->key_len;
-    int vlen = (int)entry_payload_len(e);
+    int dlen;
+    const char *data_ptr;
+    char *flat_buf = NULL;
+
+    if (entry_type(e) == KV_TYPE_LIST &&
+        entry_encoding(e) == KV_ENCODING_QUICKLIST) {
+        uint32_t flat_len = 0;
+        if (list_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
+            dlen     = (int)flat_len;
+            data_ptr = flat_buf;
+        } else {
+            dlen     = (int)e->val_len;
+            data_ptr = e->data;
+        }
+    } else {
+        dlen     = (int)e->val_len;
+        data_ptr = e->data;
+    }
+
     long long expire = e->expire;
     dynbuf_append(out, (const char *)&klen, sizeof(int));
     dynbuf_append(out, key, klen);
-    dynbuf_append(out, (const char *)&vlen, sizeof(int));
-    dynbuf_append(out, entry_payload(e), vlen);
+    dynbuf_append(out, (const char *)&dlen, sizeof(int));
+    dynbuf_append(out, data_ptr, dlen);
+
+    free(flat_buf);
+
     dynbuf_append(out, (const char *)&expire, sizeof(long long));
 }
 
@@ -385,7 +433,7 @@ static void dict_scan(kv_dict_t *d, void (*cb)(kv_entry_t *e, void *priv), void 
 
 void rdb_serialize_to_buf(DynBuf *out) {
     int magic = 0x524442;
-    int version = 1;
+    int version = 2;
     int db_num = 0;
     int key_count = (int)dict_count(&g_dict);
 
@@ -450,7 +498,7 @@ void rdb_save_sync(void) {
     rdb_buf_t b = {0};
 
     int magic = 0x524442;
-    int version = 1;
+    int version = 2;
     int db_num = 0;
     int key_count = (int)dict_count(&g_dict);
 
@@ -562,34 +610,24 @@ int rdb_load_from_buf(const char *buf, size_t len) {
     dict_clear(&g_dict);
 
     for (int i = 0; i < key_count; i++) {
-        int klen = 0, vlen = 0;
+        int klen = 0, dlen = 0;
         long long expire = 0;
 
         if (!(p = mread(p, end, &klen, sizeof(int)))) break;
         if (p + klen > end) break;
-        const char *ks = p;  /* key data starts here */
+        const char *ks = p;
         p += klen;
 
-        if (!(p = mread(p, end, &vlen, sizeof(int)))) break;
-        if (p + vlen > end) break;
+        if (!(p = mread(p, end, &dlen, sizeof(int)))) break;
+        if (p + dlen > end) break;
 
-        /* Build entry data: [type=STRING][encoding=RAW][value] */
-        uint32_t dlen = (uint32_t)(2 + vlen);
-        char *data = (char *)malloc((size_t)dlen);
-        data[0] = (char)KV_TYPE_STRING;
-        data[1] = (char)KV_ENCODING_RAW;
-        memcpy(data + 2, p, (size_t)vlen);
-        p += vlen;
-
-        if (!(p = mread(p, end, &expire, sizeof(long long)))) {
-            free(data);
-            break;
-        }
-
+        /* data[] already includes type + encoding + payload */
         uint64_t h = kv_hash((const uint8_t *)ks, (uint32_t)klen);
-        kv_entry_t *e = dict_add(&g_dict, ks, (uint32_t)klen, data, dlen, h);
+        kv_entry_t *e = dict_add(&g_dict, ks, (uint32_t)klen, p, (uint32_t)dlen, h);
+        p += dlen;
+
+        if (!(p = mread(p, end, &expire, sizeof(long long)))) break;
         if (e && expire) e->expire = expire;
-        free(data);
     }
 
     printf("[RDB] buf load: %d keys, %zu bytes\n", key_count, len);

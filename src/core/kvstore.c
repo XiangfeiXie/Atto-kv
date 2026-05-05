@@ -1,5 +1,6 @@
 #include "kvstore.h"
 #include "kv_type_string.h"
+#include "kv_type_list.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,6 +89,14 @@ int kvs_dispatch(kvs_token_t *tokens, int argc,
     }
 
     if (TOKEN_EQ(cmd, "FLUSHALL")) {
+        /* Clean up LIST quicklist nodes before clearing */
+        kv_iter_t *it = dict_iter_new(&g_dict, 1);
+        if (it) {
+            kv_entry_t *e;
+            while ((e = dict_iter_next(it)) != NULL)
+                list_cleanup_entry(e);
+            dict_iter_free(it);
+        }
         dict_clear(&g_dict);
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
@@ -134,6 +143,10 @@ int kvs_dispatch(kvs_token_t *tokens, int argc,
             string_cmd(cmd, entry, tokens + 1, argc - 1,
                        wb, msg_raw, msg_len);
             break;
+        case KV_TYPE_LIST:
+            list_cmd(cmd, entry, tokens + 1, argc - 1,
+                     wb, msg_raw, msg_len);
+            break;
         default:
             dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
             return -1;
@@ -145,6 +158,12 @@ int kvs_dispatch(kvs_token_t *tokens, int argc,
             TOKEN_EQ(cmd, "EXIST") || TOKEN_EQ(cmd, "EXPIRE")) {
             string_cmd(cmd, NULL, tokens + 1, argc - 1,
                        wb, msg_raw, msg_len);
+        } else if (TOKEN_EQ(cmd, "LPUSH") || TOKEN_EQ(cmd, "RPUSH") ||
+                   TOKEN_EQ(cmd, "LPOP")  || TOKEN_EQ(cmd, "RPOP") ||
+                   TOKEN_EQ(cmd, "LLEN")  || TOKEN_EQ(cmd, "LRANGE") ||
+                   TOKEN_EQ(cmd, "LINDEX")) {
+            list_cmd(cmd, NULL, tokens + 1, argc - 1,
+                     wb, msg_raw, msg_len);
         } else {
             dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
             return -1;
@@ -152,7 +171,10 @@ int kvs_dispatch(kvs_token_t *tokens, int argc,
     }
 
     /* ── Write-command post-processing (AOF + eBPF) ── */
-    if (string_is_write_cmd(cmd)) {
+    if (TOKEN_EQ(cmd, "SET")   || TOKEN_EQ(cmd, "DEL")  ||
+        TOKEN_EQ(cmd, "MOD")   || TOKEN_EQ(cmd, "LPUSH") ||
+        TOKEN_EQ(cmd, "RPUSH") || TOKEN_EQ(cmd, "LPOP")  ||
+        TOKEN_EQ(cmd, "RPOP")) {
         const char *resp = wb->buf + pre_len;
         int rlen = wb->len - pre_len;
         int ok = (rlen > 0 && resp[0] != '-' &&
@@ -178,6 +200,14 @@ void dest_kvengine(void) {
 }
 
 void kvs_flush_all(void) {
+    /* Clean up LIST quicklist nodes before dict_clear frees entries */
+    kv_iter_t *it = dict_iter_new(&g_dict, 1);
+    if (it) {
+        kv_entry_t *e;
+        while ((e = dict_iter_next(it)) != NULL)
+            list_cleanup_entry(e);
+        dict_iter_free(it);
+    }
     dict_clear(&g_dict);
     mallctl("arenas.purge", NULL, NULL, NULL, 0);
 }

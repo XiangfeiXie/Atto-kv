@@ -43,6 +43,7 @@ set(ENGINE_SRCS
 
 set(TYPE_SRCS
     src/type/kv_type_string.c
+    src/type/kv_type_list.c
 )
 
 set(NET_SRCS

@@ -116,3 +116,65 @@ src/
 ```
 
 Each module has a single, well-defined responsibility. Zero behavioral changes — all functional regression tests pass.
+
+---
+
+## 2026-05-05 — Phase 3: LIST Type Implementation (Packed + Quicklist Dual Encoding)
+
+### Overview
+
+Implemented the LIST type — a double-ended sequence of strings — with dual encoding: inline packed arrays for small lists and a linked list of packed nodes (quicklist) for large lists. This is the first collection type beyond STRING, enabling message queue use cases.
+
+### New files
+
+- `src/type/kv_type_list.h` — LIST type interface: `list_cmd()`, `list_cleanup_entry()`, `list_flatten_to_packed()`
+- `src/type/kv_type_list.c` — ~1000 lines: packed encoding, quicklist node management, quicklist header, conversion, LRANGE response, command dispatch
+
+### Design
+
+**Dual encoding:**
+- **Packed (KV_ENCODING_PACKED)**: Inline array in entry data[], format: `[count:4][elem1_len:4][elem1_data...]...`. Used for lists ≤ 128 elements and ≤ 4096 bytes. Single memmove for front insertions.
+- **Quicklist (KV_ENCODING_QUICKLIST)**: Linked list of packed nodes. Entry data[] stores a 30-byte header: `[type:1][encoding:1][total_count:4][node_max:4][head:8][tail:8][node_count:4]`. Node pointers stored as uint64_t raw addresses in data[], safe across realloc because realloc copies byte values. Node capacity: 64 elements or 4096 bytes per node.
+- **Automatic conversion**: Exceeding 128 elements or 4096 bytes triggers `list_convert_to_quicklist()`, which saves all elements to temporary buffers, shrinks the entry to QL_HEADER_SIZE (30 bytes), and rebuilds as quicklist nodes.
+
+**Commands implemented:**
+- LPUSH / RPUSH — prepend/append with auto-encoding conversion
+- LPOP / RPOP — single-element mode returns bulk string, count mode returns array
+- LLEN — list length (0 for non-existent key, Redis-compatible)
+- LRANGE — range query with negative index support
+- LINDEX — single element lookup
+- DEL / EXIST — key lifecycle ops (type-agnostic, dispatched by entry type)
+
+**Persistence:**
+- `list_cleanup_entry()` — frees quicklist nodes before dict_delete/dict_clear
+- `list_flatten_to_packed()` — serializes quicklist to packed format for RDB save (avoids storing raw pointers)
+- RDB version bumped from 1 to 2: now saves full data[] including type+encoding bytes, enabling multi-type persistence
+
+**Key invariants maintained:**
+- Single malloc per entry (dict layout preserved for both encodings)
+- Raw pointer fixup after realloc in ql_node_push_left/right (neighbor prev/next)
+- pk_pop_front/back copy element data to caller buffer before memmove (zero-copy pointer would be invalidated)
+- Conversion saves all elements to malloc'd buffers before dict_resize_entry (memmove during shrink corrupts in-situ data)
+
+### Modified files
+
+- `src/core/kvstore.c` — Added LIST dispatch routing (`case KV_TYPE_LIST`), LIST commands in new-key routing (LPUSH/RPUSH/LPOP/RPOP/LLEN/LRANGE/LINDEX), FLUSHALL iterates to call `list_cleanup_entry()`, replaced `string_is_write_cmd()` with inline TOKEN_EQ checks
+- `src/persist/persistence.c` — RDB save/load now handles both types via full data[] serialization, quicklist entries flattened before save, bumped RDB version
+- `CMakeLists.txt` — Added `src/type/kv_type_list.c` to TYPE_SRCS
+
+### Bugs fixed during implementation
+
+- **QL_HEADER_SIZE=26 corrected to 30**: Header fields total 30 bytes (type+encoding+count+node_max+head+tail+node_count). With 26, node_count overlapped with key position after dict_resize_entry, corrupting lookups.
+- **Dangling first pointer after node realloc**: In construction loop, `ql_node_push_right` may realloc the node, invalidating `first`. Fixed by reassigning `first = last` when `!last->prev`.
+- **Neighbor pointers not updated after realloc**: `ql_node_push_left/right` now fix up `nn->prev->next` and `nn->next->prev` after realloc.
+- **pk_pop_front use-after-free**: Zero-copy pointer to element data became invalid after memmove. Fixed by copying data to caller buffer before memmove.
+- **LPOP/RPOP return format**: Single-element pop now returns bulk string; only multi-element (count argument) returns array (Redis-compatible).
+
+### Verified (49/49 tests pass)
+
+- STRING regression: SET/GET/DEL/EXIST/ECHO/PING (no regressions)
+- Small packed LIST: RPUSH/LPUSH/LPOP/RPOP/LLEN/LRANGE/LINDEX on inline lists
+- 200-element quicklist: automatic conversion, correct elements at all positions, LPOP/RPOP correctness
+- Type safety: SET on LIST key returns error, EXIST on LIST key works correctly
+- AOF persistence: STRING + LIST data survives restart correctly
+- DEL/LLEN on deleted keys: correct behavior (LLEN returns 0 for non-existent)

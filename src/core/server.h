@@ -16,17 +16,10 @@ typedef struct {
     int cap;        // 总容量
 } DynBuf;
 
-// ==================== 动态缓冲区工具函数声明（仅声明，不实现） ====================
-// 初始化动态缓冲区（init_cap：初始容量，建议4096）
+// ==================== 动态缓冲区工具函数声明 ====================
 void dynbuf_init(DynBuf *db, int init_cap);
-
-// 向动态缓冲区追加数据（自动扩容，返回0成功，-1失败）
-int dynbuf_append(DynBuf *db, const char *data, int len);
-
-// 清空动态缓冲区（不释放内存，仅重置长度）
+int  dynbuf_append(DynBuf *db, const char *data, int len);
 void dynbuf_clear(DynBuf *db);
-
-// 释放动态缓冲区内存（彻底清空）
 void dynbuf_free(DynBuf *db);
 // ==================================================================================
 
@@ -36,11 +29,11 @@ typedef int (*RCALLBACK)(int fd);
 // 协议处理回调（统一接口，适配io_uring/Reactor/协程）
 typedef int (*msg_handler)(char *msg, int len, DynBuf *write_buf);
 
-// 连接结构体（无冗余，无错误）
+// 连接结构体
 struct conn {
 	int fd;
-	DynBuf read_buf;   // 动态读缓冲区（自带len，无需额外rlength）
-	DynBuf write_buf;  // 动态写缓冲区（自带len，无需额外wlength）
+	DynBuf read_buf;   // 动态读缓冲区
+	DynBuf write_buf;  // 动态写缓冲区
 	int r_off;         // 读缓冲已消费偏移（避免 memmove）
 	int w_off;         // 写缓冲已发送偏移（避免 memmove）
 
@@ -54,16 +47,15 @@ struct conn {
 };
 
 #if ENABLE_KVSTORE
-// KV核心协议接口（正确声明）
+// KV核心协议接口
 int kvs_protocol(char *msg, int len, DynBuf *write_buf);
-int resp_try_parse_full_cmd(const char *buf, int buflen);
+
 /* 网络层读缓冲初始大小（pipeline 批处理） */
 #ifndef KVS_NET_BUF_INIT
 #define KVS_NET_BUF_INIT 65536
 #endif
 
 /* 偏移指针版本：rb + r_off 表示有效数据起点，内部不做 memmove */
-int kvs_drain_resp_commands_ex_off(DynBuf *rb, int *r_off, DynBuf *wb, msg_handler h);
 int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb);
 #endif
 

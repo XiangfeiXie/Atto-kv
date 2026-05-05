@@ -42,10 +42,55 @@ extern int reactor_start(unsigned short port, msg_handler handler);
 extern int proactor_start(unsigned short port, msg_handler handler);
 extern int ntyco_start(unsigned short port, msg_handler handler);
 long long get_time_now(void);
-int resp_try_parse_full_cmd(const char *buf, int buflen);
+
+// ==================== Zero-copy token slice ====================
+// Points directly into the read buffer — no allocation, no copy.
+typedef struct {
+    const char *ptr;   // pointer into original RESP buffer
+    int         len;   // argument length in bytes
+} kvs_token_t;
+
+// Length-preferred comparison: checks len first, then memcmp.
+// Works on non-null-terminated slices.
+#define TOKEN_EQ(t, literal) \
+    ((t).len == (int)(sizeof(literal)-1) && memcmp((t).ptr, literal, sizeof(literal)-1) == 0)
+
+// Single-pass RESP parser: validates wire format AND extracts token slices.
+// Returns: >0 = total command length, 0 = incomplete, -1 = protocol error.
+// On success, tokens[0..*out_argc-1] point into buf (zero allocation).
+int resp_parse_slices(const char *buf, int buflen,
+                      kvs_token_t *tokens, int max_tokens,
+                      int *out_argc);
+
+// Command dispatch on pre-parsed token slices.
+// msg_raw/msg_len are the original RESP bytes (for AOF persistence & eBPF probe).
+int kvs_dispatch(kvs_token_t *tokens, int argc,
+                 const char *msg_raw, int msg_len,
+                 DynBuf *wb);
+
+// Legacy entry point kept for AOF replay compatibility.
+// Internally uses resp_parse_slices + kvs_dispatch (zero-copy).
+int kvs_protocol(char *msg, int length, DynBuf *write_buf);
+
 void kvs_flush_all();
-bool resp_unpack(const char *data, int len, char **out_commands);
-void free_tokens(char **tokens, int count);
+
+// Fast inline: append data with precomputed length (no strlen call).
+static inline int dynbuf_cat(DynBuf *db, const char *data, int len)
+{
+    if (!db || !data || len <= 0) return -1;
+    if (db->len + len > db->cap) {
+        int new_cap = db->cap > 0 ? db->cap : 16;
+        while (new_cap < db->len + len) new_cap *= 2;
+        char *nb = (char *)realloc(db->buf, (size_t)new_cap);
+        if (!nb) return -1;
+        db->buf = nb;
+        db->cap = new_cap;
+    }
+    memcpy(db->buf + db->len, data, (size_t)len);
+    db->len += len;
+    return 0;
+}
+
 
 //value结构体负责存储值
 typedef struct {
@@ -184,7 +229,6 @@ int kvs_skiptable_mod(kvs_skiptable_t *inst, const char *key, const KVItem *item
 int kvs_skiptable_exist(kvs_skiptable_t *inst, const char *key);
 void kvs_skiptable_scan(kvs_skiptable_t *db, kv_scan_cb cb, void *priv);
 void kvs_skiptable_clear(kvs_skiptable_t *db);
-
 
 
 

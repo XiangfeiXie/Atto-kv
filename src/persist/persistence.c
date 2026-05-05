@@ -662,16 +662,17 @@ void aof_reload_mmap(void) {
     DynBuf wb;
     dynbuf_init(&wb, BUF_INIT_CAP);
 
+    kvs_token_t tokens[KVS_MAX_TOKENS];
+
     while (remaining > 0) {
-        int cmd_len = resp_try_parse_full_cmd(p, remaining);
+        int argc = 0;
+        int cmd_len = resp_parse_slices(p, (int)remaining,
+                                        tokens, KVS_MAX_TOKENS, &argc);
         if (cmd_len <= 0) break;
-        /* 解析时 kvs_protocol 需要可写（strtok 等），这里拷贝一份小 buffer */
-        char *cmd = (char *)malloc(cmd_len);
-        if (!cmd) break;
-        memcpy(cmd, p, cmd_len);
+
         dynbuf_clear(&wb);
-        kvs_protocol(cmd, cmd_len, &wb);
-        free(cmd);
+        /* 零拷贝：直接传递 mmap 指针和 token slice，无需 malloc+memcpy */
+        kvs_dispatch(tokens, argc, p, cmd_len, &wb);
 
         p += cmd_len;
         remaining -= cmd_len;

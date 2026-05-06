@@ -262,7 +262,9 @@ void kvs_flush_all(void) {
         dict_iter_free(it);
     }
     dict_clear(&g_dict);
+#ifdef USE_JEMALLOC
     mallctl("arenas.purge", NULL, NULL, NULL, 0);
+#endif
 }
 
 void engine_reload(void) {

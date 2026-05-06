@@ -51,5 +51,6 @@ void    free_kvitem(KVItem *item);
 
 /* ── Global dict ── */
 extern kv_dict_t g_dict;
+extern int g_in_reload;   /* 1 during AOF/RDB reload — suppress AOF append + eBPF */
 
 #endif

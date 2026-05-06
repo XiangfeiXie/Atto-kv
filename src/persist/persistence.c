@@ -437,6 +437,9 @@ void rdb_serialize_to_buf(DynBuf *out) {
     int db_num = 0;
     int key_count = (int)dict_count(&g_dict);
 
+    /* Reserve: header (16) + per-entry estimate (key + value + overhead ~= 256) */
+    dynbuf_reserve(out, 16 + key_count * 256);
+
     dynbuf_append(out, (const char *)&magic,     sizeof(int));
     dynbuf_append(out, (const char *)&version,   sizeof(int));
     dynbuf_append(out, (const char *)&db_num,    sizeof(int));
@@ -673,6 +676,8 @@ void aof_reload_mmap(void) {
 
     printf("[AOF] mmap load start, size=%zu\n", fsz);
 
+    g_in_reload = 1;
+
     const char *p = base;
     long remaining = (long)fsz;
     DynBuf wb;
@@ -696,5 +701,6 @@ void aof_reload_mmap(void) {
 
     dynbuf_free(&wb);
     munmap(base, fsz);
+    g_in_reload = 0;
     printf("[AOF] mmap load finished\n");
 }

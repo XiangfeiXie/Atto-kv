@@ -34,6 +34,7 @@ enum {
     KV_ENCODING_QUICKLIST = 2, /* LIST: linked ziplist nodes      */
     KV_ENCODING_DICT     = 3,  /* SET/HASH: nested dict           */
     KV_ENCODING_SKIPLIST = 4,  /* ZSET: dict + skiplist dual idx  */
+    KV_ENCODING_INT      = 5,  /* STRING: inline int64_t           */
 };
 
 /* --- Single heap allocation entry --- */
@@ -89,6 +90,11 @@ void     dict_clear(kv_dict_t *d);
 kv_entry_t *dict_find(kv_dict_t *d, const char *key, uint32_t key_len, uint64_t hash);
 kv_entry_t *dict_add(kv_dict_t *d, const char *key, uint32_t key_len,
                      const char *data, uint32_t data_len, uint64_t hash);
+/* Direct add: builds entry from raw components (no intermediate data buffer) */
+kv_entry_t *dict_add_raw(kv_dict_t *d, const char *key, uint32_t key_len,
+                         uint8_t type, uint8_t enc,
+                         const char *payload, uint32_t payload_len,
+                         uint64_t hash);
 int         dict_delete(kv_dict_t *d, const char *key, uint32_t key_len, uint64_t hash);
 
 /* --- In-place entry resize (for packed encodings that grow) --- */

@@ -474,12 +474,16 @@ static kv_entry_t *list_convert_to_quicklist(kv_entry_t *e) {
         return NULL;
     }
 
-    for (uint32_t i = 0; i < old_count; i++) {
-        int elen;
-        const char *edata = pk_elem_get(e->data + 2, pk_len, i, &elen);
-        saved_lens[i]  = elen;
-        saved_elems[i] = (char *)malloc((size_t)elen);
-        if (saved_elems[i]) memcpy(saved_elems[i], edata, (size_t)elen);
+    {
+        const char *p = e->data + 6;  /* skip type:1 + encoding:1 + count:4 */
+        for (uint32_t i = 0; i < old_count; i++) {
+            uint32_t elen = pk_read_u32(p);
+            const char *edata = p + 4;
+            saved_lens[i]  = (int)elen;
+            saved_elems[i] = (char *)malloc((size_t)elen);
+            if (saved_elems[i]) memcpy(saved_elems[i], edata, (size_t)elen);
+            p += 4 + elen;
+        }
     }
 
     /* Now safe to resize */

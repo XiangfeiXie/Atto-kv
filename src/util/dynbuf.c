@@ -9,6 +9,18 @@ void dynbuf_init(DynBuf *db, int init_cap) {
     db->cap = init_cap;
 }
 
+int dynbuf_reserve(DynBuf *db, int total_cap) {
+    if (!db || total_cap <= 0) return -1;
+    if (total_cap <= db->cap) return 0;
+    int new_cap = db->cap > 0 ? db->cap : 16;
+    while (new_cap < total_cap) new_cap *= 2;
+    char *nb = (char *)realloc(db->buf, (size_t)new_cap);
+    if (!nb) return -1;
+    db->buf = nb;
+    db->cap = new_cap;
+    return 0;
+}
+
 int dynbuf_append(DynBuf *db, const char *data, int len) {
     if (!db || !data || len <= 0) return -1;
     if (db->len + len > db->cap) {

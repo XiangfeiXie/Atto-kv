@@ -15,6 +15,7 @@
 
 /* ==================== Global dict (single storage engine) ==================== */
 kv_dict_t g_dict;
+int g_in_reload = 0;    /* set by persistence layer during AOF/RDB reload */
 
 /* ==================== Utility ==================== */
 
@@ -131,8 +132,10 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         }
         dict_clear(&g_dict);
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-        if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
-        kvs_rdma_incr_probe(msg_raw, msg_len);
+        if (!g_in_reload) {
+            if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
+            kvs_rdma_incr_probe(msg_raw, msg_len);
+        }
         return DISPATCH_OK;
     }
 
@@ -160,8 +163,10 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         }
         entry->expire = get_time_now() + token_to_ll(tokens[2]) * 1000;
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-        if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
-        kvs_rdma_incr_probe(msg_raw, msg_len);
+        if (!g_in_reload) {
+            if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
+            kvs_rdma_incr_probe(msg_raw, msg_len);
+        }
         return DISPATCH_OK;
     }
 
@@ -217,7 +222,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         int rlen = wb->len - pre_len;
         int ok = (rlen > 0 && resp[0] != '-' &&
                   !(rlen >= 5 && memcmp(resp, "$-1\r\n", 5) == 0));
-        if (ok) {
+        if (ok && !g_in_reload) {
             if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
             kvs_rdma_incr_probe(msg_raw, msg_len);
         }

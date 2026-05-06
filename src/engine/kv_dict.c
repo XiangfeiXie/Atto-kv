@@ -188,8 +188,8 @@ static int dict_maybe_expand(kv_dict_t *d) {
     /* Lazy initialise */
     if (size == 0) return ht_alloc(&d->ht[0], DICT_INIT_SIZE);
 
-    /* Expand when load factor > 2 and haven't hit max */
-    if (size < DICT_MAX_SIZE && used > size * 2) {
+    /* Expand when load factor > 1 and haven't hit max */
+    if (size < DICT_MAX_SIZE && used > size) {
         uint32_t new_size = next_pow2(used * 2);
         if (new_size > DICT_MAX_SIZE) new_size = DICT_MAX_SIZE;
         if (new_size <= size) return 0;  /* already at max */
@@ -224,6 +224,10 @@ static int dict_maybe_shrink(kv_dict_t *d) {
 kv_entry_t *dict_find(kv_dict_t *d, const char *key, uint32_t key_len,
                       uint64_t hash)
 {
+    /* Fast return when dict is empty (no tables allocated yet) */
+    if (d->ht[0].size == 0 && d->rehash_idx < 0)
+        return NULL;
+
     /* Search ht[0] */
     if (d->ht[0].size > 0) {
         uint32_t idx = (uint32_t)(hash & d->ht[0].size_mask);
@@ -288,6 +292,45 @@ use_ht0:
     if (!e) return NULL;
 
     /* Prepend to bucket chain */
+    uint32_t idx = (uint32_t)(hash & ht->size_mask);
+    e->next = ht->buckets[idx];
+    ht->buckets[idx] = e;
+    ht->used++;
+
+    return e;
+}
+
+kv_entry_t *dict_add_raw(kv_dict_t *d, const char *key, uint32_t key_len,
+                         uint8_t type, uint8_t enc,
+                         const char *payload, uint32_t payload_len,
+                         uint64_t hash)
+{
+    dict_maybe_expand(d);
+
+    kv_ht_t *ht;
+    if (d->rehash_idx >= 0) {
+        dict_rehash_step(d, 1);
+        if (d->ht[1].size == 0) goto use_ht0;
+        ht = &d->ht[1];
+    } else {
+use_ht0:
+        if (d->ht[0].size == 0) {
+            if (ht_alloc(&d->ht[0], DICT_INIT_SIZE) < 0)
+                return NULL;
+        }
+        ht = &d->ht[0];
+    }
+
+    /* Build entry directly: [type:1][enc:1][payload][key] — one malloc */
+    uint32_t data_len = (uint32_t)(2 + payload_len);
+    kv_entry_t *e = entry_alloc(key, key_len, NULL, data_len, hash);
+    if (!e) return NULL;
+
+    e->data[0] = (char)type;
+    e->data[1] = (char)enc;
+    if (payload && payload_len)
+        memcpy(e->data + 2, payload, payload_len);
+
     uint32_t idx = (uint32_t)(hash & ht->size_mask);
     e->next = ht->buckets[idx];
     ht->buckets[idx] = e;

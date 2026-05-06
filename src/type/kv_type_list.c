@@ -1,4 +1,5 @@
 #include "kv_type_list.h"
+#include "block.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -744,9 +745,10 @@ int list_flatten_to_packed(kv_entry_t *e, char **out_data, uint32_t *out_len) {
  * LIST command dispatch
  * ===================================================================== */
 
-int list_cmd(kvs_token_t cmd, kv_entry_t *entry,
-             kvs_token_t *args, int argc, DynBuf *wb,
-             const char *msg_raw, int msg_len)
+dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
+                           kvs_token_t *args, int argc, DynBuf *wb,
+                           const char *msg_raw, int msg_len,
+                           client_t *client)
 {
     (void)msg_raw;
     (void)msg_len;
@@ -764,7 +766,7 @@ int list_cmd(kvs_token_t cmd, kv_entry_t *entry,
     /* ── LPUSH / LPOP / LLEN / LRANGE / LINDEX ── */
     case 'L':
         if (TOKEN_EQ(cmd, "LPUSH")) {
-            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return -1; }
+            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
 
             uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
             kv_entry_t *e = dict_find(&g_dict, key, (uint32_t)strlen(key), hash);
@@ -773,43 +775,43 @@ int list_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 char data[16];
                 list_build_empty(data);
                 e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, LIST_EMPTY_SIZE, hash);
-                if (!e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24); return -1; }
+                if (!e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24); return DISPATCH_ERROR; }
             } else if (entry_type(e) != KV_TYPE_LIST) {
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                return -1;
+                return DISPATCH_ERROR;
             }
 
             if (check_expiry(e, key, hash)) {
                 char data[16];
                 list_build_empty(data);
                 e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, LIST_EMPTY_SIZE, hash);
-                if (!e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24); return -1; }
+                if (!e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24); return DISPATCH_ERROR; }
             }
 
             for (int i = 1; i < argc; i++) {
                 if (list_push(&e, key, args[i].ptr, args[i].len, 1) < 0) {
                     dynbuf_cat(wb, "-ERR push failed\r\n", 18);
-                    return -1;
+                    return DISPATCH_ERROR;
                 }
             }
 
             uint32_t ll = list_len(e);
             int hl = snprintf(temp, sizeof(temp), ":%u\r\n", ll);
             dynbuf_cat(wb, temp, hl);
-            return wb->len;
+            return DISPATCH_OK;
         }
 
         if (TOKEN_EQ(cmd, "LPOP")) {
-            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return -1; }
+            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_LIST) {
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                return -1;
+                return DISPATCH_ERROR;
             }
 
             uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
             if (check_expiry(entry, key, hash)) {
                 dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
-                return -1;
+                return DISPATCH_OK;
             }
 
             int pop_count = 1;
@@ -821,22 +823,21 @@ int list_cmd(kvs_token_t cmd, kv_entry_t *entry,
 
             if (actual == 0) {
                 dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
-                return wb->len;
+                return DISPATCH_OK;
             }
 
             if (!has_count) {
-                /* Single element — return bulk string, not array */
                 char out_buf[65536];
                 int olen = 0;
                 if (list_pop(&entry, key, out_buf, &olen, 1) < 0) {
                     dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
-                    return -1;
+                    return DISPATCH_ERROR;
                 }
                 int bh = snprintf(temp, sizeof(temp), "$%d\r\n", olen);
                 dynbuf_cat(wb, temp, bh);
                 dynbuf_cat(wb, out_buf, olen);
                 dynbuf_cat(wb, "\r\n", 2);
-                return wb->len;
+                return DISPATCH_OK;
             }
 
             char hdr[32];
@@ -852,37 +853,37 @@ int list_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, out_buf, olen);
                 dynbuf_cat(wb, "\r\n", 2);
             }
-            return wb->len;
+            return DISPATCH_OK;
         }
 
         if (TOKEN_EQ(cmd, "LLEN")) {
-            if (!entry) { dynbuf_cat(wb, ":0\r\n", 4); return wb->len; }
+            if (!entry) { dynbuf_cat(wb, ":0\r\n", 4); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_LIST) {
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                return -1;
+                return DISPATCH_ERROR;
             }
             uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
             if (check_expiry(entry, key, hash)) {
                 dynbuf_cat(wb, ":0\r\n", 4);
-                return wb->len;
+                return DISPATCH_OK;
             }
             int hl = snprintf(temp, sizeof(temp), ":%u\r\n", list_len(entry));
             dynbuf_cat(wb, temp, hl);
-            return wb->len;
+            return DISPATCH_OK;
         }
 
         if (TOKEN_EQ(cmd, "LRANGE")) {
-            if (!entry) { dynbuf_cat(wb, "*0\r\n", 4); return wb->len; }
+            if (!entry) { dynbuf_cat(wb, "*0\r\n", 4); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_LIST) {
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                return -1;
+                return DISPATCH_ERROR;
             }
-            if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return -1; }
+            if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
 
             uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
             if (check_expiry(entry, key, hash)) {
                 dynbuf_cat(wb, "*0\r\n", 4);
-                return wb->len;
+                return DISPATCH_OK;
             }
 
             int start = 0, stop = 0;
@@ -890,21 +891,21 @@ int list_cmd(kvs_token_t cmd, kv_entry_t *entry,
             token_to_int(args[2], &stop);
 
             list_range_response(entry, start, stop, wb);
-            return wb->len;
+            return DISPATCH_OK;
         }
 
         if (TOKEN_EQ(cmd, "LINDEX")) {
-            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return -1; }
+            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_LIST) {
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                return -1;
+                return DISPATCH_ERROR;
             }
-            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return -1; }
+            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
 
             uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
             if (check_expiry(entry, key, hash)) {
                 dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
-                return -1;
+                return DISPATCH_OK;
             }
 
             int idx = 0;
@@ -920,14 +921,14 @@ int list_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, edata, elen);
                 dynbuf_cat(wb, "\r\n", 2);
             }
-            return wb->len;
+            return DISPATCH_OK;
         }
         break; /* 'L' */
 
     /* ── RPUSH / RPOP ── */
     case 'R':
         if (TOKEN_EQ(cmd, "RPUSH")) {
-            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return -1; }
+            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
 
             uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
             kv_entry_t *e = dict_find(&g_dict, key, (uint32_t)strlen(key), hash);
@@ -936,43 +937,43 @@ int list_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 char data[16];
                 list_build_empty(data);
                 e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, LIST_EMPTY_SIZE, hash);
-                if (!e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24); return -1; }
+                if (!e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24); return DISPATCH_ERROR; }
             } else if (entry_type(e) != KV_TYPE_LIST) {
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                return -1;
+                return DISPATCH_ERROR;
             }
 
             if (check_expiry(e, key, hash)) {
                 char data[16];
                 list_build_empty(data);
                 e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, LIST_EMPTY_SIZE, hash);
-                if (!e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24); return -1; }
+                if (!e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24); return DISPATCH_ERROR; }
             }
 
             for (int i = 1; i < argc; i++) {
                 if (list_push(&e, key, args[i].ptr, args[i].len, 0) < 0) {
                     dynbuf_cat(wb, "-ERR push failed\r\n", 18);
-                    return -1;
+                    return DISPATCH_ERROR;
                 }
             }
 
             uint32_t ll = list_len(e);
             int hl = snprintf(temp, sizeof(temp), ":%u\r\n", ll);
             dynbuf_cat(wb, temp, hl);
-            return wb->len;
+            return DISPATCH_OK;
         }
 
         if (TOKEN_EQ(cmd, "RPOP")) {
-            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return -1; }
+            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_LIST) {
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                return -1;
+                return DISPATCH_ERROR;
             }
 
             uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
             if (check_expiry(entry, key, hash)) {
                 dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
-                return -1;
+                return DISPATCH_OK;
             }
 
             int pop_count = 1;
@@ -984,22 +985,21 @@ int list_cmd(kvs_token_t cmd, kv_entry_t *entry,
 
             if (actual == 0) {
                 dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
-                return wb->len;
+                return DISPATCH_OK;
             }
 
             if (!has_count) {
-                /* Single element — return bulk string, not array */
                 char out_buf[65536];
                 int olen = 0;
                 if (list_pop(&entry, key, out_buf, &olen, 0) < 0) {
                     dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
-                    return -1;
+                    return DISPATCH_ERROR;
                 }
                 int bh = snprintf(temp, sizeof(temp), "$%d\r\n", olen);
                 dynbuf_cat(wb, temp, bh);
                 dynbuf_cat(wb, out_buf, olen);
                 dynbuf_cat(wb, "\r\n", 2);
-                return wb->len;
+                return DISPATCH_OK;
             }
 
             char hdr[32];
@@ -1015,17 +1015,99 @@ int list_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, out_buf, olen);
                 dynbuf_cat(wb, "\r\n", 2);
             }
-            return wb->len;
+            return DISPATCH_OK;
         }
         break; /* 'R' */
+
+    /* ── BLPOP / BRPOP ── */
+    case 'B':
+        if (TOKEN_EQ(cmd, "BLPOP") || TOKEN_EQ(cmd, "BRPOP")) {
+            int is_left = TOKEN_EQ(cmd, "BLPOP");
+            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+
+            int num_keys = argc - 1;
+            long long timeout_sec = 0;
+            {
+                long long v = 0;
+                kvs_token_t tt = args[argc - 1];
+                for (int i = 0; i < tt.len; i++)
+                    v = v * 10 + (tt.ptr[i] - '0');
+                timeout_sec = v;
+            }
+
+            /* Try each key in order, pop from first non-empty list */
+            for (int i = 0; i < num_keys; i++) {
+                char kb[256];
+                const char *k = key_from_token(args[i], kb, (int)sizeof(kb));
+                uint64_t hash = kv_hash((const uint8_t *)k, (uint32_t)strlen(k));
+                kv_entry_t *e = dict_find(&g_dict, k, (uint32_t)strlen(k), hash);
+
+                if (!e || entry_type(e) != KV_TYPE_LIST) continue;
+                if (check_expiry(e, k, hash)) continue;
+
+                uint32_t ll = list_len(e);
+                if (ll == 0) continue;
+
+                /* Found a non-empty list — pop and return [key, value] */
+                char out_buf[65536];
+                int olen = 0;
+                list_pop(&e, k, out_buf, &olen, is_left);
+
+                dynbuf_cat(wb, "*2\r\n", 4);
+                int kl = (int)strlen(k);
+                int hl = snprintf(temp, sizeof(temp), "$%d\r\n", kl);
+                dynbuf_cat(wb, temp, hl);
+                dynbuf_cat(wb, k, kl);
+                dynbuf_cat(wb, "\r\n", 2);
+                hl = snprintf(temp, sizeof(temp), "$%d\r\n", olen);
+                dynbuf_cat(wb, temp, hl);
+                dynbuf_cat(wb, out_buf, olen);
+                dynbuf_cat(wb, "\r\n", 2);
+                return DISPATCH_OK;
+            }
+
+            /* All keys empty — block or return nil */
+            if (!client) {
+                dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
+                return DISPATCH_OK;
+            }
+
+            client->state = CLIENT_BLOCKED;
+            client->block_reason = BLOCK_LIST;
+            client->block_key_count = 0;
+
+            for (int i = 0; i < num_keys && i < 4; i++) {
+                char kb[256];
+                const char *k = key_from_token(args[i], kb, (int)sizeof(kb));
+                int klen = (int)strlen(k);
+                if (klen < 64) {
+                    memcpy(client->block_keys[i], k, (size_t)klen + 1);
+                }
+                block_add(k, (uint32_t)klen, client);
+                client->block_key_count++;
+            }
+
+            if (timeout_sec > 0)
+                client->block_until_ms = get_time_now() + timeout_sec * 1000;
+            else
+                client->block_until_ms = 0;  /* 0 means no timeout */
+
+            if (msg_raw && msg_len > 0 && msg_len < (int)sizeof(client->block_cmd_buf)) {
+                memcpy(client->block_cmd_buf, msg_raw, msg_len);
+                client->block_cmd_len = msg_len;
+            }
+
+            return DISPATCH_BLOCKED;
+        }
+        break;
 
     /* ── DEL ── */
     case 'D':
         if (TOKEN_EQ(cmd, "DEL")) {
-            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return -1; }
+            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_LIST) {
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                return -1;
+                return DISPATCH_ERROR;
             }
             {
                 uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
@@ -1034,17 +1116,17 @@ int list_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, ret == 0 ? REP_OK : REP_NIL,
                                 ret == 0 ? REP_OK_LEN : REP_NIL_LEN);
             }
-            return wb->len;
+            return DISPATCH_OK;
         }
         break;
 
     /* ── EXIST ── */
     case 'E':
         if (TOKEN_EQ(cmd, "EXIST")) {
-            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return -1; }
+            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_LIST) {
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                return -1;
+                return DISPATCH_ERROR;
             }
             {
                 uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
@@ -1053,11 +1135,11 @@ int list_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 else
                     dynbuf_cat(wb, ":1\r\n", 4);
             }
-            return wb->len;
+            return DISPATCH_OK;
         }
         break;
     }
 
     dynbuf_cat(wb, REP_ERR_UNK, REP_ERR_UNK_LEN);
-    return -1;
+    return DISPATCH_ERROR;
 }

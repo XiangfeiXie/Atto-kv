@@ -688,7 +688,7 @@ void aof_reload_mmap(void) {
 
         dynbuf_clear(&wb);
         /* 零拷贝：直接传递 mmap 指针和 token slice，无需 malloc+memcpy */
-        kvs_dispatch(tokens, argc, p, cmd_len, &wb);
+        kvs_dispatch(tokens, argc, p, cmd_len, &wb, NULL);
 
         p += cmd_len;
         remaining -= cmd_len;

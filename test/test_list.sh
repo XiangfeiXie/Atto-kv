@@ -208,6 +208,28 @@ r=$(send "*2\r\n\$4\r\nLLEN\r\n\$5\r\nqlist")
 check "LLEN deleted qlist" $':0\r\n' "$r"
 
 echo ""
+echo "=== Part 4: Blocking Commands (BLPOP/BRPOP) ==="
+
+# BLPOP with existing data (immediate return)
+r=$(send "*3\r\n\$5\r\nRPUSH\r\n\$2\r\nb1\r\n\$1\r\na")
+r=$(send "*3\r\n\$5\r\nBLPOP\r\n\$2\r\nb1\r\n\$1\r\n0")
+check "BLPOP immediate" $'*2\r\n$2\r\nb1\r\n$1\r\na\r\n' "$r"
+
+# BRPOP with existing data
+r=$(send "*3\r\n\$5\r\nRPUSH\r\n\$2\r\nb2\r\n\$1\r\nb")
+r=$(send "*3\r\n\$5\r\nBRPOP\r\n\$2\r\nb2\r\n\$1\r\n0")
+check "BRPOP immediate" $'*2\r\n$2\r\nb2\r\n$1\r\nb\r\n' "$r"
+
+# BLPOP on empty list with short timeout returns nil
+r=$(send "*3\r\n\$5\r\nBLPOP\r\n\$2\r\nez\r\n\$1\r\n1")
+check "BLPOP empty timeout nil" $'$-1\r\n' "$r"
+
+# BLPOP multi-key: first key empty, second has data
+r=$(send "*3\r\n\$5\r\nRPUSH\r\n\$2\r\nmk\r\n\$1\r\nz")
+r=$(send "*4\r\n\$5\r\nBLPOP\r\n\$2\r\nez\r\n\$2\r\nmk\r\n\$1\r\n0")
+check "BLPOP multi-key" $'*2\r\n$2\r\nmk\r\n$1\r\nz\r\n' "$r"
+
+echo ""
 echo "============================================"
 echo "Results: $PASS/$TOTAL passed, $FAIL/$TOTAL failed"
 [ $FAIL -eq 0 ] && echo "ALL TESTS PASSED" || echo "SOME TESTS FAILED"

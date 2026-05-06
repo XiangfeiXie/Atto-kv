@@ -13,11 +13,10 @@
  * This is the default type.  All keys created via SET are STRING type.
  */
 
-/* Command dispatch for STRING-type keys (or new keys that become STRING).
-   Returns the number of bytes appended to wb, or -1 on error. */
-int string_cmd(kvs_token_t cmd, kv_entry_t *entry,
-               kvs_token_t *args, int argc, DynBuf *wb,
-               const char *msg_raw, int msg_len);
+/* Command dispatch for STRING-type keys (or new keys that become STRING). */
+dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
+                             kvs_token_t *args, int argc, DynBuf *wb,
+                             const char *msg_raw, int msg_len);
 
 /* Write-command check for AOF / eBPF probe */
 int string_is_write_cmd(kvs_token_t cmd);

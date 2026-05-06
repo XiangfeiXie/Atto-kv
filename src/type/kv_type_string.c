@@ -155,9 +155,9 @@ static int engine_exist(const char *key) {
  * Does NOT handle AOF/eBPF — that's the caller's job (kvs_dispatch).
  * ===================================================================== */
 
-int string_cmd(kvs_token_t cmd, kv_entry_t *entry,
-               kvs_token_t *args, int argc, DynBuf *wb,
-               const char *msg_raw, int msg_len)
+dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
+                             kvs_token_t *args, int argc, DynBuf *wb,
+                             const char *msg_raw, int msg_len)
 {
     (void)entry;   /* engine helpers do their own dict lookup */
     (void)msg_raw; /* AOF handled by kvs_dispatch */
@@ -175,7 +175,7 @@ int string_cmd(kvs_token_t cmd, kv_entry_t *entry,
 
     case 'S': /* SET */
         if (!TOKEN_EQ(cmd, "SET")) break;
-        if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return -1; }
+        if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
         {
             KVItem *it = item_create_len(args[1].ptr, args[1].len);
             if (it && argc >= 3) {
@@ -188,7 +188,7 @@ int string_cmd(kvs_token_t cmd, kv_entry_t *entry,
             else if (ret == 0) dynbuf_cat(wb, REP_OK,    REP_OK_LEN);
             else               dynbuf_cat(wb, REP_EXIST, REP_EXIST_LEN);
         }
-        return wb->len;
+        return DISPATCH_OK;
 
     case 'G': /* GET */
         if (!TOKEN_EQ(cmd, "GET")) break;
@@ -204,7 +204,7 @@ int string_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 item_free(r);
             }
         }
-        return wb->len;
+        return DISPATCH_OK;
 
     case 'D': /* DEL */
         if (!TOKEN_EQ(cmd, "DEL")) break;
@@ -212,11 +212,11 @@ int string_cmd(kvs_token_t cmd, kv_entry_t *entry,
         if (ret < 0)       dynbuf_cat(wb, REP_ERROR, REP_ERROR_LEN);
         else if (ret == 0) dynbuf_cat(wb, REP_OK,   REP_OK_LEN);
         else               dynbuf_cat(wb, REP_NIL,  REP_NIL_LEN);
-        return wb->len;
+        return DISPATCH_OK;
 
     case 'M': /* MOD */
         if (!TOKEN_EQ(cmd, "MOD")) break;
-        if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return -1; }
+        if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
         {
             KVItem *it = item_create_len(args[1].ptr, args[1].len);
             if (it && argc >= 3) {
@@ -229,17 +229,17 @@ int string_cmd(kvs_token_t cmd, kv_entry_t *entry,
             else if (ret == 0) dynbuf_cat(wb, REP_OK,   REP_OK_LEN);
             else               dynbuf_cat(wb, REP_NIL,  REP_NIL_LEN);
         }
-        return wb->len;
+        return DISPATCH_OK;
 
     case 'E': /* EXIST */
         if (!TOKEN_EQ(cmd, "EXIST")) break;
         ret = engine_exist(key);
         dynbuf_cat(wb, (ret == 0) ? REP_EXIST : REP_NIL,
                         (ret == 0) ? REP_EXIST_LEN : REP_NIL_LEN);
-        return wb->len;
+        return DISPATCH_OK;
     }
 
     /* unknown STRING sub-command */
     dynbuf_cat(wb, REP_ERR_UNK, REP_ERR_UNK_LEN);
-    return -1;
+    return DISPATCH_ERROR;
 }

@@ -28,8 +28,9 @@ extern int ntyco_start(unsigned short port, msg_handler handler);
 long long get_time_now(void);
 
 /* ── Command dispatch ── */
-int kvs_dispatch(kvs_token_t *tokens, int argc,
-                 const char *msg_raw, int msg_len, DynBuf *wb);
+dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
+                               const char *msg_raw, int msg_len,
+                               DynBuf *wb, struct conn *c);
 
 void kvs_flush_all(void);
 

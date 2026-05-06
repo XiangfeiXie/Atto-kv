@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "dynbuf.h"
+#include "client.h"
 
 #define ENABLE_HTTP      0
 #define ENABLE_WEBSOCKET 0
@@ -12,7 +13,7 @@
 typedef int (*RCALLBACK)(int fd);
 typedef int (*msg_handler)(char *msg, int len, DynBuf *write_buf);
 
-/* Per-connection state */
+/* Per-connection state (pure network I/O) */
 struct conn {
     int fd;
     DynBuf read_buf;
@@ -22,9 +23,7 @@ struct conn {
     int active;             /* slot is in use (dynamic pool) */
     uint32_t cur_events;    /* cached epoll mask (lazy MOD optimization) */
 
-    /* Phase 7 blocking command support (zero-init, unused for now) */
-    int       blocked;          /* 0=normal, 1=waiting for data */
-    long long block_until_ms;   /* absolute wake-up timestamp */
+    struct client *client;  /* application-layer session (NULL until first command) */
 
     RCALLBACK send_callback;
     union {

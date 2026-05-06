@@ -1,0 +1,192 @@
+#include "block.h"
+#include "dynbuf.h"
+#include "server.h"
+#include <stdlib.h>
+#include <string.h>
+
+#define BLOCK_TABLE_SIZE 256
+
+typedef struct block_waiter_s {
+    client_t *client;
+    struct block_waiter_s *next;
+} block_waiter_t;
+
+typedef struct block_entry_s {
+    char *key;
+    uint32_t key_len;
+    block_waiter_t *waiters;
+    struct block_entry_s *next;
+} block_entry_t;
+
+static block_entry_t *block_table[BLOCK_TABLE_SIZE];
+static block_notify_cb g_notify_cb = NULL;
+
+void block_set_notify_cb(block_notify_cb cb) { g_notify_cb = cb; }
+
+/* djb2 hash */
+static unsigned int block_hash(const char *key, uint32_t len) {
+    unsigned int h = 5381;
+    for (uint32_t i = 0; i < len; i++)
+        h = ((h << 5) + h) ^ (unsigned char)key[i];
+    return h % BLOCK_TABLE_SIZE;
+}
+
+void block_init(void) {
+    memset(block_table, 0, sizeof(block_table));
+}
+
+void block_add(const char *key, uint32_t key_len, client_t *c) {
+    if (!key || !c) return;
+
+    unsigned int idx = block_hash(key, key_len);
+    block_entry_t *e = block_table[idx];
+
+    while (e) {
+        if (e->key_len == key_len && memcmp(e->key, key, key_len) == 0)
+            break;
+        e = e->next;
+    }
+    if (!e) {
+        e = (block_entry_t *)calloc(1, sizeof(*e));
+        if (!e) return;
+        e->key = (char *)malloc(key_len + 1);
+        if (!e->key) { free(e); return; }
+        memcpy(e->key, key, key_len);
+        e->key[key_len] = '\0';
+        e->key_len = key_len;
+        e->next = block_table[idx];
+        block_table[idx] = e;
+    }
+
+    block_waiter_t *w = (block_waiter_t *)malloc(sizeof(*w));
+    if (!w) return;
+    w->client = c;
+    w->next = e->waiters;
+    e->waiters = w;
+}
+
+client_t *block_wake_one(const char *key, uint32_t key_len) {
+    if (!key) return NULL;
+
+    unsigned int idx = block_hash(key, key_len);
+    block_entry_t *e = block_table[idx];
+    while (e) {
+        if (e->key_len == key_len && memcmp(e->key, key, key_len) == 0)
+            break;
+        e = e->next;
+    }
+    if (!e || !e->waiters) return NULL;
+
+    block_waiter_t *w = e->waiters;
+    client_t *c = w->client;
+    e->waiters = w->next;
+    free(w);
+
+    /* Remove from other keys this client is waiting on */
+    if (c) {
+        for (int i = 0; i < BLOCK_TABLE_SIZE; i++) {
+            block_entry_t *be = block_table[i];
+            while (be) {
+                block_waiter_t **prev = &be->waiters;
+                block_waiter_t *bw = be->waiters;
+                while (bw) {
+                    if (bw->client == c) {
+                        *prev = bw->next;
+                        free(bw);
+                        bw = *prev;
+                    } else {
+                        prev = &bw->next;
+                        bw = bw->next;
+                    }
+                }
+                be = be->next;
+            }
+        }
+        c->block_key_count = 0;
+        c->state = CLIENT_IDLE;
+    }
+    return c;
+}
+
+void block_remove_client(client_t *c) {
+    if (!c) return;
+
+    for (int i = 0; i < BLOCK_TABLE_SIZE; i++) {
+        block_entry_t *e = block_table[i];
+        while (e) {
+            block_waiter_t **prev = &e->waiters;
+            block_waiter_t *w = e->waiters;
+            while (w) {
+                if (w->client == c) {
+                    *prev = w->next;
+                    free(w);
+                    w = *prev;
+                } else {
+                    prev = &w->next;
+                    w = w->next;
+                }
+            }
+            e = e->next;
+        }
+    }
+    c->state = CLIENT_IDLE;
+    c->block_key_count = 0;
+}
+
+void block_notify_woken(client_t *c) {
+    if (c && g_notify_cb) g_notify_cb(c);
+}
+
+/* Extern from kvstore.c */
+extern long long get_time_now(void);
+
+int block_nearest_timeout(void) {
+    long long now = get_time_now();
+    long long nearest = -1;
+
+    for (int i = 0; i < BLOCK_TABLE_SIZE; i++) {
+        for (block_entry_t *e = block_table[i]; e; e = e->next) {
+            for (block_waiter_t *w = e->waiters; w; w = w->next) {
+                client_t *c = w->client;
+                if (c && c->state == CLIENT_BLOCKED) {
+                    long long remain = c->block_until_ms - now;
+                    if (remain < 0) remain = 0;
+                    if (nearest < 0 || remain < nearest)
+                        nearest = remain;
+                }
+            }
+        }
+    }
+    return (int)nearest;
+}
+
+void block_check_timeouts(void) {
+    long long now = get_time_now();
+
+    for (int i = 0; i < BLOCK_TABLE_SIZE; i++) {
+        block_entry_t *e = block_table[i];
+        while (e) {
+            block_waiter_t **prev = &e->waiters;
+            block_waiter_t *w = e->waiters;
+            while (w) {
+                client_t *c = w->client;
+                if (c && c->state == CLIENT_BLOCKED && c->block_until_ms <= now) {
+                    /* Unlink from current key's waiter list */
+                    *prev = w->next;
+                    free(w);
+                    w = *prev;
+
+                    /* Write timeout response and clean up */
+                    dynbuf_cat(&c->conn->write_buf, "$-1\r\n", 5);
+                    /* Remove from all other keys too */
+                    block_remove_client(c);
+                    if (g_notify_cb) g_notify_cb(c);
+                } else {
+                    prev = &w->next;
+                    w = w->next;
+                }
+            }
+            e = e->next;
+        }
+    }
+}

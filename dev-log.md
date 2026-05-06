@@ -236,3 +236,113 @@ Optimized the network layer across all three I/O models (reactor, proactor, ntyc
 - Dynamic pool startup: correct slot count and memory footprint printed
 - Config parsing: maxclients honored, bounds enforced (64–65536)
 - Zero warnings, clean build
+
+---
+
+## 2026-05-06 — Phase 7: Blocking Commands (BLPOP/BRPOP)
+
+### Overview
+
+Implemented blocking pop commands (BLPOP/BRPOP) to eliminate polling for message queue consumption. This required a new application-layer client abstraction, a blocking subsystem with timeout management, and integration across both network I/O models.
+
+### New files
+
+- `src/core/client.h` — Application-layer client abstraction
+  ```c
+  typedef enum { CLIENT_IDLE = 0, CLIENT_BLOCKED = 1 } client_state_t;
+  typedef enum { BLOCK_NONE = 0, BLOCK_LIST = 1 } block_reason_t;
+  typedef struct client {
+      struct conn *conn;
+      client_state_t state;
+      block_reason_t block_reason;
+      long long      block_until_ms;
+      int            block_key_count;
+      char           block_keys[4][64];
+      char  block_cmd_buf[4096];
+      int   block_cmd_len;
+  } client_t;
+  ```
+- `src/core/block.h` — Blocking subsystem interface
+- `src/core/block.c` — ~190 lines: hash table (256 buckets, djb2), waiter linked lists, timeout scanning
+
+### Design
+
+**client_t — independently allocated, not inline in struct conn:**
+- Lazy allocation on first command via `calloc` in `kvs_dispatch`
+- Stores saved RESP bytes (`block_cmd_buf`) for command replay on wake-up
+- Supports up to 4 keys per block (multi-key BLPOP/BRPOP)
+- Freed in `conn_release` via `block_remove_client` + `free`
+
+**dispatch_result_t — three-valued return type:**
+- `DISPATCH_OK` (0), `DISPATCH_BLOCKED` (1), `DISPATCH_ERROR` (-1)
+- Replaced `int` return throughout the entire dispatch chain:
+  - `kvs_dispatch`, `list_cmd`, `string_cmd` all return `dispatch_result_t`
+  - Type handlers return `DISPATCH_BLOCKED` when a client must wait
+
+**block_table — key-indexed waiter queue:**
+- 256-bucket hash table, djb2 hash function
+- Each bucket holds `block_entry_t` → linked list of `block_waiter_t`
+- `block_add(key, client)` — register client on a key
+- `block_wake_one(key)` — pop first waiter, reset state to CLIENT_IDLE, remove from all other keys
+- `block_remove_client(client)` — clean up all registrations (disconnect/error)
+- `block_nearest_timeout()` — scan all waiters, return ms until nearest expiry (-1 if none)
+- `block_check_timeouts()` — wake all expired waiters, write `$-1\r\n` nil response
+- `block_notify_woken(client)` — invoke network-layer callback to trigger send
+
+**BLPOP/BRPOP flow:**
+1. Parse timeout from last argument
+2. Iterate all key arguments, try to pop from first non-empty list
+3. If found: write `*2\r\n$<klen>\r\n<key>\r\n$<vlen>\r\n<value>\r\n`, return `DISPATCH_OK`
+4. If all empty and no client: return `$-1\r\n` (non-blocking caller)
+5. If all empty and client: set state=CLIENT_BLOCKED, register on all keys via `block_add`, save timeout + raw RESP bytes, return `DISPATCH_BLOCKED`
+
+**Wake-up on LPUSH/RPUSH:**
+- After successful push, `kvs_dispatch` calls `block_wake_one(key)`
+- Woken client's saved command is re-parsed and re-dispatched via `block_retry_client`
+- `block_notify_woken` triggers the network layer to send the response
+
+**Network layer integration:**
+
+| Feature | Reactor | Proactor |
+|---|---|---|
+| Notify callback | `reactor_block_notify`: drain read_buf, set EPOLLOUT | `proactor_block_notify`: drain read_buf, submit send SQE |
+| Blocked conn skip recv | `conn_set_events` masks out EPOLLIN | Skip `io_uring_prep_recv` submission |
+| Bounded wait | `epoll_wait(nearest_timeout_ms)` | `io_uring_prep_timeout` SQE with `__kernel_timespec` |
+| Timeout CQE | N/A | Filtered by `fd==0 && result.event==0` |
+| conn_release | `block_remove_client` + `free(c->client)` | Same |
+
+### Modified files
+
+- `src/core/kvstore.h` — `kvs_dispatch` signature: returns `dispatch_result_t`, adds `struct conn *c`
+- `src/core/kvstore.c` — Lazy client allocation, BLPOP/BRPOP in write-command AOF list, wake-on-push call to `block_wake_one` + `block_retry_client` + `block_notify_woken`
+- `src/core/protocol.h` — Added `dispatch_result_t` enum, forward-declared `struct conn`, updated `kvs_drain_resp_commands_off` signature
+- `src/core/protocol.c` — Detects `DISPATCH_BLOCKED`, passes conn to dispatch
+- `src/core/server.h` — Added `struct client *client` pointer to `struct conn`
+- `src/type/kv_type_list.h` — `list_cmd` returns `dispatch_result_t`, adds `client_t *` parameter
+- `src/type/kv_type_list.c` — Added `#include "block.h"`, BLPOP/BRPOP handler in 'B' case with multi-key pop + blocking logic, all returns migrated to `dispatch_result_t`
+- `src/type/kv_type_string.h` — `string_cmd` returns `dispatch_result_t`
+- `src/type/kv_type_string.c` — All returns migrated to `dispatch_result_t`
+- `src/net/reactor.c` — `#include "block.h"`, notify callback + registration, blocked-conn EPOLLIN masking, `block_nearest_timeout` for `epoll_wait` timeout, `block_check_timeouts` in event loop
+- `src/net/proactor.c` — `#include "block.h"`, notify callback + registration, blocked-conn recv skip, `io_uring_prep_timeout` SQEs for bounded wait, timeout CQE filtering
+- `src/net/ntyco.c` — Updated `kvs_drain_resp_commands_off` call (NULL conn)
+- `src/persist/persistence.c` — Updated `kvs_dispatch` call (NULL conn)
+- `CMakeLists.txt` — Added `src/core/block.c` to CORE_SRCS
+- `test/test_list.sh` — Added Part 4: BLPOP immediate, BRPOP immediate, BLPOP timeout nil, BLPOP multi-key
+
+### Bugs fixed during implementation
+
+- **block_wake_one didn't reset client state**: Woken client stayed in CLIENT_BLOCKED, preventing further commands. Fixed by setting `c->state = CLIENT_IDLE` and `c->block_key_count = 0`.
+- **No notify callback after wake**: `block_retry_client` wrote response to buffer but nothing triggered `send()`. Fixed by adding `block_notify_woken()` called after `block_retry_client` in `kvs_dispatch`.
+- **Test script RESP length errors**: Multiple incorrect `$N` lengths in hand-written RESP strings (e.g., `$3` for 2-char key "k1"). Manually corrected all lengths.
+
+### Verified (53/53 tests pass)
+
+- STRING regression: SET/GET/DEL/EXIST/ECHO/PING (no regressions)
+- Small packed LIST: all RPUSH/LPUSH/LPOP/RPOP/LLEN/LRANGE/LINDEX (no regressions)
+- 200-element quicklist: all operations correct (no regressions)
+- BLPOP immediate: pops from existing list, returns `*2` with key+value
+- BRPOP immediate: pops from tail, returns `*2` with key+value
+- BLPOP timeout: returns `$-1\r\n` on empty list with short timeout
+- BLPOP multi-key: skips empty first key, pops from second key with data
+- Reactor: 53/53 tests pass
+- Proactor: 53/53 tests pass

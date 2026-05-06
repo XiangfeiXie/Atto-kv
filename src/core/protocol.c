@@ -65,13 +65,13 @@ int resp_parse_slices(const char *buf, int buflen,
 
 /* ==================== Batch drain loop ==================== */
 
-int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb);
+int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn *c);
 
 /* Forward declaration — kvs_dispatch lives in kvstore.c */
-extern int kvs_dispatch(kvs_token_t *tokens, int argc,
-                        const char *msg_raw, int msg_len, DynBuf *wb);
+extern dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
+                        const char *msg_raw, int msg_len, DynBuf *wb, struct conn *c);
 
-int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb) {
+int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn *c) {
     if (!rb || !rb->buf || !r_off || !wb)
         return -1;
 
@@ -99,10 +99,16 @@ int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb) {
         int cmd_len = resp_parse_slices(rb->buf + off, remaining,
                                         tokens, KVS_MAX_TOKENS, &argc);
         if (cmd_len > 0) {
-            kvs_dispatch(tokens, argc, rb->buf + off, cmd_len, wb);
+            dispatch_result_t r = kvs_dispatch(tokens, argc, rb->buf + off, cmd_len, wb, c);
             off += cmd_len;
             remaining -= cmd_len;
             ncmd++;
+            if (r == DISPATCH_BLOCKED) {
+                /* Client parked — stop processing further commands on this conn */
+                *r_off = off;
+                rb->len = remaining;
+                return -1;
+            }
         } else if (cmd_len == 0) {
             break;
         } else {
@@ -132,7 +138,8 @@ int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
         dynbuf_cat(write_buf, RESP_ERR_INV, RESP_ERR_INV_LEN);
         return -1;
     }
-    return kvs_dispatch(tokens, argc, msg, length, write_buf);
+    dispatch_result_t r = kvs_dispatch(tokens, argc, msg, length, write_buf, NULL);
+    return (r == DISPATCH_OK) ? write_buf->len : -1;
 }
 
 int kvs_protocol_batch(char *msg, int len, DynBuf *write_buf) {
@@ -141,7 +148,7 @@ int kvs_protocol_batch(char *msg, int len, DynBuf *write_buf) {
     dynbuf_init(&read_buf, BUF_INIT_CAP);
     dynbuf_append(&read_buf, msg, len);
     dynbuf_clear(write_buf);
-    kvs_drain_resp_commands_off(&read_buf, &read_offset, write_buf);
+    kvs_drain_resp_commands_off(&read_buf, &read_offset, write_buf, NULL);
     dynbuf_free(&read_buf);
     return write_buf->len;
 }

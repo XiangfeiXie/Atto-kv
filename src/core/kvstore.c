@@ -11,6 +11,7 @@
 
 #include "rdma_repl.h"
 #include "persistence.h"
+#include "block.h"
 
 /* ==================== Global dict (single storage engine) ==================== */
 kv_dict_t g_dict;
@@ -51,22 +52,54 @@ void kvs_rdma_incr_probe(const char *msg, int length) {
     (void)msg; (void)length;
 }
 
+/* ── Parse a token as long long ── */
+static long long token_to_ll(kvs_token_t t) {
+    long long v = 0;
+    for (int i = 0; i < t.len; i++)
+        v = v * 10 + (t.ptr[i] - '0');
+    return v;
+}
+
+/* ── Retry a blocked client's saved command ── */
+static void block_retry_client(client_t *wc) {
+    if (!wc || !wc->block_cmd_len) return;
+
+    int argc2 = 0;
+    kvs_token_t tokens2[KVS_MAX_TOKENS];
+    int consumed = resp_parse_slices(wc->block_cmd_buf, wc->block_cmd_len,
+                                     tokens2, KVS_MAX_TOKENS, &argc2);
+    if (consumed <= 0) return;
+
+    /* Re-dispatch into the woken client's write buffer */
+    dispatch_result_t rr = kvs_dispatch(tokens2, argc2,
+                                        wc->block_cmd_buf, consumed,
+                                        &wc->conn->write_buf, wc->conn);
+    (void)rr;
+}
+
 /* ==================== Command dispatch ==================== */
 
-int kvs_dispatch(kvs_token_t *tokens, int argc,
-                 const char *msg_raw, int msg_len,
-                 DynBuf *wb)
+dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
+                               const char *msg_raw, int msg_len,
+                               DynBuf *wb, struct conn *c)
 {
     if (tokens == NULL || argc <= 0 || wb == NULL)
-        return -1;
+        return DISPATCH_ERROR;
 
     kvs_token_t cmd = tokens[0];
+
+    /* ── Lazy client allocation ── */
+    if (c && !c->client) {
+        c->client = (client_t *)calloc(1, sizeof(client_t));
+        if (c->client)
+            c->client->conn = c;
+    }
 
     /* ── Global commands (no key needed) ── */
 
     if (TOKEN_EQ(cmd, "PING")) {
         dynbuf_cat(wb, RESP_PONG, RESP_PONG_LEN);
-        return wb->len;
+        return DISPATCH_OK;
     }
 
     if (TOKEN_EQ(cmd, "ECHO")) {
@@ -79,17 +112,16 @@ int kvs_dispatch(kvs_token_t *tokens, int argc,
         } else {
             dynbuf_cat(wb, "-ERR wrong number of arguments for 'echo' command\r\n", 50);
         }
-        return wb->len;
+        return DISPATCH_OK;
     }
 
     if (TOKEN_EQ(cmd, "SAVE")) {
         rdb_save_async_uring();
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-        return wb->len;
+        return DISPATCH_OK;
     }
 
     if (TOKEN_EQ(cmd, "FLUSHALL")) {
-        /* Clean up LIST quicklist nodes before clearing */
         kv_iter_t *it = dict_iter_new(&g_dict, 1);
         if (it) {
             kv_entry_t *e;
@@ -101,13 +133,13 @@ int kvs_dispatch(kvs_token_t *tokens, int argc,
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
         kvs_rdma_incr_probe(msg_raw, msg_len);
-        return wb->len;
+        return DISPATCH_OK;
     }
 
     /* ── Key-based commands ── */
     if (argc < 2) {
         dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
-        return -1;
+        return DISPATCH_ERROR;
     }
 
     kvs_token_t key_tok = tokens[1];
@@ -120,21 +152,20 @@ int kvs_dispatch(kvs_token_t *tokens, int argc,
     if (TOKEN_EQ(cmd, "EXPIRE")) {
         if (argc < 3) {
             dynbuf_cat(wb, "-ERR wrong number of arguments for 'expire' command\r\n", 53);
-            return -1;
+            return DISPATCH_ERROR;
         }
         if (!entry) {
             dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
-            return -1;
+            return DISPATCH_OK;
         }
-        long long ms = 0;
-        for (int i = 0; i < tokens[2].len; i++)
-            ms = ms * 10 + (tokens[2].ptr[i] - '0');
-        entry->expire = get_time_now() + ms * 1000;
+        entry->expire = get_time_now() + token_to_ll(tokens[2]) * 1000;
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
         kvs_rdma_incr_probe(msg_raw, msg_len);
-        return wb->len;
+        return DISPATCH_OK;
     }
+
+    dispatch_result_t r = DISPATCH_OK;
 
     if (entry) {
         /* Key exists — dispatch by entry type */
@@ -142,14 +173,15 @@ int kvs_dispatch(kvs_token_t *tokens, int argc,
         case KV_TYPE_STRING:
             string_cmd(cmd, entry, tokens + 1, argc - 1,
                        wb, msg_raw, msg_len);
+            r = DISPATCH_OK;
             break;
         case KV_TYPE_LIST:
-            list_cmd(cmd, entry, tokens + 1, argc - 1,
-                     wb, msg_raw, msg_len);
+            r = list_cmd(cmd, entry, tokens + 1, argc - 1,
+                        wb, msg_raw, msg_len, c ? c->client : NULL);
             break;
         default:
             dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
-            return -1;
+            return DISPATCH_ERROR;
         }
     } else {
         /* New key — dispatch by command name */
@@ -158,23 +190,29 @@ int kvs_dispatch(kvs_token_t *tokens, int argc,
             TOKEN_EQ(cmd, "EXIST") || TOKEN_EQ(cmd, "EXPIRE")) {
             string_cmd(cmd, NULL, tokens + 1, argc - 1,
                        wb, msg_raw, msg_len);
+            r = DISPATCH_OK;
         } else if (TOKEN_EQ(cmd, "LPUSH") || TOKEN_EQ(cmd, "RPUSH") ||
                    TOKEN_EQ(cmd, "LPOP")  || TOKEN_EQ(cmd, "RPOP") ||
+                   TOKEN_EQ(cmd, "BLPOP") || TOKEN_EQ(cmd, "BRPOP") ||
                    TOKEN_EQ(cmd, "LLEN")  || TOKEN_EQ(cmd, "LRANGE") ||
                    TOKEN_EQ(cmd, "LINDEX")) {
-            list_cmd(cmd, NULL, tokens + 1, argc - 1,
-                     wb, msg_raw, msg_len);
+            r = list_cmd(cmd, NULL, tokens + 1, argc - 1,
+                        wb, msg_raw, msg_len, c ? c->client : NULL);
         } else {
             dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
-            return -1;
+            return DISPATCH_ERROR;
         }
     }
+
+    if (r == DISPATCH_BLOCKED)
+        return DISPATCH_BLOCKED;
 
     /* ── Write-command post-processing (AOF + eBPF) ── */
     if (TOKEN_EQ(cmd, "SET")   || TOKEN_EQ(cmd, "DEL")  ||
         TOKEN_EQ(cmd, "MOD")   || TOKEN_EQ(cmd, "LPUSH") ||
         TOKEN_EQ(cmd, "RPUSH") || TOKEN_EQ(cmd, "LPOP")  ||
-        TOKEN_EQ(cmd, "RPOP")) {
+        TOKEN_EQ(cmd, "RPOP")  || TOKEN_EQ(cmd, "BLPOP") ||
+        TOKEN_EQ(cmd, "BRPOP")) {
         const char *resp = wb->buf + pre_len;
         int rlen = wb->len - pre_len;
         int ok = (rlen > 0 && resp[0] != '-' &&
@@ -184,13 +222,24 @@ int kvs_dispatch(kvs_token_t *tokens, int argc,
             kvs_rdma_incr_probe(msg_raw, msg_len);
         }
     }
-    return wb->len;
+
+    /* ── After LPUSH/RPUSH, wake any client blocked on this key ── */
+    if (r == DISPATCH_OK && (TOKEN_EQ(cmd, "LPUSH") || TOKEN_EQ(cmd, "RPUSH"))) {
+        client_t *wc = block_wake_one(key_tok.ptr, (uint32_t)key_tok.len);
+        if (wc) {
+            block_retry_client(wc);
+            block_notify_woken(wc);
+        }
+    }
+
+    return DISPATCH_OK;
 }
 
 /* ==================== Engine lifecycle ==================== */
 
 int init_kvengine(void) {
     dict_init(&g_dict);
+    block_init();
     printf("Using unified dict engine\n");
     return 0;
 }
@@ -200,7 +249,6 @@ void dest_kvengine(void) {
 }
 
 void kvs_flush_all(void) {
-    /* Clean up LIST quicklist nodes before dict_clear frees entries */
     kv_iter_t *it = dict_iter_new(&g_dict, 1);
     if (it) {
         kv_entry_t *e;

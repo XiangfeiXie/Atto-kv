@@ -57,7 +57,7 @@ void server_reader(void *arg) {
         client->read_buf.len += ret;
 
         // 3. 协议解析（复用已验证的批量解析函数，不清空write_buf！）
-        kvs_drain_resp_commands_off(&client->read_buf, &client->r_off, &client->write_buf);
+        kvs_drain_resp_commands_off(&client->read_buf, &client->r_off, &client->write_buf, NULL);
 
         // 4. NtyCo异步send（完整处理半包发送，零拷贝）
         while (client->write_buf.len > 0) {

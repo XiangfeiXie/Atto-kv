@@ -4,6 +4,8 @@
 #include "kv_dict.h"
 #include "server.h"
 #include "kvstore.h"
+#include "protocol.h"
+#include "client.h"
 
 /* LIST type — double-ended sequence of strings.
  *
@@ -17,10 +19,12 @@
  * Quicklist node capacity: 64 elements or 4096 bytes per node.
  */
 
-/* Command dispatch for LIST-type keys (or new keys created via LPUSH/RPUSH). */
-int list_cmd(kvs_token_t cmd, kv_entry_t *entry,
-             kvs_token_t *args, int argc, DynBuf *wb,
-             const char *msg_raw, int msg_len);
+/* Command dispatch for LIST-type keys (or new keys created via LPUSH/RPUSH).
+   Returns DISPATCH_BLOCKED for BLPOP/BRPOP when all keys are empty. */
+dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
+                           kvs_token_t *args, int argc, DynBuf *wb,
+                           const char *msg_raw, int msg_len,
+                           client_t *client);
 
 /* Free quicklist nodes owned by a LIST entry (call before dict_delete/dict_clear). */
 void list_cleanup_entry(kv_entry_t *e);

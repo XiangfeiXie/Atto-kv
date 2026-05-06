@@ -13,6 +13,7 @@
 
 #include "server.h"
 #include "kvstore.h"
+#include "block.h"
 
 #define MAX_PORTS  20
 
@@ -25,21 +26,12 @@ static int          conn_pool_size = 0;
 #if ENABLE_KVSTORE
 extern int epfd;
 
-/* ── Blocked-connection timeout stub (Phase 7) ── */
-static int block_nearest_timeout(void) {
-    /* Phase 7 will scan conn_pool for the nearest block_until_ms
-       and return (block_until_ms - now_ms), clamped to >= 0.
-       Returns -1 when no connections are blocked. */
-    return -1;
-}
-
 /* ── Lazy event mask update: only epoll_ctl when mask actually changed ── */
 static void conn_set_events(int fd, struct conn *c) {
     uint32_t ev = EPOLLIN;
     if (c->write_buf.len > 0)
         ev |= EPOLLOUT;
-    /* Phase 7: blocked connections drop EPOLLIN */
-    if (c->blocked)
+    if (c->client && c->client->state == CLIENT_BLOCKED)
         ev &= ~EPOLLIN;
 
     if (ev == c->cur_events)
@@ -50,6 +42,19 @@ static void conn_set_events(int fd, struct conn *c) {
     e.events = ev;
     e.data.fd = fd;
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &e);
+}
+
+/* ── Notify callback: block subsystem calls this when a client is unblocked ── */
+static void reactor_block_notify(client_t *c) {
+    if (!c || !c->conn) return;
+    struct conn *conn = c->conn;
+    /* Drain remaining pipelined commands from the read buffer */
+    if (conn->read_buf.len > 0) {
+        conn->w_off = 0;
+        kvs_drain_resp_commands_off(&conn->read_buf, &conn->r_off,
+                                     &conn->write_buf, conn);
+    }
+    conn_set_events(conn->fd, conn);
 }
 #endif
 
@@ -106,6 +111,11 @@ int event_register(int fd, int event) {
 static void conn_release(int fd) {
     if (fd < 0 || fd >= conn_pool_size) return;
     struct conn *c = &conn_pool[fd];
+    if (c->client) {
+        block_remove_client(c->client);
+        free(c->client);
+        c->client = NULL;
+    }
     dynbuf_free(&c->read_buf);
     dynbuf_free(&c->write_buf);
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
@@ -156,7 +166,12 @@ int recv_cb(int fd) {
 
 #if ENABLE_KVSTORE
     c->w_off = 0;
-    kvs_drain_resp_commands_off(&c->read_buf, &c->r_off, &c->write_buf);
+    kvs_drain_resp_commands_off(&c->read_buf, &c->r_off, &c->write_buf, c);
+    /* If client became blocked, don't re-enable EPOLLIN */
+    if (c->client && c->client->state == CLIENT_BLOCKED) {
+        conn_set_events(fd, c);
+        return 0;
+    }
     conn_set_events(fd, c);
 #endif
 
@@ -248,14 +263,15 @@ int reactor_start(unsigned short port, msg_handler handler) {
 
     gettimeofday(&begin, NULL);
 
+    block_set_notify_cb(reactor_block_notify);
+
     struct epoll_event events[1024];
 
     while (1) {
-        int timeout_ms = block_nearest_timeout();  /* -1 in Phase 0, dynamic in Phase 7 */
+        int timeout_ms = block_nearest_timeout();
         int nready = epoll_wait(epfd, events, 1024, timeout_ms);
 
-        /* Phase 7: check blocked-connection timeouts here when timeout_ms == 0
-           (i.e. epoll_wait returned due to timeout, not an event) */
+        block_check_timeouts();
 
         for (i = 0; i < nready; i++) {
             int connfd = events[i].data.fd;

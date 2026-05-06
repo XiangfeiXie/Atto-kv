@@ -16,6 +16,15 @@ typedef struct {
 #define TOKEN_EQ(t, literal) \
     ((t).len == (int)(sizeof(literal)-1) && memcmp((t).ptr, literal, sizeof(literal)-1) == 0)
 
+/* Dispatch return codes */
+typedef enum {
+    DISPATCH_OK      = 0,   /* response written to wb */
+    DISPATCH_BLOCKED = 1,   /* client parked, don't send, don't close */
+    DISPATCH_ERROR   = -1,  /* protocol error, close connection */
+} dispatch_result_t;
+
+struct conn;
+
 /* Single-pass RESP parser: validates format + extracts (ptr,len) pairs.
    Returns bytes consumed on success, 0 if incomplete, -1 on protocol error. */
 int resp_parse_slices(const char *buf, int buflen,
@@ -23,8 +32,9 @@ int resp_parse_slices(const char *buf, int buflen,
                       int *out_argc);
 
 /* Drain RESP commands from read buffer, appending responses to write buffer.
-   Uses r_off to track consumption without memmove. Returns command count. */
-int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb);
+   c may be NULL for legacy callers that don't support blocking.
+   Returns command count, or -1 if a blocked client was encountered. */
+int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn *c);
 
 /* Legacy entry points */
 int kvs_protocol(char *msg, int length, DynBuf *write_buf);

@@ -35,6 +35,7 @@ set(CORE_SRCS
     src/core/kvstore.c
     src/core/config.c
     src/core/protocol.c
+    src/core/block.c
 )
 
 set(ENGINE_SRCS

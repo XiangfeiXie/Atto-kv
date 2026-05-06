@@ -8,6 +8,7 @@
 #include "server.h"
 #include "config.h"
 #include "protocol.h"
+#include "block.h"
 
 #define EVENT_ACCEPT    0
 #define EVENT_READ      1
@@ -17,6 +18,7 @@
 static struct conn *conn_pool = NULL;
 static int          conn_pool_size = 0;
 static msg_handler  kvs_handler;
+static struct io_uring *g_ring = NULL;
 
 struct conn_info {
     int fd;
@@ -63,10 +65,32 @@ void set_event_accept(struct io_uring *ring, int sockfd, struct sockaddr *addr, 
     memcpy(&sqe->user_data, &ci, sizeof(ci));
 }
 
+/* ── Notify callback: block subsystem calls this when a client is unblocked ── */
+static void proactor_block_notify(client_t *cl) {
+    if (!cl || !cl->conn || !g_ring) return;
+    struct conn *conn = cl->conn;
+    /* Drain remaining pipelined commands from the read buffer */
+    if (conn->read_buf.len > 0) {
+        conn->w_off = 0;
+        kvs_drain_resp_commands_off(&conn->read_buf, &conn->r_off,
+                                     &conn->write_buf, conn);
+    }
+    if (conn->write_buf.len > 0) {
+        set_event_send(g_ring, conn->fd,
+                       conn->write_buf.buf + conn->w_off,
+                       conn->write_buf.len);
+    }
+}
+
 /* ── Release a connection slot ── */
 static void conn_release(int fd) {
     if (fd < 0 || fd >= conn_pool_size) return;
     struct conn *c = &conn_pool[fd];
+    if (c->client) {
+        block_remove_client(c->client);
+        free(c->client);
+        c->client = NULL;
+    }
     dynbuf_free(&c->read_buf);
     dynbuf_free(&c->write_buf);
     close(fd);
@@ -92,6 +116,9 @@ int proactor_start(unsigned short port, msg_handler handler) {
     memset(&params, 0, sizeof(params));
     struct io_uring ring;
     io_uring_queue_init_params(ENTRIES_LENGTH, &ring, &params);
+    g_ring = &ring;
+
+    block_set_notify_cb(proactor_block_notify);
 
     struct sockaddr_in clientaddr;
     socklen_t len = sizeof(clientaddr);
@@ -102,10 +129,19 @@ int proactor_start(unsigned short port, msg_handler handler) {
         int nready = io_uring_peek_batch_cqe(&ring, cqes, 128);
 
         if (nready == 0) {
-            /* Phase 7: before submit_and_wait, check block_nearest_timeout().
-               If a timeout exists, submit an IORING_OP_TIMEOUT linked to an
-               IORING_OP_READ on a dummy fd to force wake-up at the deadline.
-               For now (Phase 0), no connections block, so infinite wait is safe. */
+            block_check_timeouts();
+            int to_ms = block_nearest_timeout();
+            if (to_ms >= 0) {
+                /* Submit a timeout SQE to bound the wait */
+                struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+                if (sqe) {
+                    struct __kernel_timespec ts;
+                    ts.tv_sec = to_ms / 1000;
+                    ts.tv_nsec = (to_ms % 1000) * 1000000L;
+                    io_uring_prep_timeout(sqe, &ts, 0, 0);
+                    sqe->user_data = 0; /* sentinel */
+                }
+            }
             int ret = io_uring_submit_and_wait(&ring, 1);
             if (ret < 0) {
                 if (ret == -EINTR)  continue;
@@ -121,6 +157,9 @@ int proactor_start(unsigned short port, msg_handler handler) {
             memcpy(&result, &cqe->user_data, sizeof(result));
             int fd = result.fd;
             int res = cqe->res;
+
+            /* Skip timeout CQEs (user_data == 0) */
+            if (fd == 0 && result.event == 0) continue;
 
             if (result.event == EVENT_ACCEPT) {
                 set_event_accept(&ring, sockfd, (struct sockaddr*)&clientaddr, &len);
@@ -154,9 +193,8 @@ int proactor_start(unsigned short port, msg_handler handler) {
                 DynBuf *wb = &c->write_buf;
 
                 if (res <= 0) {
-                    /* EOF/error with unprocessed data — flush before releasing */
                     if (rb->len > 0) {
-                        kvs_drain_resp_commands_off(rb, &c->r_off, wb);
+                        kvs_drain_resp_commands_off(rb, &c->r_off, wb, c);
                         if (wb->len > 0)
                             set_event_send(&ring, fd, wb->buf + c->w_off, wb->len);
                     }
@@ -166,13 +204,16 @@ int proactor_start(unsigned short port, msg_handler handler) {
                 }
 
                 rb->len += res;
-                kvs_drain_resp_commands_off(rb, &c->r_off, wb);
+                kvs_drain_resp_commands_off(rb, &c->r_off, wb, c);
+
+                if (c->client && c->client->state == CLIENT_BLOCKED) {
+                    if (wb->len > 0)
+                        set_event_send(&ring, fd, wb->buf + c->w_off, wb->len);
+                    continue;
+                }
 
                 if (wb->len > 0) {
                     set_event_send(&ring, fd, wb->buf + c->w_off, wb->len);
-                } else if (c->blocked) {
-                    /* Phase 7: blocked conn — don't submit recv; wait for wake-up */
-                    continue;
                 } else {
                     size_t read_pos = c->r_off + rb->len;
                     set_event_recv(&ring, fd,
@@ -210,10 +251,8 @@ int proactor_start(unsigned short port, msg_handler handler) {
                     c->w_off = 0;
                     dynbuf_clear(wb);
 
-                    if (c->blocked) {
-                        /* Phase 7: blocked conn — don't submit recv */
+                    if (c->client && c->client->state == CLIENT_BLOCKED)
                         continue;
-                    }
                     size_t read_pos = c->r_off + c->read_buf.len;
                     set_event_recv(&ring, fd,
                         c->read_buf.buf + read_pos,

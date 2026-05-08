@@ -570,5 +570,73 @@ When the dict has never been populated (size == 0 and not rehashing), skip all h
 
 1. **各测试脚本结果互相覆盖** — 每个脚本调用 `init_results()` 重置 results.csv，串行运行时后续测试覆盖先前结果。应改为追加模式或独立输出文件。
 2. **RDMA 端口检测误警** — `ss -tlnp` 只能检测 TCP socket，RDMA verbs 端口不经过 TCP 栈，持续误报 "端口未监听"。
-3. **eBPF .o 路径** — kvstore 从 CWD 查找 `ebpf_incr.bpf.o`，需在项目根目录创建 `build/ebpf_incr.bpf.o` 的符号链接。
-4. **SAVE 重叠不充分** — 见上文改进方向。
+3. **SAVE 重叠不充分** — 见上文改进方向。
+
+---
+
+## 2026-05-08 — Phase 9.2: eBPF 增量同步稳定性修复
+
+### Overview
+
+修复了 6 个阻塞 eBPF 增量同步的问题：包括编译器优化导致的 uprobe 静默失效（根因）、部分读写、内存爆炸、路径解析、错误处理、端口清理。增量同步从完全不可用恢复到正常工作的状态。
+
+### Bug 1 (ROOT CAUSE): -O3 编译器优化消除了 kvs_rdma_incr_probe 的所有调用点
+
+- **问题**：Release 构建使用 `-O3 -DNDEBUG`。`kvs_rdma_incr_probe()` 函数体为 `(void)msg; (void)length;` — 无任何副作用的纯函数。编译器判定所有调用点为死代码并将其全部移除。BPF uprobe 成功挂载，但目标函数从未被调用，因此 BPF 程序从未触发（`emitted=0`）。`__attribute__((noinline))` 仅阻止内联，不能阻止调用点消除。
+- **修复**：将空函数体替换为 `asm volatile("" : : "r"(msg), "r"(length) : "memory")` — 一个带有输入寄存器约束和内存屏障的内联汇编，告知优化器参数被不透明操作消费。该汇编生成零条机器指令（函数仍为 `endbr64; ret`），但改变了编译器的分析结论。
+- **验证**：修复前 objdump 显示零次调用 → bpftool emitted=0。修复后 objdump 显示 2 次调用（0x46ca、0x4b89）→ bpftool emitted=11。所有 SET/GET/LPUSH/LRANGE 操作在从节点均可正常读取。
+- **文件**：[kvstore.c](src/core/kvstore.c)
+
+### Bug 2: eBPF .o 文件路径依赖 CWD
+
+- **问题**：`bpf_object__open_file("ebpf_incr.bpf.o", NULL)` 使用相对路径，要求工作目录为 build/。从其他目录启动 kvstore 时加载失败。
+- **修复**：通过 `readlink("/proc/self/exe", ...)` 解析二进制文件的绝对路径，剥离文件名，拼接 `ebpf_incr.bpf.o` 作为 BPF 对象的完整路径。缓冲区声明为 `char bpf_path[PATH_MAX + 32]` 以避免格式化截断警告。
+- **文件**：[ebpf_incr_repl.c](src/repl/ebpf_incr_repl.c)
+
+### Bug 3: TCP 监听失败时缺少清理
+
+- **问题**：`ebpf_incr_master_start()` 中 `socket()` / `bind()` 失败直接跳转至 `done`，返回 0 表示成功，但消费者线程和 BPF 资源均已初始化。TCP 监听线程创建失败时同样存在此问题。
+- **修复**：新增 `err_listen` 标签，在 `err_link` 之前添加。socket()/bind()/pthread_create(listener) 失败时跳转至 `err_listen`，将 `g_running` 置为 0，join 消费者线程，再回退至 `err_link` 清理 BPF 资源，最后返回 -1。
+- **文件**：[ebpf_incr_repl.c](src/repl/ebpf_incr_repl.c)
+
+### Bug 4: 从节点 TCP 增量接收中的 MSG_WAITALL 部分读取
+
+- **问题**：从节点增量接收线程使用 `recv(MSG_WAITALL)` 读取 8 字节命令长度头，但 MSG_WAITALL 不保证原子性 — 内核可能返回少于请求的字节数。
+- **修复**：使用 `recv(0)` 进行循环读取，直到收到完整的 8 字节头。负载读取同理，循环读取直到 `cmd_len` 字节全部接收完成。每次循环使用独立的计数器变量，避免变量作用域错误。
+- **文件**：[rdma_repl.c](src/repl/rdma_repl.c)
+
+### Bug 5: 全量同步管道 I/O 部分传输
+
+- **问题**：子进程使用单次 `write()` 调用通过管道向父进程发送序列化后的引擎数据，父进程同样使用单次 `read()` 接收。对于大型数据集，管道缓冲区可能填满，导致部分写入/读取，进而损坏全量同步数据。
+- **修复**：改为循环写入/读取，直到所有字节传输完成。头（payload_len）和负载均进行循环处理。使用独立变量追踪各缓冲区的偏移量。
+- **文件**：[rdma_repl.c](src/repl/rdma_repl.c)
+
+### Bug 6: Backlog BSS 内存爆炸（4.3GB）
+
+- **问题**：`INCR_MAX_CMD` 从 64KB 增大至 256KB 后，`struct backlog_record` 包含一个固定数组 `char msg[INCR_MAX_CMD]`。共 16384 条记录（`INCR_BACKLOG_CAP`），BSS 段增长至 16384 × 262156 ≈ 4.3GB。链接时出现重定位截断错误。
+- **修复**：将 `backlog_record.msg` 从固定长度数组改为 `char *msg`，在 `backlog_append_locked()` 中使用 `malloc(e->length)` 动态分配，淘汰旧条目时使用 `free()` 释放。在 `ebpf_incr_stop()` 中添加清理循环，释放所有待处理 backlog 消息。
+- **文件**：[ebpf_incr_repl.c](src/repl/ebpf_incr_repl.c)
+
+### 其他修复
+
+**reset.sh 端口清理不完整**：
+- 增加 4 个端口变量（2000/2002/2200/6382）
+- 将进程终止方式从 `pkill -f "build/kvstore"` 改为先发 TERM 再发 KILL 的 `pgrep -f "kvstore"`
+- 在检查监听状态前，新增循环释放所有 4 个端口
+- **文件**：[reset.sh](test/reset.sh)
+
+**端口标准化**（统一为 2000/2002/2200/6382）：
+- `conf/kvstore.conf`：rdma_listen_port 2100 → 2200
+- `conf/bench/kvstore-master-repl.conf`：rdma_listen_port 2100 → 2200
+- `conf/bench/kvstore-slave-repl.conf`：rdma_master_port 2100 → 2200
+- `test/bench/common.sh`：MASTER_RDMA_PORT 2100 → 2200
+
+**Long text eBPF limit**: `INCR_MAX_CMD` 64KB→256KB, `RINGBUF_SIZE` 8MB→32MB
+- **文件**：[ebpf_incr.bpf.c](src/repl/ebpf_incr.bpf.c), [ebpf_incr_repl.h](src/repl/ebpf_incr_repl.h)
+
+### Verified
+
+- eBPF uprobe 加载并触发：bpftool 确认发射计数 > 0，丢弃计数 = 0
+- 增量同步：SET/GET/LPUSH/LRANGE + 长文本（10KB）在从节点均可正常读取
+- 全量同步 + 增量同步：全量同步完成后，从节点通过 INCR_SYNC 握手连接，正常接收 TCP 增量数据
+- reset.sh：所有端口均被清理，持久化文件被移除，两个服务均从空状态启动

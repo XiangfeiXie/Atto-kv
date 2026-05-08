@@ -221,13 +221,25 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
         printf("[RDMA-REPL] child: serialized %" PRIu64 " bytes, "
                "base_seq=%" PRIu64 "\n", p_len, base_seq);
 
-        /* Write payload_len then payload to pipe */
-        ssize_t wn;
-        wn = write(pipefd[1], &p_len, sizeof(p_len));
-        (void)wn;
+        /* Write payload_len then payload to pipe.
+         * Loop to handle partial writes on large payloads. */
+        {
+            size_t off = 0;
+            const char *src = (const char *)&p_len;
+            while (off < sizeof(p_len)) {
+                ssize_t wn = write(pipefd[1], src + off, sizeof(p_len) - off);
+                if (wn <= 0) break;
+                off += (size_t)wn;
+            }
+        }
         if (p_len > 0) {
-            wn = write(pipefd[1], payload.buf, (size_t)p_len);
-            (void)wn;
+            size_t off = 0;
+            while (off < (size_t)p_len) {
+                ssize_t wn = write(pipefd[1], payload.buf + off,
+                                   (size_t)p_len - off);
+                if (wn <= 0) break;
+                off += (size_t)wn;
+            }
         }
 
         dynbuf_free(&payload);
@@ -242,11 +254,18 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
 
     /* Read payload_len + payload from the pipe */
     uint64_t payload_len = 0;
-    ssize_t rn = read(pipefd[0], &payload_len, sizeof(payload_len));
-    if (rn != (ssize_t)sizeof(payload_len)) {
-        fprintf(stderr, "[RDMA-REPL] failed to read payload_len from pipe\n");
-        close(pipefd[0]);
-        goto wait_child;
+    {
+        size_t off = 0;
+        while (off < sizeof(payload_len)) {
+            ssize_t rn = read(pipefd[0], (char *)&payload_len + off,
+                              sizeof(payload_len) - off);
+            if (rn <= 0) {
+                fprintf(stderr, "[RDMA-REPL] failed to read payload_len from pipe\n");
+                close(pipefd[0]);
+                goto wait_child;
+            }
+            off += (size_t)rn;
+        }
     }
 
     if (payload_len > 0) {
@@ -261,16 +280,16 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
         size_t remain = (size_t)payload_len;
         char  *p      = payload_buf;
         while (remain > 0) {
-            rn = read(pipefd[0], p, remain);
-            if (rn <= 0) {
+            ssize_t nr = read(pipefd[0], p, remain);
+            if (nr <= 0) {
                 fprintf(stderr, "[RDMA-REPL] pipe read failed\n");
                 kvs_free(payload_buf);
                 payload_buf = NULL;
                 close(pipefd[0]);
                 goto wait_child;
             }
-            p      += rn;
-            remain -= (size_t)rn;
+            p      += nr;
+            remain -= (size_t)nr;
         }
     }
     close(pipefd[0]);

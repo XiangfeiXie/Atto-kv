@@ -34,7 +34,7 @@
 struct backlog_record {
     uint64_t seq;
     uint32_t length;
-    char     msg[INCR_MAX_CMD];
+    char    *msg;   /* dynamically allocated, msg[length] */
 };
 
 /* --- per-slave connection with output buffer --- */
@@ -146,6 +146,9 @@ static void backlog_append_locked(const struct incr_event *e, uint64_t seq)
 {
     size_t idx = (g_backlog_start + g_backlog_count) % INCR_BACKLOG_CAP;
     if (g_backlog_count == INCR_BACKLOG_CAP) {
+        /* Evict oldest — free its dynamically allocated msg */
+        free(g_backlog[g_backlog_start].msg);
+        g_backlog[g_backlog_start].msg = NULL;
         g_backlog_start = (g_backlog_start + 1) % INCR_BACKLOG_CAP;
     } else {
         g_backlog_count++;
@@ -153,7 +156,9 @@ static void backlog_append_locked(const struct incr_event *e, uint64_t seq)
 
     g_backlog[idx].seq    = seq;
     g_backlog[idx].length = e->length;
-    memcpy(g_backlog[idx].msg, e->msg, e->length);
+    g_backlog[idx].msg    = (char *)malloc(e->length);
+    if (g_backlog[idx].msg)
+        memcpy(g_backlog[idx].msg, e->msg, e->length);
 }
 
 /* Replay backlog records with seq >= start_seq to a single slave.
@@ -168,7 +173,7 @@ static int replay_backlog_locked(struct slave_conn *s, uint64_t start_seq)
         struct backlog_record *rec = &g_backlog[idx];
         if (rec->seq < start_seq)
             continue;
-        if (slave_buffer_append_locked(s, rec->msg, rec->length) != 0)
+        if (rec->msg && slave_buffer_append_locked(s, rec->msg, rec->length) != 0)
             return -1;
     }
     return 0;
@@ -589,6 +594,8 @@ int ebpf_incr_master_start(void)
     g_last_dropped     = 0;
     g_fullsync_status  = FULLSYNC_IDLE;
     g_fullsync_base_seq = 0;
+    for (size_t i = 0; i < INCR_BACKLOG_CAP; i++)
+        g_backlog[i].msg = NULL;
     for (int i = 0; i < INCR_MAX_SLAVES; i++) {
         g_slaves[i].fd     = -1;
         g_slaves[i].active = 0;
@@ -697,6 +704,14 @@ void ebpf_incr_stop(void)
     g_fullsync_status = FULLSYNC_IDLE;
     for (int i = 0; i < INCR_MAX_SLAVES; i++)
         slave_close_locked(&g_slaves[i]);
+    /* Free dynamically allocated backlog messages */
+    for (size_t i = 0; i < g_backlog_count; i++) {
+        size_t idx = (g_backlog_start + i) % INCR_BACKLOG_CAP;
+        free(g_backlog[idx].msg);
+        g_backlog[idx].msg = NULL;
+    }
+    g_backlog_start = 0;
+    g_backlog_count = 0;
     pthread_mutex_unlock(&g_mu);
 
     if (g_link) {

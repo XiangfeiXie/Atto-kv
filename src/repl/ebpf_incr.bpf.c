@@ -11,8 +11,8 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-#define INCR_MAX_CMD  65536
-#define RINGBUF_SIZE  (8 * 1024 * 1024)   /* 8 MB */
+#define INCR_MAX_CMD  262144               /* 256 KB — accommodates large SET values */
+#define RINGBUF_SIZE  (32 * 1024 * 1024)   /* 32 MB */
 
 struct incr_event {
 	__u64    seq;      /* global sequence number, assigned atomically in-kernel */

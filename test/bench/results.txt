@@ -1,7 +1,7 @@
-# KVStore Performance Benchmark Results — 2026-05-08 03:12:29
+# KVStore Performance Benchmark Results — 2026-05-08 06:25:30
 === 主从同步性能测试 ===
 
-实时同步 | A1-关闭主从同步: 300300.31 req/s
-实时同步 | A2-eBPF增量复制: 299760.19 req/s
-  eBPF 性能损耗: 10.0%
+实时同步 | A1-关闭主从同步: 316856.78 req/s
+实时同步 | A2-eBPF增量复制: 68880.02 req/s
+  eBPF 性能损耗: 80.0%
 

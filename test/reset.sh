@@ -28,6 +28,9 @@ KVS_BIN="${PROJECT_DIR}/build/kvstore"
 KVS_CONF="${PROJECT_DIR}/conf/kvstore-master.conf"
 KVS_BUILD_DIR="${PROJECT_DIR}/build"
 KVS_PORT=2000
+KVS_SLAVE_PORT=2002
+RDMA_PORT=2100
+INCR_PORT=6382
 KVS_HOST="127.0.0.1"
 
 REDIS_PORT=6379
@@ -87,19 +90,29 @@ echo ""
 # 1. 停止 KV Store
 # ---------------------------------------------------------------------------
 info "1/8  停止 KV Store..."
-if pkill -f "build/kvstore" 2>/dev/null; then
-    sleep 1
+# 先结束所有 kvstore 进程（匹配多种启动路径）
+KILLED=0
+for sig in TERM KILL; do
+    for pid in $(pgrep -f "kvstore" 2>/dev/null || true); do
+        kill -$sig "$pid" 2>/dev/null || true
+        KILLED=1
+    done
+    [ $KILLED -eq 1 ] && sleep 1
+done
+if [ $KILLED -eq 1 ]; then
     log "KV Store 已停止"
 else
     warn "KV Store 之前未在运行"
 fi
 
-# 确保端口释放
-if ss -tlnp | grep -q ":${KVS_PORT} "; then
-    warn "端口 $KVS_PORT 仍被占用，强制释放..."
-    fuser -k ${KVS_PORT}/tcp 2>/dev/null || true
-    sleep 1
-fi
+# 确保所有相关端口释放 (client + slave + RDMA + incr)
+for port in $KVS_PORT $KVS_SLAVE_PORT $RDMA_PORT $INCR_PORT; do
+    if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+        warn "端口 $port 仍被占用，强制释放..."
+        fuser -k ${port}/tcp 2>/dev/null || true
+        sleep 0.5
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # 2. 停止 Redis

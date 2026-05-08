@@ -50,7 +50,12 @@ void free_kvitem(KVItem *item) {
 
 __attribute__((noinline))
 void kvs_rdma_incr_probe(const char *msg, int length) {
-    (void)msg; (void)length;
+    /*
+     * The compiler barrier prevents -O3 from eliminating call sites.
+     * Without this, the compiler sees an empty pure function and removes
+     * every call as dead code — the uprobe attaches but never fires.
+     */
+    asm volatile("" : : "r"(msg), "r"(length) : "memory");
 }
 
 /* ── Parse a token as long long ── */

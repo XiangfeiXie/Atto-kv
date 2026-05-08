@@ -570,6 +570,12 @@ int rdma_repl_slave_run(void) {
 
     memset(&fshdr, 0, sizeof(fshdr));
 
+    /* When stdout is redirected to a file (nohup ... > log), it becomes
+     * fully buffered. Switch to line-buffered so the bench script can
+     * detect "loaded X keys from fullsync" without waiting for the 4KB
+     * buffer to fill. */
+    setlinebuf(stdout);
+
     hints = rdma_build_hints();
     if (!hints) return -1;
 

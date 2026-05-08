@@ -109,12 +109,16 @@ do_populate() {
 
     # 触发 SAVE 获取 RDB 大小
     echo -ne '*1\r\n$4\r\nSAVE\r\n' | nc -w 10 "$host" "$port" > /dev/null 2>&1 || true
-    sleep 2
     local rdb_file="${PROJECT_DIR}/build/dump.rdb"
     local rdb_size=0
-    if [ -f "$rdb_file" ]; then
-        rdb_size=$(stat -c%s "$rdb_file" 2>/dev/null || echo 0)
-    fi
+    # 轮询等待 RDB 文件出现（SAVE 是异步的 io_uring 写入）
+    for _ in $(seq 1 20); do
+        sleep 0.5
+        if [ -f "$rdb_file" ]; then
+            rdb_size=$(stat -c%s "$rdb_file" 2>/dev/null || echo 0)
+            [ "$rdb_size" -gt 0 ] && break
+        fi
+    done
 
     if [ "$rdb_size" -gt 0 ]; then
         local rdb_mb=$(echo "scale=2; $rdb_size / 1048576" | bc -l)
@@ -132,6 +136,13 @@ do_populate() {
 
 do_test_kvs() {
     require_root
+
+    # 检查 kvstore 二进制是否存在（slave 机器上需要已编译）
+    if [ ! -x "$KVS_BIN" ]; then
+        echo -e "${RED}[ERROR]${NC} kvstore 未编译或不存在: $KVS_BIN"
+        echo "  请在 slave 机器上先执行 make 编译"
+        exit 1
+    fi
 
     local host="${MASTER_HOST}" port="${MASTER_PORT}"
 
@@ -188,9 +199,14 @@ do_test_kvs() {
     echo "  slave pid=$slave_pid"
 
     # 等待全量同步完成
+    # 双重检测: (1) slave 日志中的 loaded 消息 (2) slave 服务端口就绪
     local timeout=120 synced=0
     for ((i = 1; i <= timeout; i++)); do
         if grep -q 'loaded.*keys from fullsync' "$slave_log" 2>/dev/null; then
+            synced=1
+            break
+        fi
+        if ss -tln 2>/dev/null | grep -q ":${SLAVE_PORT} "; then
             synced=1
             break
         fi

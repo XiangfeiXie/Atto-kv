@@ -677,6 +677,34 @@ When the dict has never been populated (size == 0 and not rehashing), skip all h
 - 极小 payload 场景下 elapsed 可能舍入为 0，导致 `$PAYLOAD / $elapsed` 除零
 - 修复：若 `elapsed < 0.001`，将其钳制为 `0.001`
 
+### Bug 9: 全量同步 bench 脚本超时 — stdout 缓冲导致日志不可见
+
+**现象**：
+- bench_fullsync.sh 启动 slave 后等待 120s 超时，grep 未能在 slave 日志中找到 `loaded.*keys from fullsync`
+- 但 master 日志显示全量同步已成功完成（"full sync shipped"），且 slave 已连接增量端口（"INCR_SYNC" 握手成功）
+- slave 进程仍在运行，未退出
+
+**根因**：`nohup ... > logfile` 将 stdout 重定向到文件后，默认变为**全缓冲**（4096+ 字节）。slave 的 `printf("loaded %d keys from fullsync...")` 输出停留在缓冲区中，未写入磁盘文件，导致 bench 脚本的 `grep` 找不到该消息。
+
+slave 进程实际上已成功完成全量同步并启动服务端口，但由于日志不刷新，脚本无法检测到完成状态。
+
+**修复**：
+1. **[src/repl/rdma_repl.c](src/repl/rdma_repl.c#L575)**：在 `rdma_repl_slave_run()` 开头调用 `setlinebuf(stdout)`，使 stdout 切换为行缓冲模式，每个带 `\n` 的 `printf` 立即刷新到文件
+2. **[test/bench/bench_fullsync.sh](test/bench/bench_fullsync.sh#L192)**：增加双重检测机制 — 除了 grep 日志消息外，还检测 slave 服务端口（`ss -tln`）是否就绪。全量同步完成后 `main()` 会调用 `proactor_start()` 绑定端口，因此端口就绪是全量同步完成的可靠信号
+
+### Bug 9 补充修复（bench_fullsync.sh 健壮性）
+
+**修复 1 — `do_populate` SAVE 后固定 sleep 2 不可靠**：
+- 大数据集下 io_uring 异步 SAVE 可能超过 2 秒
+- 改为轮询检测 RDB 文件出现（最多 10 秒，每 0.5s 检查一次）
+
+**修复 2 — `do_test_kvs` 缺少 kvstore 二进制存在性检查**：
+- slave 机器上若未编译，`nohup` 静默失败，脚本需等 120s 超时
+- 添加 `[ -x "$KVS_BIN" ]` 前置检查，给出明确错误提示
+
+**修复 3 — `ss -tlnp` 改为 `ss -tln`**：
+- `-p` 需要 root 权限才能显示进程信息，`-tln` 仅检查监听端口，无需 root
+
 ### Verified
 
 - eBPF uprobe 加载并触发：bpftool 确认发射计数 > 0，丢弃计数 = 0

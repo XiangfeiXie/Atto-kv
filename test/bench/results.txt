@@ -1,23 +1,7 @@
-# KVStore Performance Benchmark Results — 2026-05-06 11:05:09
-=== AOF 持久化性能测试 ===
-压测: redis-benchmark -n 1000000 -c 50 -P 20
+# KVStore Performance Benchmark Results — 2026-05-08 03:12:29
+=== 主从同步性能测试 ===
 
-AOF-SET | A-kvstore-AOF关闭: 301386.38 req/s
-AOF-SET | B-kvstore-AOF开启: 347463.50 req/s
-  kvstore AOF 性能损耗: -10.0%
-  AOF 文件大小: 5.0 MB
-
-AOF-SET | C-Redis-无持久化: 279955.22 req/s
-AOF-SET | D-Redis-AOF开启: 161576.98 req/s
-  Redis AOF 性能损耗: 50.0%
-
-
-=== AOF 测试汇总 ===
-
-  场景                         | QPS
-  -----------------------------|----------
-  A. kvstore SET (AOF 关闭)    | 301386.38
-  B. kvstore SET (AOF+RDB)     | 347463.50  (损耗 -10.0%)
-  C. Redis SET  (无持久化)     | 279955.22
-  D. Redis SET  (AOF everysec) | 161576.98  (损耗 50.0%)
+实时同步 | A1-关闭主从同步: 300300.31 req/s
+实时同步 | A2-eBPF增量复制: 299760.19 req/s
+  eBPF 性能损耗: 10.0%
 

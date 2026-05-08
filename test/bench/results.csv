@@ -1,5 +1,3 @@
 test,scenario,qps
-AOF-SET,A-kvstore-AOF关闭,301386.38
-AOF-SET,B-kvstore-AOF开启,347463.50
-AOF-SET,C-Redis-无持久化,279955.22
-AOF-SET,D-Redis-AOF开启,161576.98
+实时同步,A1-关闭主从同步,300300.31
+实时同步,A2-eBPF增量复制,299760.19

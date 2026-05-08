@@ -16,6 +16,7 @@
 #include "config.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -498,10 +499,26 @@ int ebpf_incr_master_start(void)
     if (g_running)
         return 0;
 
-    g_obj = bpf_object__open_file("ebpf_incr.bpf.o", NULL);
+    char exe_path[PATH_MAX];
+    char bpf_path[PATH_MAX + 32];
+    ssize_t n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (n > 0) {
+        exe_path[n] = '\0';
+        char *slash = strrchr(exe_path, '/');
+        if (slash) {
+            *slash = '\0';
+            snprintf(bpf_path, sizeof(bpf_path), "%s/ebpf_incr.bpf.o", exe_path);
+        } else {
+            snprintf(bpf_path, sizeof(bpf_path), "ebpf_incr.bpf.o");
+        }
+    } else {
+        snprintf(bpf_path, sizeof(bpf_path), "ebpf_incr.bpf.o");
+    }
+
+    g_obj = bpf_object__open_file(bpf_path, NULL);
     if (!g_obj || libbpf_get_error(g_obj)) {
         fprintf(stderr,
-                "[INCR-REPL] bpf_object__open_file failed (ebpf_incr.bpf.o?)\n");
+                "[INCR-REPL] bpf_object__open_file failed (%s)\n", bpf_path);
         g_obj = NULL;
         return -1;
     }
@@ -592,7 +609,7 @@ int ebpf_incr_master_start(void)
     g_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (g_listen_fd < 0) {
         fprintf(stderr, "[INCR-REPL] socket() failed: %s\n", strerror(errno));
-        goto done;
+        goto err_listen;
     }
 
     int opt = 1;
@@ -609,7 +626,7 @@ int ebpf_incr_master_start(void)
                 kvs_config.incr_port, strerror(errno));
         close(g_listen_fd);
         g_listen_fd = -1;
-        goto done;
+        goto err_listen;
     }
 
     listen(g_listen_fd, 8);
@@ -620,6 +637,7 @@ int ebpf_incr_master_start(void)
                 strerror(errno));
         close(g_listen_fd);
         g_listen_fd = -1;
+        goto err_listen;
     } else {
         g_listen_tid_started = 1;
     }
@@ -629,6 +647,12 @@ done:
            "fullsync state machine active)\n");
     return 0;
 
+err_listen:
+    g_running = 0;
+    if (g_tid_started) {
+        pthread_join(g_tid, NULL);
+        g_tid_started = 0;
+    }
 err_link:
     g_running = 0;
     if (g_link) {

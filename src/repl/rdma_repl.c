@@ -475,11 +475,16 @@ static void *incr_tcp_slave_recv_thread(void *arg)
 
     for (;;) {
         uint64_t cmd_len = 0;
-        ssize_t n = recv(fd, &cmd_len, sizeof(cmd_len), MSG_WAITALL);
-        if (n <= 0) {
-            fprintf(stderr, "[RDMA-REPL] slave incr: connection closed "
-                    "(recv len)\n");
-            break;
+        size_t  len_off  = 0;
+        while (len_off < sizeof(cmd_len)) {
+            ssize_t n = recv(fd, (char *)&cmd_len + len_off,
+                             sizeof(cmd_len) - len_off, 0);
+            if (n <= 0) {
+                fprintf(stderr, "[RDMA-REPL] slave incr: connection closed "
+                        "(recv len)\n");
+                goto done;
+            }
+            len_off += (size_t)n;
         }
 
         if (cmd_len == 0) {
@@ -495,13 +500,13 @@ static void *incr_tcp_slave_recv_thread(void *arg)
         size_t remain = (size_t)cmd_len;
         char *p = buf;
         while (remain > 0) {
-            n = recv(fd, p, remain, MSG_WAITALL);
-            if (n <= 0) {
+            ssize_t nr = recv(fd, p, remain, 0);
+            if (nr <= 0) {
                 fprintf(stderr, "[RDMA-REPL] slave incr: recv payload failed\n");
                 goto done;
             }
-            p += n;
-            remain -= (size_t)n;
+            p += nr;
+            remain -= (size_t)nr;
         }
 
         DynBuf wb;

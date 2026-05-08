@@ -85,7 +85,12 @@ sudo apt-get update && sudo apt-get install -y \
 
 ```bash
 cd 9.1-kvstore
-make clean && make -j$(nproc)
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+
+# 如需 glibc malloc 版本（内存对比测试）：
+# cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_JEMALLOC=OFF
 ```
 
 ### 启动

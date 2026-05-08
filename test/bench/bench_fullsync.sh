@@ -21,7 +21,8 @@
 #   --master-host IP     master 地址 (默认 192.168.30.135)
 #   --master-port N      master 端口 (默认 2000/6379)
 #   --payload N          RDB 数据大小 (bytes)
-#   --slave-port N       slave 端口 (默认 2002/6380)
+#   --kvs-slave-port N   kvstore slave 端口 (默认 2002)
+#   --redis-slave-port N  Redis slave 端口 (默认 6380)
 #
 # 输出: test/bench/results_fullsync.csv
 # =============================================================================
@@ -57,7 +58,8 @@ usage() {
     echo "  --master-host IP    master 地址"
     echo "  --master-port N     master 端口"
     echo "  --payload <bytes>   RDB 数据大小 (populate 最后一行会给出)"
-    echo "  --slave-port N      slave 端口 (kvs 默认 2002, redis 默认 6380)"
+    echo "  --kvs-slave-port N   kvstore slave 端口 (默认 2002)"
+echo "  --redis-slave-port N  Redis slave 端口 (默认 6380)"
     echo ""
     echo "完整流程:"
     echo "  # master 机器: 启动 master + 填充数据"
@@ -98,7 +100,7 @@ do_populate() {
         [ $((sent + batch_n)) -gt $nkeys ] && batch_n=$((nkeys - sent))
         for i in $(seq $((sent + 1)) $((sent + batch_n))); do
             printf '*3\r\n$3\r\nSET\r\n$9\r\nkey%06d\r\n$16\r\nbenchmark_value_\r\n' $i
-        done | timeout 300 nc -w 5 "$host" "$port" > /dev/null 2>&1
+        done | timeout 300 nc -w 5 "$host" "$port" > /dev/null 2>&1 || true
         sent=$((sent + batch_n))
         echo -n "."
     done
@@ -106,7 +108,7 @@ do_populate() {
     echo "填充完成: $nkeys 条"
 
     # 触发 SAVE 获取 RDB 大小
-    echo -ne '*1\r\n$4\r\nSAVE\r\n' | nc -w 10 "$host" "$port" > /dev/null 2>&1
+    echo -ne '*1\r\n$4\r\nSAVE\r\n' | nc -w 10 "$host" "$port" > /dev/null 2>&1 || true
     sleep 2
     local rdb_file="${PROJECT_DIR}/build/dump.rdb"
     local rdb_size=0
@@ -146,6 +148,18 @@ do_test_kvs() {
     fi
     local payload_mb=$(echo "scale=2; $PAYLOAD / 1048576" | bc -l)
 
+    # 确保 slave 配置中的 rdma_master_ip 与 --master-host 一致
+    local conf_template="${KVS_CONF_DIR}/kvstore-slave-repl.conf"
+    local conf_effective="${conf_template}"
+    local conf_ip
+    conf_ip=$(grep '^rdma_master_ip ' "$conf_template" | awk '{print $2}')
+    if [ "$conf_ip" != "$host" ]; then
+        conf_effective="/tmp/kvstore_slave_$$.conf"
+        sed "s/^rdma_master_ip .*/rdma_master_ip $host/" \
+            "$conf_template" > "$conf_effective"
+        echo "  rdma_master_ip 已从配置中的 $conf_ip 更新为 $host"
+    fi
+
     # 清理旧 slave
     echo ""; echo "清理旧 slave 进程..."
     pkill -f "kvstore.*slave" 2>/dev/null || true
@@ -169,7 +183,7 @@ do_test_kvs() {
     # 启动 slave 并计时
     local t0_ns=$(date +%s%N)
 
-    nohup "$KVS_BIN" "${KVS_CONF_DIR}/kvstore-slave-repl.conf" > "$slave_log" 2>&1 &
+    nohup "$KVS_BIN" "$conf_effective" > "$slave_log" 2>&1 &
     local slave_pid=$!
     echo "  slave pid=$slave_pid"
 
@@ -199,6 +213,9 @@ do_test_kvs() {
     fi
 
     local elapsed=$(echo "scale=3; ($t1_ns - $t0_ns) / 1000000000" | bc -l)
+    if [ "$(echo "$elapsed < 0.001" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+        elapsed="0.001"
+    fi
     local speed_mbps=$(echo "scale=2; $PAYLOAD / $elapsed / 1048576" | bc -l)
 
     local loaded_info
@@ -215,9 +232,14 @@ do_test_kvs() {
     echo "  加载信息:   $loaded_info"
     echo ""
 
-    # 数据验证
+    # 数据验证 (等待 slave 端口绑定)
     local verify
-    verify=$(printf '*2\r\n$5\r\nEXIST\r\n$9\r\nkey000001\r\n' | nc -w 2 127.0.0.1 "$SLAVE_PORT" 2>/dev/null | head -c 4)
+    sleep 0.5
+    verify=$(printf '*2\r\n$5\r\nEXIST\r\n$9\r\nkey000001\r\n' | nc -w 2 127.0.0.1 "$SLAVE_PORT" 2>/dev/null | head -c 4 || true)
+    if [ "$verify" != ":1" ]; then
+        sleep 1.0
+        verify=$(printf '*2\r\n$5\r\nEXIST\r\n$9\r\nkey000001\r\n' | nc -w 2 127.0.0.1 "$SLAVE_PORT" 2>/dev/null | head -c 4 || true)
+    fi
     if [ "$verify" = ":1" ]; then
         echo -e "  数据验证:   ${GREEN}通过${NC}"
     else
@@ -237,6 +259,7 @@ do_test_kvs() {
     kill "$slave_pid" 2>/dev/null || true
     sleep 0.5
     fuser -k "${SLAVE_PORT}/tcp" 2>/dev/null || true
+    [ "$conf_effective" != "$conf_template" ] && rm -f "$conf_effective"
 }
 
 # ---- Redis 全量同步测试 ----
@@ -346,6 +369,9 @@ do_test_redis_diskless() {
     fi
 
     local elapsed=$(echo "scale=3; ($t1_ns - $t0_ns) / 1000000000" | bc -l)
+    if [ "$(echo "$elapsed < 0.001" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+        elapsed="0.001"
+    fi
     local speed_mbps=$(echo "scale=2; $payload / $elapsed / 1048576" | bc -l)
 
     echo ""
@@ -446,7 +472,8 @@ while [ $# -gt 0 ]; do
         --master-host) MASTER_HOST="$2"; shift 2 ;;
         --master-port) MASTER_PORT="$2"; shift 2 ;;
         --payload)     PAYLOAD="$2"; shift 2 ;;
-        --slave-port)  SLAVE_PORT="$2"; REDIS_SLAVE_PORT="$2"; shift 2 ;;
+        --kvs-slave-port)   SLAVE_PORT="$2"; shift 2 ;;
+        --redis-slave-port) REDIS_SLAVE_PORT="$2"; shift 2 ;;
         -*) echo "未知选项: $1"; exit 1 ;;
         *)  break ;;
     esac

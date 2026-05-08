@@ -625,14 +625,57 @@ When the dict has never been populated (size == 0 and not rehashing), skip all h
 - 在检查监听状态前，新增循环释放所有 4 个端口
 - **文件**：[reset.sh](test/reset.sh)
 
-**端口标准化**（统一为 2000/2002/2200/6382）：
-- `conf/kvstore.conf`：rdma_listen_port 2100 → 2200
-- `conf/bench/kvstore-master-repl.conf`：rdma_listen_port 2100 → 2200
-- `conf/bench/kvstore-slave-repl.conf`：rdma_master_port 2100 → 2200
-- `test/bench/common.sh`：MASTER_RDMA_PORT 2100 → 2200
+**端口标准化**（统一为 2000/2002/2100/6382，**注意：2100 已从 2200 回退**）：
+- `conf/kvstore.conf`：rdma_listen_port 保持 2100
+- `conf/bench/kvstore-master-repl.conf`：rdma_listen_port 保持 2100
+- `conf/bench/kvstore-slave-repl.conf`：rdma_master_port 保持 2100
+- `test/bench/common.sh`：MASTER_RDMA_PORT 保持 2100
+- **2200→2100 回退原因**：标准 master 配置 (`kvstore-master.conf`) 实际使用 2100，bench 配置改为 2200 后导致从节点连接 master RDMA 端口失败（见 Bug 7）
 
 **Long text eBPF limit**: `INCR_MAX_CMD` 64KB→256KB, `RINGBUF_SIZE` 8MB→32MB
 - **文件**：[ebpf_incr.bpf.c](src/repl/ebpf_incr.bpf.c), [ebpf_incr_repl.h](src/repl/ebpf_incr_repl.h)
+
+### Bug 7: RDMA 端口标准化导致主从连接失败（"Unknown error"）
+
+**根因分析**：
+- Phase 9.2 的"端口标准化"将所有 RDMA 端口从 `2100` 改为 `2200`
+- 但实际运行中的 master 使用的 `conf/kvstore-master.conf` 仍然配置 `rdma_listen_port 2100`
+- Bench 从节点配置文件 (`conf/bench/kvstore-slave-repl.conf`) 被改为 `rdma_master_port 2200`
+- 从节点 `fi_connect()` 尝试连接 master 的 `192.168.30.135:2200`，但 master 监听在 `192.168.30.135:2100`
+- libfabric `fi_connect()` 失败时 `fi_strerror()` 返回 "Unknown error"（无法识别端口不可达错误码）
+
+**修复**（全部恢复为 `2100`，与正在运行的 master 配置保持一致）：
+- `conf/bench/kvstore-master-repl.conf`：rdma_listen_port 2200 → 2100
+- `conf/bench/kvstore-slave-repl.conf`：rdma_master_port 2200 → 2100
+- `conf/bench/kvstore-master-repl-tcp.conf`：rdma_listen_port 2200 → 2100
+- `conf/bench/kvstore-slave-repl-tcp.conf`：rdma_master_port 2200 → 2100
+- `test/bench/common.sh`：MASTER_RDMA_PORT 2200 → 2100
+- `conf/kvstore.conf`：注释行 `# rdma_master_port 2200` → `2100`
+
+**根因总结**：端口标准化必须同时更新所有引用该端口的配置文件。标准 master 配置 (`kvstore-master.conf`) 和 bench 配置 (`kvstore-master-repl.conf`) 中的 `rdma_listen_port` 必须保持一致。
+
+### Bug 8: bench_fullsync.sh 多项缺陷修复
+
+**问题 1 — `--slave-port` 同时覆盖 kvstore 和 Redis 端口**：
+- `--slave-port` 将一个值同时赋给 `SLAVE_PORT`（默认 2002）和 `REDIS_SLAVE_PORT`（默认 6380）
+- 修复：拆分为 `--kvs-slave-port` 和 `--redis-slave-port` 两个独立选项
+
+**问题 2 — `--master-host` 未传递到 slave RDMA 连接目标**：
+- `--master-host` 仅用于 PING 检查，slave 的 RDMA 连接目标仍使用配置文件中硬编码的 `rdma_master_ip`
+- 修复：在 `do_test_kvs` 中读取配置文件的 `rdma_master_ip`，若与 `--master-host` 不同则动态生成临时配置文件
+
+**问题 3 — `set -euo pipefail` 与 nc 管道冲突**：
+- `do_populate` 中的数据填充管道和 SAVE 管道，若 `nc` 非零退出会触发脚本终止
+- 修复：所有 nc 管道添加 `|| true` 保护
+
+**问题 4 — 全量同步检测后验证提前竞争端口绑定**：
+- slave 在 `rdma_repl_slave_run()` 返回后，`main()` 才调用 `proactor_start()` 绑定服务端口
+- `loaded.*keys from fullsync` 日志出现时端口可能尚未绑定
+- 修复：在数据验证前添加 `sleep 0.5`，首次失败后重试一次（`sleep 1.0`）
+
+**问题 5 — 耗时为 0 时除零错误**：
+- 极小 payload 场景下 elapsed 可能舍入为 0，导致 `$PAYLOAD / $elapsed` 除零
+- 修复：若 `elapsed < 0.001`，将其钳制为 `0.001`
 
 ### Verified
 

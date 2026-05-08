@@ -17,7 +17,7 @@ LOG_DIR="/tmp/kvstore_bench"
 KVS_PORT=2000
 KVS_SLAVE_PORT=2002
 REDIS_PORT=6379
-MASTER_RDMA_PORT=2200
+MASTER_RDMA_PORT=2100
 
 # ---- 结果输出 ----
 RESULT_FILE="${PROJECT_DIR}/test/bench/results.txt"

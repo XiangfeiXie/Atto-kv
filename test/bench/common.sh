@@ -64,16 +64,23 @@ wait_for_port() {
 }
 
 stop_kvs() {
+    # 先通过 pid 文件杀
     local pidfile="${LOG_DIR}/kvstore.pid"
     if [ -f "$pidfile" ]; then
         local pid=$(cat "$pidfile")
         kill "$pid" 2>/dev/null || true
         rm -f "$pidfile"
     fi
-    pkill -f "build/kvstore" 2>/dev/null || true
+    # 杀所有残留 kvstore 进程
+    for sig in TERM KILL; do
+        for pid in $(pgrep -f "kvstore" 2>/dev/null || true); do
+            kill -$sig "$pid" 2>/dev/null || true
+        done
+        sleep 0.3
+    done
     sleep 0.5
     # 确保端口释放
-    for port in $KVS_PORT $KVS_SLAVE_PORT $MASTER_RDMA_PORT; do
+    for port in $KVS_PORT $KVS_SLAVE_PORT $MASTER_RDMA_PORT 6382; do
         if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
             fuser -k ${port}/tcp 2>/dev/null || true
         fi
@@ -197,10 +204,10 @@ populate() {
 
 # ---- redis-benchmark ----
 run_bench() {
-    local host=$1 port=$2 test=$3 n=${4:-1000000} c=${5:-50} P=${6:-20}
+    local host=$1 port=$2 test=$3 n=${4:-1000000} c=${5:-50} P=${6:-20} d=${7:-3}
     local csv_line
     csv_line=$(redis-benchmark -h "$host" -p "$port" -t "$test" \
-        -n "$n" -c "$c" -P "$P" --csv 2>/dev/null | tail -1)
+        -n "$n" -c "$c" -P "$P" -d "$d" --csv 2>/dev/null | tail -1)
     # 解析 CSV: "test","rps","..."
     local qps=$(echo "$csv_line" | cut -d',' -f2 | tr -d '"')
     echo "${qps:-0}"

@@ -311,7 +311,7 @@ void common_testcase_05(int connfd){
 void common_testcase_06(int connfd){
 	int i;
 
-	int count = 10000;
+	int count = 500000;
 
 	struct timeval tv_begin;
 	gettimeofday(&tv_begin, NULL);
@@ -344,7 +344,7 @@ void common_testcase_06(int connfd){
 void common_testcase_07(int connfd){
 	int i;
 
-	int count = 10000;
+	int count = 500000;
 
 	struct timeval tv_begin;
 	gettimeofday(&tv_begin, NULL);

@@ -103,6 +103,7 @@ kv_entry_t *dict_resize_entry(kv_dict_t *d, kv_entry_t *e, uint32_t new_data_len
 /* --- Iteration --- */
 kv_iter_t  *dict_iter_new(kv_dict_t *d, int safe);
 kv_entry_t *dict_iter_next(kv_iter_t *it);
+kv_entry_t *dict_iter_peek(kv_iter_t *it);
 void        dict_iter_free(kv_iter_t *it);
 
 /* --- Stats --- */

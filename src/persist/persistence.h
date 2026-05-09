@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include "server.h"
+#include "kv_dict.h"
 
 /* =========================================================
  * 持久化模块：AOF / RDB 异步化 + io_uring 写入 + mmap 加载
@@ -49,5 +50,23 @@ void rdb_serialize_to_buf(DynBuf *out);
 /* RDB 二进制反序列化 ← 内存 buffer（全量同步用）
  * 返回加载的 key 数量，失败返回 -1 */
 int rdb_load_from_buf(const char *buf, size_t len);
+
+/* Single-entry serialization (used by streaming fullsync child process).
+ * Appends [klen:4][key][dlen:4][data][expire:8] to out.
+ * Handles quicklist flattening internally. */
+void serialize_entry_to_buf(DynBuf *out, kv_entry_t *e);
+
+/* Inline serialization: writes [klen:4][key][dlen:4][data][expire:8]
+ * directly to dst. Returns bytes written, or -1 if larger than max_space.
+ * Caller advances its write pointer by the return value. */
+int serialize_entry_inline(char *dst, size_t max_space, kv_entry_t *e);
+
+/* Streaming RDB load (for RDMA fullsync slave).
+ * rdb_load_stream_begin: parse header, clear engine, return key_count or -1.
+ *   Buffer format: [magic:4][version:4][db_num:4][key_count:4]
+ * rdb_load_stream_append: parse entries from chunk, return count loaded.
+ *   Buffer format: [klen:4][key][dlen:4][data][expire:8]... */
+int rdb_load_stream_begin(const char *buf, size_t len);
+int rdb_load_stream_append(const char *buf, size_t len);
 
 #endif

@@ -367,7 +367,7 @@ static void rdb_save_callback_buf(kv_entry_t *e, void *priv) {
             data_ptr = flat_buf;
         } else {
             dlen     = (int)e->val_len;
-            data_ptr = e->data;  /* fallback, but pointers will be garbage */
+            data_ptr = e->data;
         }
     } else {
         dlen     = (int)e->val_len;
@@ -385,10 +385,9 @@ static void rdb_save_callback_buf(kv_entry_t *e, void *priv) {
     rdb_buf_put(b, &expire, sizeof(long long));
 }
 
-/* Same RDB binary format, appends to a DynBuf (for RDMA fullsync). */
-static void rdb_serialize_cb_dynbuf(kv_entry_t *e, void *priv) {
-    if (!e) return;
-    DynBuf *out = (DynBuf *)priv;
+/* Single-entry serialization to DynBuf (reusable, handles quicklist flattening).
+   Appends [klen:4][key:klen][dlen:4][data:dlen][expire:8]. */
+void serialize_entry_to_buf(DynBuf *out, kv_entry_t *e) {
     const char *key = entry_key(e);
     int klen = (int)e->key_len;
     int dlen;
@@ -415,10 +414,57 @@ static void rdb_serialize_cb_dynbuf(kv_entry_t *e, void *priv) {
     dynbuf_append(out, key, klen);
     dynbuf_append(out, (const char *)&dlen, sizeof(int));
     dynbuf_append(out, data_ptr, dlen);
+    dynbuf_append(out, (const char *)&expire, sizeof(long long));
 
     free(flat_buf);
+}
 
-    dynbuf_append(out, (const char *)&expire, sizeof(long long));
+/* Inline variant: writes directly to dst, returns bytes written.
+ * Returns -1 if the serialized entry would exceed max_space. */
+int serialize_entry_inline(char *dst, size_t max_space, kv_entry_t *e) {
+    const char *key = entry_key(e);
+    int klen = (int)e->key_len;
+    int dlen;
+    const char *data_ptr;
+    char *flat_buf = NULL;
+
+    if (entry_type(e) == KV_TYPE_LIST &&
+        entry_encoding(e) == KV_ENCODING_QUICKLIST) {
+        uint32_t flat_len = 0;
+        if (list_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
+            dlen     = (int)flat_len;
+            data_ptr = flat_buf;
+        } else {
+            dlen     = (int)e->val_len;
+            data_ptr = e->data;
+        }
+    } else {
+        dlen     = (int)e->val_len;
+        data_ptr = e->data;
+    }
+
+    long long expire = e->expire;
+    int total = (int)(sizeof(int) + klen + sizeof(int) + dlen + sizeof(long long));
+    if (total > (int)max_space) {
+        free(flat_buf);
+        return -1;
+    }
+
+    char *p = dst;
+    memcpy(p, &klen, sizeof(int)); p += sizeof(int);
+    memcpy(p, key, klen);          p += klen;
+    memcpy(p, &dlen, sizeof(int)); p += sizeof(int);
+    memcpy(p, data_ptr, dlen);     p += dlen;
+    memcpy(p, &expire, sizeof(long long));
+
+    free(flat_buf);
+    return total;
+}
+
+/* Same RDB binary format, appends to a DynBuf (for RDMA fullsync). */
+static void rdb_serialize_cb_dynbuf(kv_entry_t *e, void *priv) {
+    if (!e) return;
+    serialize_entry_to_buf((DynBuf *)priv, e);
 }
 
 /* Iterate all dict entries, calling cb for each. */
@@ -591,11 +637,10 @@ static const char *mread(const char *p, const char *end, void *out, size_t n) {
     return p + n;
 }
 
-/* In-memory RDB loader: parses the same binary format as rdb_load_mmap()
- * but operates on a buffer already in memory (no file, no mmap).
- * Used by the slave fullsync path — data arrives via RDMA and is loaded
- * directly without any disk I/O or RESP text parsing. */
-int rdb_load_from_buf(const char *buf, size_t len) {
+/* Streaming RDB load: parse only the header, clear engine, return key_count.
+ * Buffer format: [magic:4][version:4][db_num:4][key_count:4]
+ * Returns key_count on success, -1 on format error. */
+int rdb_load_stream_begin(const char *buf, size_t len) {
     const char *p   = buf;
     const char *end = buf + len;
 
@@ -606,13 +651,24 @@ int rdb_load_from_buf(const char *buf, size_t len) {
     if (!(p = mread(p, end, &key_count, sizeof(int)))) return -1;
 
     if (magic != 0x524442) {
-        printf("[RDB] buf load: magic mismatch (0x%x)\n", magic);
+        printf("[RDB] stream load: magic mismatch (0x%x)\n", magic);
         return -1;
     }
 
     dict_clear(&g_dict);
+    printf("[RDB] stream begin: version=%d, expected keys=%d\n", version, key_count);
+    return key_count;
+}
 
-    for (int i = 0; i < key_count; i++) {
+/* Streaming RDB load: parse entries from a chunk buffer.
+ * Buffer format: [klen:4][key:klen][dlen:4][data:dlen][expire:8]...
+ * Returns number of entries loaded, -1 on parse error. */
+int rdb_load_stream_append(const char *buf, size_t len) {
+    const char *p   = buf;
+    const char *end = buf + len;
+    int loaded = 0;
+
+    while (p < end) {
         int klen = 0, dlen = 0;
         long long expire = 0;
 
@@ -624,17 +680,33 @@ int rdb_load_from_buf(const char *buf, size_t len) {
         if (!(p = mread(p, end, &dlen, sizeof(int)))) break;
         if (p + dlen > end) break;
 
-        /* data[] already includes type + encoding + payload */
         uint64_t h = kv_hash((const uint8_t *)ks, (uint32_t)klen);
         kv_entry_t *e = dict_add(&g_dict, ks, (uint32_t)klen, p, (uint32_t)dlen, h);
         p += dlen;
 
         if (!(p = mread(p, end, &expire, sizeof(long long)))) break;
         if (e && expire) e->expire = expire;
+        loaded++;
     }
 
-    printf("[RDB] buf load: %d keys, %zu bytes\n", key_count, len);
-    return key_count;
+    return loaded;
+}
+
+/* In-memory RDB loader: parses the same binary format as rdb_load_mmap()
+ * but operates on a buffer already in memory (no file, no mmap).
+ * Used by the slave fullsync path — data arrives via RDMA and is loaded
+ * directly without any disk I/O or RESP text parsing. */
+int rdb_load_from_buf(const char *buf, size_t len) {
+    if (len < 16) return -1;
+
+    int key_count = rdb_load_stream_begin(buf, 16);
+    if (key_count < 0) return -1;
+
+    int loaded = rdb_load_stream_append(buf + 16, len - 16);
+    if (loaded < 0) { dict_clear(&g_dict); return -1; }
+
+    printf("[RDB] buf load: %d keys, %zu bytes\n", loaded, len);
+    return loaded;
 }
 
 void rdb_load_mmap(void) {

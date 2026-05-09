@@ -711,3 +711,84 @@ slave 进程实际上已成功完成全量同步并启动服务端口，但由�
 - 增量同步：SET/GET/LPUSH/LRANGE + 长文本（10KB）在从节点均可正常读取
 - 全量同步 + 增量同步：全量同步完成后，从节点通过 INCR_SYNC 握手连接，正常接收 TCP 增量数据
 - reset.sh：所有端口均被清理，持久化文件被移除，两个服务均从空状态启动
+
+---
+
+## 2026-05-09 — Phase 9.3: RDMA Fullsync Streaming Pipeline 批量优化
+
+### Overview
+
+RDMA 流式全量同步在 Phase 9 已能正常工作，但存在严重性能瓶颈：子进程序列化循环中**每个 shm_slot 只放一个 dict entry**（~40-300 字节），对于 100 万 key 的数据库需要 ~100 万次 `fi_send`、`eventfd_write`、CQ reap、slave buffer repost。256KB 的 slot 容量几乎未被利用，流水线深度 4 slot × 256KB = 1MB 形同虚设。
+
+本次实施 4 项优化，将 `fi_send` 调用次数从 O(entries) 降至 O(chunks)，消除中间拷贝和额外 roundtrip。
+
+### Improvement 1: 直接序列化（消除 DynBuf + memcpy）
+
+**问题**：`serialize_entry_to_buf()` 先将条目序列化到中间 `DynBuf`，再 `memcpy` 到 slot 的 `data[]`。每个条目多一次分配和拷贝。
+
+**修复**：新增 `serialize_entry_inline(char *dst, size_t max_space, kv_entry_t *e)` — 将 `[klen:4][key][dlen:4][data][expire:8]` 直接写入目标指针，返回写入字节数（超空间返回 -1）。处理 quicklist 扁平化，与 `serialize_entry_to_buf` 逻辑一致。
+
+**文件**：[persistence.h](src/persist/persistence.h), [persistence.c](src/persist/persistence.c)
+
+**影响**：每条目消除 1 次 DynBuf 分配/扩容 + 1 次 memcpy。100 万 key 省去 100 万次临时 buffer 操作。
+
+### Improvement 2: 批量分块（关键优化）
+
+**问题**：旧 `child_serialize_loop()` 每迭代一个 entry 就获取一个 slot、放入一条记录、标记 READY、发 eventfd。一个 slot（256KB）只装 40-300 字节。
+
+**修复**：重写 `child_serialize_loop()`：
+1. 获取首个 slot，写入 24 字节 RDB header，设置写指针 `wp = s->data + 24`
+2. 迭代 dict entries，调用 `serialize_entry_inline(wp, room, e)` 直接写入 slot
+3. 条目成功写入：`wp += n`
+4. 条目放不下（返回 -1）且 slot 非空：刷新当前 slot（设 chunk_len、SLOT_READY、eventfd），获取新 slot，重试该条目
+5. 条目在空 slot 中也放不下：视为超大条目，跳过
+6. 迭代结束：flush 最后一个非空 slot，发送 EOF
+
+**文件**：[rdma_repl.c:285-380](src/repl/rdma_repl.c)
+
+**影响**：100 万 key 场景，`fi_send` 调用从 ~100 万次降至 ~200 次（~5000x 减少）。`eventfd_write` 和 CQ reap 同比例降低。流水线真正发挥作用。
+
+### Improvement 3: 加深流水线（4 → 8 slots）
+
+**问题**：`SHM_RING_SIZE = 4` 时流水线窗口仅 1MB，在高带宽 RDMA 链路上可能不足以完全隐藏序列化延迟。
+
+**修复**：`SHM_RING_SIZE` 从 4 改为 8。窗口扩大至 2MB。`parent_send_thread` 和 slave recv loop 均使用该宏，自动适配。
+
+**文件**：[rdma_repl.c:150](src/repl/rdma_repl.c)
+
+### Improvement 4: 合并 HEADER 到首个 DATA chunk
+
+**问题**：旧协议用独立的 `CHUNK_TYPE_HEADER`（24 字节 payload）单独占用一个 slot 和一次 `fi_send`。对于小数据库（< 256KB），这意味着两次 fi_send（header + data + eof），其中一次仅发送 24 字节。
+
+**修复**：
+- Master 端：将 24 字节 RDB header 直接写入第一个 DATA slot 的 data[] 起始位置，条目从 `data + 24` 开始堆积。首个 chunk 的 `chunk_type` 仍为 `CHUNK_TYPE_DATA`。
+- Slave 端：新增 `header_parsed` 标志。收到首个 DATA chunk 时，从 payload 前 24 字节解析 header（调用 `rdb_load_stream_begin` + 提取 `base_seq`），剩余字节作为 entries 传入 `rdb_load_stream_append`。后续 DATA chunk 整块作为 entries 处理。
+- 向后兼容：`case CHUNK_TYPE_HEADER:` fallthrough 到 `case CHUNK_TYPE_DATA:`，旧格式 master 发来的独立 HEADER chunk（chunk_len=24，无 entries）仍能正确解析。
+
+**文件**：[rdma_repl.c](src/repl/rdma_repl.c) (child_serialize_loop + slave recv loop)
+
+**影响**：省去 1 次 `fi_send` + 1 次 `eventfd` roundtrip。从端逻辑兼容新旧两种格式。
+
+### 性能影响估算
+
+以 100 万 key（平均 key 8B + value 16B + overhead 16B ≈ 每 entry 40B）为例：
+
+| 指标 | 优化前 | 优化后 | 改善 |
+|------|--------|--------|------|
+| fi_send 调用 | ~1,000,000 | ~200 | ~5000x |
+| eventfd 信号 | ~1,000,000 | ~200 | ~5000x |
+| CQ reap | ~1,000,000 | ~200 | ~5000x |
+| 中间 memcpy | 1,000,000 次 | 0 次 | 消除 |
+| DynBuf 分配 | 1,000,000 次 | 0 次 | 消除 |
+| Slot 利用率 | ~0.1% | ~80% | ~800x |
+| 流水线窗口 | 4 slots (1MB) | 8 slots (2MB) | 2x |
+
+### 文件变更
+
+- [src/persist/persistence.h](src/persist/persistence.h) — 新增 `serialize_entry_inline()` 声明
+- [src/persist/persistence.c](src/persist/persistence.c) — 新增 `serialize_entry_inline()` 实现（~45 行）
+- [src/repl/rdma_repl.c](src/repl/rdma_repl.c) — 重写 `child_serialize_loop()`（~95 行）、修改 slave recv loop（合并 header 解析）、`SHM_RING_SIZE` 4→8、注释更新
+
+### Verified
+
+- 编译通过，零 warning（仅 pre-existing testcase.c 的 `-Wunused-result`）

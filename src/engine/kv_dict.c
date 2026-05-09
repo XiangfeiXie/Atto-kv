@@ -480,6 +480,10 @@ done:
     return result;
 }
 
+kv_entry_t *dict_iter_peek(kv_iter_t *it) {
+    return it->next;
+}
+
 void dict_iter_free(kv_iter_t *it) {
     if (!it) return;
     if (it->safe && it->dict->iterators > 0)

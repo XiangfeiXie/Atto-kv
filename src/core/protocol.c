@@ -25,7 +25,30 @@ int resp_parse_slices(const char *buf, int buflen,
 {
     int idx = 0;
     if (buflen < 1) return 0;
-    if (buf[idx] != '*') return -1;
+
+    /* ── Inline command (e.g., "PING\r\n", "QUIT\r\n") ── */
+    if (buf[idx] != '*') {
+        int eol = idx;
+        while (eol < buflen - 1 && !(buf[eol] == '\r' && buf[eol + 1] == '\n'))
+            eol++;
+        if (eol >= buflen - 1) return 0;
+
+        int argc = 0;
+        int pos = idx;
+        while (pos < eol && argc < max_tokens) {
+            while (pos < eol && buf[pos] == ' ') pos++;
+            if (pos >= eol) break;
+            int tok_end = pos;
+            while (tok_end < eol && buf[tok_end] != ' ') tok_end++;
+            tokens[argc].ptr = buf + pos;
+            tokens[argc].len = tok_end - pos;
+            argc++;
+            pos = tok_end;
+        }
+        *out_argc = argc;
+        return eol + 2;
+    }
+
     if (buflen < 5) return 0;
 
     idx++;

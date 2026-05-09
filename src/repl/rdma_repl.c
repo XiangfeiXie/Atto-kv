@@ -982,6 +982,7 @@ int rdma_repl_slave_run(void) {
         }
     }
     printf("[RDMA-REPL] slave: connected, awaiting streaming full sync\n");
+    fflush(stdout);
 
     /* Timing: measure pure transfer + load time, not process startup */
     struct timespec t0, t1;
@@ -1116,6 +1117,7 @@ done:
     }
     printf("[RDMA-REPL] slave: loaded %d keys from fullsync (rdb streaming)\n",
            total_keys);
+    fflush(stdout);
 
     rc_ret = 0;
 

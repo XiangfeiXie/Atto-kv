@@ -108,6 +108,11 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
+    if (TOKEN_EQ(cmd, "QUIT")) {
+        dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        return DISPATCH_OK;
+    }
+
     if (TOKEN_EQ(cmd, "ECHO")) {
         if (argc >= 2) {
             char hdr[32];

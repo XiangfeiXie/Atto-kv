@@ -6,20 +6,20 @@
 #   ./bench_fullsync_slave.sh kvs   --payload N [选项]
 #   ./bench_fullsync_slave.sh redis --payload N [选项]
 #
-# 选项:
-#   --payload N          RDB 字节数 (必填，从 master 脚本输出获取)
-#   --master-host IP     master 地址 (默认 192.168.30.135)
-#   --master-port PORT   master 端口 (默认 2000)
-#   --slave-port PORT    kvstore slave 端口 (默认 2002)
-#   --redis-port PORT    Redis slave 端口 (默认 6380)
-#   --redis-server PATH  redis-server 路径 (默认 redis-server)
-#   --mode MODE          Redis: sendfile (默认) | diskless
+# kvstore 计时窗口: RDMA 建连完成 → EOF 接收完成 (纯传输+加载，不含进程启动)
+# Redis   计时窗口: SLAVEOF 发送 → master_link_status:up
 #
-# 输出:
-#   test/bench/results.csv (追加模式)
+# 选项:
+#   --payload N            RDB 字节数 (必填，从 master 脚本输出获取)
+#   --master-host IP       master 地址 (默认 192.168.30.135)
+#   --master-port PORT     kvstore master 端口 (默认 2000)
+#   --redis-master-port PORT  Redis master 端口 (默认 6379)
+#   --slave-port PORT      kvstore slave 端口 (默认 2002)
+#   --redis-port PORT      Redis slave 端口 (默认 6380)
+#   --redis-server PATH    redis-server 路径 (默认 redis-server)
+#   --mode MODE            Redis 同步模式: sendfile (默认) | diskless
 #
 # 示例:
-#   rm -f test/bench/results.csv
 #   sudo ./test/bench/bench_fullsync_slave.sh kvs   --payload 1250000
 #   sudo ./test/bench/bench_fullsync_slave.sh redis --payload 1250000
 #   sudo ./test/bench/bench_fullsync_slave.sh redis --payload 1250000 --mode diskless
@@ -31,16 +31,16 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 KVS_BIN="${PROJECT_DIR}/build/kvstore"
 KVS_CONF_TEMPLATE="${PROJECT_DIR}/conf/bench/kvstore-slave-repl.conf"
-RESULT_CSV="${SCRIPT_DIR}/results.csv"
 
 # 默认值
 MASTER_HOST="192.168.30.135"
-MASTER_PORT="2000"
+MASTER_PORT="2000"          # kvstore master port
+REDIS_MASTER_PORT="6379"    # Redis master port
 KVS_SLAVE_PORT="2002"
 REDIS_SLAVE_PORT="6380"
 REDIS_SERVER="redis-server"
 PAYLOAD="0"
-MODE="sendfile"   # Redis: sendfile | diskless
+MODE="sendfile"             # Redis: sendfile | diskless
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
 
@@ -52,13 +52,14 @@ usage() {
     echo "  redis   测试 Redis 全量同步"
     echo ""
     echo "选项:"
-    echo "  --payload N          RDB 字节数 (必填)"
-    echo "  --master-host IP     master 地址 (默认 $MASTER_HOST)"
-    echo "  --master-port PORT   master 端口 (默认 $MASTER_PORT)"
-    echo "  --slave-port PORT    kvstore slave 端口 (默认 $KVS_SLAVE_PORT)"
-    echo "  --redis-port PORT    Redis slave 端口 (默认 $REDIS_SLAVE_PORT)"
-    echo "  --redis-server PATH  redis-server 路径 (默认 $REDIS_SERVER)"
-    echo "  --mode MODE          Redis 同步模式: sendfile (默认) | diskless"
+    echo "  --payload N             RDB 字节数 (必填)"
+    echo "  --master-host IP        master 地址 (默认 $MASTER_HOST)"
+    echo "  --master-port PORT      kvstore master 端口 (默认 $MASTER_PORT)"
+    echo "  --redis-master-port PORT Redis master 端口 (默认 $REDIS_MASTER_PORT)"
+    echo "  --slave-port PORT       kvstore slave 端口 (默认 $KVS_SLAVE_PORT)"
+    echo "  --redis-port PORT       Redis slave 端口 (默认 $REDIS_SLAVE_PORT)"
+    echo "  --redis-server PATH     redis-server 路径 (默认 $REDIS_SERVER)"
+    echo "  --mode MODE             Redis: sendfile (默认) | diskless"
     echo ""
     echo "示例:"
     echo "  sudo $0 kvs   --payload 1250000"
@@ -91,13 +92,14 @@ while [ $# -gt 0 ]; do
         kvs|redis)
             SCENARIO="$1"; shift
             ;;
-        --payload)       PAYLOAD="$2"; shift 2 ;;
-        --master-host)   MASTER_HOST="$2"; shift 2 ;;
-        --master-port)   MASTER_PORT="$2"; shift 2 ;;
-        --slave-port)    KVS_SLAVE_PORT="$2"; shift 2 ;;
-        --redis-port)    REDIS_SLAVE_PORT="$2"; shift 2 ;;
-        --redis-server)  REDIS_SERVER="$2"; shift 2 ;;
-        --mode)          MODE="$2"; shift 2 ;;
+        --payload)            PAYLOAD="$2"; shift 2 ;;
+        --master-host)        MASTER_HOST="$2"; shift 2 ;;
+        --master-port)        MASTER_PORT="$2"; shift 2 ;;
+        --redis-master-port)  REDIS_MASTER_PORT="$2"; shift 2 ;;
+        --slave-port)         KVS_SLAVE_PORT="$2"; shift 2 ;;
+        --redis-port)         REDIS_SLAVE_PORT="$2"; shift 2 ;;
+        --redis-server)       REDIS_SERVER="$2"; shift 2 ;;
+        --mode)               MODE="$2"; shift 2 ;;
         -*) echo "未知选项: $1"; usage ;;
         *)  break ;;
     esac
@@ -111,48 +113,19 @@ if [ "$PAYLOAD" -le 0 ]; then
 fi
 
 require_cmd bc
-require_cmd ss
 
 # ---- 公共函数 ----
 
 # 检查 master kvstore 可达 (用 printf+nc 发送 RESP PING)
 master_kvs_alive() {
     local resp
-    resp=$(printf '*1\r\n$4\r\nPING\r\n' | nc -w 3 "$MASTER_HOST" "$MASTER_PORT" 2>/dev/null | tr -d '\r\n' || true)
+    resp=$(printf '*1\r\n$4\r\nPING\r\n' | nc -w 3 "$1" "$2" 2>/dev/null | tr -d '\r\n' || true)
     [ "$resp" = "+PONG" ]
 }
 
-# 检查 master Redis 可达 (用 redis-cli)
-master_redis_alive() {
-    redis-cli -h "$MASTER_HOST" -p "$MASTER_PORT" PING >/dev/null 2>&1
-}
-
-# 写入 results.csv
-write_result() {
-    local scenario="$1" mode="$2" payload="$3" elapsed="$4" speed="$5" verified="$6"
-    if [ ! -f "$RESULT_CSV" ]; then
-        echo "scenario,mode,payload_bytes,elapsed_s,speed_mbps,verified" > "$RESULT_CSV"
-    fi
-    echo "${scenario},${mode},${payload},${elapsed},${speed},${verified}" >> "$RESULT_CSV"
-}
-
-# 对比已存在的所有结果
-show_comparison() {
-    [ ! -f "$RESULT_CSV" ] && return
-    local count
-    count=$(tail -n +2 "$RESULT_CSV" 2>/dev/null | wc -l)
-    [ "$count" -lt 2 ] && return
-
-    echo ""
-    echo "  ═══════════════════════════════════"
-    echo "  已有结果对比 (共 $count 条)"
-    echo "  ═══════════════════════════════════"
-    while IFS=',' read -r scenario mode payload elapsed speed verified; do
-        [ "$scenario" = "scenario" ] && continue
-        printf "  %-10s %-12s  %8s MB/s  (%s)\n" \
-               "$scenario" "$mode" "$speed" "$verified"
-    done < "$RESULT_CSV"
-    echo ""
+# 从日志提取 fullsync_time_ms (C 代码计时)
+extract_fullsync_ms() {
+    grep 'fullsync_time_ms=' "$1" 2>/dev/null | tail -1 | sed 's/.*fullsync_time_ms=//' | tr -d ' '
 }
 
 # ================================================================
@@ -165,7 +138,7 @@ do_test_kvs() {
 
     # 检查 master kvstore 可达
     echo "检查 master kvstore 连接 $MASTER_HOST:$MASTER_PORT ..."
-    if ! master_kvs_alive; then
+    if ! master_kvs_alive "$MASTER_HOST" "$MASTER_PORT"; then
         echo -e "${RED}[ERROR]${NC} kvstore master 未运行 ($MASTER_HOST:$MASTER_PORT)"
         exit 1
     fi
@@ -177,16 +150,14 @@ do_test_kvs() {
         exit 1
     fi
 
-    # 生成临时配置 (rdma_provider verbs + 正确的 master_ip)
+    # 生成临时配置
     local conf_tmp="/tmp/kvstore_slave_fullsync_$$.conf"
     sed -e "s/^rdma_provider .*/rdma_provider verbs/" \
         -e "s/^rdma_master_ip .*/rdma_master_ip $MASTER_HOST/" \
         "$KVS_CONF_TEMPLATE" > "$conf_tmp"
-    echo "  临时配置: $conf_tmp"
 
     # 清理旧从机
     echo "清理旧从机 ..."
-    # 先按端口杀 (最精确)
     fuser -k "${KVS_SLAVE_PORT}/tcp" 2>/dev/null || true
     sleep 0.3
     rm -f "${PROJECT_DIR}/build/dump.rdb"
@@ -203,14 +174,10 @@ do_test_kvs() {
     echo "============================================"
     echo "  Master:    $MASTER_HOST:$MASTER_PORT"
     echo "  Payload:   ${payload_mb} MB"
-    echo "  Slave log: $slave_log"
     echo "============================================"
     echo ""
 
-    # 启动从机并计时
-    local t0_ns t1_ns
-    t0_ns=$(date +%s%N)
-
+    # 启动从机
     nohup "$KVS_BIN" "$conf_tmp" > "$slave_log" 2>&1 &
     local slave_pid=$!
     echo "  从机 pid=$slave_pid"
@@ -236,8 +203,6 @@ do_test_kvs() {
         sleep 1
     done
 
-    t1_ns=$(date +%s%N)
-
     if [ "$synced" -eq 0 ]; then
         echo -e "${RED}[ERROR]${NC} 全量同步超时 (${timeout}s)"
         echo "--- 最后 15 行日志 ---"
@@ -247,15 +212,21 @@ do_test_kvs() {
         exit 1
     fi
 
-    # 计算耗时和吞吐量
-    local elapsed speed_mbps
-    elapsed=$(echo "scale=3; ($t1_ns - $t0_ns) / 1000000000" | bc -l)
-    if [ "$(echo "$elapsed < 0.001" | bc -l)" = "1" ]; then
-        elapsed="0.001"
+    # 从日志提取 C 代码的纯传输时间
+    local fullsync_ms
+    fullsync_ms=$(extract_fullsync_ms "$slave_log" || true)
+    if [ -z "$fullsync_ms" ]; then
+        echo -e "${RED}[ERROR]${NC} 未从日志提取到 fullsync_time_ms (kvstore 需重新编译)"
+        kill "$slave_pid" 2>/dev/null || true
+        rm -f "$conf_tmp"
+        exit 1
     fi
-    speed_mbps=$(echo "scale=2; $PAYLOAD / $elapsed / 1048576" | bc -l)
+    local fullsync_s
+    fullsync_s=$(echo "scale=3; $fullsync_ms / 1000" | bc -l)
+    local speed_mbps
+    speed_mbps=$(echo "scale=2; $PAYLOAD / $fullsync_ms * 1000 / 1048576" | bc -l)
 
-    # 等待端口完全就绪
+    # 等待端口就绪
     sleep 0.3
 
     # 数据验证
@@ -266,7 +237,6 @@ do_test_kvs() {
     if [ "$verify_raw" = ":1" ]; then
         verify="yes"
     else
-        # 重试一次
         sleep 0.5
         verify_raw=$(printf '*2\r\n$5\r\nEXIST\r\n$9\r\nkey000001\r\n' | \
                      nc -w 2 127.0.0.1 "$KVS_SLAVE_PORT" 2>/dev/null | \
@@ -278,16 +248,11 @@ do_test_kvs() {
     echo "  ═══════════════════════════════════"
     echo "  kvstore verbs 全量同步结果"
     echo "  ═══════════════════════════════════"
-    echo "  数据量:     ${payload_mb} MB"
-    echo "  耗时:       ${elapsed} s"
-    echo -e "  吞吐量:     ${GREEN}${speed_mbps} MB/s${NC}"
-    echo -e "  数据验证:   $([ "$verify" = "yes" ] && echo -e "${GREEN}通过${NC}" || echo -e "${RED}失败${NC} (EXIST=$verify_raw)")"
+    echo "  数据量:       ${payload_mb} MB"
+    echo "  传输+加载:    ${fullsync_ms} ms  (纯传输，不含进程启动)"
+    echo -e "  吞吐量:       ${GREEN}${speed_mbps} MB/s${NC}"
+    echo -e "  数据验证:     $([ "$verify" = "yes" ] && echo -e "${GREEN}通过${NC}" || echo -e "${RED}失败${NC} (EXIST=$verify_raw)")"
     echo ""
-
-    # 写入 CSV
-    write_result "kvstore" "verbs" "$PAYLOAD" "$elapsed" "$speed_mbps" "$verify"
-
-    show_comparison
 
     # 清理
     kill "$slave_pid" 2>/dev/null || true
@@ -303,20 +268,18 @@ do_test_kvs() {
 do_test_redis() {
     require_cmd redis-cli
 
-    local redis_mode="$MODE"
-    local label scenario_mode
-    if [ "$redis_mode" = "diskless" ]; then
+    local label
+    if [ "$MODE" = "diskless" ]; then
         label="Redis diskless"
-        scenario_mode="diskless"
     else
         label="Redis sendfile"
-        scenario_mode="sendfile"
     fi
 
-    # 检查 master Redis 可达
-    echo "检查 master Redis 连接 $MASTER_HOST:$MASTER_PORT ..."
-    if ! master_redis_alive; then
-        echo -e "${RED}[ERROR]${NC} Redis master 未运行 ($MASTER_HOST:$MASTER_PORT)"
+    # 检查 master Redis 可达 (用 Redis 专用端口)
+    echo "检查 master Redis 连接 $MASTER_HOST:$REDIS_MASTER_PORT ..."
+    if ! redis-cli -h "$MASTER_HOST" -p "$REDIS_MASTER_PORT" PING >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR]${NC} Redis master 未运行 ($MASTER_HOST:$REDIS_MASTER_PORT)"
+        echo "  提示: 默认连接端口 $REDIS_MASTER_PORT，可用 --redis-master-port 指定"
         exit 1
     fi
     echo -e "  ${GREEN}master Redis 可达${NC}"
@@ -351,10 +314,10 @@ do_test_redis() {
     echo -e "  ${GREEN}Redis 从机就绪 (port $REDIS_SLAVE_PORT)${NC}"
 
     # 设置 master redis 的 diskless 模式
-    redis-cli -h "$MASTER_HOST" -p "$MASTER_PORT" \
-              CONFIG SET repl-diskless-sync "$redis_mode" >/dev/null 2>&1 || true
-    if [ "$redis_mode" = "diskless" ]; then
-        redis-cli -h "$MASTER_HOST" -p "$MASTER_PORT" \
+    redis-cli -h "$MASTER_HOST" -p "$REDIS_MASTER_PORT" \
+              CONFIG SET repl-diskless-sync "$MODE" >/dev/null 2>&1 || true
+    if [ "$MODE" = "diskless" ]; then
+        redis-cli -h "$MASTER_HOST" -p "$REDIS_MASTER_PORT" \
                   CONFIG SET repl-diskless-sync-delay 0 >/dev/null 2>&1 || true
     fi
 
@@ -365,7 +328,7 @@ do_test_redis() {
     echo "============================================"
     echo "  全量同步测试 — $label"
     echo "============================================"
-    echo "  Master:    $MASTER_HOST:$MASTER_PORT"
+    echo "  Master:    $MASTER_HOST:$REDIS_MASTER_PORT"
     echo "  Slave:     127.0.0.1:$REDIS_SLAVE_PORT"
     echo "  Payload:   ${payload_mb} MB"
     echo "============================================"
@@ -375,10 +338,10 @@ do_test_redis() {
     redis-cli -p "$REDIS_SLAVE_PORT" SLAVEOF NO ONE >/dev/null 2>&1 || true
     sleep 1
 
-    # 开始同步并计时
+    # 开始同步并计时 (t0 = SLAVEOF 发出的时刻)
     local t0_ns t1_ns
     t0_ns=$(date +%s%N)
-    redis-cli -p "$REDIS_SLAVE_PORT" SLAVEOF "$MASTER_HOST" "$MASTER_PORT" >/dev/null 2>&1
+    redis-cli -p "$REDIS_SLAVE_PORT" SLAVEOF "$MASTER_HOST" "$REDIS_MASTER_PORT" >/dev/null 2>&1
 
     # 等待同步完成
     local timeout=120 synced=0
@@ -410,8 +373,7 @@ do_test_redis() {
     speed_mbps=$(echo "scale=2; $PAYLOAD / $elapsed / 1048576" | bc -l)
 
     # 数据验证
-    local verify="no"
-    local verify_val
+    local verify="no" verify_val
     verify_val=$(redis-cli -p "$REDIS_SLAVE_PORT" GET key000001 2>/dev/null || true)
     if [ -n "$verify_val" ] && [ "$verify_val" != "nil" ] && [ "$verify_val" != "(nil)" ]; then
         verify="yes"
@@ -421,18 +383,13 @@ do_test_redis() {
     echo "  ═══════════════════════════════════"
     echo "  $label 全量同步结果"
     echo "  ═══════════════════════════════════"
-    echo "  数据量:     ${payload_mb} MB"
-    echo "  耗时:       ${elapsed} s"
-    echo -e "  吞吐量:     ${GREEN}${speed_mbps} MB/s${NC}"
-    echo -e "  数据验证:   $([ "$verify" = "yes" ] && echo -e "${GREEN}通过${NC} (key000001=$verify_val)" || echo -e "${RED}失败${NC} (key000001=$verify_val)")"
+    echo "  数据量:       ${payload_mb} MB"
+    echo "  耗时:         ${elapsed} s"
+    echo -e "  吞吐量:       ${GREEN}${speed_mbps} MB/s${NC}"
+    echo -e "  数据验证:     $([ "$verify" = "yes" ] && echo -e "${GREEN}通过${NC} (key000001=$verify_val)" || echo -e "${RED}失败${NC} (key000001=$verify_val)")"
     echo ""
 
-    # 写入 CSV
-    write_result "redis" "$scenario_mode" "$PAYLOAD" "$elapsed" "$speed_mbps" "$verify"
-
-    show_comparison
-
-    # 断开复制 (保留从机进程)
+    # 断开复制 (保留从机进程供后续测试)
     redis-cli -p "$REDIS_SLAVE_PORT" SLAVEOF NO ONE >/dev/null 2>&1 || true
 }
 

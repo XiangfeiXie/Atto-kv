@@ -38,6 +38,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 #include <dirent.h>
 
 #include <rdma/fabric.h>
@@ -982,6 +983,10 @@ int rdma_repl_slave_run(void) {
     }
     printf("[RDMA-REPL] slave: connected, awaiting streaming full sync\n");
 
+    /* Timing: measure pure transfer + load time, not process startup */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
     /* Streaming recv loop */
     while (!eof_received && pending > 0) {
         struct fi_cq_data_entry ce;
@@ -1103,6 +1108,12 @@ int rdma_repl_slave_run(void) {
     }
 
 done:
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    {
+        double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                            (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+        printf("[RDMA-REPL] slave: fullsync_time_ms=%.1f\n", elapsed_ms);
+    }
     printf("[RDMA-REPL] slave: loaded %d keys from fullsync (rdb streaming)\n",
            total_keys);
 

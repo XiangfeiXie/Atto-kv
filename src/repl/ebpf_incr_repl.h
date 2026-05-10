@@ -83,6 +83,10 @@ int  ebpf_incr_fullsync_status(void);
 /* Get the base_seq of the current/last fullsync */
 uint64_t ebpf_incr_fullsync_base_seq(void);
 
+/* Override base_seq after fork() — the post-fork read is the authoritative
+ * cut point because the COW snapshot is taken at fork(). */
+void ebpf_incr_fullsync_set_base_seq(uint64_t seq);
+
 /* TCP incr handshake: slave sends this after fullsync to request
  * catchup from a specific base_seq.                               */
 #define INCR_SYNC_CMD  "INCR_SYNC"

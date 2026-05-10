@@ -285,9 +285,19 @@ static shm_slot_t *child_acquire_slot(shm_ring_t *shm) {
 
 static void child_serialize_loop(shm_ring_t *shm,
                                  int child_evt_fd,
-                                 int parent_evt_fd,
-                                 uint64_t base_seq)
+                                 int parent_evt_fd)
 {
+    /* Wait for the parent to write the post-fork base_seq into
+     * shm->base_seq and signal us.  Reading base_seq after fork
+     * guarantees that no write command with seq >= base_seq is
+     * included in the COW snapshot — the fork() itself is the
+     * serialisation point. */
+    {
+        uint64_t dummy;
+        eventfd_read(parent_evt_fd, &dummy);
+    }
+    uint64_t base_seq = shm->base_seq;
+
     /* Acquire first slot.  HEADER is prepended to the data[] of the
      * first DATA chunk so the slave can parse it inline — no separate
      * HEADER chunk needed. */
@@ -571,7 +581,9 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
     printf("[RDMA-REPL] master: slave connected, starting streaming full sync\n");
 
     /* 3) Begin fullsync: read eBPF global_seq, set status=INPROGRESS */
-    uint64_t base_seq = ebpf_incr_fullsync_begin();
+    /* Begin fullsync: set INPROGRESS, read pre-fork global_seq.
+     * The authoritative base_seq is read again after fork(). */
+    (void)ebpf_incr_fullsync_begin();
 
     /* 4) Create shared memory ring: memfd + ftruncate + mmap */
     shm_fd = memfd_create("kvstore_fullsync", 0);
@@ -600,9 +612,9 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
         goto fail;
     }
 
-    /* Zero-initialize the ring (all slots EMPTY) */
+    /* Zero-initialize the ring (all slots EMPTY).
+     * base_seq is written by the parent AFTER fork. */
     memset(shm, 0, shm_size);
-    shm->base_seq = base_seq;
 
     /* 5) Register MR for shared memory BEFORE fork.
      *     MAP_SHARED guarantees physical pages are stable across fork. */
@@ -639,7 +651,7 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
          * ============================================================ */
         child_close_extra_fds(child_evt_fd, parent_evt_fd);
 
-        child_serialize_loop(shm, child_evt_fd, parent_evt_fd, base_seq);
+        child_serialize_loop(shm, child_evt_fd, parent_evt_fd);
 
         /* Clean up what we still hold */
         munmap(shm, shm_size);
@@ -652,6 +664,21 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
      * PARENT: spawn worker thread to handle RDMA send pipeline
      * ============================================================ */
     session_add(child_pid);
+
+    /* Read global_seq AFTER fork.  The fork() is the serialisation
+     * point: the child's COW snapshot reflects every write with
+     * seq < post_fork_seq, and the backlog will contain every write
+     * with seq >= post_fork_seq.  No overlap, no duplicates. */
+    {
+        uint64_t post_fork_seq = ebpf_incr_read_global_seq();
+        ebpf_incr_fullsync_set_base_seq(post_fork_seq);
+        shm->base_seq = post_fork_seq;
+        /* Wake the child — it is blocked on parent_evt_fd waiting
+         * for base_seq to be ready. */
+        eventfd_write(parent_evt_fd, (eventfd_t)1);
+        printf("[RDMA-REPL] master: post-fork base_seq=%" PRIu64 "\n",
+               post_fork_seq);
+    }
 
     /* Parent closes the write end of child_evt (child writes, we read)
      * and the read end of parent_evt (we write, child reads).
@@ -688,9 +715,10 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
     }
 
     printf("[RDMA-REPL] master: streaming full sync done "
-           "(base_seq=%" PRIu64 ")\n", base_seq);
+           "(base_seq=%" PRIu64 ")\n",
+           ebpf_incr_fullsync_base_seq());
 
-    /* Transition incr to CATCHUP */
+    /* Transition incr to IDLE (or CATCHUP if no slave connected yet) */
     if (rc == 0)
         ebpf_incr_fullsync_send_done();
     else
@@ -719,6 +747,11 @@ fail:
 
 static void *rdma_master_thread(void *arg) {
     (void)arg;
+
+    /* When stdout is redirected to a file it becomes fully buffered.
+     * Switch to line-buffered so bench scripts can see log messages
+     * in real time. */
+    setlinebuf(stdout);
 
     struct fi_info      *hints  = NULL, *info = NULL;
     struct fid_fabric   *fabric = NULL;

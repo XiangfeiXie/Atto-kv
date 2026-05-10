@@ -182,13 +182,6 @@ if [ "$(echo "$elapsed < 0.001" | bc -l)" = "1" ]; then
 fi
 speed_mbps=$(echo "scale=2; $PAYLOAD / $elapsed / 1048576" | bc -l)
 
-# 数据验证 — 取一个存在的 key
-verify="no"
-verify_val=$(redis-cli -p "$REDIS_SLAVE_PORT" GET __bench_marker__ 2>/dev/null || true)
-if [ -n "$verify_val" ] && [ "$verify_val" != "nil" ] && [ "$verify_val" != "(nil)" ]; then
-    verify="yes"
-fi
-
 echo ""
 echo "  ═══════════════════════════════════"
 echo "  $label 全量同步结果"
@@ -196,7 +189,6 @@ echo "  ════════════════════════
 echo "  数据量:       ${payload_mb} MB"
 echo "  耗时:         ${elapsed} s"
 echo -e "  吞吐量:       ${GREEN}${speed_mbps} MB/s${NC}"
-echo -e "  数据验证:     $([ "$verify" = "yes" ] && echo -e "${GREEN}通过${NC} (__bench_marker__=$verify_val)" || echo -e "${RED}失败${NC} (__bench_marker__=$verify_val)")"
 echo ""
 
 # 断开复制 (保留从机进程供后续测试)

@@ -226,9 +226,16 @@ uint64_t ebpf_incr_read_global_seq(void)
 
 uint64_t ebpf_incr_fullsync_begin(void)
 {
+    /* Set INPROGRESS FIRST so the consumer thread stops direct-send
+     * immediately.  Otherwise there is a window where an event fires
+     * between reading global_seq and setting INPROGRESS — the consumer
+     * sees IDLE, direct-sends it (to nobody), but the seq is already
+     * >= the base_seq we just read, so the later backlog replay would
+     * send it again (duplicate for list ops, and worse: the COW
+     * snapshot taken at fork() may already include it). */
+    g_fullsync_status   = FULLSYNC_INPROGRESS;
     uint64_t base = ebpf_incr_read_global_seq();
     g_fullsync_base_seq = base;
-    g_fullsync_status   = FULLSYNC_INPROGRESS;
     printf("[INCR-REPL] fullsync begin: base_seq=%llu, status=INPROGRESS\n",
            (unsigned long long)base);
     return base;
@@ -236,9 +243,41 @@ uint64_t ebpf_incr_fullsync_begin(void)
 
 void ebpf_incr_fullsync_send_done(void)
 {
-    g_fullsync_status = FULLSYNC_CATCHUP;
-    printf("[INCR-REPL] fullsync send done: status=CATCHUP (base_seq=%llu)\n",
-           (unsigned long long)g_fullsync_base_seq);
+    pthread_mutex_lock(&g_mu);
+
+    /* The slave may have already connected via TCP incr during the
+     * RDMA fullsync (INPROGRESS).  In that case ebpf_incr_add_slave()
+     * deferred the backlog replay — we must replay it now and go
+     * directly to IDLE so the consumer resumes direct-send. */
+    int waiting_slaves = 0;
+    for (int i = 0; i < INCR_MAX_SLAVES; i++) {
+        struct slave_conn *s = &g_slaves[i];
+        if (!s->active)
+            continue;
+        waiting_slaves++;
+        replay_backlog_locked(s, g_fullsync_base_seq);
+    }
+
+    if (waiting_slaves > 0) {
+        g_fullsync_status = FULLSYNC_IDLE;
+        printf("[INCR-REPL] fullsync send done: status=IDLE "
+               "(base_seq=%llu, %d slave(s) already connected)\n",
+               (unsigned long long)g_fullsync_base_seq, waiting_slaves);
+    } else {
+        g_fullsync_status = FULLSYNC_CATCHUP;
+        printf("[INCR-REPL] fullsync send done: status=CATCHUP "
+               "(base_seq=%llu, waiting for slave)\n",
+               (unsigned long long)g_fullsync_base_seq);
+    }
+
+    pthread_mutex_unlock(&g_mu);
+
+    /* Flush outside lock so slow slaves don't block other work */
+    for (int i = 0; i < INCR_MAX_SLAVES; i++) {
+        struct slave_conn *s = &g_slaves[i];
+        if (s->active)
+            slave_flush(s);
+    }
 }
 
 void ebpf_incr_fullsync_finish(void)
@@ -255,6 +294,11 @@ int ebpf_incr_fullsync_status(void)
 uint64_t ebpf_incr_fullsync_base_seq(void)
 {
     return g_fullsync_base_seq;
+}
+
+void ebpf_incr_fullsync_set_base_seq(uint64_t seq)
+{
+    g_fullsync_base_seq = seq;
 }
 
 /* ================================================================
@@ -301,19 +345,29 @@ int ebpf_incr_add_slave(int tcp_fd, uint64_t start_seq)
     s->fd     = tcp_fd;
     s->active = 1;
 
-    /* Replay backlog from start_seq */
-    if (replay_backlog_locked(s, start_seq) != 0) {
+    /* Replay backlog from start_seq.
+     * If a fullsync is still in progress (INPROGRESS), defer the
+     * replay to ebpf_incr_fullsync_send_done(): the COW snapshot
+     * hasn't been taken yet (or RDMA send is still in flight), and
+     * new backlog entries may still arrive before send_done.
+     * Replaying now would miss those late entries. */
+    int deferred = 0;
+    if (g_fullsync_status == FULLSYNC_INPROGRESS) {
+        deferred = 1;
+    } else if (replay_backlog_locked(s, start_seq) != 0) {
         slave_close_locked(s);
         pthread_mutex_unlock(&g_mu);
         return -1;
     }
 
-    printf("[INCR-REPL] slave registered slot=%d, catch-up from seq=%llu\n",
-           slot, (unsigned long long)start_seq);
+    printf("[INCR-REPL] slave registered slot=%d, catch-up from seq=%llu%s\n",
+           slot, (unsigned long long)start_seq,
+           deferred ? " (deferred to send_done)" : "");
     pthread_mutex_unlock(&g_mu);
 
-    /* Flush backlog replay outside lock */
-    slave_flush(s);
+    /* Flush backlog replay outside lock (only if NOT deferred) */
+    if (!deferred)
+        slave_flush(s);
 
     return 0;
 }

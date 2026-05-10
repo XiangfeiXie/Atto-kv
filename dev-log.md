@@ -792,3 +792,64 @@ RDMA 流式全量同步在 Phase 9 已能正常工作，但存在严重性能瓶
 ### Verified
 
 - 编译通过，零 warning（仅 pre-existing testcase.c 的 `-Wunused-result`）
+
+---
+
+## 2026-05-09 — Phase 9.4: 增量同步状态机死锁修复
+
+### Overview
+
+修复了 4 个导致增量同步状态机卡死或数据重复的 bug。核心问题是 master 端 RDMA 线程和 TCP listener 线程之间的竞态条件：slave 全量同步完成后立即连接 TCP incr 端口，此时 master 的 RDMA 发送可能尚未完成（状态仍为 INPROGRESS），TCP listener 检查 `g_fullsync_status == FULLSYNC_CATCHUP` 失败后不再重试，导致状态机永远无法推进到 IDLE，consumer 线程停止直接发送增量数据。
+
+### Bug 1 (ROOT CAUSE): 状态机卡死在 CATCHUP
+
+- **问题**：Slave 收到 EOF 后立即关闭 RDMA、连接 TCP incr 端口、发送 INCR_SYNC 握手。但 master 的 `parent_send_thread` 可能还在等待 CQ completion（RDMA 发送的异步确认），`ebpf_incr_fullsync_send_done()` 尚未被调用。TCP listener 在 `ebpf_incr_add_slave()` 之后检查 `g_fullsync_status == FULLSYNC_CATCHUP` 发现状态仍为 INPROGRESS，不调用 `finish()`。随后 `send_done()` 将状态设为 CATCHUP，但无人再次检查 —— 状态机永远卡在 CATCHUP。
+- **时序**：
+  ```
+  Slave:  收到EOF → 关闭RDMA → 连接TCP → 发送INCR_SYNC  (状态=INPROGRESS时到达)
+  Master: ...等待CQ... → send_done() → CATCHUP → (无人调用finish) → 卡死
+  ```
+- **修复**：
+  1. `ebpf_incr_add_slave()`: 状态为 INPROGRESS 时跳过 backlog replay，标记 deferred
+  2. `ebpf_incr_fullsync_send_done()`: 持有锁检查所有 active slave，若存在则 replay backlog 后直接切换到 IDLE；若不存在则切换到 CATCHUP（等待 slave 连接后由 TCP listener 触发 finish）
+  3. `tcp_listener_thread`: CATCHUP → IDLE 逻辑保持不变（slave 在 send_done 之后连接的正常路径）
+- **文件**：[ebpf_incr_repl.c](src/repl/ebpf_incr_repl.c)
+
+### Bug 2: base_seq 在 fork 之前读取
+
+- **问题**：`ebpf_incr_fullsync_begin()` 在 fork() 之前读取 `global_seq` 作为 `base_seq`。从读取到 fork 之间存在多个系统调用（memfd_create、ftruncate、mmap、memset、rdma_mr_reg），在此期间发生的写命令（seq >= base_seq）既被包含在子进程的 COW 快照中，又被追加到 backlog。Slave 全量加载后回放 backlog 时，这些命令被重复执行。
+- **修复**：`base_seq` 改为在 fork() 之后读取。父进程通过 `ebpf_incr_read_global_seq()` 读取 post-fork 值，写入 `shm->base_seq`（MAP_SHARED），通过 `parent_evt_fd` 通知子进程。子进程在写入 RDB header 前阻塞等待 `eventfd_read(parent_evt_fd)`，然后从 `shm->base_seq` 读取。fork() 本身成为序列化点 —— 快照与 backlog 之间零重叠。
+- **文件**：[rdma_repl.c](src/repl/rdma_repl.c), [ebpf_incr_repl.h](src/repl/ebpf_incr_repl.h), [ebpf_incr_repl.c](src/repl/ebpf_incr_repl.c)
+
+### Bug 3: ebpf_incr_fullsync_begin() 先读 seq 后设状态
+
+- **问题**：先调用 `ebpf_incr_read_global_seq()` 再设置 `g_fullsync_status = FULLSYNC_INPROGRESS`。两者之间的窗口期 consumer 线程仍处于 IDLE 模式，会将新事件直接发送（虽然无已连接 slave，但逻辑错误）。
+- **修复**：调换顺序 —— 先设置 INPROGRESS（consumer 立即停止直接发送），再读取 global_seq。
+- **文件**：[ebpf_incr_repl.c](src/repl/ebpf_incr_repl.c)
+
+### Bug 4: stdout 缓冲导致 master 日志不可见
+
+- **问题**：Master 端 `rdma_master_thread()` 的 `printf` 在 stdout 重定向到文件时变为全缓冲（4096+ 字节），日志消息长时间不可见，影响调试。
+- **修复**：在 `rdma_master_thread()` 开头调用 `setlinebuf(stdout)`，与 slave 端一致。
+- **文件**：[rdma_repl.c](src/repl/rdma_repl.c)
+
+### 架构说明
+
+| 同步类型 | 传输方式 | 端口 | 说明 |
+|---------|---------|------|------|
+| 全量同步 | RDMA (libfabric/verbs) | 2100 | 大数据块零拷贝传输 |
+| 增量同步 | TCP | 6382 | 小命令实时推送，eBPF uprobe 捕获 |
+
+全量同步期间增量命令只积压在 backlog 环形缓冲区（16384 条容量），全量完成后通过 backlog replay + 实时发送无缝衔接。两个流程互不阻塞。
+
+### Verified (20/20 tests pass)
+
+- Fullsync: STRING key + 2 LIST keys 正确复制（12.2ms, 1268 keys）
+- Incremental STRING: 10/10 单 key 写入同步
+- Incremental LIST: LPUSH + RPUSH = 5 elements 正确同步
+- Incremental DEL: SET → DEL 正确复制
+- Incremental MOD: SET → MOD（value 更新）正确复制
+- Incremental Batch: 50/50 批量写入同步
+- 状态机: 正确完成 IDLE → INPROGRESS → CATCHUP → IDLE 完整周期
+- Master 日志: `fullsync begin → post-fork base_seq → send done → slave registered → finish`
+- Slave 日志: `header → EOF → fullsync_time_ms → loaded keys → INCR_SYNC → recv thread started`

@@ -1,10 +1,24 @@
-# KVStore Performance Benchmark Results — 2026-05-08 06:53:08
-=== 主从同步性能测试 (2026-05-08 06:53:08) ===
+# KVStore Performance Benchmark Results — 2026-05-09 12:58:37
+=== 内存分配器对比测试 (500000 keys × 64B value) ===
 
-实时同步-SET | A1-关闭复制-P1: 19735.54 req/s
-实时同步-GET | A1-关闭复制-P1: 19535.07 req/s
-实时同步-SET | A1-关闭复制-P20: 348675.03 req/s
-实时同步-GET | A1-关闭复制-P20: 333555.72 req/s
-实时同步-SET | A1-关闭复制-P80: 661375.69 req/s
-实时同步-GET | A1-关闭复制-P80: 711237.56 req/s
+  jemalloc 空闲态: VmSize=23036 kB, VmRSS=6792 kB
+  jemalloc 峰值态: VmSize=103932 kB, VmRSS=71456 kB
+  jemalloc 稳定态: VmSize=103932 kB, VmRSS=71404 kB
+  内存增长: 63.1 MB, 归还: 0 MB, 残留: 63.0 MB
 
+  glibc 空闲态: VmSize=1057736 kB, VmRSS=4032 kB
+  glibc 峰值态: VmSize=1129188 kB, VmRSS=75292 kB
+  glibc 稳定态: VmSize=1129188 kB, VmRSS=75292 kB
+  内存增长: 69.5 MB, 归还: 0 MB, 残留: 69.5 MB
+
+
+=== 内存方案对比汇总 ===
+
+  分配器   | 阶段     | VmSize (kB) | VmRSS (kB)
+  ---------|----------|-------------|------------
+  jemalloc | idle     |       23036 |       6792
+  jemalloc | peak     |      103932 |      71456
+  jemalloc | stable   |      103932 |      71404
+  glibc    | idle     |     1057736 |       4032
+  glibc    | peak     |     1129188 |      75292
+  glibc    | stable   |     1129188 |      75292

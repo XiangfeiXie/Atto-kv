@@ -71,9 +71,9 @@ stop_kvs() {
         kill "$pid" 2>/dev/null || true
         rm -f "$pidfile"
     fi
-    # 杀所有残留 kvstore 进程
+    # 杀所有残留 kvstore 进程（排除本脚本自身）
     for sig in TERM KILL; do
-        for pid in $(pgrep -f "kvstore" 2>/dev/null || true); do
+        for pid in $(pgrep -x "kvstore" 2>/dev/null || true); do
             kill -$sig "$pid" 2>/dev/null || true
         done
         sleep 0.3

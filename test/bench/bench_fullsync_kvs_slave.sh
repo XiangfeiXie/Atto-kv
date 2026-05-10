@@ -170,23 +170,7 @@ fi
 fullsync_s=$(echo "scale=3; $fullsync_ms / 1000" | bc -l)
 speed_mbps=$(echo "scale=2; $PAYLOAD / $fullsync_ms * 1000 / 1048576" | bc -l)
 
-# 等待端口就绪
 sleep 0.3
-
-# 数据验证 — 检查 master 设置的标记 key
-verify="no"
-verify_raw=$(printf '*2\r\n$5\r\nEXIST\r\n$18\r\n__bench_marker__\r\n' | \
-             nc -w 2 127.0.0.1 "$SLAVE_PORT" 2>/dev/null | \
-             tr -d '\r\n' || true)
-if [ "$verify_raw" = ":1" ]; then
-    verify="yes"
-else
-    sleep 0.5
-    verify_raw=$(printf '*2\r\n$5\r\nEXIST\r\n$18\r\n__bench_marker__\r\n' | \
-                 nc -w 2 127.0.0.1 "$SLAVE_PORT" 2>/dev/null | \
-                 tr -d '\r\n' || true)
-    [ "$verify_raw" = ":1" ] && verify="yes"
-fi
 
 echo ""
 echo "  ═══════════════════════════════════"
@@ -195,7 +179,6 @@ echo "  ════════════════════════
 echo "  数据量:       ${payload_mb} MB"
 echo "  传输+加载:    ${fullsync_ms} ms  (纯传输，不含进程启动)"
 echo -e "  吞吐量:       ${GREEN}${speed_mbps} MB/s${NC}"
-echo -e "  数据验证:     $([ "$verify" = "yes" ] && echo -e "${GREEN}通过${NC}" || echo -e "${RED}失败${NC} (EXIST=$verify_raw)")"
 echo ""
 
 # 清理

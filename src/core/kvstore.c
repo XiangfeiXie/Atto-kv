@@ -1,6 +1,9 @@
 #include "kvstore.h"
 #include "kv_type_string.h"
 #include "kv_type_list.h"
+#include "kv_type_set.h"
+#include "kv_type_hash.h"
+#include "kv_type_zset.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,8 +139,12 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         kv_iter_t *it = dict_iter_new(&g_dict, 1);
         if (it) {
             kv_entry_t *e;
-            while ((e = dict_iter_next(it)) != NULL)
+            while ((e = dict_iter_next(it)) != NULL) {
                 list_cleanup_entry(e);
+                set_cleanup_entry(e);
+                hash_cleanup_entry(e);
+                zset_cleanup_entry(e);
+            }
             dict_iter_free(it);
         }
         dict_clear(&g_dict);
@@ -183,6 +190,35 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     dispatch_result_t r = DISPATCH_OK;
 
     if (entry) {
+        /* If command matches a different type, return WRONGTYPE early */
+        int cmd_expects = -1;
+        if (TOKEN_EQ(cmd, "SET") || TOKEN_EQ(cmd, "GET") ||
+            TOKEN_EQ(cmd, "MOD")) cmd_expects = KV_TYPE_STRING;
+        else if (TOKEN_EQ(cmd, "LPUSH") || TOKEN_EQ(cmd, "RPUSH") ||
+                 TOKEN_EQ(cmd, "LPOP")  || TOKEN_EQ(cmd, "RPOP") ||
+                 TOKEN_EQ(cmd, "LLEN")  || TOKEN_EQ(cmd, "LRANGE") ||
+                 TOKEN_EQ(cmd, "LINDEX") || TOKEN_EQ(cmd, "BLPOP") ||
+                 TOKEN_EQ(cmd, "BRPOP")) cmd_expects = KV_TYPE_LIST;
+        else if (TOKEN_EQ(cmd, "SADD") || TOKEN_EQ(cmd, "SREM") ||
+                 TOKEN_EQ(cmd, "SMEMBERS") || TOKEN_EQ(cmd, "SCARD") ||
+                 TOKEN_EQ(cmd, "SISMEMBER") || TOKEN_EQ(cmd, "SPOP") ||
+                 TOKEN_EQ(cmd, "SRANDMEMBER")) cmd_expects = KV_TYPE_SET;
+        else if (TOKEN_EQ(cmd, "HSET") || TOKEN_EQ(cmd, "HGET") ||
+                 TOKEN_EQ(cmd, "HDEL") || TOKEN_EQ(cmd, "HGETALL") ||
+                 TOKEN_EQ(cmd, "HKEYS") || TOKEN_EQ(cmd, "HVALS") ||
+                 TOKEN_EQ(cmd, "HLEN") || TOKEN_EQ(cmd, "HEXISTS") ||
+                 TOKEN_EQ(cmd, "HSETNX") || TOKEN_EQ(cmd, "HINCRBY") ||
+                 TOKEN_EQ(cmd, "HMGET") || TOKEN_EQ(cmd, "HSTRLEN")) cmd_expects = KV_TYPE_HASH;
+        else if (TOKEN_EQ(cmd, "ZADD") || TOKEN_EQ(cmd, "ZREM") ||
+                 TOKEN_EQ(cmd, "ZSCORE") || TOKEN_EQ(cmd, "ZRANGE") ||
+                 TOKEN_EQ(cmd, "ZRANK") || TOKEN_EQ(cmd, "ZCARD") ||
+                 TOKEN_EQ(cmd, "ZCOUNT") || TOKEN_EQ(cmd, "ZRANGEBYSCORE")) cmd_expects = KV_TYPE_ZSET;
+
+        if (cmd_expects != -1 && cmd_expects != (int)entry_type(entry)) {
+            dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
+            return DISPATCH_ERROR;
+        }
+
         /* Key exists — dispatch by entry type */
         switch (entry_type(entry)) {
         case KV_TYPE_STRING:
@@ -192,6 +228,18 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             break;
         case KV_TYPE_LIST:
             r = list_cmd(cmd, entry, tokens + 1, argc - 1,
+                        wb, msg_raw, msg_len, c ? c->client : NULL);
+            break;
+        case KV_TYPE_SET:
+            r = set_cmd(cmd, entry, tokens + 1, argc - 1,
+                       wb, msg_raw, msg_len, c ? c->client : NULL);
+            break;
+        case KV_TYPE_HASH:
+            r = hash_cmd(cmd, entry, tokens + 1, argc - 1,
+                        wb, msg_raw, msg_len, c ? c->client : NULL);
+            break;
+        case KV_TYPE_ZSET:
+            r = zset_cmd(cmd, entry, tokens + 1, argc - 1,
                         wb, msg_raw, msg_len, c ? c->client : NULL);
             break;
         default:
@@ -213,6 +261,26 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                    TOKEN_EQ(cmd, "LINDEX")) {
             r = list_cmd(cmd, NULL, tokens + 1, argc - 1,
                         wb, msg_raw, msg_len, c ? c->client : NULL);
+        } else if (TOKEN_EQ(cmd, "SADD") || TOKEN_EQ(cmd, "SREM") ||
+                   TOKEN_EQ(cmd, "SMEMBERS") || TOKEN_EQ(cmd, "SCARD") ||
+                   TOKEN_EQ(cmd, "SISMEMBER") || TOKEN_EQ(cmd, "SPOP") ||
+                   TOKEN_EQ(cmd, "SRANDMEMBER")) {
+            r = set_cmd(cmd, NULL, tokens + 1, argc - 1,
+                       wb, msg_raw, msg_len, c ? c->client : NULL);
+        } else if (TOKEN_EQ(cmd, "HSET") || TOKEN_EQ(cmd, "HGET") ||
+                   TOKEN_EQ(cmd, "HDEL") || TOKEN_EQ(cmd, "HGETALL") ||
+                   TOKEN_EQ(cmd, "HKEYS") || TOKEN_EQ(cmd, "HVALS") ||
+                   TOKEN_EQ(cmd, "HLEN") || TOKEN_EQ(cmd, "HEXISTS") ||
+                   TOKEN_EQ(cmd, "HSETNX") || TOKEN_EQ(cmd, "HINCRBY") ||
+                   TOKEN_EQ(cmd, "HMGET") || TOKEN_EQ(cmd, "HSTRLEN")) {
+            r = hash_cmd(cmd, NULL, tokens + 1, argc - 1,
+                        wb, msg_raw, msg_len, c ? c->client : NULL);
+        } else if (TOKEN_EQ(cmd, "ZADD") || TOKEN_EQ(cmd, "ZREM") ||
+                   TOKEN_EQ(cmd, "ZSCORE") || TOKEN_EQ(cmd, "ZRANGE") ||
+                   TOKEN_EQ(cmd, "ZRANK") || TOKEN_EQ(cmd, "ZCARD") ||
+                   TOKEN_EQ(cmd, "ZCOUNT") || TOKEN_EQ(cmd, "ZRANGEBYSCORE")) {
+            r = zset_cmd(cmd, NULL, tokens + 1, argc - 1,
+                        wb, msg_raw, msg_len, c ? c->client : NULL);
         } else {
             dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
             return DISPATCH_ERROR;
@@ -227,7 +295,11 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         TOKEN_EQ(cmd, "MOD")   || TOKEN_EQ(cmd, "LPUSH") ||
         TOKEN_EQ(cmd, "RPUSH") || TOKEN_EQ(cmd, "LPOP")  ||
         TOKEN_EQ(cmd, "RPOP")  || TOKEN_EQ(cmd, "BLPOP") ||
-        TOKEN_EQ(cmd, "BRPOP")) {
+        TOKEN_EQ(cmd, "BRPOP") || TOKEN_EQ(cmd, "SADD")  ||
+        TOKEN_EQ(cmd, "SREM")  || TOKEN_EQ(cmd, "SPOP")  ||
+        TOKEN_EQ(cmd, "HSET")  || TOKEN_EQ(cmd, "HDEL")  ||
+        TOKEN_EQ(cmd, "HSETNX") || TOKEN_EQ(cmd, "HINCRBY") ||
+        TOKEN_EQ(cmd, "ZADD")  || TOKEN_EQ(cmd, "ZREM")) {
         const char *resp = wb->buf + pre_len;
         int rlen = wb->len - pre_len;
         int ok = (rlen > 0 && resp[0] != '-' &&
@@ -267,8 +339,12 @@ void kvs_flush_all(void) {
     kv_iter_t *it = dict_iter_new(&g_dict, 1);
     if (it) {
         kv_entry_t *e;
-        while ((e = dict_iter_next(it)) != NULL)
+        while ((e = dict_iter_next(it)) != NULL) {
             list_cleanup_entry(e);
+            set_cleanup_entry(e);
+            hash_cleanup_entry(e);
+            zset_cleanup_entry(e);
+        }
         dict_iter_free(it);
     }
     dict_clear(&g_dict);

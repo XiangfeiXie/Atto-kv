@@ -88,6 +88,16 @@ void     dict_clear(kv_dict_t *d);
 
 /* --- Core operations --- */
 kv_entry_t *dict_find(kv_dict_t *d, const char *key, uint32_t key_len, uint64_t hash);
+
+/* dict_find variant: entry key area stores a pointer to the actual key
+ * (not the key bytes themselves). Used by ZSET skiplist encoding where
+ * member strings are owned by skiplist nodes.
+ *   entry data[]: [type][encoding][real_key_len:4][score:8]
+ *   entry key area: [ptr:8] -> external key string
+ *   entry->key_len = 8 (sizeof(void*))
+ * Comparison dereferences the stored pointer before memcmp. */
+kv_entry_t *dict_find_extkey(kv_dict_t *d, const char *key,
+                              uint32_t key_len, uint64_t hash);
 kv_entry_t *dict_add(kv_dict_t *d, const char *key, uint32_t key_len,
                      const char *data, uint32_t data_len, uint64_t hash);
 /* Direct add: builds entry from raw components (no intermediate data buffer) */

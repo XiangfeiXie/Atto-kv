@@ -345,8 +345,16 @@ static void rdb_buf_put(rdb_buf_t *b, const void *p, size_t n) {
 
 #include "kv_dict.h"
 
-/* Forward declaration — quicklist flattening helper (in kv_type_list.c) */
+/* Forward declarations — flattening helpers from type modules */
 extern int list_flatten_to_packed(kv_entry_t *e, char **out_data, uint32_t *out_len);
+extern int set_flatten_to_packed(kv_entry_t *e, char **out_data, uint32_t *out_len);
+extern int hash_flatten_to_packed(kv_entry_t *e, char **out_data, uint32_t *out_len);
+extern int zset_flatten_to_packed(kv_entry_t *e, char **out_data, uint32_t *out_len);
+
+/* Forward declarations — encoding rebuild after RDB load */
+extern void set_rebuild_encoding(kv_entry_t *e);
+extern void hash_rebuild_encoding(kv_entry_t *e);
+extern void zset_rebuild_encoding(kv_entry_t *e);
 
 /* Serialize one dict entry to RDB binary format (appends to rdb_buf_t). */
 static void rdb_save_callback_buf(kv_entry_t *e, void *priv) {
@@ -358,20 +366,72 @@ static void rdb_save_callback_buf(kv_entry_t *e, void *priv) {
     const char *data_ptr;
     char *flat_buf = NULL;
 
-    /* Quicklist LIST entries contain raw pointers — flatten to packed */
-    if (entry_type(e) == KV_TYPE_LIST &&
-        entry_encoding(e) == KV_ENCODING_QUICKLIST) {
-        uint32_t flat_len = 0;
-        if (list_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
-            dlen     = (int)flat_len;
-            data_ptr = flat_buf;
+    /* Flatten encodings that contain heap pointers to packed format */
+    switch (entry_type(e)) {
+    case KV_TYPE_LIST:
+        if (entry_encoding(e) == KV_ENCODING_QUICKLIST) {
+            uint32_t flat_len = 0;
+            if (list_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
+                dlen     = (int)flat_len;
+                data_ptr = flat_buf;
+            } else {
+                dlen     = (int)e->val_len;
+                data_ptr = e->data;
+            }
         } else {
             dlen     = (int)e->val_len;
             data_ptr = e->data;
         }
-    } else {
+        break;
+    case KV_TYPE_SET:
+        if (entry_encoding(e) == KV_ENCODING_DICT) {
+            uint32_t flat_len = 0;
+            if (set_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
+                dlen     = (int)flat_len;
+                data_ptr = flat_buf;
+            } else {
+                dlen     = (int)e->val_len;
+                data_ptr = e->data;
+            }
+        } else {
+            dlen     = (int)e->val_len;
+            data_ptr = e->data;
+        }
+        break;
+    case KV_TYPE_HASH:
+        if (entry_encoding(e) == KV_ENCODING_DICT) {
+            uint32_t flat_len = 0;
+            if (hash_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
+                dlen     = (int)flat_len;
+                data_ptr = flat_buf;
+            } else {
+                dlen     = (int)e->val_len;
+                data_ptr = e->data;
+            }
+        } else {
+            dlen     = (int)e->val_len;
+            data_ptr = e->data;
+        }
+        break;
+    case KV_TYPE_ZSET:
+        if (entry_encoding(e) == KV_ENCODING_SKIPLIST) {
+            uint32_t flat_len = 0;
+            if (zset_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
+                dlen     = (int)flat_len;
+                data_ptr = flat_buf;
+            } else {
+                dlen     = (int)e->val_len;
+                data_ptr = e->data;
+            }
+        } else {
+            dlen     = (int)e->val_len;
+            data_ptr = e->data;
+        }
+        break;
+    default:
         dlen     = (int)e->val_len;
         data_ptr = e->data;
+        break;
     }
 
     long long expire = e->expire;
@@ -394,19 +454,71 @@ void serialize_entry_to_buf(DynBuf *out, kv_entry_t *e) {
     const char *data_ptr;
     char *flat_buf = NULL;
 
-    if (entry_type(e) == KV_TYPE_LIST &&
-        entry_encoding(e) == KV_ENCODING_QUICKLIST) {
-        uint32_t flat_len = 0;
-        if (list_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
-            dlen     = (int)flat_len;
-            data_ptr = flat_buf;
+    switch (entry_type(e)) {
+    case KV_TYPE_LIST:
+        if (entry_encoding(e) == KV_ENCODING_QUICKLIST) {
+            uint32_t flat_len = 0;
+            if (list_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
+                dlen     = (int)flat_len;
+                data_ptr = flat_buf;
+            } else {
+                dlen     = (int)e->val_len;
+                data_ptr = e->data;
+            }
         } else {
             dlen     = (int)e->val_len;
             data_ptr = e->data;
         }
-    } else {
+        break;
+    case KV_TYPE_SET:
+        if (entry_encoding(e) == KV_ENCODING_DICT) {
+            uint32_t flat_len = 0;
+            if (set_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
+                dlen     = (int)flat_len;
+                data_ptr = flat_buf;
+            } else {
+                dlen     = (int)e->val_len;
+                data_ptr = e->data;
+            }
+        } else {
+            dlen     = (int)e->val_len;
+            data_ptr = e->data;
+        }
+        break;
+    case KV_TYPE_HASH:
+        if (entry_encoding(e) == KV_ENCODING_DICT) {
+            uint32_t flat_len = 0;
+            if (hash_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
+                dlen     = (int)flat_len;
+                data_ptr = flat_buf;
+            } else {
+                dlen     = (int)e->val_len;
+                data_ptr = e->data;
+            }
+        } else {
+            dlen     = (int)e->val_len;
+            data_ptr = e->data;
+        }
+        break;
+    case KV_TYPE_ZSET:
+        if (entry_encoding(e) == KV_ENCODING_SKIPLIST) {
+            uint32_t flat_len = 0;
+            if (zset_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
+                dlen     = (int)flat_len;
+                data_ptr = flat_buf;
+            } else {
+                dlen     = (int)e->val_len;
+                data_ptr = e->data;
+            }
+        } else {
+            dlen     = (int)e->val_len;
+            data_ptr = e->data;
+        }
+        break;
+    default:
         dlen     = (int)e->val_len;
         data_ptr = e->data;
+        break;
     }
 
     long long expire = e->expire;
@@ -428,19 +540,71 @@ int serialize_entry_inline(char *dst, size_t max_space, kv_entry_t *e) {
     const char *data_ptr;
     char *flat_buf = NULL;
 
-    if (entry_type(e) == KV_TYPE_LIST &&
-        entry_encoding(e) == KV_ENCODING_QUICKLIST) {
-        uint32_t flat_len = 0;
-        if (list_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
-            dlen     = (int)flat_len;
-            data_ptr = flat_buf;
+    switch (entry_type(e)) {
+    case KV_TYPE_LIST:
+        if (entry_encoding(e) == KV_ENCODING_QUICKLIST) {
+            uint32_t flat_len = 0;
+            if (list_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
+                dlen     = (int)flat_len;
+                data_ptr = flat_buf;
+            } else {
+                dlen     = (int)e->val_len;
+                data_ptr = e->data;
+            }
         } else {
             dlen     = (int)e->val_len;
             data_ptr = e->data;
         }
-    } else {
+        break;
+    case KV_TYPE_SET:
+        if (entry_encoding(e) == KV_ENCODING_DICT) {
+            uint32_t flat_len = 0;
+            if (set_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
+                dlen     = (int)flat_len;
+                data_ptr = flat_buf;
+            } else {
+                dlen     = (int)e->val_len;
+                data_ptr = e->data;
+            }
+        } else {
+            dlen     = (int)e->val_len;
+            data_ptr = e->data;
+        }
+        break;
+    case KV_TYPE_HASH:
+        if (entry_encoding(e) == KV_ENCODING_DICT) {
+            uint32_t flat_len = 0;
+            if (hash_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
+                dlen     = (int)flat_len;
+                data_ptr = flat_buf;
+            } else {
+                dlen     = (int)e->val_len;
+                data_ptr = e->data;
+            }
+        } else {
+            dlen     = (int)e->val_len;
+            data_ptr = e->data;
+        }
+        break;
+    case KV_TYPE_ZSET:
+        if (entry_encoding(e) == KV_ENCODING_SKIPLIST) {
+            uint32_t flat_len = 0;
+            if (zset_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
+                dlen     = (int)flat_len;
+                data_ptr = flat_buf;
+            } else {
+                dlen     = (int)e->val_len;
+                data_ptr = e->data;
+            }
+        } else {
+            dlen     = (int)e->val_len;
+            data_ptr = e->data;
+        }
+        break;
+    default:
         dlen     = (int)e->val_len;
         data_ptr = e->data;
+        break;
     }
 
     long long expire = e->expire;
@@ -704,6 +868,23 @@ int rdb_load_from_buf(const char *buf, size_t len) {
 
     int loaded = rdb_load_stream_append(buf + 16, len - 16);
     if (loaded < 0) { dict_clear(&g_dict); return -1; }
+
+    /* Rebuild encodings for entries loaded as PACKED that should be richer */
+    {
+        kv_iter_t *it = dict_iter_new(&g_dict, 1);
+        if (it) {
+            kv_entry_t *e;
+            while ((e = dict_iter_next(it)) != NULL) {
+                switch (entry_type(e)) {
+                case KV_TYPE_SET:  set_rebuild_encoding(e);  break;
+                case KV_TYPE_HASH: hash_rebuild_encoding(e); break;
+                case KV_TYPE_ZSET: zset_rebuild_encoding(e); break;
+                default: break;
+                }
+            }
+            dict_iter_free(it);
+        }
+    }
 
     printf("[RDB] buf load: %d keys, %zu bytes\n", loaded, len);
     return loaded;

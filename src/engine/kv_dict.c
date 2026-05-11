@@ -262,6 +262,40 @@ kv_entry_t *dict_find(kv_dict_t *d, const char *key, uint32_t key_len,
     return NULL;
 }
 
+kv_entry_t *dict_find_extkey(kv_dict_t *d, const char *key,
+                              uint32_t key_len, uint64_t hash)
+{
+    if (d->ht[0].size == 0 && d->rehash_idx < 0)
+        return NULL;
+
+    for (int t = 0; t < 2; t++) {
+        kv_ht_t *ht = &d->ht[t];
+        if (ht->size == 0) continue;
+
+        uint32_t idx = (uint32_t)(hash & ht->size_mask);
+        kv_entry_t *e = ht->buckets[idx];
+        while (e) {
+            /* e->key_len == sizeof(void*), entry_key(e) points to a
+             * pointer whose value is the actual key address.
+             * Real key length is stored in e->data[2..6] (payload prefix). */
+            uint32_t real_klen;
+            memcpy(&real_klen, e->data + 2, sizeof(uint32_t));
+            const char *real_key = *(const char **)entry_key(e);
+
+            if (e->hash == hash && real_klen == key_len &&
+                memcmp(real_key, key, key_len) == 0)
+            {
+                dict_rehash_step(d, 1);
+                return e;
+            }
+            e = e->next;
+        }
+    }
+
+    dict_rehash_step(d, 1);
+    return NULL;
+}
+
 kv_entry_t *dict_add(kv_dict_t *d, const char *key, uint32_t key_len,
                      const char *data, uint32_t data_len, uint64_t hash)
 {

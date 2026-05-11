@@ -50,6 +50,9 @@ set(ENGINE_SRCS
 set(TYPE_SRCS
     src/type/kv_type_string.c
     src/type/kv_type_list.c
+    src/type/kv_type_set.c
+    src/type/kv_type_hash.c
+    src/type/kv_type_zset.c
 )
 
 set(NET_SRCS

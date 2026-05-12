@@ -882,6 +882,23 @@ int rdb_load_stream_append(const char *buf, size_t len) {
     return loaded;
 }
 
+/* Rebuild encodings for all loaded entries. After streaming load, SET/HASH/ZSET
+ * entries are PACKED; this upgrades them to DICT/SKIPLIST when thresholds met. */
+void rdb_rebuild_all_encodings(void) {
+    kv_iter_t *it = dict_iter_new(&g_dict, 1);
+    if (!it) return;
+    kv_entry_t *e;
+    while ((e = dict_iter_next(it)) != NULL) {
+        switch (entry_type(e)) {
+        case KV_TYPE_SET:  set_rebuild_encoding(e);  break;
+        case KV_TYPE_HASH: hash_rebuild_encoding(e); break;
+        case KV_TYPE_ZSET: zset_rebuild_encoding(e); break;
+        default: break;
+        }
+    }
+    dict_iter_free(it);
+}
+
 /* In-memory RDB loader: parses the same binary format as rdb_load_mmap()
  * but operates on a buffer already in memory (no file, no mmap).
  * Used by the slave fullsync path — data arrives via RDMA and is loaded
@@ -895,22 +912,7 @@ int rdb_load_from_buf(const char *buf, size_t len) {
     int loaded = rdb_load_stream_append(buf + 16, len - 16);
     if (loaded < 0) { dict_clear(&g_dict); return -1; }
 
-    /* Rebuild encodings for entries loaded as PACKED that should be richer */
-    {
-        kv_iter_t *it = dict_iter_new(&g_dict, 1);
-        if (it) {
-            kv_entry_t *e;
-            while ((e = dict_iter_next(it)) != NULL) {
-                switch (entry_type(e)) {
-                case KV_TYPE_SET:  set_rebuild_encoding(e);  break;
-                case KV_TYPE_HASH: hash_rebuild_encoding(e); break;
-                case KV_TYPE_ZSET: zset_rebuild_encoding(e); break;
-                default: break;
-                }
-            }
-            dict_iter_free(it);
-        }
-    }
+    rdb_rebuild_all_encodings();
 
     printf("[RDB] buf load: %d keys, %zu bytes\n", loaded, len);
     return loaded;

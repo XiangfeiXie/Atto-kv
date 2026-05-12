@@ -675,6 +675,11 @@ void engine_reload(void) {
 
 int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN);
+    /* Line-buffer stdout early so all threads inherit it.
+     * When stdout is redirected to a file it defaults to fully
+     * buffered (4096+ bytes), hiding log messages from bench scripts. */
+    setlinebuf(stdout);
+    setlinebuf(stderr);
     persist_set_basedir(argv[0]);
     const char *conf_path = (argc >= 2) ? argv[1] : "conf/kvstore.conf";
     config_load(conf_path);

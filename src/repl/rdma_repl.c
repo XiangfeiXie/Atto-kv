@@ -148,8 +148,8 @@ static int rdma_wait_eq(struct fid_eq *eq, uint32_t *event,
 /* 2. Streaming fullsync — data structures                    */
 /* ========================================================== */
 
-#define SHM_RING_SIZE      8
-#define CHUNK_DATA_SIZE    (256 * 1024)     /* 256 KB per slot */
+#define SHM_RING_SIZE      16
+#define CHUNK_DATA_SIZE    (1024 * 1024)    /* 1 MB per slot */
 #define CHUNK_HDR_SIZE     5               /* [chunk_len:4][type:1] */
 #define CHUNK_WIRE_SIZE    (CHUNK_HDR_SIZE + CHUNK_DATA_SIZE)
 
@@ -440,8 +440,12 @@ static void *parent_send_thread(void *arg) {
     printf("[RDMA-REPL] parent: send thread started\n");
 
     while (1) {
+        /* When we have in-flight sends, poll briefly to reap CQ
+         * completions (which free slots for the child).  Otherwise
+         * block until the child signals new data. */
+        int timeout_ms = (inflight > 0) ? 1 : -1;
         struct epoll_event ev_out;
-        int n = epoll_wait(epfd, &ev_out, 1, 10);  /* 10ms timeout */
+        int n = epoll_wait(epfd, &ev_out, 1, timeout_ms);
 
         /* Consume eventfd counter */
         if (n > 0 && (ev_out.events & EPOLLIN)) {
@@ -748,11 +752,6 @@ fail:
 static void *rdma_master_thread(void *arg) {
     (void)arg;
 
-    /* When stdout is redirected to a file it becomes fully buffered.
-     * Switch to line-buffered so bench scripts can see log messages
-     * in real time. */
-    setlinebuf(stdout);
-
     struct fi_info      *hints  = NULL, *info = NULL;
     struct fid_fabric   *fabric = NULL;
     struct fid_eq       *eq     = NULL;
@@ -942,12 +941,6 @@ int rdma_repl_slave_run(void) {
     int    total_keys    = 0;
     int    pending       = 0;
 
-    /* When stdout is redirected to a file (nohup ... > log), it becomes
-     * fully buffered. Switch to line-buffered so the bench script can
-     * detect "loaded X keys from fullsync" without waiting for the 4KB
-     * buffer to fill. */
-    setlinebuf(stdout);
-
     hints = rdma_build_hints();
     if (!hints) return -1;
 
@@ -1119,7 +1112,8 @@ int rdma_repl_slave_run(void) {
         }
         case CHUNK_TYPE_EOF:
             eof_received = 1;
-            printf("[RDMA-REPL] slave: EOF received\n");
+            printf("[RDMA-REPL] slave: EOF received, rebuilding encodings\n");
+            rdb_rebuild_all_encodings();
             goto done;
         default:
             fprintf(stderr, "[RDMA-REPL] slave: unknown chunk type %u\n",

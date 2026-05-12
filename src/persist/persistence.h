@@ -69,4 +69,8 @@ int serialize_entry_inline(char *dst, size_t max_space, kv_entry_t *e);
 int rdb_load_stream_begin(const char *buf, size_t len);
 int rdb_load_stream_append(const char *buf, size_t len);
 
+/* Rebuild encodings for all loaded entries that exceed PACKED thresholds.
+ * Call after streaming load to upgrade SET→DICT, HASH→DICT, ZSET→SKIPLIST. */
+void rdb_rebuild_all_encodings(void);
+
 #endif

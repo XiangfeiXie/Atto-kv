@@ -26,6 +26,7 @@ extern int proactor_start(unsigned short port, msg_handler handler);
 extern int ntyco_start(unsigned short port, msg_handler handler);
 
 long long get_time_now(void);
+void update_cached_time(void);  /* call once per event-loop iteration */
 
 /* ── Command dispatch ── */
 dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
@@ -33,6 +34,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                                DynBuf *wb, struct conn *c);
 
 void kvs_flush_all(void);
+void kvs_cleanup_entry(kv_entry_t *e);  /* free type-specific internal structures */
 
 /* ── Value item (legacy, used by persistence layer) ── */
 typedef struct {

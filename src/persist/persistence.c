@@ -34,6 +34,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/eventfd.h>
+#include <stdatomic.h>
 #include <liburing.h>
 
 /* ── 项目根目录：由 persist_set_basedir 在启动时设置 ── */
@@ -107,145 +109,138 @@ void persist_set_basedir(const char *argv0) {
 KVItem* create_kvitem(char *value_str, char *expire_str);
 
 /* =============================================================================
- * Part 1. AOF 异步写（pthread + io_uring）
+ * Part 1. AOF 异步写（pthread + io_uring + lock-free ring buffer）
  * ============================================================================= */
 
-#define AOF_URING_DEPTH       64         /* io_uring SQ 深度 */
-#define AOF_BATCH_MAX         32         /* 一次批量提交的最大 entry */
+#define AOF_URING_DEPTH       64
+#define AOF_BATCH_MAX         32
+#define AOF_RING_SIZE         1024          /* power of 2 */
+#define AOF_RING_MASK         (AOF_RING_SIZE - 1)
+#define AOF_SLOT_INIT_CAP     4096          /* grows as needed to fit max command */
 
-typedef struct aof_entry_s {
-    char                *buf;
-    int                  len;
-    struct aof_entry_s  *next;
-} aof_entry_t;
+typedef struct {
+    char  *buf;
+    int    len;
+    int    cap;
+} aof_slot_t;
 
 static struct {
-    int                  fd;              /* aof 文件 fd */
-    pthread_t            tid;
-    pthread_mutex_t      mtx;
-    pthread_cond_t       cond;
-    aof_entry_t         *head;
-    aof_entry_t         *tail;
-    int                  running;         /* 1: 运行中 0: 退出 */
-    struct io_uring      ring;
-    int                  ring_inited;
+    int              fd;
+    pthread_t        tid;
+    aof_slot_t       slots[AOF_RING_SIZE];
+    _Atomic uint32_t head;           /* producer writes here (monotonic) */
+    _Atomic uint32_t tail;           /* consumer writes here (monotonic) */
+    _Atomic int      running;
+    struct io_uring  ring;
+    int              ring_inited;
+    int              evt_fd;         /* eventfd for consumer wakeup */
 } g_aof = {
-    .fd = -1,
-    .mtx = PTHREAD_MUTEX_INITIALIZER,
-    .cond = PTHREAD_COND_INITIALIZER,
+    .fd     = -1,
+    .evt_fd = -1,
 };
 
-/* pthread_atfork handlers: ensure child never inherits a locked g_aof.mtx
- * and that the child's AOF resources are cleaned up before RDB scan. */
-static void aof_atfork_prepare(void) {
-    /* Lock before fork so the AOF worker is not mid-append. */
-    pthread_mutex_lock(&g_aof.mtx);
-}
-static void aof_atfork_parent(void) {
-    pthread_mutex_unlock(&g_aof.mtx);
-}
-static void aof_atfork_child(void) {
-    /* Unlock the mutex we inherited from the prepare handler.
-     * The AOF worker thread does not exist in the child, so close
-     * the AOF fd to prevent accidental double-writes.  We intentionally
-     * do NOT call io_uring_queue_exit here: the ring may have in-flight
-     * kernel operations from the parent's worker thread; trying to drain
-     * or close the ring in the child can hang.  The ring_fd and mmaped
-     * memory are released automatically when the child exits. */
-    pthread_mutex_unlock(&g_aof.mtx);
-    if (g_aof.fd >= 0) { close(g_aof.fd); g_aof.fd = -1; }
-    g_aof.ring_inited = 0;  /* mark uninitialized so child won't use it */
-    g_aof.head    = NULL;
-    g_aof.tail    = NULL;
-    g_aof.running = 0;
+static void aof_slot_ensure(aof_slot_t *s, int need) {
+    if (s->cap >= need) return;
+    int new_cap = s->cap ? s->cap : AOF_SLOT_INIT_CAP;
+    while (new_cap < need) new_cap *= 2;
+    char *nb = (char *)realloc(s->buf, (size_t)new_cap);
+    if (!nb) return;
+    s->buf = nb;
+    s->cap = new_cap;
 }
 
-/* 后台线程：消费队列 + io_uring 批量写 */
+/* pthread_atfork: child must not inherit the worker thread.  Close fds
+ * and free slot buffers so the child starts with a clean AOF slate. */
+static void aof_atfork_child(void) {
+    if (g_aof.fd >= 0)     { close(g_aof.fd);     g_aof.fd     = -1; }
+    if (g_aof.evt_fd >= 0) { close(g_aof.evt_fd); g_aof.evt_fd = -1; }
+    g_aof.ring_inited = 0;
+    atomic_store_explicit(&g_aof.running, 0, memory_order_relaxed);
+    for (int i = 0; i < AOF_RING_SIZE; i++) {
+        free(g_aof.slots[i].buf);
+        g_aof.slots[i].buf = NULL;
+        g_aof.slots[i].cap = 0;
+    }
+    atomic_store_explicit(&g_aof.head, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_aof.tail, 0, memory_order_relaxed);
+}
+
+/* 后台线程：消费 ring buffer + io_uring 批量写 */
 static void *aof_worker(void *arg) {
     (void)arg;
-    /* 忽略 SIGPIPE，避免写管道类异常导致整个进程挂掉（文件不会触发，但兜底） */
     signal(SIGPIPE, SIG_IGN);
 
+    /* Tracks how far we've consumed (monotonic, local to worker) */
+    uint32_t t = atomic_load_explicit(&g_aof.tail, memory_order_relaxed);
+
     while (1) {
-        aof_entry_t *batch = NULL;
-        aof_entry_t *batch_tail = NULL;
-        int          batch_n = 0;
-
-        /* 1) 等待并取出一批待写 entry */
-        pthread_mutex_lock(&g_aof.mtx);
-        while (g_aof.running && g_aof.head == NULL) {
-            pthread_cond_wait(&g_aof.cond, &g_aof.mtx);
-        }
-        if (!g_aof.running && g_aof.head == NULL) {
-            pthread_mutex_unlock(&g_aof.mtx);
-            break;
-        }
-        /* 从队头截取最多 AOF_BATCH_MAX 个 */
-        batch = g_aof.head;
-        batch_tail = batch;
-        batch_n = 1;
-        while (batch_tail->next && batch_n < AOF_BATCH_MAX) {
-            batch_tail = batch_tail->next;
-            batch_n++;
-        }
-        g_aof.head = batch_tail->next;
-        if (g_aof.head == NULL) g_aof.tail = NULL;
-        batch_tail->next = NULL;
-        pthread_mutex_unlock(&g_aof.mtx);
-
-        /* 2) 使用 io_uring 批量提交 write SQE —— 追加模式（O_APPEND），offset=-1 */
+        uint32_t h = atomic_load_explicit(&g_aof.head, memory_order_acquire);
+        int batch_n = 0;
         int submitted = 0;
-        for (aof_entry_t *e = batch; e != NULL; e = e->next) {
+
+        /* Drain up to AOF_BATCH_MAX entries from the ring */
+        while (t != h && batch_n < AOF_BATCH_MAX) {
+            aof_slot_t *s = &g_aof.slots[t & AOF_RING_MASK];
+
             struct io_uring_sqe *sqe = io_uring_get_sqe(&g_aof.ring);
             if (!sqe) {
-                /* 队列满，先 submit 一次释放 SQE */
                 io_uring_submit(&g_aof.ring);
-                /* 等待已提交的完成 */
                 for (int i = 0; i < submitted; i++) {
                     struct io_uring_cqe *cqe;
-                    if (io_uring_wait_cqe(&g_aof.ring, &cqe) == 0) {
+                    if (io_uring_wait_cqe(&g_aof.ring, &cqe) == 0)
                         io_uring_cqe_seen(&g_aof.ring, cqe);
-                    }
                 }
                 submitted = 0;
                 sqe = io_uring_get_sqe(&g_aof.ring);
-                if (!sqe) continue; /* 异常情况，丢弃 */
+                if (!sqe) continue;
             }
-            io_uring_prep_write(sqe, g_aof.fd, e->buf, e->len, (uint64_t)-1);
-            io_uring_sqe_set_data(sqe, e);
+            io_uring_prep_write(sqe, g_aof.fd, s->buf, s->len, (uint64_t)-1);
+            io_uring_sqe_set_data(sqe, NULL);
             submitted++;
+            batch_n++;
+            t++;
         }
+
+        /* Commit the batch and wait for completions */
         if (submitted > 0) {
             io_uring_submit(&g_aof.ring);
-            /* 等待全部完成，确保持久化顺序 */
             for (int i = 0; i < submitted; i++) {
                 struct io_uring_cqe *cqe = NULL;
                 if (io_uring_wait_cqe(&g_aof.ring, &cqe) == 0) {
                     if (cqe->res < 0) {
-                        fprintf(stderr, "[AOF] io_uring write error: %s\n", strerror(-cqe->res));
+                        fprintf(stderr, "[AOF] io_uring write error: %s\n",
+                                strerror(-cqe->res));
                     }
                     io_uring_cqe_seen(&g_aof.ring, cqe);
                 }
             }
+            /* Publish consumed entries to producer */
+            atomic_store_explicit(&g_aof.tail, t, memory_order_release);
         }
 
-        /* 3) 释放这批 entry */
-        aof_entry_t *e = batch;
-        while (e) {
-            aof_entry_t *nxt = e->next;
-            free(e->buf);
-            free(e);
-            e = nxt;
+        /* Check for shutdown */
+        if (!atomic_load_explicit(&g_aof.running, memory_order_relaxed)) {
+            /* Drain any stragglers */
+            h = atomic_load_explicit(&g_aof.head, memory_order_acquire);
+            if (t == h) break;
+            continue;
         }
+
+        /* Ring still empty after our batch? Wait on eventfd. */
+        h = atomic_load_explicit(&g_aof.head, memory_order_acquire);
+        if (t != h) continue;
+
+        uint64_t cnt;
+        ssize_t nr = read(g_aof.evt_fd, &cnt, sizeof(cnt));
+        if (nr < 0 && errno != EAGAIN && errno != EINTR) break;
     }
 
-    /* 退出前 flush：fsync */
     if (g_aof.fd >= 0) fsync(g_aof.fd);
     return NULL;
 }
 
 int aof_async_init(void) {
-    if (g_aof.fd >= 0) return 0; /* 已初始化 */
+    if (g_aof.fd >= 0) return 0;
 
     const char *path = persist_path(AOF_REL);
     g_aof.fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -254,40 +249,47 @@ int aof_async_init(void) {
         return -1;
     }
 
-    if (io_uring_queue_init(AOF_URING_DEPTH, &g_aof.ring, 0) < 0) {
-        fprintf(stderr, "[AOF] io_uring_queue_init failed\n");
+    g_aof.evt_fd = eventfd(0, EFD_NONBLOCK);
+    if (g_aof.evt_fd < 0) {
+        fprintf(stderr, "[AOF] eventfd failed: %s\n", strerror(errno));
         close(g_aof.fd);
         g_aof.fd = -1;
         return -1;
     }
+
+    if (io_uring_queue_init(AOF_URING_DEPTH, &g_aof.ring, 0) < 0) {
+        fprintf(stderr, "[AOF] io_uring_queue_init failed\n");
+        close(g_aof.evt_fd); g_aof.evt_fd = -1;
+        close(g_aof.fd);     g_aof.fd     = -1;
+        return -1;
+    }
     g_aof.ring_inited = 1;
-    g_aof.running = 1;
+    atomic_store_explicit(&g_aof.running, 1, memory_order_relaxed);
 
     if (pthread_create(&g_aof.tid, NULL, aof_worker, NULL) != 0) {
         fprintf(stderr, "[AOF] pthread_create failed\n");
         io_uring_queue_exit(&g_aof.ring);
         g_aof.ring_inited = 0;
-        close(g_aof.fd);
-        g_aof.fd = -1;
-        g_aof.running = 0;
+        close(g_aof.evt_fd); g_aof.evt_fd = -1;
+        close(g_aof.fd);     g_aof.fd     = -1;
         return -1;
     }
 
-    /* Register fork handlers once: lock AOF queue in parent before fork so
-     * the child never inherits g_aof.mtx in a locked state. */
-    pthread_atfork(aof_atfork_prepare, aof_atfork_parent, aof_atfork_child);
+    pthread_atfork(NULL, NULL, aof_atfork_child);
 
-    printf("[AOF] async writer started (uring depth=%d)\n", AOF_URING_DEPTH);
+    printf("[AOF] async writer started (uring depth=%d, ring=%d slots)\n",
+           AOF_URING_DEPTH, AOF_RING_SIZE);
     return 0;
 }
 
 void aof_async_shutdown(void) {
     if (g_aof.fd < 0) return;
 
-    pthread_mutex_lock(&g_aof.mtx);
-    g_aof.running = 0;
-    pthread_cond_broadcast(&g_aof.cond);
-    pthread_mutex_unlock(&g_aof.mtx);
+    atomic_store_explicit(&g_aof.running, 0, memory_order_relaxed);
+    /* Wake worker if it's blocked on eventfd */
+    uint64_t one = 1;
+    ssize_t wr = write(g_aof.evt_fd, &one, sizeof(one));
+    (void)wr;
 
     pthread_join(g_aof.tid, NULL);
 
@@ -295,28 +297,48 @@ void aof_async_shutdown(void) {
         io_uring_queue_exit(&g_aof.ring);
         g_aof.ring_inited = 0;
     }
+    if (g_aof.evt_fd >= 0) { close(g_aof.evt_fd); g_aof.evt_fd = -1; }
     close(g_aof.fd);
     g_aof.fd = -1;
+
+    /* Free slot buffers */
+    for (int i = 0; i < AOF_RING_SIZE; i++) {
+        free(g_aof.slots[i].buf);
+        g_aof.slots[i].buf = NULL;
+        g_aof.slots[i].cap = 0;
+    }
     printf("[AOF] async writer stopped\n");
 }
 
 void aof_async_append(const char *buf, int len) {
     if (g_aof.fd < 0 || !buf || len <= 0) return;
 
-    aof_entry_t *e = (aof_entry_t *)malloc(sizeof(*e));
-    if (!e) return;
-    e->buf = (char *)malloc(len);
-    if (!e->buf) { free(e); return; }
-    memcpy(e->buf, buf, len);
-    e->len = len;
-    e->next = NULL;
+    uint32_t h = atomic_load_explicit(&g_aof.head, memory_order_relaxed);
+    uint32_t t;
 
-    pthread_mutex_lock(&g_aof.mtx);
-    if (g_aof.tail) g_aof.tail->next = e;
-    else            g_aof.head = e;
-    g_aof.tail = e;
-    pthread_cond_signal(&g_aof.cond);
-    pthread_mutex_unlock(&g_aof.mtx);
+    /* Ring full — spin briefly; consumer should be faster than producer */
+    for (int spin = 0; ; spin++) {
+        t = atomic_load_explicit(&g_aof.tail, memory_order_acquire);
+        if (h - t < AOF_RING_SIZE) break;
+        if (spin < 100) {
+            /* short busy-wait */
+        } else {
+            usleep(1000);  /* back off to let consumer catch up */
+        }
+    }
+
+    uint32_t idx = h & AOF_RING_MASK;
+    aof_slot_t *s = &g_aof.slots[idx];
+    aof_slot_ensure(s, len);
+    memcpy(s->buf, buf, (size_t)len);
+    s->len = len;
+
+    atomic_store_explicit(&g_aof.head, h + 1, memory_order_release);
+
+    /* Wake consumer */
+    uint64_t one = 1;
+    ssize_t wr = write(g_aof.evt_fd, &one, sizeof(one));
+    (void)wr;
 }
 
 /* =============================================================================
@@ -819,7 +841,11 @@ int rdb_load_stream_begin(const char *buf, size_t len) {
         return -1;
     }
 
-    dict_clear(&g_dict);
+    /* Clean up any existing collection-type entries before clearing.
+     * kvs_flush_all iterates the dict, calls per-type cleanup for nested
+     * structures (quicklist nodes, internal dicts, skiplist nodes), then
+     * clears the dict.  Necessary when a slave receives a second fullsync. */
+    kvs_flush_all();
     printf("[RDB] stream begin: version=%d, expected keys=%d\n", version, key_count);
     return key_count;
 }

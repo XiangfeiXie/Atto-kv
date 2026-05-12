@@ -16,6 +16,10 @@
 #include "persistence.h"
 #include "block.h"
 
+/* Pack first 4 bytes of a command name into a uint32_t for jump-table dispatch */
+#define CMD4(a,b,c,d) ((uint32_t)(uint8_t)(a) | ((uint32_t)(uint8_t)(b) << 8) | \
+                        ((uint32_t)(uint8_t)(c) << 16) | ((uint32_t)(uint8_t)(d) << 24))
+
 /* ==================== Global dict (single storage engine) ==================== */
 kv_dict_t g_dict;
 int g_in_reload = 0;    /* set by persistence layer during AOF/RDB reload */
@@ -25,10 +29,21 @@ int g_in_reload = 0;    /* set by persistence layer during AOF/RDB reload */
 void *kvs_malloc(size_t size) { return malloc(size); }
 void kvs_free(void *ptr)       { free(ptr); }
 
-long long get_time_now(void) {
+/* ── Cached time: updated once per event-loop iteration ── */
+static long long g_cached_ms;
+
+static long long get_time_now_real(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+}
+
+long long get_time_now(void) {
+    return g_cached_ms;
+}
+
+void update_cached_time(void) {
+    g_cached_ms = get_time_now_real();
 }
 
 KVItem* create_kvitem_len(const char *value, int vlen) {
@@ -90,6 +105,12 @@ static void entry_cleanup_by_type(kv_entry_t *e) {
     case KV_TYPE_ZSET: zset_cleanup_entry(e); break;
     default: break;
     }
+}
+
+/* Public wrapper: free any type-specific internal structures before dict_delete.
+   Safe to call on NULL or any entry type (no-op for PACKED/RAW encodings). */
+void kvs_cleanup_entry(kv_entry_t *e) {
+    entry_cleanup_by_type(e);
 }
 
 /* Append an integer reply ":N\r\n" */
@@ -470,102 +491,82 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
-    /* ── Resolve command → expected type in a single first-letter switch.
-         Performance: 1 dispatch by ptr[0], then a small set of length+memcmp
-         compares (via TOKEN_EQ). Avoids the O(n) cmd-list walk previously
-         done twice (wrongtype check + new-key branch). ── */
-    int cmd_type = -1;       /* -1 = unknown */
+    /* ── Resolve command → expected type via CMD4 jump table.
+         Pack first 4 bytes into a uint32_t and switch directly.
+         Only 3 conflict pairs (SINTER/SINTERSTORE, SUNION/SUNIONSTORE,
+         SDIFF/SDIFFSTORE) need a secondary cmd.len check. ── */
+    uint32_t c4 = 0;
+    memcpy(&c4, cmd.ptr, (size_t)(cmd.len < 4 ? cmd.len : 4));
+    int cmd_type = -1;
     int is_write = 0;
-    switch (cmd.ptr[0]) {
-    case 'S':
-        if (TOKEN_EQ(cmd, "SET"))               { cmd_type = KV_TYPE_STRING; is_write = 1; }
-        else if (TOKEN_EQ(cmd, "SETNX"))        { cmd_type = KV_TYPE_STRING; is_write = 1; }
-        else if (TOKEN_EQ(cmd, "SETEX"))        { cmd_type = KV_TYPE_STRING; is_write = 1; }
-        else if (TOKEN_EQ(cmd, "STRLEN"))       { cmd_type = KV_TYPE_STRING; }
-        else if (TOKEN_EQ(cmd, "SADD")        || TOKEN_EQ(cmd, "SREM")  ||
-                 TOKEN_EQ(cmd, "SPOP")        || TOKEN_EQ(cmd, "SMOVE") ||
-                 TOKEN_EQ(cmd, "SINTERSTORE")|| TOKEN_EQ(cmd, "SUNIONSTORE") ||
-                 TOKEN_EQ(cmd, "SDIFFSTORE")) {
-                                                  cmd_type = KV_TYPE_SET; is_write = 1;
-        }
-        else if (TOKEN_EQ(cmd, "SMEMBERS")    || TOKEN_EQ(cmd, "SCARD")     ||
-                 TOKEN_EQ(cmd, "SISMEMBER")   || TOKEN_EQ(cmd, "SMISMEMBER")||
-                 TOKEN_EQ(cmd, "SRANDMEMBER") || TOKEN_EQ(cmd, "SINTER")    ||
-                 TOKEN_EQ(cmd, "SUNION")      || TOKEN_EQ(cmd, "SDIFF")) {
-                                                  cmd_type = KV_TYPE_SET;
-        }
-        break;
-    case 'G':
-        if (TOKEN_EQ(cmd, "GET"))               { cmd_type = KV_TYPE_STRING; }
-        else if (TOKEN_EQ(cmd, "GETSET"))       { cmd_type = KV_TYPE_STRING; is_write = 1; }
-        break;
-    case 'A':
-        if (TOKEN_EQ(cmd, "APPEND"))            { cmd_type = KV_TYPE_STRING; is_write = 1; }
-        break;
-    case 'I':
-        if (TOKEN_EQ(cmd, "INCR") ||
-            TOKEN_EQ(cmd, "INCRBY") ||
-            TOKEN_EQ(cmd, "INCRBYFLOAT"))       { cmd_type = KV_TYPE_STRING; is_write = 1; }
-        break;
-    case 'D':
-        if (TOKEN_EQ(cmd, "DECR") ||
-            TOKEN_EQ(cmd, "DECRBY"))            { cmd_type = KV_TYPE_STRING; is_write = 1; }
-        break;
-    case 'M':
-        if (TOKEN_EQ(cmd, "MOD"))               { cmd_type = KV_TYPE_STRING; is_write = 1; }
-        break;
-    case 'L':
-        if (TOKEN_EQ(cmd, "LPUSH")   || TOKEN_EQ(cmd, "LPOP")   ||
-            TOKEN_EQ(cmd, "LPUSHX")  || TOKEN_EQ(cmd, "LSET")   ||
-            TOKEN_EQ(cmd, "LREM")    || TOKEN_EQ(cmd, "LTRIM")  ||
-            TOKEN_EQ(cmd, "LINSERT") || TOKEN_EQ(cmd, "LMOVE")) {
-                                                  cmd_type = KV_TYPE_LIST; is_write = 1;
-        } else if (TOKEN_EQ(cmd, "LLEN")   || TOKEN_EQ(cmd, "LRANGE") ||
-                   TOKEN_EQ(cmd, "LINDEX") || TOKEN_EQ(cmd, "LPOS")) {
-                                                  cmd_type = KV_TYPE_LIST;
-        }
-        break;
-    case 'R':
-        if (TOKEN_EQ(cmd, "RPUSH")   || TOKEN_EQ(cmd, "RPOP")  ||
-            TOKEN_EQ(cmd, "RPUSHX")  || TOKEN_EQ(cmd, "RPOPLPUSH")) {
-                                                  cmd_type = KV_TYPE_LIST; is_write = 1;
-        }
-        break;
-    case 'B':
-        if (TOKEN_EQ(cmd, "BLPOP") ||
-            TOKEN_EQ(cmd, "BRPOP"))             { cmd_type = KV_TYPE_LIST; is_write = 1; }
-        break;
-    case 'H':
-        if (TOKEN_EQ(cmd, "HSET")    || TOKEN_EQ(cmd, "HDEL")  ||
-            TOKEN_EQ(cmd, "HSETNX")  || TOKEN_EQ(cmd, "HMSET") ||
-            TOKEN_EQ(cmd, "HINCRBY") || TOKEN_EQ(cmd, "HINCRBYFLOAT")) {
-                                                  cmd_type = KV_TYPE_HASH; is_write = 1;
-        } else if (TOKEN_EQ(cmd, "HGET")    || TOKEN_EQ(cmd, "HGETALL") ||
-                   TOKEN_EQ(cmd, "HKEYS")   || TOKEN_EQ(cmd, "HVALS")   ||
-                   TOKEN_EQ(cmd, "HLEN")    || TOKEN_EQ(cmd, "HEXISTS") ||
-                   TOKEN_EQ(cmd, "HMGET")   || TOKEN_EQ(cmd, "HSTRLEN") ||
-                   TOKEN_EQ(cmd, "HRANDFIELD")) {
-                                                  cmd_type = KV_TYPE_HASH;
-        }
-        break;
-    case 'Z':
-        if (TOKEN_EQ(cmd, "ZADD")            || TOKEN_EQ(cmd, "ZREM")   ||
-            TOKEN_EQ(cmd, "ZINCRBY")         || TOKEN_EQ(cmd, "ZPOPMIN")||
-            TOKEN_EQ(cmd, "ZPOPMAX")         ||
-            TOKEN_EQ(cmd, "ZREMRANGEBYRANK") ||
-            TOKEN_EQ(cmd, "ZREMRANGEBYSCORE")) {
-                                                  cmd_type = KV_TYPE_ZSET; is_write = 1;
-        } else if (TOKEN_EQ(cmd, "ZSCORE")   || TOKEN_EQ(cmd, "ZMSCORE") ||
-                   TOKEN_EQ(cmd, "ZRANGE")   || TOKEN_EQ(cmd, "ZREVRANGE") ||
-                   TOKEN_EQ(cmd, "ZRANK")    || TOKEN_EQ(cmd, "ZREVRANK")  ||
-                   TOKEN_EQ(cmd, "ZCARD")    || TOKEN_EQ(cmd, "ZCOUNT")    ||
-                   TOKEN_EQ(cmd, "ZRANGEBYSCORE") ||
-                   TOKEN_EQ(cmd, "ZREVRANGEBYSCORE") ||
-                   TOKEN_EQ(cmd, "ZRANDMEMBER")) {
-                                                  cmd_type = KV_TYPE_ZSET;
-        }
-        break;
-    default: break;
+    switch (c4) {
+    /* ── STRING ── */
+    case CMD4('S','E','T',0):   cmd_type = KV_TYPE_STRING; is_write = 1; break;
+    case CMD4('S','E','T','N'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* SETNX */
+    case CMD4('S','E','T','E'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* SETEX */
+    case CMD4('G','E','T',0):   cmd_type = KV_TYPE_STRING; break;              /* GET */
+    case CMD4('G','E','T','S'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* GETSET */
+    case CMD4('A','P','P','E'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* APPEND */
+    case CMD4('I','N','C','R'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* INCR / INCRBY / INCRBYFLOAT */
+    case CMD4('D','E','C','R'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* DECR / DECRBY */
+    case CMD4('M','O','D',0):   cmd_type = KV_TYPE_STRING; is_write = 1; break; /* MOD */
+    case CMD4('S','T','R','L'): cmd_type = KV_TYPE_STRING; break;              /* STRLEN */
+    /* ── SET ── */
+    case CMD4('S','A','D','D'): cmd_type = KV_TYPE_SET; is_write = 1; break; /* SADD */
+    case CMD4('S','R','E','M'): cmd_type = KV_TYPE_SET; is_write = 1; break; /* SREM */
+    case CMD4('S','P','O','P'): cmd_type = KV_TYPE_SET; is_write = 1; break; /* SPOP */
+    case CMD4('S','M','O','V'): cmd_type = KV_TYPE_SET; is_write = 1; break; /* SMOVE */
+    case CMD4('S','M','E','M'): cmd_type = KV_TYPE_SET; break;              /* SMEMBERS */
+    case CMD4('S','C','A','R'): cmd_type = KV_TYPE_SET; break;              /* SCARD */
+    case CMD4('S','I','S','M'): cmd_type = KV_TYPE_SET; break;              /* SISMEMBER */
+    case CMD4('S','M','I','S'): cmd_type = KV_TYPE_SET; break;              /* SMISMEMBER */
+    case CMD4('S','R','A','N'): cmd_type = KV_TYPE_SET; break;              /* SRANDMEMBER */
+    case CMD4('S','I','N','T'):                                           /* SINTER / SINTERSTORE */
+        cmd_type = KV_TYPE_SET; is_write = (cmd.len > 6); break;
+    case CMD4('S','U','N','I'):                                           /* SUNION / SUNIONSTORE */
+        cmd_type = KV_TYPE_SET; is_write = (cmd.len > 6); break;
+    case CMD4('S','D','I','F'):                                           /* SDIFF / SDIFFSTORE */
+        cmd_type = KV_TYPE_SET; is_write = (cmd.len > 5); break;
+    /* ── HASH ── */
+    case CMD4('H','S','E','T'): cmd_type = KV_TYPE_HASH; is_write = 1; break; /* HSET / HSETNX */
+    case CMD4('H','D','E','L'): cmd_type = KV_TYPE_HASH; is_write = 1; break; /* HDEL */
+    case CMD4('H','M','S','E'): cmd_type = KV_TYPE_HASH; is_write = 1; break; /* HMSET */
+    case CMD4('H','I','N','C'): cmd_type = KV_TYPE_HASH; is_write = 1; break; /* HINCRBY / HINCRBYFLOAT */
+    case CMD4('H','G','E','T'): cmd_type = KV_TYPE_HASH; break;              /* HGET / HGETALL */
+    case CMD4('H','K','E','Y'): cmd_type = KV_TYPE_HASH; break;              /* HKEYS */
+    case CMD4('H','V','A','L'): cmd_type = KV_TYPE_HASH; break;              /* HVALS */
+    case CMD4('H','L','E','N'): cmd_type = KV_TYPE_HASH; break;              /* HLEN */
+    case CMD4('H','E','X','I'): cmd_type = KV_TYPE_HASH; break;              /* HEXISTS */
+    case CMD4('H','M','G','E'): cmd_type = KV_TYPE_HASH; break;              /* HMGET */
+    case CMD4('H','S','T','R'): cmd_type = KV_TYPE_HASH; break;              /* HSTRLEN */
+    case CMD4('H','R','A','N'): cmd_type = KV_TYPE_HASH; break;              /* HRANDFIELD */
+    /* ── ZSET ── */
+    case CMD4('Z','A','D','D'): cmd_type = KV_TYPE_ZSET; is_write = 1; break; /* ZADD */
+    case CMD4('Z','R','E','M'): cmd_type = KV_TYPE_ZSET; is_write = 1; break; /* ZREM / ZREMRANGEBYRANK / ZREMRANGEBYSCORE */
+    case CMD4('Z','I','N','C'): cmd_type = KV_TYPE_ZSET; is_write = 1; break; /* ZINCRBY */
+    case CMD4('Z','P','O','P'): cmd_type = KV_TYPE_ZSET; is_write = 1; break; /* ZPOPMIN / ZPOPMAX */
+    case CMD4('Z','S','C','O'): cmd_type = KV_TYPE_ZSET; break;              /* ZSCORE */
+    case CMD4('Z','M','S','C'): cmd_type = KV_TYPE_ZSET; break;              /* ZMSCORE */
+    case CMD4('Z','R','A','N'): cmd_type = KV_TYPE_ZSET; break;              /* ZRANGE / ZRANK / ZRANGEBYSCORE / ZRANDMEMBER */
+    case CMD4('Z','R','E','V'): cmd_type = KV_TYPE_ZSET; break;              /* ZREVRANGE / ZREVRANK / ZREVRANGEBYSCORE */
+    case CMD4('Z','C','A','R'): cmd_type = KV_TYPE_ZSET; break;              /* ZCARD */
+    case CMD4('Z','C','O','U'): cmd_type = KV_TYPE_ZSET; break;              /* ZCOUNT */
+    /* ── LIST ── */
+    case CMD4('L','P','U','S'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* LPUSH / LPUSHX */
+    case CMD4('L','P','O','P'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* LPOP */
+    case CMD4('L','S','E','T'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* LSET */
+    case CMD4('L','R','E','M'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* LREM */
+    case CMD4('L','T','R','I'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* LTRIM */
+    case CMD4('L','I','N','S'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* LINSERT */
+    case CMD4('L','M','O','V'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* LMOVE */
+    case CMD4('L','L','E','N'): cmd_type = KV_TYPE_LIST; break;              /* LLEN */
+    case CMD4('L','R','A','N'): cmd_type = KV_TYPE_LIST; break;              /* LRANGE */
+    case CMD4('L','I','N','D'): cmd_type = KV_TYPE_LIST; break;              /* LINDEX */
+    case CMD4('L','P','O','S'): cmd_type = KV_TYPE_LIST; break;              /* LPOS */
+    case CMD4('R','P','U','S'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* RPUSH / RPUSHX */
+    case CMD4('R','P','O','P'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* RPOP / RPOPLPUSH */
+    case CMD4('B','L','P','O'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* BLPOP */
+    case CMD4('B','R','P','O'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* BRPOP */
     }
 
     if (cmd_type < 0) {
@@ -640,6 +641,7 @@ int init_kvengine(void) {
 }
 
 void dest_kvengine(void) {
+    kvs_flush_all();  /* clean up nested structures before freeing entries */
     dict_destroy(&g_dict);
 }
 

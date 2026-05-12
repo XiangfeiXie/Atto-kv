@@ -9,6 +9,7 @@
 #include "config.h"
 #include "protocol.h"
 #include "block.h"
+#include "kvstore.h"
 
 #define EVENT_ACCEPT    0
 #define EVENT_READ      1
@@ -125,6 +126,7 @@ int proactor_start(unsigned short port, msg_handler handler) {
     set_event_accept(&ring, sockfd, (struct sockaddr*)&clientaddr, &len);
 
     while (1) {
+        update_cached_time();
         struct io_uring_cqe *cqes[128];
         int nready = io_uring_peek_batch_cqe(&ring, cqes, 128);
 

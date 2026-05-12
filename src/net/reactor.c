@@ -291,6 +291,7 @@ int reactor_start(unsigned short port, msg_handler handler) {
     struct epoll_event events[1024];
 
     while (1) {
+        update_cached_time();
         int timeout_ms = block_nearest_timeout();
         int nready = epoll_wait(epfd, events, 1024, timeout_ms);
 

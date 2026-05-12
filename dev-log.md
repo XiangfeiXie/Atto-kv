@@ -1086,3 +1086,75 @@ RDMA 流式全量同步在 Phase 9 已能正常工作，但存在严重性能瓶
 2. **SINTERSTORE 等存储命令对目标 key 的处理**：目标 key 已存在且类型不同时应先清理后覆盖（Redis 行为），当前实现可能遗留旧类型子结构
 3. **INCRBYFLOAT 精度**：使用 `double` + `snprintf`，极值场景可能丢失精度（Redis 使用 long double + 自定义格式化）
 4. **Smoke test 覆盖率**：smoke 测试为正向路径测试，缺少大量边界条件（OOM、大 key、高并发等）
+
+---
+
+## 2026-05-12 — Phase 12: 持久化 Bug 修复 + 三项性能优化
+
+### Overview
+
+修复了 RDB/AOF 持久化在新数据类型下的 2 个内存泄漏 bug，并实施三项性能优化：时间缓存、CMD4 命令分发跳表、AOF 无锁环形缓冲区。所有优化经过 295 项 smoke 测试 + RDB/AOF 功能验证。
+
+### Bug 修复
+
+**Bug 1: `rdb_load_stream_begin()` 直接调用 `dict_clear()` 导致内存泄漏**
+- 全量同步/ RDB 加载前清空 dict 时，直接调用 `dict_clear()` 仅 free entry 本身，不释放 LIST quicklist 节点、SET/HASH 内嵌 dict、ZSET skiplist 节点
+- 修复：改为调用 `kvs_flush_all()`，该函数先迭代所有 entry 调用 `entry_cleanup_by_type()` 释放类型特定子结构，再 `dict_clear()`
+- 同时修复 `dest_kvengine()` 中的相同问题
+
+**Bug 2: `engine_set_raw()` 过期 entry 替换时内存泄漏**
+- MSET/MSETNX 覆盖已过期的 collection 类型 key 为 STRING 时，旧 entry 的嵌套结构（quicklist/dict/skiplist）未被释放
+- 修复：调用 `kvs_cleanup_entry(existing)` 后再 `dict_delete()`
+
+### 优化 1: 时间缓存
+
+**问题**：每次命令调用 `gettimeofday()` 获取当前时间用于 lazy expiry 检查，高 QPS 下 vDSO 调用累积开销可观。
+
+**修复**：
+- `get_time_now()` 改为返回全局 `g_cached_ms`（每事件循环迭代更新一次）
+- 新增 `get_time_now_real()` 保留原始实现
+- 新增 `update_cached_time()` 在 reactor/proactor 事件循环顶部调用
+- [kvstore.h:29](src/core/kvstore.h#L29), [kvstore.c:28-35](src/core/kvstore.c#L28), [reactor.c:294](src/net/reactor.c#L294), [proactor.c:129](src/net/proactor.c#L129)
+
+### 优化 2: CMD4 命令分发跳表
+
+**问题**：命令→类型解析使用首字母 `switch` + ~60 条 `TOKEN_EQ` 链（每条约 15-20 字节 memcmp），79 个命令在最坏情况下需遍历多次 memcmp。
+
+**修复**：
+- 新增 `CMD4(a,b,c,d)` 宏，将命令名前 4 字节打包为 `uint32_t`
+- 用 `memcpy(&c4, cmd.ptr, min(cmd.len, 4))` 零填充短命令
+- 替换为 `switch(c4)` 直接跳转（~55 个 case，编译器生成跳表）
+- 仅 3 对冲突需二次 `cmd.len` 检查：SINTER/SINTERSTORE、SUNION/SUNIONSTORE、SDIFF/SDIFFSTORE
+- [kvstore.c:22-24](src/core/kvstore.c#L22) (宏), [kvstore.c:490-557](src/core/kvstore.c#L490) (跳表)
+
+### 优化 3: AOF 无锁环形缓冲区
+
+**问题**：AOF 异步写入使用 `malloc` 链表队列 + `pthread_mutex_t`，每次 append 需 2 次 malloc（节点 + 数据副本）+ 锁争用。
+
+**修复**：
+- 替换为 **lock-free SPSC ring buffer**（1024 slots，2 的幂掩码索引）
+- 使用 `_Atomic uint32_t head/tail` + acquire/release 内存序，零锁
+- 每 slot 预分配 4KB buffer（按需增长），热路径零 malloc
+- 使用 `eventfd` 唤醒消费者线程（替代 `pthread_cond_t`）
+- 生产者：原子获取 slot → memcpy → 发布 head → 写 eventfd
+- 消费者：批量读取 → io_uring write → 发布 tail → 阻塞读 eventfd
+- [persistence.c:113-320](src/persist/persistence.c#L113)
+
+### 测试结果
+
+- **编译**：零 warning，干净构建
+- **Smoke 测试**：295/295 通过（STRING:54, LIST:62, HASH:55, SET:49, ZSET:75）
+- **RDB 保存/加载**：5 种数据类型数据正确恢复
+- **AOF 追加/重载**：117MB AOF 文件 mmap 重载正常，新命令正确追加
+- **AOF ring buffer**：启动日志确认 `[AOF] async writer started (uring depth=64, ring=1024 slots)`，无错误
+
+### 文件变更
+
+| 文件 | 变更 |
+|------|------|
+| `src/core/kvstore.c` | +CMD4 宏，重写命令分发跳表（-97 行旧代码，+67 行新代码），时间缓存 |
+| `src/core/kvstore.h` | 新增 `update_cached_time()`、`kvs_cleanup_entry()` 声明 |
+| `src/core/kvtype_string.c` | 过期 entry 替换前调用 `kvs_cleanup_entry()` |
+| `src/persist/persistence.c` | 重写 AOF 子系统：ring buffer + eventfd + atomics（-160 行旧代码，+180 行新代码），新增 `<sys/eventfd.h>` `<stdatomic.h>` |
+| `src/net/reactor.c` | 事件循环顶部调用 `update_cached_time()` |
+| `src/net/proactor.c` | 事件循环顶部调用 `update_cached_time()`，新增 `#include "kvstore.h"` |

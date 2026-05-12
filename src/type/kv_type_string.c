@@ -73,6 +73,7 @@ static int engine_set_raw(const char *key, uint32_t key_len,
     uint64_t hash = kv_hash((const uint8_t *)key, key_len);
     kv_entry_t *existing = dict_find(&g_dict, key, key_len, hash);
     if (existing && existing->expire && get_time_now() > existing->expire) {
+        kvs_cleanup_entry(existing);  /* free nested structures for collection types */
         dict_delete(&g_dict, key, key_len, hash);
         existing = NULL;
     }

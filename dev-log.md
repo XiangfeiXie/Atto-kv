@@ -1158,3 +1158,70 @@ RDMA 流式全量同步在 Phase 9 已能正常工作，但存在严重性能瓶
 | `src/persist/persistence.c` | 重写 AOF 子系统：ring buffer + eventfd + atomics（-160 行旧代码，+180 行新代码），新增 `<sys/eventfd.h>` `<stdatomic.h>` |
 | `src/net/reactor.c` | 事件循环顶部调用 `update_cached_time()` |
 | `src/net/proactor.c` | 事件循环顶部调用 `update_cached_time()`，新增 `#include "kvstore.h"` |
+
+---
+
+## 2026-05-12 — Phase 13: eBPF 增量同步重构（无锁 SPSC + 预分配 Backlog）
+
+### Overview
+
+全面重构 eBPF 增量同步的用户态数据面，消除全局锁、消除 per-event malloc、消除逐字节 TCP 读取、消除 DynBuf 拼接拷贝。架构从"全局锁串行化 + malloc 热路径"转变为"内核捕获+原子序号 + 用户态无锁分发"。sk_msg 内核组播经调研不可行（`bpf_msg_redirect_hash()` 仅单播），采用 Plan B：eBPF 负责编号，用户态 SPSC 负责无锁分发。
+
+### 设计决策
+
+**sk_msg 方案放弃原因**：`bpf_msg_redirect_hash()` 每次 verdict 只能重定向到一个 socket，不存在从 sk_msg 多路传播的机制。要将一个写命令同时推送到多个 slave，需要多次 verdict 或内核侧循环，BPF 不支持。
+
+**最终架构**：
+- eBPF uprobe：捕获写命令 → 原子分配 global_seq → 写入 ringbuf（内核态零拷贝到用户态）
+- Consumer 线程：poll ringbuf → backlog_append（窄锁）→ SPSC push 到每个 slave（无锁）
+- Per-slave 发送线程：独立 drain SPSC 队列 → `sendmsg(writev)` TCP 发送（零额外拷贝）
+
+### 修改文件
+
+- **`src/repl/ebpf_incr.bpf.c`** — RINGBUF_SIZE 32MB→256MB，保留固定大小 struct（kernel 6.8 verifier 要求编译期常量），~998 events 容量对小 MQ 工作负载可接受
+- **`src/repl/ebpf_incr_repl.h`** — 重写数据结构：
+  - `incr_event`：完整 16B header + `msg[INCR_MAX_CMD]` inline（与 BPF 侧一致）
+  - `backlog_slot_t`：预分配 msg 指针 + valid 标记（替代 malloc 模型）
+  - `spsc_slot_t`：延迟分配 buffer（4KB 起，按需 ×2 增长）
+  - `slave_spsc_t`：per-slave 无锁 SPSC 队列（4096 slots，atomic head/tail，eventfd 唤醒）
+  - `incr_fanout_fn`：Phase 2 内核级组播预留接口
+- **`src/repl/ebpf_incr_repl.c`** — ~700 行重写：
+  - `spsc_push()`：lock-free SPSC producer（AOF ring buffer 模式：relaxed head + acquire tail spin + release head + eventfd write）
+  - `slave_send_thread()`：SPSC consumer + `sendmsg(writev)` 散布/聚集发送 `[uint64_t len][payload]`
+  - `slave_start()` / `slave_close()`：从节点生命周期管理
+  - `backlog_append()`：窄锁 `g_backlog_mu`（仅保护 start/count/valid），预分配 slot memcpy
+  - `tcp_read_line()`：缓冲读取（64 字节 chunks），替代逐字节 recv（~30 syscall → ~1 syscall）
+  - `on_incr_event()`：零全局锁热路径，读取 `incr_event*` + `e->msg` 直接访问
+  - `ebpf_incr_add_slave()`：INPROGRESS 延期机制（解决状态机竞态）
+  - `ebpf_incr_fullsync_send_done()`：持有 backlog 锁检查已连接 slave，直接转 IDLE
+  - `ebpf_incr_master_start()`：预分配全部 16384 个 backlog 槽位（每个 INCR_MAX_CMD 字节）
+  - `ebpf_incr_stop()`：释放所有 SPSC slot buffer + backlog buffer
+
+### 拷贝路径对比
+
+| 阶段 | 改造前 | 改造后 |
+|------|--------|--------|
+| uprobe 捕获 | bpf_probe_read 固定 262KB | bpf_probe_read 固定 262KB（待 per-CPU array 优化） |
+| backlog | malloc + memcpy（全局锁内） | memcpy 到预分配 slot（窄锁） |
+| slave buffer | dynbuf_append memcpy（全局锁内） | SPSC push memcpy（无锁） |
+| TCP 发送 | 用户态 send() 循环 | 独立线程 sendmsg(writev)（无锁） |
+| 总拷贝次数 | 5 次 | 3 次 |
+| 全局锁持有 | 毫秒级 | 微秒级（仅 backlog 元数据） |
+
+### VM 环境修复
+
+- **问题**：`/sys/kernel/security/lockdown` = `[none] integrity confidentiality`，BPF 加载被 `lockdown=confidentiality` 阻止（EPERM）
+- **修复**：修改 `/etc/default/grub` → `GRUB_CMDLINE_LINUX="lockdown=integrity"` → `update-grub` → 重启生效
+- **重启后验证**：`cat /sys/kernel/security/lockdown` 应显示 `[none] integrity confidentiality`（integrity 被选中，confidentiality 未激活）
+
+### 验证状态
+
+- 编译：BPF + 用户态 + 最终二进制均通过，零 warning
+- eBPF 加载：待 VM 重启后测试
+- 增量同步：待 eBPF 加载成功后测试
+- 全量+增量集成：待上述完成后测试
+
+### 已知限制
+
+- **固定大小 ringbuf record**：kernel 6.8 verifier 不接受 `bpf_ringbuf_reserve()` 的动态大小，每个事件仍占用 262KB。256MB ringbuf 容纳 ~998 events。后续 per-CPU array 模式可解决此限制
+- **SPSC 满队列退避**：当前自旋 100 次后 usleep(100)，高负载下可能需要更精细的退避策略

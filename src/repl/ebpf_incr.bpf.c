@@ -1,22 +1,28 @@
 /* SPDX-License-Identifier: GPL-2.0
- * ebpf_incr.bpf.c  —  BPF kernel program for RDMA incremental replication
+ * ebpf_incr.bpf.c  —  BPF kernel program for incremental replication
  *
  * Attaches as a uprobe on kvs_rdma_incr_probe().
  * Captures write commands and assigns a global monotonically-increasing
  * sequence number (global_seq) so the user-space fullsync coordinator
  * can precisely determine the cut point for fork-based snapshots.
+ *
+ * Ring buffer: fixed-size records (INCR_MAX_CMD + header).
+ * Kernel 6.8 verifier requires constant-size reservations.
+ * 256 MB ringbuf holds ~998 events — sufficient for small MQ workloads
+ * with the lock-free userspace SPSC consumer.
  */
 
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-#define INCR_MAX_CMD  262144               /* 256 KB — accommodates large SET values */
-#define RINGBUF_SIZE  (32 * 1024 * 1024)   /* 32 MB */
+#define INCR_MAX_CMD  262144               /* 256 KB — max RESP command */
+#define RINGBUF_SIZE  (256 * 1024 * 1024)  /* 256 MB */
 
 struct incr_event {
-	__u64    seq;      /* global sequence number, assigned atomically in-kernel */
+	__u64    seq;
 	__u32    length;
+	__u32    _pad;
 	char     msg[INCR_MAX_CMD];
 };
 
@@ -68,6 +74,9 @@ int on_kvs_rdma_incr_probe(struct pt_regs *ctx)
 	__u64 *seq_p = bpf_map_lookup_elem(&global_seq, &zero);
 	__u64 cur_seq = seq_p ? __sync_fetch_and_add(seq_p, 1) : 0;
 
+	/* Fixed-size reservation (kernel 6.8 verifier requires constant).
+	 * 256 MB ringbuf holds ~998 events at 256 KB each.
+	 * Acceptable for small-MQ workloads with our lock-free consumer. */
 	struct incr_event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
 	if (!e) {
 		if (st)

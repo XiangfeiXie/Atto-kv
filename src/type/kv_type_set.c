@@ -201,7 +201,7 @@ static uint32_t set_card(kv_entry_t *e) {
  * Convert packed set to dict encoding
  * ===================================================================== */
 
-#define SET_DICT_HEADER_SIZE 54  /* type:1 + encoding:1 + kv_dict_t:52 */
+#define SET_DICT_HEADER_SIZE (2 + (uint32_t)sizeof(kv_dict_t))  /* type:1 + encoding:1 + kv_dict_t */
 
 static kv_entry_t *set_convert_to_dict(kv_entry_t *e) {
     uint32_t old_count = pk_read_u32(e->data + 2);
@@ -616,6 +616,134 @@ void set_rebuild_encoding(kv_entry_t *e) {
 }
 
 /* =====================================================================
+ * Enumerate all members of a set into newly-allocated parallel arrays.
+ *
+ * On success returns 0 and fills *out_ptrs / *out_lens / *out_count.
+ * Ownership: the returned arrays (and all individual element buffers)
+ * must be freed by the caller via set_members_free().
+ * Returns -1 on allocation failure.
+ * ===================================================================== */
+static int set_members_dup(kv_entry_t *e,
+                           char ***out_ptrs,
+                           uint32_t **out_lens,
+                           uint32_t *out_count)
+{
+    *out_ptrs  = NULL;
+    *out_lens  = NULL;
+    *out_count = 0;
+    if (!e) return 0;
+
+    uint32_t n = set_card(e);
+    if (n == 0) return 0;
+
+    char     **ptrs = (char **)     malloc((size_t)n * sizeof(char *));
+    uint32_t  *lens = (uint32_t *)  malloc((size_t)n * sizeof(uint32_t));
+    if (!ptrs || !lens) { free(ptrs); free(lens); return -1; }
+
+    uint32_t idx = 0;
+    if (entry_encoding(e) == KV_ENCODING_PACKED) {
+        const char *p = e->data + 6;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t elen = pk_read_u32(p);
+            char *buf = (char *)malloc(elen ? elen : 1);
+            if (!buf) goto oom;
+            memcpy(buf, p + 4, elen);
+            ptrs[idx] = buf; lens[idx] = elen; idx++;
+            p += 4 + elen;
+        }
+    } else {
+        kv_dict_t *d = (kv_dict_t *)(e->data + 2);
+        kv_iter_t *it = dict_iter_new(d, 1);
+        if (!it) goto oom;
+        kv_entry_t *de;
+        while ((de = dict_iter_next(it)) != NULL && idx < n) {
+            uint32_t elen = de->key_len;
+            char *buf = (char *)malloc(elen ? elen : 1);
+            if (!buf) { dict_iter_free(it); goto oom; }
+            memcpy(buf, entry_key(de), elen);
+            ptrs[idx] = buf; lens[idx] = elen; idx++;
+        }
+        dict_iter_free(it);
+    }
+
+    *out_ptrs  = ptrs;
+    *out_lens  = lens;
+    *out_count = idx;
+    return 0;
+
+oom:
+    for (uint32_t i = 0; i < idx; i++) free(ptrs[i]);
+    free(ptrs); free(lens);
+    return -1;
+}
+
+static void set_members_free(char **ptrs, uint32_t *lens, uint32_t count) {
+    if (ptrs) {
+        for (uint32_t i = 0; i < count; i++) free(ptrs[i]);
+        free(ptrs);
+    }
+    free(lens);
+}
+
+/* Look up key → set entry, validating type and handling expiry.
+ * *out_entry is set to:
+ *   - non-NULL valid set entry, or
+ *   - NULL if key does not exist / was expired
+ * Returns 0 on success, -1 on WRONGTYPE (caller should send WRONGTYPE). */
+static int resolve_set_key(const char *key, int klen, kv_entry_t **out_entry) {
+    *out_entry = NULL;
+    if (klen <= 0) return 0;
+    uint64_t h = kv_hash((const uint8_t *)key, (uint32_t)klen);
+    kv_entry_t *e = dict_find(&g_dict, key, (uint32_t)klen, h);
+    if (!e) return 0;
+    if (entry_type(e) != KV_TYPE_SET) return -1;
+    if (e->expire && get_time_now() > e->expire) {
+        set_cleanup_entry(e);
+        dict_delete(&g_dict, key, (uint32_t)klen, h);
+        return 0;
+    }
+    *out_entry = e;
+    return 0;
+}
+
+/* Write a RESP bulk string or null bulk for the given element. */
+static inline void resp_write_bulk(DynBuf *wb, const char *s, uint32_t l) {
+    char hdr[24];
+    int hl = snprintf(hdr, sizeof(hdr), "$%u\r\n", l);
+    dynbuf_cat(wb, hdr, hl);
+    dynbuf_cat(wb, s, (int)l);
+    dynbuf_cat(wb, "\r\n", 2);
+}
+
+/* Replace the set at `key` atomically with the given member list.
+ * If count is 0 the existing key (of any type) is deleted.
+ * Used by SINTERSTORE/SUNIONSTORE/SDIFFSTORE. */
+static int set_store_overwrite(const char *key, int klen,
+                               char * const *ptrs,
+                               const uint32_t *lens, uint32_t count)
+{
+    uint64_t h = kv_hash((const uint8_t *)key, (uint32_t)klen);
+    kv_entry_t *existing = dict_find(&g_dict, key, (uint32_t)klen, h);
+    if (existing) {
+        if (entry_type(existing) == KV_TYPE_SET) set_cleanup_entry(existing);
+        dict_delete(&g_dict, key, (uint32_t)klen, h);
+    }
+    if (count == 0) return 0;
+
+    char init[16];
+    set_build_empty(init);
+    kv_entry_t *e = dict_add(&g_dict, key, (uint32_t)klen, init, SET_EMPTY_SIZE, h);
+    if (!e) return -1;
+
+    for (uint32_t i = 0; i < count; i++) {
+        int added = 0;
+        if (set_add(&e, key, ptrs[i], (int)lens[i], &added) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* =====================================================================
  * SET command dispatch
  * ===================================================================== */
 
@@ -771,55 +899,56 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 return DISPATCH_OK;
             }
 
-            uint32_t count = set_card(entry);
-            if (count == 0) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
-
-            /* Pick random element */
-            uint32_t ridx = (uint32_t)(rand() % count);
-
-            /* Get the element first (before remove destroys it) */
-            char elem_buf[65536];
-            uint32_t elem_len = 0;
-            int found = 0;
-
-            if (entry_encoding(entry) == KV_ENCODING_PACKED) {
-                uint32_t pk_len = entry->val_len - 2;
-                char *p = pk_elem_ptr(entry->data + 2, pk_len, ridx);
-                if (p) {
-                    elem_len = pk_read_u32(p);
-                    if (elem_len < sizeof(elem_buf)) {
-                        memcpy(elem_buf, p + 4, elem_len);
-                        found = 1;
-                    }
-                }
-            } else {
-                kv_dict_t *d = (kv_dict_t *)(entry->data + 2);
-                kv_iter_t *it = dict_iter_new(d, 1);
-                if (it) {
-                    kv_entry_t *de;
-                    uint32_t i = 0;
-                    while ((de = dict_iter_next(it)) != NULL && i < ridx) i++;
-                    if (de && de->key_len < sizeof(elem_buf)) {
-                        memcpy(elem_buf, entry_key(de), de->key_len);
-                        elem_len = de->key_len;
-                        found = 1;
-                    }
-                    dict_iter_free(it);
+            uint32_t card = set_card(entry);
+            /* SPOP key            → bulk string or nil
+             * SPOP key 0          → empty array
+             * SPOP key N          → array of up to N distinct popped members */
+            int has_count = (argc >= 2);
+            long long count = 1;
+            if (has_count) {
+                char nbuf[32];
+                int nl = args[1].len < 31 ? args[1].len : 31;
+                memcpy(nbuf, args[1].ptr, nl); nbuf[nl] = '\0';
+                count = atoll(nbuf);
+                if (count < 0) {
+                    dynbuf_cat(wb, "-ERR value is out of range\r\n", 28);
+                    return DISPATCH_ERROR;
                 }
             }
+            if (card == 0) {
+                dynbuf_cat(wb, has_count ? "*0\r\n" : REP_NIL,
+                               has_count ? 4         : REP_NIL_LEN);
+                return DISPATCH_OK;
+            }
+            if (has_count && count == 0) {
+                dynbuf_cat(wb, "*0\r\n", 4);
+                return DISPATCH_OK;
+            }
+            if ((uint64_t)count > card) count = card;
 
-            if (!found) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
+            /* Snapshot all members, shuffle the first `count` via partial
+             * Fisher–Yates, then remove and emit them. */
+            char **ptrs; uint32_t *lens; uint32_t n;
+            if (set_members_dup(entry, &ptrs, &lens, &n) < 0) {
+                dynbuf_cat(wb, "-ERR oom\r\n", 10);
+                return DISPATCH_ERROR;
+            }
 
-            /* Remove it */
-            int removed = 0;
-            set_remove(&entry, key, elem_buf, (int)elem_len, &removed);
+            if (has_count) {
+                char hdr[32];
+                int hl = snprintf(hdr, sizeof(hdr), "*%lld\r\n", count);
+                dynbuf_cat(wb, hdr, hl);
+            }
 
-            /* Send response */
-            char hdr[32];
-            int hl = snprintf(hdr, sizeof(hdr), "$%u\r\n", elem_len);
-            dynbuf_cat(wb, hdr, hl);
-            dynbuf_cat(wb, elem_buf, (int)elem_len);
-            dynbuf_cat(wb, "\r\n", 2);
+            for (long long i = 0; i < count; i++) {
+                uint32_t j = (uint32_t)i + (uint32_t)(rand() % (n - (uint32_t)i));
+                char *tp = ptrs[i]; ptrs[i] = ptrs[j]; ptrs[j] = tp;
+                uint32_t tl = lens[i]; lens[i] = lens[j]; lens[j] = tl;
+                resp_write_bulk(wb, ptrs[i], lens[i]);
+                int removed = 0;
+                set_remove(&entry, key, ptrs[i], (int)lens[i], &removed);
+            }
+            set_members_free(ptrs, lens, n);
             return DISPATCH_OK;
         }
 
@@ -834,8 +963,284 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
                 return DISPATCH_OK;
             }
-            set_send_random_one(entry, wb);
+            /* SRANDMEMBER key [count]  — Redis-compatible count behaviour:
+             *   count > 0  → up to count distinct members (array)
+             *   count < 0  → exactly |count| members, may repeat (array)
+             *   count == 0 → empty array */
+            if (argc < 2) {
+                set_send_random_one(entry, wb);
+                return DISPATCH_OK;
+            }
+            char nbuf[32];
+            int nl = args[1].len < 31 ? args[1].len : 31;
+            memcpy(nbuf, args[1].ptr, nl); nbuf[nl] = '\0';
+            long long cnt = atoll(nbuf);
+
+            uint32_t card = set_card(entry);
+            if (cnt == 0 || card == 0) {
+                dynbuf_cat(wb, "*0\r\n", 4);
+                return DISPATCH_OK;
+            }
+
+            char **ptrs; uint32_t *lens; uint32_t n;
+            if (set_members_dup(entry, &ptrs, &lens, &n) < 0) {
+                dynbuf_cat(wb, "-ERR out of memory\r\n", 20);
+                return DISPATCH_ERROR;
+            }
+
+            uint32_t want = (cnt > 0) ? (uint32_t)cnt : (uint32_t)(-cnt);
+            if (cnt > 0 && want > n) want = n;
+
+            char hdr[32];
+            int hl = snprintf(hdr, sizeof(hdr), "*%u\r\n", want);
+            dynbuf_cat(wb, hdr, hl);
+
+            if (cnt > 0) {
+                /* Distinct sample via partial Fisher-Yates */
+                for (uint32_t i = 0; i < want; i++) {
+                    uint32_t j = i + (uint32_t)(rand() % (n - i));
+                    char *tp = ptrs[i]; ptrs[i] = ptrs[j]; ptrs[j] = tp;
+                    uint32_t tl = lens[i]; lens[i] = lens[j]; lens[j] = tl;
+                    resp_write_bulk(wb, ptrs[i], lens[i]);
+                }
+            } else {
+                /* With repeats */
+                for (uint32_t i = 0; i < want; i++) {
+                    uint32_t j = (uint32_t)(rand() % n);
+                    resp_write_bulk(wb, ptrs[j], lens[j]);
+                }
+            }
+            set_members_free(ptrs, lens, n);
             return DISPATCH_OK;
+        }
+
+        /* SMISMEMBER key member [member ...] → array of 0/1 */
+        if (TOKEN_EQ(cmd, "SMISMEMBER")) {
+            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            int n = argc - 1;
+            char hdr[32]; int hl = snprintf(hdr, sizeof(hdr), "*%d\r\n", n);
+            dynbuf_cat(wb, hdr, hl);
+            for (int i = 1; i < argc; i++) {
+                int ism = 0;
+                if (entry && entry_type(entry) == KV_TYPE_SET)
+                    ism = set_ismember(entry, args[i].ptr, args[i].len);
+                dynbuf_cat(wb, ism ? REP_ONE : REP_ZERO,
+                               ism ? REP_ONE_LEN : REP_ZERO_LEN);
+            }
+            return DISPATCH_OK;
+        }
+
+        /* SMOVE source destination member → 1 if moved, 0 otherwise */
+        if (TOKEN_EQ(cmd, "SMOVE")) {
+            if (argc != 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+
+            char dkey_buf[256] = {0};
+            const char *dkey = key_from_token(args[1], dkey_buf, sizeof(dkey_buf));
+
+            /* Source already in `entry` (per-dispatch resolved on args[0]); validate. */
+            if (!entry) { dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN); return DISPATCH_OK; }
+            if (entry_type(entry) != KV_TYPE_SET) {
+                dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                return DISPATCH_ERROR;
+            }
+            kv_entry_t *de = NULL;
+            if (resolve_set_key(dkey, (int)strlen(dkey), &de) < 0) {
+                dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                return DISPATCH_ERROR;
+            }
+
+            if (!set_ismember(entry, args[2].ptr, args[2].len)) {
+                dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN);
+                return DISPATCH_OK;
+            }
+
+            int removed = 0;
+            set_remove(&entry, key, args[2].ptr, args[2].len, &removed);
+
+            if (!de) {
+                char init[16];
+                set_build_empty(init);
+                uint64_t dh = kv_hash((const uint8_t *)dkey, (uint32_t)strlen(dkey));
+                de = dict_add(&g_dict, dkey, (uint32_t)strlen(dkey),
+                              init, SET_EMPTY_SIZE, dh);
+                if (!de) { dynbuf_cat(wb, "-ERR smove failed\r\n", 18); return DISPATCH_ERROR; }
+            }
+            int added = 0;
+            set_add(&de, dkey, args[2].ptr, args[2].len, &added);
+
+            dynbuf_cat(wb, REP_ONE, REP_ONE_LEN);
+            return DISPATCH_OK;
+        }
+
+        /* Generic helper inline: SINTER / SUNION / SDIFF and STORE variants. */
+        {
+            int is_inter = TOKEN_EQ(cmd, "SINTER");
+            int is_union = TOKEN_EQ(cmd, "SUNION");
+            int is_diff  = TOKEN_EQ(cmd, "SDIFF");
+            int is_inter_store = TOKEN_EQ(cmd, "SINTERSTORE");
+            int is_union_store = TOKEN_EQ(cmd, "SUNIONSTORE");
+            int is_diff_store  = TOKEN_EQ(cmd, "SDIFFSTORE");
+
+            if (is_inter || is_union || is_diff ||
+                is_inter_store || is_union_store || is_diff_store) {
+
+                int store = is_inter_store || is_union_store || is_diff_store;
+                /* For STORE: args[0]=dst, args[1..]=src keys.
+                 * For read:  args[0..]=src keys (entry already resolved on args[0]). */
+                int first_src = store ? 1 : 0;
+                int src_n = argc - first_src;
+                if (src_n < 1) {
+                    dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN);
+                    return DISPATCH_ERROR;
+                }
+
+                /* Resolve all source set entries upfront. */
+                kv_entry_t **srcs = (kv_entry_t **)calloc((size_t)src_n, sizeof(*srcs));
+                if (!srcs) { dynbuf_cat(wb, "-ERR oom\r\n", 10); return DISPATCH_ERROR; }
+                for (int i = 0; i < src_n; i++) {
+                    /* For STORE the dispatch path didn't pre-resolve src args[i]. */
+                    if (i == 0 && !store) {
+                        srcs[i] = entry;
+                        if (srcs[i] && entry_type(srcs[i]) != KV_TYPE_SET) {
+                            free(srcs);
+                            dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                            return DISPATCH_ERROR;
+                        }
+                    } else {
+                        char kb[256] = {0};
+                        const char *sk = key_from_token(args[first_src + i], kb, sizeof(kb));
+                        kv_entry_t *se = NULL;
+                        if (resolve_set_key(sk, (int)strlen(sk), &se) < 0) {
+                            free(srcs);
+                            dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                            return DISPATCH_ERROR;
+                        }
+                        srcs[i] = se;
+                    }
+                }
+
+                /* Build result member list. */
+                char **rp = NULL; uint32_t *rl = NULL; uint32_t rc = 0;
+
+                if (is_inter || is_inter_store) {
+                    /* If any src missing/empty → empty result. */
+                    int any_empty = 0;
+                    for (int i = 0; i < src_n && !any_empty; i++)
+                        if (!srcs[i] || set_card(srcs[i]) == 0) any_empty = 1;
+                    if (!any_empty) {
+                        /* Pick smallest set as base for membership probing. */
+                        int base = 0;
+                        for (int i = 1; i < src_n; i++)
+                            if (set_card(srcs[i]) < set_card(srcs[base])) base = i;
+                        char **bp; uint32_t *bl; uint32_t bn;
+                        if (set_members_dup(srcs[base], &bp, &bl, &bn) < 0) {
+                            free(srcs); dynbuf_cat(wb, "-ERR oom\r\n", 10);
+                            return DISPATCH_ERROR;
+                        }
+                        rp = (char **)malloc((size_t)bn * sizeof(char *));
+                        rl = (uint32_t *)malloc((size_t)bn * sizeof(uint32_t));
+                        if (!rp || !rl) {
+                            free(rp); free(rl);
+                            set_members_free(bp, bl, bn); free(srcs);
+                            dynbuf_cat(wb, "-ERR oom\r\n", 10); return DISPATCH_ERROR;
+                        }
+                        for (uint32_t i = 0; i < bn; i++) {
+                            int ok = 1;
+                            for (int j = 0; j < src_n && ok; j++) {
+                                if (j == base) continue;
+                                if (!set_ismember(srcs[j], bp[i], (int)bl[i])) ok = 0;
+                            }
+                            if (ok) {
+                                char *buf = (char *)malloc(bl[i] ? bl[i] : 1);
+                                if (!buf) { ok = 0; break; }
+                                memcpy(buf, bp[i], bl[i]);
+                                rp[rc] = buf; rl[rc] = bl[i]; rc++;
+                            }
+                        }
+                        set_members_free(bp, bl, bn);
+                    }
+                } else if (is_union || is_union_store) {
+                    /* Insert all members from all sources; dedup via linear probe
+                     * (acceptable: bounded by total cardinality). */
+                    uint32_t total = 0;
+                    for (int i = 0; i < src_n; i++)
+                        if (srcs[i]) total += set_card(srcs[i]);
+                    if (total > 0) {
+                        rp = (char **)malloc((size_t)total * sizeof(char *));
+                        rl = (uint32_t *)malloc((size_t)total * sizeof(uint32_t));
+                        if (!rp || !rl) {
+                            free(rp); free(rl); free(srcs);
+                            dynbuf_cat(wb, "-ERR oom\r\n", 10); return DISPATCH_ERROR;
+                        }
+                        for (int i = 0; i < src_n; i++) {
+                            if (!srcs[i]) continue;
+                            char **mp; uint32_t *ml; uint32_t mn;
+                            if (set_members_dup(srcs[i], &mp, &ml, &mn) < 0) continue;
+                            for (uint32_t k = 0; k < mn; k++) {
+                                int dup = 0;
+                                for (uint32_t q = 0; q < rc && !dup; q++)
+                                    if (rl[q] == ml[k] && memcmp(rp[q], mp[k], ml[k]) == 0) dup = 1;
+                                if (!dup) {
+                                    char *buf = (char *)malloc(ml[k] ? ml[k] : 1);
+                                    if (!buf) continue;
+                                    memcpy(buf, mp[k], ml[k]);
+                                    rp[rc] = buf; rl[rc] = ml[k]; rc++;
+                                }
+                            }
+                            set_members_free(mp, ml, mn);
+                        }
+                    }
+                } else /* SDIFF / SDIFFSTORE */ {
+                    if (srcs[0] && set_card(srcs[0]) > 0) {
+                        char **bp; uint32_t *bl; uint32_t bn;
+                        if (set_members_dup(srcs[0], &bp, &bl, &bn) < 0) {
+                            free(srcs); dynbuf_cat(wb, "-ERR oom\r\n", 10);
+                            return DISPATCH_ERROR;
+                        }
+                        rp = (char **)malloc((size_t)bn * sizeof(char *));
+                        rl = (uint32_t *)malloc((size_t)bn * sizeof(uint32_t));
+                        if (!rp || !rl) {
+                            free(rp); free(rl);
+                            set_members_free(bp, bl, bn); free(srcs);
+                            dynbuf_cat(wb, "-ERR oom\r\n", 10); return DISPATCH_ERROR;
+                        }
+                        for (uint32_t i = 0; i < bn; i++) {
+                            int in_other = 0;
+                            for (int j = 1; j < src_n && !in_other; j++)
+                                if (srcs[j] && set_ismember(srcs[j], bp[i], (int)bl[i]))
+                                    in_other = 1;
+                            if (!in_other) {
+                                char *buf = (char *)malloc(bl[i] ? bl[i] : 1);
+                                if (!buf) continue;
+                                memcpy(buf, bp[i], bl[i]);
+                                rp[rc] = buf; rl[rc] = bl[i]; rc++;
+                            }
+                        }
+                        set_members_free(bp, bl, bn);
+                    }
+                }
+                free(srcs);
+
+                if (store) {
+                    char dkb[256] = {0};
+                    const char *dk = key_from_token(args[0], dkb, sizeof(dkb));
+                    if (set_store_overwrite(dk, (int)strlen(dk), rp, rl, rc) < 0) {
+                        set_members_free(rp, rl, rc);
+                        dynbuf_cat(wb, "-ERR store failed\r\n", 18);
+                        return DISPATCH_ERROR;
+                    }
+                    int hl2 = snprintf(temp, sizeof(temp), ":%u\r\n", rc);
+                    dynbuf_cat(wb, temp, hl2);
+                } else {
+                    char hdr[32];
+                    int hl2 = snprintf(hdr, sizeof(hdr), "*%u\r\n", rc);
+                    dynbuf_cat(wb, hdr, hl2);
+                    for (uint32_t i = 0; i < rc; i++)
+                        resp_write_bulk(wb, rp[i], rl[i]);
+                }
+                set_members_free(rp, rl, rc);
+                return DISPATCH_OK;
+            }
         }
         break; /* 'S' */
 

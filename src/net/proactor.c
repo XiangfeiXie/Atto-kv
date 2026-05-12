@@ -212,6 +212,16 @@ int proactor_start(unsigned short port, msg_handler handler) {
                     continue;
                 }
 
+                /* QUIT / protocol error: flush then close. */
+                if (c->status) {
+                    if (wb->len > 0) {
+                        set_event_send(&ring, fd, wb->buf + c->w_off, wb->len);
+                    } else {
+                        conn_release(fd);
+                    }
+                    continue;
+                }
+
                 if (wb->len > 0) {
                     set_event_send(&ring, fd, wb->buf + c->w_off, wb->len);
                 } else {
@@ -250,6 +260,12 @@ int proactor_start(unsigned short port, msg_handler handler) {
                 } else {
                     c->w_off = 0;
                     dynbuf_clear(wb);
+
+                    /* Close-after-flush requested by QUIT / protocol error. */
+                    if (c->status) {
+                        conn_release(fd);
+                        continue;
+                    }
 
                     if (c->client && c->client->state == CLIENT_BLOCKED)
                         continue;

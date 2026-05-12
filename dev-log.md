@@ -853,3 +853,236 @@ RDMA 流式全量同步在 Phase 9 已能正常工作，但存在严重性能瓶
 - 状态机: 正确完成 IDLE → INPROGRESS → CATCHUP → IDLE 完整周期
 - Master 日志: `fullsync begin → post-fork base_seq → send done → slave registered → finish`
 - Slave 日志: `header → EOF → fullsync_time_ms → loaded keys → INCR_SYNC → recv thread started`
+
+---
+
+## 2026-05-11 — Phase 10: HASH / SET / ZSET 数据类型
+
+### Overview
+
+新增三种集合数据类型：HASH（字段-值映射）、SET（无序唯一集合）、ZSET（有序集合，按 score 排序）。三种类型复用 unified Dict 引擎作为内部存储，与 STRING/LIST 并列组成完整的五种数据类型。
+
+### New files
+
+- `src/type/kv_type_hash.h` + `src/type/kv_type_hash.c` — ~1330 行：HSET/HSETNX/HGET/HMGET/HSTRLEN/HDEL/HINCRBY/HLEN/HEXISTS/HGETALL/HKEYS/HVALS
+- `src/type/kv_type_set.h` + `src/type/kv_type_set.c` — ~880 行：SADD/SREM/SMEMBERS/SCARD/SISMEMBER/SRANDMEMBER/SPOP/SINTER/SUNION/SDIFF
+- `src/type/kv_type_zset.h` + `src/type/kv_type_zset.c` — ~1320 行：ZADD/ZREM/ZSCORE/ZRANK/ZRANGE/ZCARD/ZCOUNT/ZLEXCOUNT/ZRANGEBYLEX/ZREMRANGEBYLEX
+
+### Design
+
+**HASH** — 每个 hash key 下内嵌一个小型 Dict：
+- Entry data[] 存储 `[type:1][enc:1][dict_header...]`，hash fields/values 作为子 dict 的 entries
+- `hash_cleanup_entry()` 在删除前迭代子 dict 释放所有 field entry
+- HGETALL/HKEYS/HVALS 遍历子 dict 构造 RESP 数组返回
+
+**SET** — 每个 set key 下内嵌一个小型 Dict：
+- Set members 存储为子 dict 的 key，value 为空（类似 Redis intset/dict 编码）
+- `set_cleanup_entry()` 释放子 dict 所有 entry
+- SINTER/SUNION/SDIFF 遍历最小集合，在其余集合上做 dict_find
+- SINTERSTORE/SUNIONSTORE/SDIFFSTORE 创建新集合 key
+
+**ZSET** — 每个 zset key 下内嵌一个 Dict + 一个 Skiplist：
+- Dict 按 member 索引（member → score），Skiplist 按 score 排序（score → member）
+- ZADD 同时插入两个结构，ZREM 同时从两个结构删除
+- ZRANK/ZRANGE 走 Skiplist 路径（O(log N)），ZSCORE 走 Dict 路径（O(1)）
+- `zset_cleanup_entry()` 释放 dict、skiplist 节点及 key 副本
+- Skiplist 层数最大 32，概率 1/4 晋升，与 Redis t_zset 实现对齐
+
+**持久化**：
+- RDB 保存时三种类型均扁平化为二进制流（避免存储指针），格式 `[type:1][enc:1][sub_entries...]`
+- 加载时反向重建内部结构（dict/skiplist）
+- quicklist/zset skiplist 均需 `cleanup_entry` 释放 malloc 内存
+
+### Modified files
+
+- `src/core/kvstore.c` — 新增 KV_TYPE_HASH/SET/ZSET dispatch 路由，FLUSHALL 调用三种类型的 cleanup
+- `src/engine/kv_dict.h/c` — 新增 `dict_count()` 返回 entry 数量（用于 DBSIZE/SCARD/ZCARD 等）
+- `src/persist/persistence.c` — RDB 保存/加载三种新类型，format 版本保持不变（数据自描述）
+- `CMakeLists.txt` — 新增 `kv_type_hash.c`, `kv_type_set.c`, `kv_type_zset.c`
+- `test/test_hash.sh`, `test/test_set.sh`, `test/test_zset.sh` — 各类型独立测试脚本
+
+### Verified
+
+- HASH: HSET/HSETNX/HGET/HMGET/HDEL/HINCRBY/HLEN/HEXISTS/HGETALL/HKEYS/HVALS
+- SET: SADD/SREM/SMEMBERS/SCARD/SISMEMBER/SRANDMEMBER/SPOP/SINTER/SUNION/SDIFF + *STORE
+- ZSET: ZADD/ZREM/ZSCORE/ZRANK/ZRANGE/ZCARD/ZCOUNT（正确排序）
+- RDB 保存/加载三种类型均正确
+- 所有已有 STRING/LIST 测试无回归
+
+---
+
+## 2026-05-12 — Phase 11: Redis 全命令集 + 协议兼容性增强
+
+### Overview
+
+实现 STRING/LIST/SET/HASH/ZSET 五种数据类型的完整 Redis 命令集（~65 个新命令/选项），加固 RESP 解析器，新增关闭连接语义（QUIT / protocol error close-after-flush），重组测试为 smoke test 体系。目标：redis-cli 可直接用作 kvstore 客户端，Python Redis 库基本可用。
+
+### 1. 协议层加固 (`protocol.c`)
+
+**RESP 解析器重写**：
+- **memchr 扫描 CRLF**：替代逐字节循环，大 bulk 值场景跳过 payload 仅扫描长度头
+- **溢出保护**：argc 解析使用 `long` 累加，超过 `max_tokens` 立即拒绝；bulk 长度头最长 32 字节后判定为协议错误
+- **内联模式增强**：支持 tab 作为参数分隔符（Redis-compat），空行返回 -1（协议错误，不阻塞）
+- **内联长度限制**：`KVS_MAX_INLINE_LEN` 界定最大 inline 行长度，超长返回 -1（防 DoS）
+
+**新增 `DISPATCH_CLOSE`**：
+- QUIT 命令返回 `DISPATCH_CLOSE`（区别于 `DISPATCH_OK`）
+- 网络层收到后设置 `c->status = 1`，先 flush 写缓冲区再关闭连接（close-after-flush）
+- 协议错误同样走 close-after-flush 路径（Redis 行为一致：错误连接立即关闭）
+
+### 2. 全局/连接命令 (`kvstore.c`)
+
+**新增命令**（位于 key-based dispatch 之前）：
+
+| 命令 | 行为 |
+|------|------|
+| `PING [msg]` | 无参数返回 `+PONG\r\n`，有参数返回 bulk reply echo |
+| `QUIT` | 返回 `+OK\r\n` + `DISPATCH_CLOSE`（flush 后关闭） |
+| `ECHO msg` | 参数不足返回 `-ERR`（Redis-compat） |
+| `HELLO` | 返回 `-NOPROTO` 拒绝 RESP3，客户端回退至 RESP2 |
+| `CLIENT SETNAME / GETNAME / ID / NO-EVICT / REPLY` | 返回 `+OK`（SETNAME/NO-EVICT），`$-1\r\n`（GETNAME），`:fd\r\n`（ID） |
+| `COMMAND` / `COMMAND COUNT` | 返回 `*0\r\n` / `:0\r\n`（关闭 redis-cli `COMMAND DOCS` 首连查询） |
+| `SELECT 0` | 仅接受 DB 0，其他返回 `-ERR DB index out of range` |
+| `DBSIZE` | 返回 `dict_count()` |
+| `SAVE` / `BGSAVE` | 异步 fork+io_uring RDB 保存 |
+| `FLUSHALL` / `FLUSHDB` | 清空 dict + 重置 RDB/AOF |
+
+**通用辅助函数**：
+- `reply_integer(wb, v)` — 格式化 `:N\r\n` 整数回复
+- `reply_bulk(wb, s, len)` — 格式化 `$N\r\n<data>\r\n` bulk 字符串回复
+- `entry_cleanup_by_type(e)` — 按 entry type 调用对应 cleanup 函数
+- `token_to_ll()` 改为严格模式（返回错误码，支持负数和溢出检测）
+
+**重新设计的命令路由表**：
+- 新增 key-entry 命令识别采用 TOKEN_EQ 链 + `cmd_type` / `is_write` 分类
+- 覆盖所有 5 种类型的全部命令（~60 个命令名），O(1) 线性扫描（单条 TOKEN_EQ 即匹配）
+- 写入命令识别用于 AOF 追加 + eBPF uprobe 触发
+
+### 3. STRING 类型扩展 (`kv_type_string.c`)
+
+**重构 engine 层**：
+- `string_engine_set()` / `string_engine_get()` 成为公共 API（供 MSET/MGET 跨类型调用）
+- `engine_set_raw()` 新增 `mode` 参数：0=无条件，1=NX（key 不存在时才写），2=XX（key 存在时才写）
+- lazy expiry 检查移到 engine 层统一处理
+
+**新增命令**：
+
+| 命令 | 行为 |
+|------|------|
+| `SET key val [EX s\|PX ms] [NX\|XX]` | 完整 Redis SET 语法，支持过期 + 条件写入 |
+| `SETNX key val` | NX 语义简写，返回 `:1` / `:0` |
+| `SETEX key s val` | 固定秒级过期，返回 `+OK` |
+| `GETSET key val` | 返回旧值后设置新值 |
+| `STRLEN key` | 返回 value 长度（INT 编码返回 snprintf 后长度） |
+| `APPEND key val` | 追加字符串到 value（INT→RAW 自动转换） |
+| `INCR key` / `DECR key` | 原子 int64 ±1 |
+| `INCRBY key N` / `DECRBY key N` | 原子 int64 ±N |
+| `INCRBYFLOAT key F` | 原子 float64 ±F（自动 INT↔RAW 转换） |
+| `MSET k v [k v ...]` | 批量写入（替换任意类型，Redis-compat） |
+| `MSETNX k v [k v ...]` | 批量 NX 写入，任一 key 存在则全不写 |
+| `MGET k [k ...]` | 批量读取（非 STRING key 返回 nil） |
+
+### 4. LIST 类型扩展 (`kv_type_list.c`, +589 行)
+
+| 命令 | 行为 |
+|------|------|
+| `LPUSHX key val` | 仅 key 存在时 push left |
+| `RPUSHX key val` | 仅 key 存在时 push right |
+| `LSET key idx val` | 按索引设置元素（O(N)，支持负索引） |
+| `LREM key count val` | 按值删除（count>0 从左，<0 从右，=0 全删） |
+| `LTRIM key start stop` | 区间保留（O(N)，支持负索引） |
+| `LINSERT key BEFORE\|AFTER pivot val` | 在 pivot 前/后插入 |
+| `LPOS key val [RANK n]` | 值位置查找（支持第 N 次出现） |
+| `LMOVE src dst LEFT\|RIGHT LEFT\|RIGHT` | 原子移动元素（源→目标） |
+| `RPOPLPUSH src dst` | LMOVE RIGHT LEFT 简写 |
+
+### 5. SET 类型扩展 (`kv_type_set.c`, +497 行)
+
+| 命令 | 行为 |
+|------|------|
+| `SMISMEMBER key m1 [m2 ...]` | 批量成员检查，返回 `[i1, i2, ...]` |
+| `SMOVE src dst member` | 原子移动（src→dst），返回 `:1` / `:0` |
+| `SINTER k1 k2 [k3 ...]` | 多集合交集（遍历最小集合） |
+| `SUNION k1 k2 [k3 ...]` | 多集合并集 |
+| `SDIFF k1 k2 [k3 ...]` | 多集合差集（k1 有其余无） |
+| `SINTERSTORE dst k1 k2 [...]` | 交集结果存入 dst |
+| `SUNIONSTORE dst k1 k2 [...]` | 并集结果存入 dst |
+| `SDIFFSTORE dst k1 k2 [...]` | 差集结果存入 dst |
+| `SCARD key` | 返回集合基数 |
+| `SPOP [count]` | 随机弹出 count 个成员 |
+
+### 6. HASH 类型扩展 (`kv_type_hash.c`, +342 行)
+
+| 命令 | 行为 |
+|------|------|
+| `HMSET key f1 v1 [f2 v2 ...]` | 批量设置字段（HSET 同义） |
+| `HINCRBYFLOAT key field F` | 浮点增量 |
+| `HRANDFIELD key [count]` | 随机字段（正数不重复，负数可重复） |
+| `HSTRLEN key field` | 字段值长度 |
+
+### 7. ZSET 类型扩展 (`kv_type_zset.c`, +763 行)
+
+| 命令 | 行为 |
+|------|------|
+| `ZINCRBY key N member` | 原子增减 score（支持负值/零） |
+| `ZMSCORE key m1 [m2 ...]` | 批量查 score，返回 `[s1, s2, ...]` |
+| `ZREVRANK key member` | 逆序排名（按 score 降序） |
+| `ZREVRANGE key start stop [WITHSCORES]` | 逆序区间查询 |
+| `ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT o c]` | 逆序 score 区间查询 |
+| `ZPOPMIN` / `ZPOPMAX key [count]` | 弹出最低/最高 score 成员 |
+| `ZREMRANGEBYRANK key start stop` | 按排名删除 |
+| `ZREMRANGEBYSCORE key min max` | 按 score 删除 |
+| `ZRANDMEMBER key [count]` | 随机成员 |
+
+### 8. 网络层 QUIT / 协议错误处理 (`reactor.c`, `proactor.c`)
+
+- **recv 路径**：dispatch 返回 `DISPATCH_CLOSE` 后设置 `c->status = 1`，若写缓冲区为空立即 `conn_release()`，否则关闭 EPOLLIN，保留 EPOLLOUT 等待 flush
+- **send 路径**：flush 完成后检查 `c->status`，若为 1 则 `conn_release()`
+- **Proactor**：send completion 处理中检测 `c->status`，release 前检查写缓冲区，recv 提交前检查 `c->status`
+- 协议错误（`resp_parse_slices` 返回 -1）同样设置 `c->status = 1`
+
+### 9. 测试重组
+
+**移除文件**（独立测试脚本，功能已覆盖于 smoke）：
+- `test/test_hash.sh` (~619 行)
+- `test/test_list.sh` (~235 行)
+- `test/test_set.sh` (~306 行)
+- `test/test_zset.sh` (~389 行)
+
+**新增目录 `test/smoke/`**：
+- `_lib.sh` — 公共函数库（ok/bad/chk/section/summary），使用 `redis-cli` 作为测试客户端
+- `run_all.sh` — 总入口，顺序执行 5 个 smoke 脚本，打印汇总
+- `smoke_string.sh` — STRING 全命令 smoke test
+- `smoke_list.sh` — LIST 全命令 smoke test
+- `smoke_set.sh` — SET 全命令 smoke test
+- `smoke_hash.sh` — HASH 全命令 smoke test
+- `smoke_zset.sh` — ZSET 全命令 smoke test
+
+### 协议兼容性
+
+- Python `redis` 库 `StrictRedis.from_url()` 连接 kvstore 基本可用（HELLO→NOPROTO→fallback RESP2→COMMAND DOCS→空数组→正常 SET/GET）
+- `redis-cli -h ... -p ...` 直接可用
+
+### 文件变更
+
+| 文件 | 变更 |
+|------|------|
+| `src/core/kvstore.c` | +441 行：~30 个新全局/多 key 命令，重写命令路由表，辅助函数 |
+| `src/core/protocol.c` | 重写：memchr 扫描，溢出保护，tab 支持，DISPATCH_CLOSE |
+| `src/core/protocol.h` | 新增 `DISPATCH_CLOSE`，内联长度限制常量 |
+| `src/type/kv_type_string.c` | +335 行：SET 完整语法，INCR*/DECR*/APPEND/GETSET/STRLEN，engine 重构 |
+| `src/type/kv_type_string.h` | 新增公共 API：`string_engine_set/get` |
+| `src/type/kv_type_list.c` | +589 行：9 个新命令 |
+| `src/type/kv_type_set.c` | +497 行：集合运算 + SMOVE/SMISMEMBER |
+| `src/type/kv_type_hash.c` | +342 行：HMSET/HINCRBYFLOAT/HRANDFIELD/HSTRLEN |
+| `src/type/kv_type_zset.c` | +763 行：逆向操作 + ZPOP + 范围删除 + 随机 |
+| `src/net/reactor.c` | +23 行：QUIT/protocol error close-after-flush |
+| `src/net/proactor.c` | +16 行：QUIT/protocol error close-after-flush |
+| `test/smoke/*` | 7 个新文件（公共库 + 5 类型 smoke + 总入口） |
+
+### Known Issues (Phase 11)
+
+1. **ZSET 子 dict/skiplist 生命周期**：`zset_cleanup_entry()` 需正确释放 skiplist 节点内 malloc 的 member 副本，遗漏会导致内存泄漏
+2. **SINTERSTORE 等存储命令对目标 key 的处理**：目标 key 已存在且类型不同时应先清理后覆盖（Redis 行为），当前实现可能遗留旧类型子结构
+3. **INCRBYFLOAT 精度**：使用 `double` + `snprintf`，极值场景可能丢失精度（Redis 使用 long double + 自定义格式化）
+4. **Smoke test 覆盖率**：smoke 测试为正向路径测试，缺少大量边界条件（OOM、大 key、高并发等）

@@ -3,8 +3,14 @@
 
 #include "dynbuf.h"
 
-#define KVS_MAX_TOKENS 256
-#define BUF_INIT_CAP   4096
+#define KVS_MAX_TOKENS         1024            /* Redis: 1M; conservative cap here */
+#define KVS_MAX_BULK_LEN       (512 * 1024 * 1024) /* 512 MB, matches Redis proto-max-bulk-len */
+#define KVS_MAX_INLINE_LEN     65536           /* inline command line length cap */
+#define BUF_INIT_CAP           4096
+
+/* Read-buffer compaction threshold: when r_off exceeds this fraction of cap
+   and unconsumed bytes are small, memmove to the head to reclaim space. */
+#define KVS_RB_COMPACT_RATIO   2               /* compact when r_off > cap/2 */
 
 /* Zero-copy token slice — points into the read buffer, no malloc */
 typedef struct {
@@ -20,8 +26,13 @@ typedef struct {
 typedef enum {
     DISPATCH_OK      = 0,   /* response written to wb */
     DISPATCH_BLOCKED = 1,   /* client parked, don't send, don't close */
+    DISPATCH_CLOSE   = 2,   /* response written, then close after flush (QUIT) */
     DISPATCH_ERROR   = -1,  /* protocol error, close connection */
 } dispatch_result_t;
+
+/* Drain return codes — distinguish blocked vs protocol-error vs ok */
+#define KVS_DRAIN_BLOCKED   (-2)
+#define KVS_DRAIN_PROTOERR  (-1)
 
 struct conn;
 

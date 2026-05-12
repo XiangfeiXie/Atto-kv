@@ -167,6 +167,24 @@ int recv_cb(int fd) {
 #if ENABLE_KVSTORE
     c->w_off = 0;
     kvs_drain_resp_commands_off(&c->read_buf, &c->r_off, &c->write_buf, c);
+
+    /* QUIT / protocol error path: drain set c->status = 1 to request
+       close-after-flush. If nothing to flush, close now; else let send_cb
+       drain the buffer first, then close. */
+    if (c->status) {
+        if (c->write_buf.len == 0) {
+            conn_release(fd);
+            return 0;
+        }
+        /* Disable EPOLLIN, keep EPOLLOUT to flush remaining bytes */
+        struct epoll_event ev;
+        ev.events = EPOLLOUT;
+        ev.data.fd = fd;
+        c->cur_events = EPOLLOUT;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+        return 0;
+    }
+
     /* If client became blocked, don't re-enable EPOLLIN */
     if (c->client && c->client->state == CLIENT_BLOCKED) {
         conn_set_events(fd, c);
@@ -204,6 +222,11 @@ int send_cb(int fd) {
     if (wb->len == 0) {
         c->w_off = 0;
         dynbuf_clear(wb);
+        /* Close-after-flush requested by QUIT / protocol error. */
+        if (c->status) {
+            conn_release(fd);
+            return 0;
+        }
     }
 
 #if ENABLE_KVSTORE

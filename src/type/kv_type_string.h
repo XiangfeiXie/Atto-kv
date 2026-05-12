@@ -25,4 +25,15 @@ int string_is_write_cmd(kvs_token_t cmd);
    out_data must be at least val_len + 2 bytes. */
 void string_build_entry_data(const char *value, int val_len, char *out_data);
 
+/* Public helpers used by multi-key string commands (MSET/MGET/MSETNX) in kvs_dispatch.
+ * string_engine_set: mode 0 unconditional, 1 NX (absent only), 2 XX (present only).
+ *   Returns 0 ok, 1 precondition failed, -1 error.
+ * string_engine_get: returns payload pointer + length; NULL if missing / expired.
+ *   Caller must honour enc_out (KV_ENCODING_INT means payload is int64). */
+int         string_engine_set(const char *key, uint32_t key_len,
+                              const char *val, uint32_t val_len,
+                              long long expire, int mode);
+const char *string_engine_get(const char *key, uint32_t key_len,
+                              uint32_t *vlen_out, uint8_t *enc_out);
+
 #endif

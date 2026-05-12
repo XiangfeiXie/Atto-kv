@@ -746,6 +746,150 @@ int list_flatten_to_packed(kv_entry_t *e, char **out_data, uint32_t *out_len) {
 }
 
 /* =====================================================================
+ * Slice collection + rewrite helpers
+ *
+ * For multi-step mutators (LSET / LREM / LTRIM / LINSERT) we materialize
+ * the entire list into a heap buffer of (ptr, len) slices, mutate the
+ * array, then rebuild the list via list_push. This is O(N) but greatly
+ * simplifies correctness: a single code path handles both PACKED and
+ * QUICKLIST encodings, and conversion direction (shrink → packed,
+ * grow → quicklist) is automatic.
+ * ===================================================================== */
+
+typedef struct {
+    const char *p;
+    int         len;
+} list_slice_t;
+
+/* Walks the list and copies all elements into a single contiguous heap
+   buffer. Returns 0 on success, -1 on OOM. Caller frees *out_slices and
+   *out_buf even on success. */
+static int list_collect(kv_entry_t *e,
+                        list_slice_t **out_slices, int *out_count,
+                        char **out_buf)
+{
+    *out_slices = NULL; *out_buf = NULL; *out_count = 0;
+
+    uint32_t total_n = list_len(e);
+    if (total_n == 0) return 0;
+
+    /* Pass 1: compute total byte size */
+    uint32_t total_bytes = 0;
+    if (entry_encoding(e) == KV_ENCODING_PACKED) {
+        const char *p = e->data + 6;
+        for (uint32_t i = 0; i < total_n; i++) {
+            uint32_t el = pk_read_u32(p);
+            total_bytes += el;
+            p += 4 + el;
+        }
+    } else {
+        kv_ql_node_t *node = ql_head(e);
+        while (node) {
+            const char *p = node->data + 4;
+            for (uint32_t i = 0; i < node->count; i++) {
+                uint32_t el = pk_read_u32(p);
+                total_bytes += el;
+                p += 4 + el;
+            }
+            node = node->next;
+        }
+    }
+
+    char         *buf = (char *)malloc(total_bytes > 0 ? total_bytes : 1);
+    list_slice_t *arr = (list_slice_t *)malloc(sizeof(list_slice_t) * total_n);
+    if (!buf || !arr) { free(buf); free(arr); return -1; }
+
+    /* Pass 2: copy element bodies + populate slice pointers */
+    char *bp = buf;
+    int   idx = 0;
+    if (entry_encoding(e) == KV_ENCODING_PACKED) {
+        const char *p = e->data + 6;
+        for (uint32_t i = 0; i < total_n; i++) {
+            uint32_t el = pk_read_u32(p);
+            memcpy(bp, p + 4, el);
+            arr[idx].p = bp; arr[idx].len = (int)el;
+            bp += el; idx++;
+            p += 4 + el;
+        }
+    } else {
+        kv_ql_node_t *node = ql_head(e);
+        while (node) {
+            const char *p = node->data + 4;
+            for (uint32_t i = 0; i < node->count; i++) {
+                uint32_t el = pk_read_u32(p);
+                memcpy(bp, p + 4, el);
+                arr[idx].p = bp; arr[idx].len = (int)el;
+                bp += el; idx++;
+                p += 4 + el;
+            }
+            node = node->next;
+        }
+    }
+
+    *out_slices = arr;
+    *out_count  = (int)total_n;
+    *out_buf    = buf;
+    return 0;
+}
+
+/* Replace the contents of *pe with the provided slice array. Preserves
+   TTL. May reallocate *pe via list_push. */
+static int list_rewrite(kv_entry_t **pe, const char *key,
+                        const list_slice_t *slices, int count)
+{
+    kv_entry_t *e = *pe;
+    long long saved_expire = e->expire;
+
+    /* Free any external quicklist nodes; entry data is owned by the dict. */
+    if (entry_encoding(e) == KV_ENCODING_QUICKLIST)
+        list_cleanup_entry(e);
+
+    /* Reset entry to empty PACKED list. */
+    kv_entry_t *ne = dict_resize_entry(&g_dict, e, LIST_EMPTY_SIZE);
+    if (!ne) return -1;
+    list_build_empty(ne->data);
+    ne->expire = saved_expire;
+    *pe = ne;
+
+    /* Push all slices to the tail; list_push auto-converts to quicklist
+       once packed limits are exceeded. */
+    for (int i = 0; i < count; i++) {
+        if (list_push(pe, key, slices[i].p, slices[i].len, /*left=*/0) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* After a pop, if the list became empty Redis deletes the key. */
+static void list_maybe_delete_empty(kv_entry_t *e, const char *key, uint64_t hash) {
+    if (!e || list_len(e) != 0) return;
+    list_cleanup_entry(e);
+    dict_delete(&g_dict, key, (uint32_t)strlen(key), hash);
+}
+
+/* Locate a list-typed entry by token; returns 0 if absent or wrong type
+   (sets *out_e to NULL and writes WRONGTYPE on wrong-type). */
+static int list_lookup(kvs_token_t key_tok, kv_entry_t **out_e,
+                       uint64_t *out_hash, char *kbuf, int kbuf_sz,
+                       DynBuf *wb)
+{
+    const char *k = key_from_token(key_tok, kbuf, kbuf_sz);
+    uint32_t kl = (uint32_t)strlen(k);
+    uint64_t h = kv_hash((const uint8_t *)k, kl);
+    kv_entry_t *e = dict_find(&g_dict, k, kl, h);
+    *out_hash = h;
+    if (!e) { *out_e = NULL; return 0; }
+    if (entry_type(e) != KV_TYPE_LIST) {
+        if (wb) dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+        *out_e = NULL;
+        return -1;
+    }
+    if (check_expiry(e, k, h)) { *out_e = NULL; return 0; }
+    *out_e = e;
+    return 0;
+}
+
+/* =====================================================================
  * LIST command dispatch
  * ===================================================================== */
 
@@ -841,6 +985,7 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, temp, bh);
                 dynbuf_cat(wb, out_buf, olen);
                 dynbuf_cat(wb, "\r\n", 2);
+                list_maybe_delete_empty(entry, key, hash);
                 return DISPATCH_OK;
             }
 
@@ -857,6 +1002,7 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, out_buf, olen);
                 dynbuf_cat(wb, "\r\n", 2);
             }
+            list_maybe_delete_empty(entry, key, hash);
             return DISPATCH_OK;
         }
 
@@ -925,6 +1071,348 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, edata, elen);
                 dynbuf_cat(wb, "\r\n", 2);
             }
+            return DISPATCH_OK;
+        }
+
+        /* ── LPUSHX key val [val ...] — push only if key exists ── */
+        if (TOKEN_EQ(cmd, "LPUSHX")) {
+            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) { dynbuf_cat(wb, ":0\r\n", 4); return DISPATCH_OK; }
+            kv_entry_t *e = entry;
+            for (int i = 1; i < argc; i++) {
+                if (list_push(&e, key, args[i].ptr, args[i].len, /*left=*/1) < 0) {
+                    dynbuf_cat(wb, "-ERR push failed\r\n", 18);
+                    return DISPATCH_ERROR;
+                }
+            }
+            int hl = snprintf(temp, sizeof(temp), ":%u\r\n", list_len(e));
+            dynbuf_cat(wb, temp, hl);
+            return DISPATCH_OK;
+        }
+
+        /* ── LSET key idx value ── */
+        if (TOKEN_EQ(cmd, "LSET")) {
+            if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) {
+                dynbuf_cat(wb, "-ERR no such key\r\n", 18);
+                return DISPATCH_ERROR;
+            }
+            int idx = 0;
+            if (token_to_int(args[1], &idx) < 0) {
+                dynbuf_cat(wb, "-ERR value is not an integer or out of range\r\n", 46);
+                return DISPATCH_ERROR;
+            }
+            uint32_t llen = list_len(entry);
+            if (idx < 0) idx = (int)llen + idx;
+            if (idx < 0 || (uint32_t)idx >= llen) {
+                dynbuf_cat(wb, "-ERR index out of range\r\n", 25);
+                return DISPATCH_ERROR;
+            }
+
+            list_slice_t *sl = NULL; int sc = 0; char *bb = NULL;
+            if (list_collect(entry, &sl, &sc, &bb) < 0) {
+                free(sl); free(bb);
+                dynbuf_cat(wb, "-ERR collect failed\r\n", 21);
+                return DISPATCH_ERROR;
+            }
+            sl[idx].p = args[2].ptr;
+            sl[idx].len = args[2].len;
+            kv_entry_t *e = entry;
+            int rr = list_rewrite(&e, key, sl, sc);
+            free(sl); free(bb);
+            if (rr < 0) { dynbuf_cat(wb, "-ERR rewrite failed\r\n", 21);
+                          return DISPATCH_ERROR; }
+            dynbuf_cat(wb, REP_OK, REP_OK_LEN);
+            return DISPATCH_OK;
+        }
+
+        /* ── LREM key count value ── */
+        if (TOKEN_EQ(cmd, "LREM")) {
+            if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) { dynbuf_cat(wb, ":0\r\n", 4); return DISPATCH_OK; }
+            int count = 0;
+            if (token_to_int(args[1], &count) < 0) {
+                dynbuf_cat(wb, "-ERR value is not an integer or out of range\r\n", 46);
+                return DISPATCH_ERROR;
+            }
+            kvs_token_t vtok = args[2];
+
+            list_slice_t *sl = NULL; int sc = 0; char *bb = NULL;
+            if (list_collect(entry, &sl, &sc, &bb) < 0) {
+                free(sl); free(bb);
+                dynbuf_cat(wb, "-ERR collect failed\r\n", 21);
+                return DISPATCH_ERROR;
+            }
+
+            int removed = 0;
+            /* keep[i] = 1 means keep, 0 means drop */
+            char *keep = (char *)malloc((size_t)(sc > 0 ? sc : 1));
+            if (!keep) { free(sl); free(bb);
+                         dynbuf_cat(wb, "-ERR oom\r\n", 10);
+                         return DISPATCH_ERROR; }
+            for (int i = 0; i < sc; i++) keep[i] = 1;
+
+            int limit = count == 0 ? sc : (count > 0 ? count : -count);
+            if (count >= 0) {
+                for (int i = 0; i < sc && removed < limit; i++) {
+                    if (sl[i].len == vtok.len &&
+                        memcmp(sl[i].p, vtok.ptr, (size_t)vtok.len) == 0) {
+                        keep[i] = 0; removed++;
+                    }
+                }
+            } else {
+                for (int i = sc - 1; i >= 0 && removed < limit; i--) {
+                    if (sl[i].len == vtok.len &&
+                        memcmp(sl[i].p, vtok.ptr, (size_t)vtok.len) == 0) {
+                        keep[i] = 0; removed++;
+                    }
+                }
+            }
+
+            /* Compact kept slices in place */
+            int new_sc = 0;
+            for (int i = 0; i < sc; i++) {
+                if (keep[i]) sl[new_sc++] = sl[i];
+            }
+
+            kv_entry_t *e = entry;
+            int rr = list_rewrite(&e, key, sl, new_sc);
+            free(sl); free(bb); free(keep);
+            if (rr < 0) { dynbuf_cat(wb, "-ERR rewrite failed\r\n", 21);
+                          return DISPATCH_ERROR; }
+            int hl = snprintf(temp, sizeof(temp), ":%d\r\n", removed);
+            dynbuf_cat(wb, temp, hl);
+
+            /* If we emptied the list, drop the key. */
+            uint64_t h = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            list_maybe_delete_empty(e, key, h);
+            return DISPATCH_OK;
+        }
+
+        /* ── LTRIM key start stop ── */
+        if (TOKEN_EQ(cmd, "LTRIM")) {
+            if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) { dynbuf_cat(wb, REP_OK, REP_OK_LEN); return DISPATCH_OK; }
+
+            int start = 0, stop = 0;
+            if (token_to_int(args[1], &start) < 0 ||
+                token_to_int(args[2], &stop)  < 0) {
+                dynbuf_cat(wb, "-ERR value is not an integer or out of range\r\n", 46);
+                return DISPATCH_ERROR;
+            }
+
+            list_slice_t *sl = NULL; int sc = 0; char *bb = NULL;
+            if (list_collect(entry, &sl, &sc, &bb) < 0) {
+                free(sl); free(bb);
+                dynbuf_cat(wb, "-ERR collect failed\r\n", 21);
+                return DISPATCH_ERROR;
+            }
+            if (start < 0) start += sc;
+            if (stop  < 0) stop  += sc;
+            if (start < 0) start = 0;
+            if (stop  >= sc) stop = sc - 1;
+
+            int new_sc;
+            if (start > stop || sc == 0) {
+                new_sc = 0;
+            } else {
+                new_sc = stop - start + 1;
+                for (int i = 0; i < new_sc; i++) sl[i] = sl[start + i];
+            }
+
+            kv_entry_t *e = entry;
+            int rr = list_rewrite(&e, key, sl, new_sc);
+            free(sl); free(bb);
+            if (rr < 0) { dynbuf_cat(wb, "-ERR rewrite failed\r\n", 21);
+                          return DISPATCH_ERROR; }
+            dynbuf_cat(wb, REP_OK, REP_OK_LEN);
+            uint64_t h = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            list_maybe_delete_empty(e, key, h);
+            return DISPATCH_OK;
+        }
+
+        /* ── LINSERT key BEFORE|AFTER pivot value ── */
+        if (TOKEN_EQ(cmd, "LINSERT")) {
+            if (argc < 4) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) { dynbuf_cat(wb, ":0\r\n", 4); return DISPATCH_OK; }
+
+            int before;
+            kvs_token_t pos = args[1];
+            if (pos.len == 6 && (memcmp(pos.ptr, "BEFORE", 6) == 0 ||
+                                  memcmp(pos.ptr, "before", 6) == 0)) before = 1;
+            else if (pos.len == 5 && (memcmp(pos.ptr, "AFTER", 5) == 0 ||
+                                       memcmp(pos.ptr, "after", 5) == 0)) before = 0;
+            else { dynbuf_cat(wb, "-ERR syntax error\r\n", 19);
+                   return DISPATCH_ERROR; }
+
+            kvs_token_t pivot = args[2];
+            kvs_token_t value = args[3];
+
+            list_slice_t *sl = NULL; int sc = 0; char *bb = NULL;
+            if (list_collect(entry, &sl, &sc, &bb) < 0) {
+                free(sl); free(bb);
+                dynbuf_cat(wb, "-ERR collect failed\r\n", 21);
+                return DISPATCH_ERROR;
+            }
+
+            int pivot_idx = -1;
+            for (int i = 0; i < sc; i++) {
+                if (sl[i].len == pivot.len &&
+                    memcmp(sl[i].p, pivot.ptr, (size_t)pivot.len) == 0) {
+                    pivot_idx = i; break;
+                }
+            }
+
+            if (pivot_idx < 0) {
+                free(sl); free(bb);
+                dynbuf_cat(wb, ":-1\r\n", 5);
+                return DISPATCH_OK;
+            }
+
+            /* Build new array with one extra slot. */
+            int new_sc = sc + 1;
+            list_slice_t *nsl = (list_slice_t *)malloc(sizeof(list_slice_t) * (size_t)new_sc);
+            if (!nsl) { free(sl); free(bb);
+                        dynbuf_cat(wb, "-ERR oom\r\n", 10);
+                        return DISPATCH_ERROR; }
+
+            int insert_at = before ? pivot_idx : pivot_idx + 1;
+            for (int i = 0; i < insert_at; i++) nsl[i] = sl[i];
+            nsl[insert_at].p = value.ptr;
+            nsl[insert_at].len = value.len;
+            for (int i = insert_at; i < sc; i++) nsl[i + 1] = sl[i];
+
+            kv_entry_t *e = entry;
+            int rr = list_rewrite(&e, key, nsl, new_sc);
+            free(sl); free(bb); free(nsl);
+            if (rr < 0) { dynbuf_cat(wb, "-ERR rewrite failed\r\n", 21);
+                          return DISPATCH_ERROR; }
+            int hl = snprintf(temp, sizeof(temp), ":%u\r\n", list_len(e));
+            dynbuf_cat(wb, temp, hl);
+            return DISPATCH_OK;
+        }
+
+        /* ── LPOS key element [RANK r] [COUNT c] ──
+             Simplified: supports COUNT only. Returns integer (first match)
+             or array when COUNT given. */
+        if (TOKEN_EQ(cmd, "LPOS")) {
+            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            int want_count = -1;  /* -1 means single-match mode */
+            for (int i = 2; i + 1 < argc; i += 2) {
+                kvs_token_t opt = args[i];
+                if (opt.len == 5 && (memcmp(opt.ptr, "COUNT", 5) == 0 ||
+                                      memcmp(opt.ptr, "count", 5) == 0)) {
+                    if (token_to_int(args[i + 1], &want_count) < 0 || want_count < 0) {
+                        dynbuf_cat(wb, "-ERR COUNT must be >= 0\r\n", 25);
+                        return DISPATCH_ERROR;
+                    }
+                } else {
+                    dynbuf_cat(wb, "-ERR syntax error\r\n", 19);
+                    return DISPATCH_ERROR;
+                }
+            }
+            if (!entry) {
+                dynbuf_cat(wb, want_count < 0 ? REP_NIL : "*0\r\n",
+                           want_count < 0 ? REP_NIL_LEN : 4);
+                return DISPATCH_OK;
+            }
+            kvs_token_t vtok = args[1];
+
+            list_slice_t *sl = NULL; int sc = 0; char *bb = NULL;
+            if (list_collect(entry, &sl, &sc, &bb) < 0) {
+                free(sl); free(bb);
+                dynbuf_cat(wb, "-ERR collect failed\r\n", 21);
+                return DISPATCH_ERROR;
+            }
+
+            if (want_count < 0) {
+                int found = -1;
+                for (int i = 0; i < sc; i++) {
+                    if (sl[i].len == vtok.len &&
+                        memcmp(sl[i].p, vtok.ptr, (size_t)vtok.len) == 0) {
+                        found = i; break;
+                    }
+                }
+                free(sl); free(bb);
+                if (found < 0) dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
+                else { int hl = snprintf(temp, sizeof(temp), ":%d\r\n", found);
+                       dynbuf_cat(wb, temp, hl); }
+                return DISPATCH_OK;
+            }
+
+            /* COUNT mode: gather up to want_count matches (0 = all). */
+            int cap = sc > 0 ? sc : 1;
+            int *idxs = (int *)malloc(sizeof(int) * (size_t)cap);
+            int n = 0;
+            if (!idxs) { free(sl); free(bb);
+                         dynbuf_cat(wb, "-ERR oom\r\n", 10);
+                         return DISPATCH_ERROR; }
+            int limit = want_count == 0 ? sc : want_count;
+            for (int i = 0; i < sc && n < limit; i++) {
+                if (sl[i].len == vtok.len &&
+                    memcmp(sl[i].p, vtok.ptr, (size_t)vtok.len) == 0)
+                    idxs[n++] = i;
+            }
+            free(sl); free(bb);
+
+            int hl = snprintf(temp, sizeof(temp), "*%d\r\n", n);
+            dynbuf_cat(wb, temp, hl);
+            for (int i = 0; i < n; i++) {
+                int el = snprintf(temp, sizeof(temp), ":%d\r\n", idxs[i]);
+                dynbuf_cat(wb, temp, el);
+            }
+            free(idxs);
+            return DISPATCH_OK;
+        }
+
+        /* ── LMOVE src dst LEFT|RIGHT LEFT|RIGHT ── */
+        if (TOKEN_EQ(cmd, "LMOVE")) {
+            if (argc < 4) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
+
+            int src_left, dst_left;
+            kvs_token_t sd = args[2], dd = args[3];
+            if (sd.len == 4 && (memcmp(sd.ptr, "LEFT", 4) == 0 || memcmp(sd.ptr, "left", 4) == 0))      src_left = 1;
+            else if (sd.len == 5 && (memcmp(sd.ptr, "RIGHT", 5) == 0 || memcmp(sd.ptr, "right", 5) == 0)) src_left = 0;
+            else { dynbuf_cat(wb, "-ERR syntax error\r\n", 19); return DISPATCH_ERROR; }
+            if (dd.len == 4 && (memcmp(dd.ptr, "LEFT", 4) == 0 || memcmp(dd.ptr, "left", 4) == 0))      dst_left = 1;
+            else if (dd.len == 5 && (memcmp(dd.ptr, "RIGHT", 5) == 0 || memcmp(dd.ptr, "right", 5) == 0)) dst_left = 0;
+            else { dynbuf_cat(wb, "-ERR syntax error\r\n", 19); return DISPATCH_ERROR; }
+
+            char dst_kb[256];
+            kv_entry_t *dst_e = NULL;
+            uint64_t dst_h = 0;
+            if (list_lookup(args[1], &dst_e, &dst_h, dst_kb, (int)sizeof(dst_kb), wb) < 0)
+                return DISPATCH_ERROR;
+            const char *dst_k = dst_kb;
+
+            uint64_t src_h = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+
+            char out_buf[65536];
+            int olen = 0;
+            if (list_pop(&entry, key, out_buf, &olen, src_left) < 0) {
+                dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
+                return DISPATCH_OK;
+            }
+
+            if (!dst_e) {
+                char data[16]; list_build_empty(data);
+                dst_e = dict_add(&g_dict, dst_k, (uint32_t)strlen(dst_k),
+                                 data, LIST_EMPTY_SIZE, dst_h);
+                if (!dst_e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24);
+                              return DISPATCH_ERROR; }
+            }
+            if (list_push(&dst_e, dst_k, out_buf, olen, dst_left) < 0) {
+                dynbuf_cat(wb, "-ERR push failed\r\n", 18);
+                return DISPATCH_ERROR;
+            }
+
+            list_maybe_delete_empty(entry, key, src_h);
+
+            int bh = snprintf(temp, sizeof(temp), "$%d\r\n", olen);
+            dynbuf_cat(wb, temp, bh);
+            dynbuf_cat(wb, out_buf, olen);
+            dynbuf_cat(wb, "\r\n", 2);
             return DISPATCH_OK;
         }
         break; /* 'L' */
@@ -1003,6 +1491,7 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, temp, bh);
                 dynbuf_cat(wb, out_buf, olen);
                 dynbuf_cat(wb, "\r\n", 2);
+                list_maybe_delete_empty(entry, key, hash);
                 return DISPATCH_OK;
             }
 
@@ -1019,6 +1508,67 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, out_buf, olen);
                 dynbuf_cat(wb, "\r\n", 2);
             }
+            list_maybe_delete_empty(entry, key, hash);
+            return DISPATCH_OK;
+        }
+
+        /* ── RPOPLPUSH src dst ── */
+        if (TOKEN_EQ(cmd, "RPOPLPUSH")) {
+            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
+
+            char dst_kb[256];
+            kv_entry_t *dst_e = NULL;
+            uint64_t dst_h = 0;
+            if (list_lookup(args[1], &dst_e, &dst_h, dst_kb, (int)sizeof(dst_kb), wb) < 0)
+                return DISPATCH_ERROR;
+            const char *dst_k = dst_kb;
+
+            uint64_t src_h = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+
+            char out_buf[65536];
+            int olen = 0;
+            if (list_pop(&entry, key, out_buf, &olen, /*left=*/0) < 0) {
+                dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
+                return DISPATCH_OK;
+            }
+
+            /* Create dst if absent */
+            if (!dst_e) {
+                char data[16]; list_build_empty(data);
+                dst_e = dict_add(&g_dict, dst_k, (uint32_t)strlen(dst_k),
+                                 data, LIST_EMPTY_SIZE, dst_h);
+                if (!dst_e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24);
+                              return DISPATCH_ERROR; }
+            }
+            if (list_push(&dst_e, dst_k, out_buf, olen, /*left=*/1) < 0) {
+                dynbuf_cat(wb, "-ERR push failed\r\n", 18);
+                return DISPATCH_ERROR;
+            }
+
+            /* If src == dst, src wasn't deleted (push refilled it). */
+            list_maybe_delete_empty(entry, key, src_h);
+
+            int bh = snprintf(temp, sizeof(temp), "$%d\r\n", olen);
+            dynbuf_cat(wb, temp, bh);
+            dynbuf_cat(wb, out_buf, olen);
+            dynbuf_cat(wb, "\r\n", 2);
+            return DISPATCH_OK;
+        }
+
+        /* ── RPUSHX key val [val ...] — push only if key exists ── */
+        if (TOKEN_EQ(cmd, "RPUSHX")) {
+            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) { dynbuf_cat(wb, ":0\r\n", 4); return DISPATCH_OK; }
+            kv_entry_t *e = entry;
+            for (int i = 1; i < argc; i++) {
+                if (list_push(&e, key, args[i].ptr, args[i].len, /*left=*/0) < 0) {
+                    dynbuf_cat(wb, "-ERR push failed\r\n", 18);
+                    return DISPATCH_ERROR;
+                }
+            }
+            int hl = snprintf(temp, sizeof(temp), ":%u\r\n", list_len(e));
+            dynbuf_cat(wb, temp, hl);
             return DISPATCH_OK;
         }
         break; /* 'R' */
@@ -1067,6 +1617,7 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, temp, hl);
                 dynbuf_cat(wb, out_buf, olen);
                 dynbuf_cat(wb, "\r\n", 2);
+                list_maybe_delete_empty(e, k, hash);
                 return DISPATCH_OK;
             }
 
@@ -1105,44 +1656,8 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
         }
         break;
 
-    /* ── DEL ── */
-    case 'D':
-        if (TOKEN_EQ(cmd, "DEL")) {
-            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
-            if (entry_type(entry) != KV_TYPE_LIST) {
-                dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                return DISPATCH_ERROR;
-            }
-            {
-                uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
-                list_cleanup_entry(entry);
-                ret = dict_delete(&g_dict, key, (uint32_t)strlen(key), hash);
-                dynbuf_cat(wb, ret == 0 ? REP_OK : REP_NIL,
-                                ret == 0 ? REP_OK_LEN : REP_NIL_LEN);
-            }
-            return DISPATCH_OK;
-        }
-        break;
-
-    /* ── EXIST ── */
-    case 'E':
-        if (TOKEN_EQ(cmd, "EXIST")) {
-            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
-            if (entry_type(entry) != KV_TYPE_LIST) {
-                dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                return DISPATCH_ERROR;
-            }
-            {
-                uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
-                if (check_expiry(entry, key, hash))
-                    dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
-                else
-                    dynbuf_cat(wb, ":1\r\n", 4);
-            }
-            return DISPATCH_OK;
-        }
-        break;
     }
+    (void)ret;
 
     dynbuf_cat(wb, REP_ERR_UNK, REP_ERR_UNK_LEN);
     return DISPATCH_ERROR;

@@ -93,6 +93,26 @@ static int parse_score(kvs_token_t t, double *out) {
     return 0;
 }
 
+/* Range-side parse: supports Redis "(N" prefix for exclusive bounds.
+ * Sets *excl to 1 if the bound is exclusive, 0 otherwise. */
+static int parse_score_range(kvs_token_t t, double *out, int *excl) {
+    *excl = 0;
+    if (t.len > 0 && t.ptr[0] == '(') {
+        *excl = 1;
+        kvs_token_t inner = { t.ptr + 1, t.len - 1 };
+        return parse_score(inner, out);
+    }
+    return parse_score(t, out);
+}
+
+/* Inclusive/exclusive score-in-range check. */
+static inline int score_in_range(double s, double mn, int mn_excl,
+                                          double mx, int mx_excl) {
+    if (mn_excl ? !(s > mn) : !(s >= mn)) return 0;
+    if (mx_excl ? !(s < mx) : !(s <= mx)) return 0;
+    return 1;
+}
+
 /* =====================================================================
  * Engine access
  * ===================================================================== */
@@ -698,6 +718,199 @@ static int zset_add_packed(kv_entry_t **pe, double score,
 }
 
 /* =====================================================================
+ * Enumerate all members (in sorted order) into newly-allocated arrays.
+ * Used by ZREVRANGE/ZPOPMIN/ZPOPMAX/ZMSCORE/ZRANDMEMBER/ZREMRANGEBY*.
+ * Returns 0 on success, -1 on OOM. Caller frees via zset_enum_free.
+ * ===================================================================== */
+typedef struct {
+    char    *m;      /* heap-allocated copy */
+    uint32_t ml;
+    double   s;
+} zset_pair_t;
+
+static int zset_enum_dup(kv_entry_t *e, zset_pair_t **out_arr, uint32_t *out_n) {
+    *out_arr = NULL;
+    *out_n   = 0;
+    if (!e) return 0;
+    uint32_t n = zset_card(e);
+    if (n == 0) return 0;
+
+    zset_pair_t *arr = (zset_pair_t *)calloc(n, sizeof(*arr));
+    if (!arr) return -1;
+    uint32_t idx = 0;
+
+    if (entry_encoding(e) == KV_ENCODING_PACKED) {
+        char *p = e->data + 6;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t mlen = pk_read_u32(p);
+            arr[idx].ml = mlen;
+            arr[idx].s  = pk_read_score(p + 4 + mlen);
+            arr[idx].m  = (char *)malloc(mlen ? mlen : 1);
+            if (!arr[idx].m) goto oom;
+            memcpy(arr[idx].m, p + 4, mlen);
+            idx++;
+            p += 4 + mlen + 8;
+        }
+    } else {
+        zskiplist_node_t *node = zset_head(e)->level[0].forward;
+        zskiplist_node_t *tail = zset_tail(e);
+        while (node && node != tail && idx < n) {
+            arr[idx].ml = node->member_len;
+            arr[idx].s  = node->score;
+            arr[idx].m  = (char *)malloc(node->member_len ? node->member_len : 1);
+            if (!arr[idx].m) goto oom;
+            memcpy(arr[idx].m, node->member, node->member_len);
+            idx++;
+            node = node->level[0].forward;
+        }
+    }
+    *out_arr = arr;
+    *out_n   = idx;
+    return 0;
+
+oom:
+    for (uint32_t i = 0; i < idx; i++) free(arr[i].m);
+    free(arr);
+    return -1;
+}
+
+static void zset_enum_free(zset_pair_t *arr, uint32_t n) {
+    if (!arr) return;
+    for (uint32_t i = 0; i < n; i++) free(arr[i].m);
+    free(arr);
+}
+
+/* Look up the current score for `member`. Returns 1 if found, 0 if not. */
+static int zset_get_score(kv_entry_t *e, const char *m, uint32_t ml, double *out) {
+    if (!e) return 0;
+    if (entry_encoding(e) == KV_ENCODING_PACKED) {
+        uint32_t pk_len = e->val_len - 2;
+        char *fp = pk_find_member(e->data + 2, pk_len, m, ml);
+        if (!fp) return 0;
+        *out = pk_get_score(fp);
+        return 1;
+    }
+    kv_dict_t *d = zset_dict(e);
+    uint64_t h = kv_hash((const uint8_t *)m, ml);
+    kv_entry_t *de = dict_find_extkey(d, m, ml, h);
+    if (!de) return 0;
+    memcpy(out, de->data + 6, 8);
+    return 1;
+}
+
+/* Remove member from zset (any encoding). Returns 1 if removed, 0 otherwise.
+ * If `*pe` shrunk to empty after removal, it is left empty (NOT auto-deleted). */
+static int zset_remove_member(kv_entry_t **pe, const char *m, uint32_t ml) {
+    kv_entry_t *e = *pe;
+    if (!e) return 0;
+    if (entry_encoding(e) == KV_ENCODING_PACKED) {
+        uint32_t pk_len = e->val_len - 2;
+        char *fp = pk_find_member(e->data + 2, pk_len, m, ml);
+        if (!fp) return 0;
+        pk_zset_remove_at(e->data + 2, &pk_len, fp);
+        uint32_t new_dlen = pk_len + 2;
+        kv_entry_t *ne = dict_resize_entry(&g_dict, e, new_dlen);
+        if (ne) { ne->val_len = new_dlen; *pe = ne; }
+        else    { e->val_len  = new_dlen; }
+        return 1;
+    }
+    kv_dict_t *d = zset_dict(e);
+    uint64_t h = kv_hash((const uint8_t *)m, ml);
+    kv_entry_t *de = dict_find_extkey(d, m, ml, h);
+    if (!de) return 0;
+    zskiplist_node_t *node = *(zskiplist_node_t **)entry_key(de);
+    zskiplist_node_t *update[ZSKIPLIST_MAXLEVEL];
+    zskiplist_node_t *found =
+        zsl_find_with_update(e, node->score, m, ml, update);
+    if (found) zsl_delete(e, found, update);
+    dict_delete(d, (const char *)&node, sizeof(char *), h);
+    *pe = zset_maybe_shrink(e);
+    return 1;
+}
+
+/* Set member's score (insert or update). Mirrors ZADD without complex parsing. */
+static int zset_set_member(kv_entry_t **pe, const char *key, uint32_t key_len,
+                           double score, const char *m, uint32_t ml,
+                           int *out_added) {
+    (void)key; (void)key_len;
+    kv_entry_t *e = *pe;
+    int added = 0;
+    if (entry_encoding(e) == KV_ENCODING_PACKED) {
+        int ret = zset_add_packed(&e, score, m, ml, &added);
+        if (ret == 0) {
+            *pe = e;
+            if (out_added) *out_added = added;
+            return 0;
+        }
+        if (ret == -2) {
+            *pe = e;
+            /* fall through into skiplist path below */
+        } else {
+            return -1;
+        }
+    }
+    /* SKIPLIST path */
+    e = *pe;
+    kv_dict_t *d = zset_dict(e);
+    uint64_t mh = kv_hash((const uint8_t *)m, ml);
+    kv_entry_t *de = dict_find_extkey(d, m, ml, mh);
+
+    if (de) {
+        double old_score;
+        memcpy(&old_score, de->data + 6, 8);
+        if (old_score == score) {
+            if (out_added) *out_added = 0;
+            return 0;
+        }
+        zskiplist_node_t *old_node = *(zskiplist_node_t **)entry_key(de);
+        zskiplist_node_t *update[ZSKIPLIST_MAXLEVEL];
+        zskiplist_node_t *found = zsl_find_with_update(e, old_score, m, ml, update);
+        if (found) zsl_delete(e, found, update);
+        zskiplist_node_t *new_node = zsl_insert(e, score, m, ml);
+        if (!new_node) return -1;
+        const char *mptr = new_node->member;
+        uint32_t mlen2 = new_node->member_len;
+        kv_entry_t *nde = dict_resize_entry(d, de, 14);
+        if (nde) {
+            nde->data[0] = (char)KV_TYPE_STRING;
+            nde->data[1] = (char)KV_ENCODING_RAW;
+            memcpy(nde->data + 2,  &mlen2, 4);
+            memcpy(nde->data + 6,  &score, 8);
+            memcpy((char *)entry_key(nde), &mptr, sizeof(char *));
+        }
+        if (out_added) *out_added = 0;
+        return 0;
+    }
+    zskiplist_node_t *node = zsl_insert(e, score, m, ml);
+    if (!node) return -1;
+    const char *mptr = node->member;
+    uint32_t mlen2 = node->member_len;
+    char payload[12];
+    memcpy(payload,     &mlen2, 4);
+    memcpy(payload + 4, &score, 8);
+    dict_add_raw(d, (const char *)&mptr, sizeof(char *),
+                 KV_TYPE_STRING, KV_ENCODING_RAW, payload, 12, mh);
+    if (out_added) *out_added = 1;
+    return 0;
+}
+
+/* Format a score as RESP bulk and append to wb. */
+static void resp_write_score(DynBuf *wb, double s) {
+    char sbuf[64]; int slen = snprintf(sbuf, sizeof(sbuf), "%.17g", s);
+    char hdr[24];  int hl   = snprintf(hdr,  sizeof(hdr),  "$%d\r\n", slen);
+    dynbuf_cat(wb, hdr, hl);
+    dynbuf_cat(wb, sbuf, slen);
+    dynbuf_cat(wb, "\r\n", 2);
+}
+
+static void resp_write_bulk_z(DynBuf *wb, const char *s, uint32_t l) {
+    char hdr[24]; int hl = snprintf(hdr, sizeof(hdr), "$%u\r\n", l);
+    dynbuf_cat(wb, hdr, hl);
+    dynbuf_cat(wb, s, (int)l);
+    dynbuf_cat(wb, "\r\n", 2);
+}
+
+/* =====================================================================
  * Flatten for serialization
  * ===================================================================== */
 
@@ -782,114 +995,106 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
         if (TOKEN_EQ(cmd, "ZADD")) {
             if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
 
-            uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
-            kv_entry_t *e = dict_find(&g_dict, key, (uint32_t)strlen(key), hash);
-            int existed = 0;
+            /* Parse leading flags: NX | XX | GT | LT | CH | INCR */
+            int flag_nx = 0, flag_xx = 0, flag_gt = 0, flag_lt = 0;
+            int flag_ch = 0, flag_incr = 0;
+            int idx = 1;
+            while (idx < argc) {
+                if (args[idx].len == 2 && memcmp(args[idx].ptr, "NX", 2) == 0)       flag_nx   = 1;
+                else if (args[idx].len == 2 && memcmp(args[idx].ptr, "XX", 2) == 0)  flag_xx   = 1;
+                else if (args[idx].len == 2 && memcmp(args[idx].ptr, "GT", 2) == 0)  flag_gt   = 1;
+                else if (args[idx].len == 2 && memcmp(args[idx].ptr, "LT", 2) == 0)  flag_lt   = 1;
+                else if (args[idx].len == 2 && memcmp(args[idx].ptr, "CH", 2) == 0)  flag_ch   = 1;
+                else if (args[idx].len == 4 && memcmp(args[idx].ptr, "INCR", 4) == 0) flag_incr = 1;
+                else break;
+                idx++;
+            }
+            if (flag_nx && flag_xx) {
+                dynbuf_cat(wb, "-ERR XX and NX options at the same time are not compatible\r\n", 60);
+                return DISPATCH_ERROR;
+            }
+            if (flag_nx && (flag_gt || flag_lt)) {
+                dynbuf_cat(wb, "-ERR GT, LT, and/or NX options at the same time are not compatible\r\n", 68);
+                return DISPATCH_ERROR;
+            }
+            if (flag_gt && flag_lt) {
+                dynbuf_cat(wb, "-ERR GT, LT options at the same time are not compatible\r\n", 57);
+                return DISPATCH_ERROR;
+            }
+            if ((argc - idx) < 2 || ((argc - idx) % 2) != 0) {
+                dynbuf_cat(wb, "-ERR syntax error\r\n", 19);
+                return DISPATCH_ERROR;
+            }
+            if (flag_incr && (argc - idx) != 2) {
+                dynbuf_cat(wb, "-ERR INCR option supports a single increment-element pair\r\n", 60);
+                return DISPATCH_ERROR;
+            }
 
-            if (!e) {
-                char data[16];
-                zset_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, ZSET_EMPTY_SIZE, hash);
-                if (!e) { dynbuf_cat(wb, "-ERR create zset failed\r\n", 24); return DISPATCH_ERROR; }
-            } else {
-                if (entry_type(e) != KV_TYPE_ZSET) {
-                    dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+            /* Ensure entry exists (unless XX prevents creation). */
+            uint64_t khash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            kv_entry_t *e = entry;
+            if (!e || check_expiry(e, key, khash)) {
+                if (flag_xx) {
+                    if (flag_incr) dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
+                    else           dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN);
+                    return DISPATCH_OK;
+                }
+                char data[16]; zset_build_empty(data);
+                e = dict_add(&g_dict, key, (uint32_t)strlen(key),
+                             data, ZSET_EMPTY_SIZE, khash);
+                if (!e) {
+                    dynbuf_cat(wb, "-ERR create zset failed\r\n", 24);
                     return DISPATCH_ERROR;
                 }
-                if (check_expiry(e, key, hash)) existed = 1;
             }
 
-            if (existed) {
-                char data[16];
-                zset_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, ZSET_EMPTY_SIZE, hash);
-                if (!e) { dynbuf_cat(wb, "-ERR create zset failed\r\n", 24); return DISPATCH_ERROR; }
-            }
+            int total_added = 0, total_changed = 0;
+            double new_score_for_incr = 0;
+            int incr_aborted = 0;
 
-            int total_added = 0;
-            for (int i = 1; i + 1 < argc; i += 2) {
+            for (int i = idx; i + 1 < argc; i += 2) {
                 double score;
                 if (parse_score(args[i], &score) < 0) {
                     dynbuf_cat(wb, "-ERR value is not a valid float\r\n", 34);
                     return DISPATCH_ERROR;
                 }
+                double cur = 0;
+                int has_cur = zset_get_score(e, args[i+1].ptr,
+                                             (uint32_t)args[i+1].len, &cur);
+
+                if (flag_nx && has_cur)  { if (flag_incr) incr_aborted = 1; continue; }
+                if (flag_xx && !has_cur) { if (flag_incr) incr_aborted = 1; continue; }
+
+                double target = score;
+                if (flag_incr) {
+                    target = has_cur ? (cur + score) : score;
+                    if (flag_gt && has_cur && target <= cur) { incr_aborted = 1; continue; }
+                    if (flag_lt && has_cur && target >= cur) { incr_aborted = 1; continue; }
+                    new_score_for_incr = target;
+                } else {
+                    if (flag_gt && has_cur && target <= cur) continue;
+                    if (flag_lt && has_cur && target >= cur) continue;
+                }
 
                 int added = 0;
-                if (entry_encoding(e) == KV_ENCODING_PACKED) {
-                    int ret = zset_add_packed(&e, score, args[i+1].ptr,
-                                              (uint32_t)args[i+1].len, &added);
-                    if (ret == -2) {
-                        goto zadd_skiplist;
-                    }
-                    if (ret < 0) {
-                        dynbuf_cat(wb, "-ERR zadd failed\r\n", 17);
-                        return DISPATCH_ERROR;
-                    }
-                } else {
-                zadd_skiplist:
-                    if (entry_encoding(e) == KV_ENCODING_SKIPLIST) {
-                        kv_dict_t *d = zset_dict(e);
-                        uint64_t mhash = kv_hash((const uint8_t *)args[i+1].ptr,
-                                                 (uint32_t)args[i+1].len);
-                        kv_entry_t *de = dict_find_extkey(d, args[i+1].ptr,
-                                                           (uint32_t)args[i+1].len, mhash);
-
-                        if (de) {
-                            double old_score;
-                            memcpy(&old_score, de->data + 6, 8);
-                            if (old_score == score) {
-                                added = 0;
-                            } else {
-                                zskiplist_node_t *old_node =
-                                    *(zskiplist_node_t **)entry_key(de);
-                                zskiplist_node_t *update[ZSKIPLIST_MAXLEVEL];
-                                zskiplist_node_t *found = zsl_find_with_update(
-                                    e, old_score, args[i+1].ptr, (uint32_t)args[i+1].len, update);
-                                if (found) {
-                                    zsl_delete(e, found, update);
-                                    zskiplist_node_t *new_node = zsl_insert(
-                                        e, score, args[i+1].ptr, (uint32_t)args[i+1].len);
-                                    if (new_node) {
-                                        const char *mptr = new_node->member;
-                                        uint32_t mlen = new_node->member_len;
-                                        uint32_t new_data_len = 14;
-                                        kv_entry_t *nde = dict_resize_entry(
-                                            d, de, new_data_len);
-                                        if (nde) {
-                                            nde->data[0] = (char)KV_TYPE_STRING;
-                                            nde->data[1] = (char)KV_ENCODING_RAW;
-                                            memcpy(nde->data + 2, &mlen, 4);
-                                            memcpy(nde->data + 6, &score, 8);
-                                            memcpy((char *)entry_key(nde), &mptr, sizeof(char *));
-                                        }
-                                        added = 0;
-                                    }
-                                }
-                            }
-                    } else {
-                            zskiplist_node_t *node = zsl_insert(
-                                e, score, args[i+1].ptr, (uint32_t)args[i+1].len);
-                            if (!node) {
-                                dynbuf_cat(wb, "-ERR zadd failed\r\n", 17);
-                                return DISPATCH_ERROR;
-                            }
-                            const char *mptr = node->member;
-                            uint32_t mlen = node->member_len;
-                            char payload[12];
-                            memcpy(payload, &mlen, 4);
-                            memcpy(payload + 4, &score, 8);
-                            dict_add_raw(d, (const char *)&mptr, sizeof(char *),
-                                        KV_TYPE_STRING, KV_ENCODING_RAW,
-                                        payload, 12, mhash);
-                            added = 1;
-                        }
-                    }
+                if (zset_set_member(&e, key, (uint32_t)strlen(key),
+                                    target, args[i+1].ptr,
+                                    (uint32_t)args[i+1].len, &added) < 0) {
+                    dynbuf_cat(wb, "-ERR zadd failed\r\n", 17);
+                    return DISPATCH_ERROR;
                 }
-                total_added += added;
+                if (added) total_added++;
+                else if (!has_cur || cur != target) total_changed++;
             }
 
-            int hl = snprintf(temp, sizeof(temp), ":%d\r\n", total_added);
-            dynbuf_cat(wb, temp, hl);
+            if (flag_incr) {
+                if (incr_aborted) dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
+                else              resp_write_score(wb, new_score_for_incr);
+            } else {
+                int hl = snprintf(temp, sizeof(temp), ":%d\r\n",
+                                  flag_ch ? (total_added + total_changed) : total_added);
+                dynbuf_cat(wb, temp, hl);
+            }
             return DISPATCH_OK;
         }
 
@@ -1161,9 +1366,9 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 return DISPATCH_OK;
             }
 
-            double min_score, max_score;
-            if (parse_score(args[1], &min_score) < 0 ||
-                parse_score(args[2], &max_score) < 0) {
+            double min_score, max_score; int min_excl=0, max_excl=0;
+            if (parse_score_range(args[1], &min_score, &min_excl) < 0 ||
+                parse_score_range(args[2], &max_score, &max_excl) < 0) {
                 dynbuf_cat(wb, "-ERR value is not a valid float\r\n", 34);
                 return DISPATCH_ERROR;
             }
@@ -1176,14 +1381,15 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 for (uint32_t i = 0; i < count; i++) {
                     uint32_t mlen = pk_read_u32(p);
                     double sc = pk_read_score(p + 4 + mlen);
-                    if (sc >= min_score && sc <= max_score) cnt++;
+                    if (score_in_range(sc, min_score, min_excl, max_score, max_excl)) cnt++;
                     p += 4 + mlen + 8;
                 }
             } else {
                 zskiplist_node_t *node = zsl_first_ge(entry, min_score);
                 zskiplist_node_t *tail = zset_tail(entry);
-                while (node && node != tail && node->score <= max_score) {
-                    cnt++;
+                while (node && node != tail) {
+                    if (score_in_range(node->score, min_score, min_excl, max_score, max_excl)) cnt++;
+                    if (max_excl ? node->score >= max_score : node->score > max_score) break;
                     node = node->level[0].forward;
                 }
             }
@@ -1206,15 +1412,27 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 return DISPATCH_OK;
             }
 
-            double min_score, max_score;
-            if (parse_score(args[1], &min_score) < 0 ||
-                parse_score(args[2], &max_score) < 0) {
+            double min_score, max_score; int min_excl=0, max_excl=0;
+            if (parse_score_range(args[1], &min_score, &min_excl) < 0 ||
+                parse_score_range(args[2], &max_score, &max_excl) < 0) {
                 dynbuf_cat(wb, "-ERR value is not a valid float\r\n", 34);
                 return DISPATCH_ERROR;
             }
 
-            int withscores = (argc >= 4 && args[3].len == 10 &&
-                              memcmp(args[3].ptr, "WITHSCORES", 10) == 0);
+            int withscores = 0;
+            long long lim_off = 0, lim_cnt = -1;
+            for (int i = 3; i < argc; i++) {
+                if (args[i].len == 10 && memcmp(args[i].ptr, "WITHSCORES", 10) == 0) {
+                    withscores = 1;
+                } else if (args[i].len == 5 && memcmp(args[i].ptr, "LIMIT", 5) == 0 && i + 2 < argc) {
+                    char b[32]; int n;
+                    n = args[i+1].len < 31 ? args[i+1].len : 31;
+                    memcpy(b, args[i+1].ptr, n); b[n] = '\0'; lim_off = atoll(b);
+                    n = args[i+2].len < 31 ? args[i+2].len : 31;
+                    memcpy(b, args[i+2].ptr, n); b[n] = '\0'; lim_cnt = atoll(b);
+                    i += 2;
+                }
+            }
 
             /* Collect matching elements first (need count for array header) */
             typedef struct { const char *m; uint32_t ml; double s; } match_t;
@@ -1229,7 +1447,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 for (uint32_t i = 0; i < count; i++) {
                     uint32_t mlen = pk_read_u32(p);
                     double sc = pk_read_score(p + 4 + mlen);
-                    if (sc >= min_score && sc <= max_score) {
+                    if (score_in_range(sc, min_score, min_excl, max_score, max_excl)) {
                         if (match_count < 4096) {
                             matches[match_count].m  = p + 4;
                             matches[match_count].ml = mlen;
@@ -1242,25 +1460,40 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
             } else {
                 zskiplist_node_t *node = zsl_first_ge(entry, min_score);
                 zskiplist_node_t *tail = zset_tail(entry);
-                while (node && node != tail && node->score <= max_score) {
-                    if (match_count < 4096) {
-                        matches[match_count].m  = node->member;
-                        matches[match_count].ml = node->member_len;
-                        matches[match_count].s  = node->score;
-                        match_count++;
-                    } else overflow = 1;
+                while (node && node != tail) {
+                    if (score_in_range(node->score, min_score, min_excl, max_score, max_excl)) {
+                        if (match_count < 4096) {
+                            matches[match_count].m  = node->member;
+                            matches[match_count].ml = node->member_len;
+                            matches[match_count].s  = node->score;
+                            match_count++;
+                        } else overflow = 1;
+                    }
+                    if (max_excl ? node->score >= max_score : node->score > max_score) break;
                     node = node->level[0].forward;
                 }
             }
 
             (void)overflow;
 
-            int out_count = withscores ? (int)match_count * 2 : (int)match_count;
+            /* Apply LIMIT offset/count window */
+            uint32_t start = 0, end = match_count;
+            if (lim_off > 0) {
+                if ((uint64_t)lim_off >= match_count) start = match_count;
+                else start = (uint32_t)lim_off;
+            }
+            if (lim_cnt >= 0) {
+                uint64_t e = (uint64_t)start + (uint64_t)lim_cnt;
+                if (e < end) end = (uint32_t)e;
+            }
+            uint32_t out_n = end - start;
+
+            int out_count = withscores ? (int)out_n * 2 : (int)out_n;
             char hdr[32];
             int hl = snprintf(hdr, sizeof(hdr), "*%d\r\n", out_count);
             dynbuf_cat(wb, hdr, hl);
 
-            for (uint32_t i = 0; i < match_count; i++) {
+            for (uint32_t i = start; i < end; i++) {
                 char bhdr[32];
                 int bhl = snprintf(bhdr, sizeof(bhdr), "$%u\r\n", matches[i].ml);
                 dynbuf_cat(wb, bhdr, bhl);
@@ -1277,6 +1510,308 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
             }
             return DISPATCH_OK;
         }
+        /* ── ZINCRBY key increment member → new score (bulk string) ── */
+        if (TOKEN_EQ(cmd, "ZINCRBY")) {
+            if (argc != 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            double incr;
+            if (parse_score(args[1], &incr) < 0) {
+                dynbuf_cat(wb, "-ERR value is not a valid float\r\n", 34);
+                return DISPATCH_ERROR;
+            }
+            /* Create on the fly if missing */
+            uint64_t khash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            kv_entry_t *e = entry;
+            if (!e || check_expiry(e, key, khash)) {
+                char init[16]; zset_build_empty(init);
+                e = dict_add(&g_dict, key, (uint32_t)strlen(key),
+                             init, ZSET_EMPTY_SIZE, khash);
+                if (!e) { dynbuf_cat(wb, "-ERR zincrby failed\r\n", 21); return DISPATCH_ERROR; }
+            }
+            double cur = 0;
+            zset_get_score(e, args[2].ptr, (uint32_t)args[2].len, &cur);
+            double new_score = cur + incr;
+            if (zset_set_member(&e, key, (uint32_t)strlen(key),
+                                new_score, args[2].ptr, (uint32_t)args[2].len, NULL) < 0) {
+                dynbuf_cat(wb, "-ERR zincrby failed\r\n", 21);
+                return DISPATCH_ERROR;
+            }
+            resp_write_score(wb, new_score);
+            return DISPATCH_OK;
+        }
+
+        /* ── ZMSCORE key member [member ...] → array of bulk-score or nil ── */
+        if (TOKEN_EQ(cmd, "ZMSCORE")) {
+            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            char hdr[32]; int hl = snprintf(hdr, sizeof(hdr), "*%d\r\n", argc - 1);
+            dynbuf_cat(wb, hdr, hl);
+            for (int i = 1; i < argc; i++) {
+                double s;
+                if (entry && zset_get_score(entry, args[i].ptr, (uint32_t)args[i].len, &s))
+                    resp_write_score(wb, s);
+                else
+                    dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
+            }
+            return DISPATCH_OK;
+        }
+
+        /* ── ZREVRANK key member → integer rank from end, or nil ── */
+        if (TOKEN_EQ(cmd, "ZREVRANK")) {
+            if (argc != 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
+            uint32_t card = zset_card(entry);
+            /* Reuse forward rank lookup, then invert. */
+            double s;
+            if (!zset_get_score(entry, args[1].ptr, (uint32_t)args[1].len, &s)) {
+                dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
+                return DISPATCH_OK;
+            }
+            int frank = -1;
+            if (entry_encoding(entry) == KV_ENCODING_PACKED) {
+                uint32_t pk_len = entry->val_len - 2;
+                uint32_t cnt = pk_read_u32(entry->data + 2);
+                char *p = entry->data + 6;
+                for (uint32_t i = 0; i < cnt; i++) {
+                    uint32_t mlen = pk_read_u32(p);
+                    if (mlen == (uint32_t)args[1].len &&
+                        memcmp(p + 4, args[1].ptr, mlen) == 0) { frank = (int)i; break; }
+                    p += 4 + mlen + 8;
+                }
+            } else {
+                frank = zsl_get_rank(entry, s, args[1].ptr, (uint32_t)args[1].len);
+            }
+            if (frank < 0) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
+            int hl2 = snprintf(temp, sizeof(temp), ":%u\r\n",
+                               (unsigned)((int)card - 1 - frank));
+            dynbuf_cat(wb, temp, hl2);
+            return DISPATCH_OK;
+        }
+
+        /* ── ZREVRANGE key start stop [WITHSCORES] ── */
+        if (TOKEN_EQ(cmd, "ZREVRANGE")) {
+            if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) { dynbuf_cat(wb, "*0\r\n", 4); return DISPATCH_OK; }
+            int start, stop;
+            { char tbuf[32]; int nl;
+              nl = args[1].len < 31 ? args[1].len : 31;
+              memcpy(tbuf, args[1].ptr, nl); tbuf[nl] = '\0'; start = atoi(tbuf);
+              nl = args[2].len < 31 ? args[2].len : 31;
+              memcpy(tbuf, args[2].ptr, nl); tbuf[nl] = '\0'; stop  = atoi(tbuf);
+            }
+            int withscores = (argc >= 4 && args[3].len == 10 &&
+                              memcmp(args[3].ptr, "WITHSCORES", 10) == 0);
+            uint32_t card = zset_card(entry);
+            if (start < 0) start = (int)card + start;
+            if (stop  < 0) stop  = (int)card + stop;
+            if (start < 0) start = 0;
+            if (stop >= (int)card) stop = (int)card - 1;
+            if (start > stop || card == 0) { dynbuf_cat(wb, "*0\r\n", 4); return DISPATCH_OK; }
+
+            int rng = stop - start + 1;
+            int hl2 = snprintf(temp, sizeof(temp), "*%d\r\n",
+                               withscores ? rng * 2 : rng);
+            dynbuf_cat(wb, temp, hl2);
+
+            zset_pair_t *arr; uint32_t n;
+            if (zset_enum_dup(entry, &arr, &n) < 0) return DISPATCH_ERROR;
+            /* Reverse iteration: rank r → index (n-1-r) */
+            for (int r = start; r <= stop; r++) {
+                uint32_t idx = (uint32_t)((int)n - 1 - r);
+                resp_write_bulk_z(wb, arr[idx].m, arr[idx].ml);
+                if (withscores) resp_write_score(wb, arr[idx].s);
+            }
+            zset_enum_free(arr, n);
+            return DISPATCH_OK;
+        }
+
+        /* ── ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT off count] ── */
+        if (TOKEN_EQ(cmd, "ZREVRANGEBYSCORE")) {
+            if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) { dynbuf_cat(wb, "*0\r\n", 4); return DISPATCH_OK; }
+            double max_s, min_s; int max_excl=0, min_excl=0;
+            if (parse_score_range(args[1], &max_s, &max_excl) < 0 ||
+                parse_score_range(args[2], &min_s, &min_excl) < 0) {
+                dynbuf_cat(wb, "-ERR value is not a valid float\r\n", 34);
+                return DISPATCH_ERROR;
+            }
+            int withscores = 0; long long lim_off = 0, lim_cnt = -1;
+            for (int i = 3; i < argc; i++) {
+                if (args[i].len == 10 && memcmp(args[i].ptr, "WITHSCORES", 10) == 0) {
+                    withscores = 1;
+                } else if (args[i].len == 5 && memcmp(args[i].ptr, "LIMIT", 5) == 0 && i + 2 < argc) {
+                    char b[32]; int n;
+                    n = args[i+1].len < 31 ? args[i+1].len : 31;
+                    memcpy(b, args[i+1].ptr, n); b[n] = '\0'; lim_off = atoll(b);
+                    n = args[i+2].len < 31 ? args[i+2].len : 31;
+                    memcpy(b, args[i+2].ptr, n); b[n] = '\0'; lim_cnt = atoll(b);
+                    i += 2;
+                }
+            }
+
+            zset_pair_t *arr; uint32_t n;
+            if (zset_enum_dup(entry, &arr, &n) < 0) return DISPATCH_ERROR;
+
+            /* Collect indices (reverse order) matching [min..max]. */
+            uint32_t *idxs = (uint32_t *)malloc(n * sizeof(uint32_t));
+            uint32_t mc = 0;
+            if (idxs) {
+                for (int i = (int)n - 1; i >= 0; i--)
+                    if (score_in_range(arr[i].s, min_s, min_excl, max_s, max_excl)) idxs[mc++] = (uint32_t)i;
+            }
+            uint32_t out_n = mc;
+            if (lim_off > 0) {
+                if ((uint64_t)lim_off >= out_n) out_n = 0;
+                else out_n -= (uint32_t)lim_off;
+            }
+            if (lim_cnt >= 0 && out_n > (uint32_t)lim_cnt) out_n = (uint32_t)lim_cnt;
+
+            int hl2 = snprintf(temp, sizeof(temp), "*%u\r\n",
+                               withscores ? out_n * 2 : out_n);
+            dynbuf_cat(wb, temp, hl2);
+            for (uint32_t i = 0; i < out_n; i++) {
+                uint32_t k = idxs[(uint32_t)lim_off + i];
+                resp_write_bulk_z(wb, arr[k].m, arr[k].ml);
+                if (withscores) resp_write_score(wb, arr[k].s);
+            }
+            free(idxs);
+            zset_enum_free(arr, n);
+            return DISPATCH_OK;
+        }
+
+        /* ── ZPOPMIN / ZPOPMAX key [count] ── */
+        if (TOKEN_EQ(cmd, "ZPOPMIN") || TOKEN_EQ(cmd, "ZPOPMAX")) {
+            int from_max = (cmd.ptr[5] == 'A');  /* ZPOP[MIN|MAX]: byte 5 differs */
+            long long cnt = 1;
+            if (argc >= 2) {
+                char b[32]; int n = args[1].len < 31 ? args[1].len : 31;
+                memcpy(b, args[1].ptr, n); b[n] = '\0'; cnt = atoll(b);
+                if (cnt < 0) cnt = 0;
+            }
+            if (!entry || zset_card(entry) == 0 || cnt == 0) {
+                dynbuf_cat(wb, "*0\r\n", 4);
+                return DISPATCH_OK;
+            }
+            uint32_t card = zset_card(entry);
+            if ((uint64_t)cnt > card) cnt = (long long)card;
+
+            /* Snapshot the members we'll pop (we must mutate the zset). */
+            zset_pair_t *arr; uint32_t n;
+            if (zset_enum_dup(entry, &arr, &n) < 0) return DISPATCH_ERROR;
+
+            int hl2 = snprintf(temp, sizeof(temp), "*%lld\r\n", cnt * 2);
+            dynbuf_cat(wb, temp, hl2);
+
+            for (long long i = 0; i < cnt; i++) {
+                uint32_t k = from_max ? (uint32_t)((long long)n - 1 - i) : (uint32_t)i;
+                resp_write_bulk_z(wb, arr[k].m, arr[k].ml);
+                resp_write_score(wb, arr[k].s);
+                zset_remove_member(&entry, arr[k].m, arr[k].ml);
+            }
+            zset_enum_free(arr, n);
+            return DISPATCH_OK;
+        }
+
+        /* ── ZREMRANGEBYRANK key start stop ── */
+        if (TOKEN_EQ(cmd, "ZREMRANGEBYRANK")) {
+            if (argc != 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) { dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN); return DISPATCH_OK; }
+            int start, stop;
+            { char b[32]; int n;
+              n = args[1].len < 31 ? args[1].len : 31; memcpy(b, args[1].ptr, n); b[n]=0; start = atoi(b);
+              n = args[2].len < 31 ? args[2].len : 31; memcpy(b, args[2].ptr, n); b[n]=0; stop  = atoi(b);
+            }
+            uint32_t card = zset_card(entry);
+            if (start < 0) start = (int)card + start;
+            if (stop  < 0) stop  = (int)card + stop;
+            if (start < 0) start = 0;
+            if (stop >= (int)card) stop = (int)card - 1;
+            if (start > stop || card == 0) { dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN); return DISPATCH_OK; }
+
+            zset_pair_t *arr; uint32_t n;
+            if (zset_enum_dup(entry, &arr, &n) < 0) return DISPATCH_ERROR;
+            uint32_t removed = 0;
+            for (int r = start; r <= stop; r++) {
+                if (zset_remove_member(&entry, arr[r].m, arr[r].ml)) removed++;
+            }
+            zset_enum_free(arr, n);
+            int hl2 = snprintf(temp, sizeof(temp), ":%u\r\n", removed);
+            dynbuf_cat(wb, temp, hl2);
+            return DISPATCH_OK;
+        }
+
+        /* ── ZREMRANGEBYSCORE key min max ── */
+        if (TOKEN_EQ(cmd, "ZREMRANGEBYSCORE")) {
+            if (argc != 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) { dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN); return DISPATCH_OK; }
+            double mn, mx; int mn_excl=0, mx_excl=0;
+            if (parse_score_range(args[1], &mn, &mn_excl) < 0 ||
+                parse_score_range(args[2], &mx, &mx_excl) < 0) {
+                dynbuf_cat(wb, "-ERR value is not a valid float\r\n", 34);
+                return DISPATCH_ERROR;
+            }
+            zset_pair_t *arr; uint32_t n;
+            if (zset_enum_dup(entry, &arr, &n) < 0) return DISPATCH_ERROR;
+            uint32_t removed = 0;
+            for (uint32_t i = 0; i < n; i++) {
+                if (score_in_range(arr[i].s, mn, mn_excl, mx, mx_excl)) {
+                    if (zset_remove_member(&entry, arr[i].m, arr[i].ml)) removed++;
+                }
+            }
+            zset_enum_free(arr, n);
+            int hl2 = snprintf(temp, sizeof(temp), ":%u\r\n", removed);
+            dynbuf_cat(wb, temp, hl2);
+            return DISPATCH_OK;
+        }
+
+        /* ── ZRANDMEMBER key [count [WITHSCORES]] ── */
+        if (TOKEN_EQ(cmd, "ZRANDMEMBER")) {
+            if (!entry || zset_card(entry) == 0) {
+                if (argc < 2) dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
+                else          dynbuf_cat(wb, "*0\r\n", 4);
+                return DISPATCH_OK;
+            }
+            if (argc < 2) {
+                /* single member */
+                zset_pair_t *arr; uint32_t n;
+                if (zset_enum_dup(entry, &arr, &n) < 0) return DISPATCH_ERROR;
+                uint32_t k = (uint32_t)(rand() % (int)n);
+                resp_write_bulk_z(wb, arr[k].m, arr[k].ml);
+                zset_enum_free(arr, n);
+                return DISPATCH_OK;
+            }
+            char b[32]; int nl = args[1].len < 31 ? args[1].len : 31;
+            memcpy(b, args[1].ptr, nl); b[nl] = '\0';
+            long long cnt = atoll(b);
+            int withscores = (argc >= 3 && args[2].len == 10 &&
+                              memcmp(args[2].ptr, "WITHSCORES", 10) == 0);
+            if (cnt == 0) { dynbuf_cat(wb, "*0\r\n", 4); return DISPATCH_OK; }
+
+            zset_pair_t *arr; uint32_t n;
+            if (zset_enum_dup(entry, &arr, &n) < 0) return DISPATCH_ERROR;
+            uint32_t want = (cnt > 0) ? (uint32_t)cnt : (uint32_t)(-cnt);
+            if (cnt > 0 && want > n) want = n;
+
+            int hl2 = snprintf(temp, sizeof(temp), "*%u\r\n",
+                               withscores ? want * 2 : want);
+            dynbuf_cat(wb, temp, hl2);
+
+            if (cnt > 0) {
+                for (uint32_t i = 0; i < want; i++) {
+                    uint32_t j = i + (uint32_t)(rand() % (n - i));
+                    zset_pair_t tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+                    resp_write_bulk_z(wb, arr[i].m, arr[i].ml);
+                    if (withscores) resp_write_score(wb, arr[i].s);
+                }
+            } else {
+                for (uint32_t i = 0; i < want; i++) {
+                    uint32_t j = (uint32_t)(rand() % n);
+                    resp_write_bulk_z(wb, arr[j].m, arr[j].ml);
+                    if (withscores) resp_write_score(wb, arr[j].s);
+                }
+            }
+            zset_enum_free(arr, n);
+            return DISPATCH_OK;
+        }
+
         break; /* 'Z' */
 
     /* ── DEL ── */

@@ -61,12 +61,51 @@ void kvs_rdma_incr_probe(const char *msg, int length) {
     asm volatile("" : : "r"(msg), "r"(length) : "memory");
 }
 
-/* ── Parse a token as long long ── */
-static long long token_to_ll(kvs_token_t t) {
-    long long v = 0;
-    for (int i = 0; i < t.len; i++)
-        v = v * 10 + (t.ptr[i] - '0');
-    return v;
+/* ── Parse a token as long long (strict). Returns 0 on success, -1 on error. ── */
+static int token_to_ll(kvs_token_t t, long long *out) {
+    if (t.len <= 0 || t.len > 20) return -1;
+    int i = 0;
+    int neg = 0;
+    if (t.ptr[0] == '-') { neg = 1; i = 1; if (t.len == 1) return -1; }
+    else if (t.ptr[0] == '+') { i = 1; if (t.len == 1) return -1; }
+    unsigned long long v = 0;
+    for (; i < t.len; i++) {
+        unsigned c = (unsigned char)t.ptr[i] - (unsigned)'0';
+        if (c > 9) return -1;
+        if (v > (unsigned long long)9223372036854775807ULL / 10) return -1;
+        v = v * 10 + c;
+        if (!neg && v > (unsigned long long)9223372036854775807ULL) return -1;
+        if (neg && v > (unsigned long long)9223372036854775808ULL) return -1;
+    }
+    *out = neg ? -(long long)v : (long long)v;
+    return 0;
+}
+
+/* ── Per-type cleanup before deleting an entry from the dict ── */
+static void entry_cleanup_by_type(kv_entry_t *e) {
+    switch (entry_type(e)) {
+    case KV_TYPE_LIST: list_cleanup_entry(e); break;
+    case KV_TYPE_SET:  set_cleanup_entry(e);  break;
+    case KV_TYPE_HASH: hash_cleanup_entry(e); break;
+    case KV_TYPE_ZSET: zset_cleanup_entry(e); break;
+    default: break;
+    }
+}
+
+/* Append an integer reply ":N\r\n" */
+static inline void reply_integer(DynBuf *wb, long long v) {
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), ":%lld\r\n", v);
+    dynbuf_cat(wb, buf, n);
+}
+
+/* Append a bulk string reply "$N\r\n<data>\r\n" */
+static inline void reply_bulk(DynBuf *wb, const char *s, int len) {
+    char hdr[24];
+    int hl = snprintf(hdr, sizeof(hdr), "$%d\r\n", len);
+    dynbuf_cat(wb, hdr, hl);
+    if (len > 0) dynbuf_cat(wb, s, len);
+    dynbuf_cat(wb, "\r\n", 2);
 }
 
 /* ── Retry a blocked client's saved command ── */
@@ -104,51 +143,204 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             c->client->conn = c;
     }
 
-    /* ── Global commands (no key needed) ── */
+    /* ── Global / connection commands (no key needed) ── */
 
     if (TOKEN_EQ(cmd, "PING")) {
-        dynbuf_cat(wb, RESP_PONG, RESP_PONG_LEN);
+        if (argc == 1) {
+            dynbuf_cat(wb, RESP_PONG, RESP_PONG_LEN);
+        } else if (argc == 2) {
+            /* Redis: PING <msg> echoes msg as bulk reply */
+            reply_bulk(wb, tokens[1].ptr, tokens[1].len);
+        } else {
+            dynbuf_cat(wb,
+                "-ERR wrong number of arguments for 'ping' command\r\n", 51);
+        }
         return DISPATCH_OK;
     }
 
     if (TOKEN_EQ(cmd, "QUIT")) {
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-        return DISPATCH_OK;
+        return DISPATCH_CLOSE;       /* reactor must close after flush */
     }
 
     if (TOKEN_EQ(cmd, "ECHO")) {
         if (argc >= 2) {
-            char hdr[32];
-            int hl = snprintf(hdr, sizeof(hdr), "$%d\r\n", tokens[1].len);
-            dynbuf_cat(wb, hdr, hl);
-            dynbuf_cat(wb, tokens[1].ptr, tokens[1].len);
-            dynbuf_cat(wb, "\r\n", 2);
+            reply_bulk(wb, tokens[1].ptr, tokens[1].len);
         } else {
-            dynbuf_cat(wb, "-ERR wrong number of arguments for 'echo' command\r\n", 50);
+            dynbuf_cat(wb,
+                "-ERR wrong number of arguments for 'echo' command\r\n", 51);
         }
         return DISPATCH_OK;
     }
 
-    if (TOKEN_EQ(cmd, "SAVE")) {
+    /* HELLO — clients use this to negotiate RESP3. Decline gracefully so
+       clients fall back to RESP2 without erroring out. */
+    if (TOKEN_EQ(cmd, "HELLO")) {
+        dynbuf_cat(wb,
+            "-NOPROTO sorry, this protocol version is not supported\r\n", 56);
+        return DISPATCH_OK;
+    }
+
+    /* CLIENT subcommands — accept the common ones used by drivers. */
+    if (TOKEN_EQ(cmd, "CLIENT")) {
+        if (argc >= 2 && (TOKEN_EQ(tokens[1], "SETNAME") ||
+                          TOKEN_EQ(tokens[1], "NO-EVICT") ||
+                          TOKEN_EQ(tokens[1], "NO-TOUCH") ||
+                          TOKEN_EQ(tokens[1], "REPLY"))) {
+            dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        } else if (argc >= 2 && TOKEN_EQ(tokens[1], "GETNAME")) {
+            dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
+        } else if (argc >= 2 && TOKEN_EQ(tokens[1], "ID")) {
+            reply_integer(wb, c ? (long long)c->fd : 0);
+        } else {
+            dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        }
+        return DISPATCH_OK;
+    }
+
+    /* COMMAND — stub: redis-cli sends "COMMAND DOCS" at connect.
+       Returning an empty array satisfies introspection without details. */
+    if (TOKEN_EQ(cmd, "COMMAND")) {
+        if (argc >= 2 && TOKEN_EQ(tokens[1], "COUNT")) {
+            reply_integer(wb, 0);
+        } else {
+            dynbuf_cat(wb, "*0\r\n", 4);
+        }
+        return DISPATCH_OK;
+    }
+
+    /* SELECT — single-DB server: accept "SELECT 0", reject others. */
+    if (TOKEN_EQ(cmd, "SELECT")) {
+        long long db = 0;
+        if (argc != 2 || token_to_ll(tokens[1], &db) < 0 || db != 0) {
+            dynbuf_cat(wb, "-ERR DB index out of range\r\n", 28);
+        } else {
+            dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        }
+        return DISPATCH_OK;
+    }
+
+    /* DBSIZE — count of keys in dict. */
+    if (TOKEN_EQ(cmd, "DBSIZE")) {
+        reply_integer(wb, (long long)dict_count(&g_dict));
+        return DISPATCH_OK;
+    }
+
+    if (TOKEN_EQ(cmd, "SAVE") || TOKEN_EQ(cmd, "BGSAVE")) {
         rdb_save_async_uring();
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         return DISPATCH_OK;
     }
 
-    if (TOKEN_EQ(cmd, "FLUSHALL")) {
+    if (TOKEN_EQ(cmd, "FLUSHALL") || TOKEN_EQ(cmd, "FLUSHDB")) {
         kv_iter_t *it = dict_iter_new(&g_dict, 1);
         if (it) {
             kv_entry_t *e;
-            while ((e = dict_iter_next(it)) != NULL) {
-                list_cleanup_entry(e);
-                set_cleanup_entry(e);
-                hash_cleanup_entry(e);
-                zset_cleanup_entry(e);
-            }
+            while ((e = dict_iter_next(it)) != NULL)
+                entry_cleanup_by_type(e);
             dict_iter_free(it);
         }
         dict_clear(&g_dict);
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        if (!g_in_reload) {
+            if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
+            kvs_rdma_incr_probe(msg_raw, msg_len);
+        }
+        return DISPATCH_OK;
+    }
+
+    /* ── Multi-key STRING commands (handled here before single-key dispatch) ── */
+
+    /* MGET key [key ...] → array of bulk strings (nil for non-string / missing) */
+    if (TOKEN_EQ(cmd, "MGET")) {
+        if (argc < 2) {
+            dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
+            return DISPATCH_ERROR;
+        }
+        char hdr[32];
+        int hl = snprintf(hdr, sizeof(hdr), "*%d\r\n", argc - 1);
+        dynbuf_cat(wb, hdr, hl);
+        for (int i = 1; i < argc; i++) {
+            uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
+            const char *val = string_engine_get(tokens[i].ptr, (uint32_t)tokens[i].len,
+                                                &vlen, &enc);
+            if (!val) {
+                dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
+                continue;
+            }
+            if (enc == KV_ENCODING_INT) {
+                int64_t iv; memcpy(&iv, val, sizeof(int64_t));
+                char ibuf[24];
+                int il = snprintf(ibuf, sizeof(ibuf), "%lld", (long long)iv);
+                int bh = snprintf(hdr, sizeof(hdr), "$%d\r\n", il);
+                dynbuf_cat(wb, hdr, bh);
+                dynbuf_cat(wb, ibuf, il);
+                dynbuf_cat(wb, "\r\n", 2);
+            } else {
+                int bh = snprintf(hdr, sizeof(hdr), "$%u\r\n", vlen);
+                dynbuf_cat(wb, hdr, bh);
+                dynbuf_cat(wb, val, (int)vlen);
+                dynbuf_cat(wb, "\r\n", 2);
+            }
+        }
+        return DISPATCH_OK;
+    }
+
+    /* MSET key val [key val ...] → always +OK (overwrites any existing type). */
+    if (TOKEN_EQ(cmd, "MSET")) {
+        if (argc < 3 || ((argc - 1) % 2) != 0) {
+            dynbuf_cat(wb,
+                "-ERR wrong number of arguments for 'mset' command\r\n", 51);
+            return DISPATCH_ERROR;
+        }
+        for (int i = 1; i + 1 < argc; i += 2) {
+            /* If a non-string entry exists at this key, drop it first so the
+             * overwrite is type-safe (Redis MSET replaces any existing type). */
+            uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
+                                  (uint32_t)tokens[i].len);
+            kv_entry_t *ke = dict_find(&g_dict, tokens[i].ptr,
+                                        (uint32_t)tokens[i].len, kh);
+            if (ke && entry_type(ke) != KV_TYPE_STRING) {
+                entry_cleanup_by_type(ke);
+                dict_delete(&g_dict, tokens[i].ptr,
+                            (uint32_t)tokens[i].len, kh);
+            }
+            string_engine_set(tokens[i].ptr, (uint32_t)tokens[i].len,
+                              tokens[i+1].ptr, (uint32_t)tokens[i+1].len,
+                              0, 0);
+        }
+        dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        if (!g_in_reload) {
+            if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
+            kvs_rdma_incr_probe(msg_raw, msg_len);
+        }
+        return DISPATCH_OK;
+    }
+
+    /* MSETNX key val [key val ...] → :1 if all keys absent and set, else :0 */
+    if (TOKEN_EQ(cmd, "MSETNX")) {
+        if (argc < 3 || ((argc - 1) % 2) != 0) {
+            dynbuf_cat(wb,
+                "-ERR wrong number of arguments for 'msetnx' command\r\n", 53);
+            return DISPATCH_ERROR;
+        }
+        /* First pass: any existing (non-expired) key aborts the whole op. */
+        for (int i = 1; i + 1 < argc; i += 2) {
+            uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
+                                  (uint32_t)tokens[i].len);
+            kv_entry_t *ke = dict_find(&g_dict, tokens[i].ptr,
+                                        (uint32_t)tokens[i].len, kh);
+            if (ke && (!ke->expire || get_time_now() <= ke->expire)) {
+                reply_integer(wb, 0);
+                return DISPATCH_OK;
+            }
+        }
+        for (int i = 1; i + 1 < argc; i += 2) {
+            string_engine_set(tokens[i].ptr, (uint32_t)tokens[i].len,
+                              tokens[i+1].ptr, (uint32_t)tokens[i+1].len,
+                              0, 0);
+        }
+        reply_integer(wb, 1);
         if (!g_in_reload) {
             if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
             kvs_rdma_incr_probe(msg_raw, msg_len);
@@ -166,20 +358,87 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
     kv_entry_t *entry = dict_find(&g_dict, key_tok.ptr, (uint32_t)key_tok.len, hash);
 
+    /* Treat already-expired entry as absent. */
+    if (entry && entry->expire && get_time_now() > entry->expire) {
+        entry_cleanup_by_type(entry);
+        dict_delete(&g_dict, key_tok.ptr, (uint32_t)key_tok.len, hash);
+        entry = NULL;
+    }
+
     int pre_len = wb->len;
 
-    /* ── EXPIRE — type-agnostic, handle before type dispatch ── */
+    /* ── DEL — type-agnostic, integer reply (Redis-compat) ── */
+    if (TOKEN_EQ(cmd, "DEL") || TOKEN_EQ(cmd, "UNLINK")) {
+        long long ndel = 0;
+        for (int i = 1; i < argc; i++) {
+            kvs_token_t kt = tokens[i];
+            uint64_t kh = kv_hash((const uint8_t *)kt.ptr, (uint32_t)kt.len);
+            kv_entry_t *ke = dict_find(&g_dict, kt.ptr, (uint32_t)kt.len, kh);
+            if (!ke) continue;
+            entry_cleanup_by_type(ke);
+            if (dict_delete(&g_dict, kt.ptr, (uint32_t)kt.len, kh) == 0)
+                ndel++;
+        }
+        reply_integer(wb, ndel);
+        if (ndel > 0 && !g_in_reload) {
+            if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
+            kvs_rdma_incr_probe(msg_raw, msg_len);
+        }
+        return DISPATCH_OK;
+    }
+
+    /* ── EXISTS — type-agnostic, integer reply (Redis-compat).
+         EXIST kept as a 1-arg alias for legacy callers. ── */
+    if (TOKEN_EQ(cmd, "EXISTS") || TOKEN_EQ(cmd, "EXIST")) {
+        long long nfound = 0;
+        for (int i = 1; i < argc; i++) {
+            kvs_token_t kt = tokens[i];
+            uint64_t kh = kv_hash((const uint8_t *)kt.ptr, (uint32_t)kt.len);
+            kv_entry_t *ke = dict_find(&g_dict, kt.ptr, (uint32_t)kt.len, kh);
+            if (!ke) continue;
+            if (ke->expire && get_time_now() > ke->expire) continue;
+            nfound++;
+        }
+        reply_integer(wb, nfound);
+        return DISPATCH_OK;
+    }
+
+    /* ── TYPE — Redis returns simple string "+string"/"+list"/etc, "+none" if absent ── */
+    if (TOKEN_EQ(cmd, "TYPE")) {
+        const char *r = "+none\r\n";
+        int rlen = 7;
+        if (entry) {
+            switch (entry_type(entry)) {
+            case KV_TYPE_STRING: r = "+string\r\n";  rlen = 9; break;
+            case KV_TYPE_LIST:   r = "+list\r\n";    rlen = 7; break;
+            case KV_TYPE_SET:    r = "+set\r\n";     rlen = 6; break;
+            case KV_TYPE_HASH:   r = "+hash\r\n";    rlen = 7; break;
+            case KV_TYPE_ZSET:   r = "+zset\r\n";    rlen = 7; break;
+            }
+        }
+        dynbuf_cat(wb, r, rlen);
+        return DISPATCH_OK;
+    }
+
+    /* ── EXPIRE — integer reply :1 (set) / :0 (no key). ── */
     if (TOKEN_EQ(cmd, "EXPIRE")) {
         if (argc < 3) {
-            dynbuf_cat(wb, "-ERR wrong number of arguments for 'expire' command\r\n", 53);
+            dynbuf_cat(wb,
+                "-ERR wrong number of arguments for 'expire' command\r\n", 53);
+            return DISPATCH_ERROR;
+        }
+        long long secs;
+        if (token_to_ll(tokens[2], &secs) < 0) {
+            dynbuf_cat(wb,
+                "-ERR value is not an integer or out of range\r\n", 46);
             return DISPATCH_ERROR;
         }
         if (!entry) {
-            dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
+            reply_integer(wb, 0);
             return DISPATCH_OK;
         }
-        entry->expire = get_time_now() + token_to_ll(tokens[2]) * 1000;
-        dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        entry->expire = get_time_now() + secs * 1000;
+        reply_integer(wb, 1);
         if (!g_in_reload) {
             if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
             kvs_rdma_incr_probe(msg_raw, msg_len);
@@ -187,119 +446,168 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
+    /* TTL / PTTL: Redis returns -2 if key missing, -1 if no TTL set,
+       else remaining seconds (TTL) or milliseconds (PTTL). */
+    if (TOKEN_EQ(cmd, "TTL") || TOKEN_EQ(cmd, "PTTL")) {
+        if (!entry) { reply_integer(wb, -2); return DISPATCH_OK; }
+        if (!entry->expire) { reply_integer(wb, -1); return DISPATCH_OK; }
+        long long rem_ms = entry->expire - get_time_now();
+        if (rem_ms < 0) { reply_integer(wb, -2); return DISPATCH_OK; }
+        if (TOKEN_EQ(cmd, "TTL")) reply_integer(wb, (rem_ms + 500) / 1000);
+        else                       reply_integer(wb, rem_ms);
+        return DISPATCH_OK;
+    }
+
+    /* PERSIST — clear TTL. */
+    if (TOKEN_EQ(cmd, "PERSIST")) {
+        if (!entry || !entry->expire) { reply_integer(wb, 0); return DISPATCH_OK; }
+        entry->expire = 0;
+        reply_integer(wb, 1);
+        if (!g_in_reload) {
+            if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
+            kvs_rdma_incr_probe(msg_raw, msg_len);
+        }
+        return DISPATCH_OK;
+    }
+
+    /* ── Resolve command → expected type in a single first-letter switch.
+         Performance: 1 dispatch by ptr[0], then a small set of length+memcmp
+         compares (via TOKEN_EQ). Avoids the O(n) cmd-list walk previously
+         done twice (wrongtype check + new-key branch). ── */
+    int cmd_type = -1;       /* -1 = unknown */
+    int is_write = 0;
+    switch (cmd.ptr[0]) {
+    case 'S':
+        if (TOKEN_EQ(cmd, "SET"))               { cmd_type = KV_TYPE_STRING; is_write = 1; }
+        else if (TOKEN_EQ(cmd, "SETNX"))        { cmd_type = KV_TYPE_STRING; is_write = 1; }
+        else if (TOKEN_EQ(cmd, "SETEX"))        { cmd_type = KV_TYPE_STRING; is_write = 1; }
+        else if (TOKEN_EQ(cmd, "STRLEN"))       { cmd_type = KV_TYPE_STRING; }
+        else if (TOKEN_EQ(cmd, "SADD")        || TOKEN_EQ(cmd, "SREM")  ||
+                 TOKEN_EQ(cmd, "SPOP")        || TOKEN_EQ(cmd, "SMOVE") ||
+                 TOKEN_EQ(cmd, "SINTERSTORE")|| TOKEN_EQ(cmd, "SUNIONSTORE") ||
+                 TOKEN_EQ(cmd, "SDIFFSTORE")) {
+                                                  cmd_type = KV_TYPE_SET; is_write = 1;
+        }
+        else if (TOKEN_EQ(cmd, "SMEMBERS")    || TOKEN_EQ(cmd, "SCARD")     ||
+                 TOKEN_EQ(cmd, "SISMEMBER")   || TOKEN_EQ(cmd, "SMISMEMBER")||
+                 TOKEN_EQ(cmd, "SRANDMEMBER") || TOKEN_EQ(cmd, "SINTER")    ||
+                 TOKEN_EQ(cmd, "SUNION")      || TOKEN_EQ(cmd, "SDIFF")) {
+                                                  cmd_type = KV_TYPE_SET;
+        }
+        break;
+    case 'G':
+        if (TOKEN_EQ(cmd, "GET"))               { cmd_type = KV_TYPE_STRING; }
+        else if (TOKEN_EQ(cmd, "GETSET"))       { cmd_type = KV_TYPE_STRING; is_write = 1; }
+        break;
+    case 'A':
+        if (TOKEN_EQ(cmd, "APPEND"))            { cmd_type = KV_TYPE_STRING; is_write = 1; }
+        break;
+    case 'I':
+        if (TOKEN_EQ(cmd, "INCR") ||
+            TOKEN_EQ(cmd, "INCRBY") ||
+            TOKEN_EQ(cmd, "INCRBYFLOAT"))       { cmd_type = KV_TYPE_STRING; is_write = 1; }
+        break;
+    case 'D':
+        if (TOKEN_EQ(cmd, "DECR") ||
+            TOKEN_EQ(cmd, "DECRBY"))            { cmd_type = KV_TYPE_STRING; is_write = 1; }
+        break;
+    case 'M':
+        if (TOKEN_EQ(cmd, "MOD"))               { cmd_type = KV_TYPE_STRING; is_write = 1; }
+        break;
+    case 'L':
+        if (TOKEN_EQ(cmd, "LPUSH")   || TOKEN_EQ(cmd, "LPOP")   ||
+            TOKEN_EQ(cmd, "LPUSHX")  || TOKEN_EQ(cmd, "LSET")   ||
+            TOKEN_EQ(cmd, "LREM")    || TOKEN_EQ(cmd, "LTRIM")  ||
+            TOKEN_EQ(cmd, "LINSERT") || TOKEN_EQ(cmd, "LMOVE")) {
+                                                  cmd_type = KV_TYPE_LIST; is_write = 1;
+        } else if (TOKEN_EQ(cmd, "LLEN")   || TOKEN_EQ(cmd, "LRANGE") ||
+                   TOKEN_EQ(cmd, "LINDEX") || TOKEN_EQ(cmd, "LPOS")) {
+                                                  cmd_type = KV_TYPE_LIST;
+        }
+        break;
+    case 'R':
+        if (TOKEN_EQ(cmd, "RPUSH")   || TOKEN_EQ(cmd, "RPOP")  ||
+            TOKEN_EQ(cmd, "RPUSHX")  || TOKEN_EQ(cmd, "RPOPLPUSH")) {
+                                                  cmd_type = KV_TYPE_LIST; is_write = 1;
+        }
+        break;
+    case 'B':
+        if (TOKEN_EQ(cmd, "BLPOP") ||
+            TOKEN_EQ(cmd, "BRPOP"))             { cmd_type = KV_TYPE_LIST; is_write = 1; }
+        break;
+    case 'H':
+        if (TOKEN_EQ(cmd, "HSET")    || TOKEN_EQ(cmd, "HDEL")  ||
+            TOKEN_EQ(cmd, "HSETNX")  || TOKEN_EQ(cmd, "HMSET") ||
+            TOKEN_EQ(cmd, "HINCRBY") || TOKEN_EQ(cmd, "HINCRBYFLOAT")) {
+                                                  cmd_type = KV_TYPE_HASH; is_write = 1;
+        } else if (TOKEN_EQ(cmd, "HGET")    || TOKEN_EQ(cmd, "HGETALL") ||
+                   TOKEN_EQ(cmd, "HKEYS")   || TOKEN_EQ(cmd, "HVALS")   ||
+                   TOKEN_EQ(cmd, "HLEN")    || TOKEN_EQ(cmd, "HEXISTS") ||
+                   TOKEN_EQ(cmd, "HMGET")   || TOKEN_EQ(cmd, "HSTRLEN") ||
+                   TOKEN_EQ(cmd, "HRANDFIELD")) {
+                                                  cmd_type = KV_TYPE_HASH;
+        }
+        break;
+    case 'Z':
+        if (TOKEN_EQ(cmd, "ZADD")            || TOKEN_EQ(cmd, "ZREM")   ||
+            TOKEN_EQ(cmd, "ZINCRBY")         || TOKEN_EQ(cmd, "ZPOPMIN")||
+            TOKEN_EQ(cmd, "ZPOPMAX")         ||
+            TOKEN_EQ(cmd, "ZREMRANGEBYRANK") ||
+            TOKEN_EQ(cmd, "ZREMRANGEBYSCORE")) {
+                                                  cmd_type = KV_TYPE_ZSET; is_write = 1;
+        } else if (TOKEN_EQ(cmd, "ZSCORE")   || TOKEN_EQ(cmd, "ZMSCORE") ||
+                   TOKEN_EQ(cmd, "ZRANGE")   || TOKEN_EQ(cmd, "ZREVRANGE") ||
+                   TOKEN_EQ(cmd, "ZRANK")    || TOKEN_EQ(cmd, "ZREVRANK")  ||
+                   TOKEN_EQ(cmd, "ZCARD")    || TOKEN_EQ(cmd, "ZCOUNT")    ||
+                   TOKEN_EQ(cmd, "ZRANGEBYSCORE") ||
+                   TOKEN_EQ(cmd, "ZREVRANGEBYSCORE") ||
+                   TOKEN_EQ(cmd, "ZRANDMEMBER")) {
+                                                  cmd_type = KV_TYPE_ZSET;
+        }
+        break;
+    default: break;
+    }
+
+    if (cmd_type < 0) {
+        dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
+        return DISPATCH_ERROR;
+    }
+
+    /* WRONGTYPE if key exists but with a different type */
+    if (entry && (int)entry_type(entry) != cmd_type) {
+        dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
+        return DISPATCH_ERROR;
+    }
+
     dispatch_result_t r = DISPATCH_OK;
-
-    if (entry) {
-        /* If command matches a different type, return WRONGTYPE early */
-        int cmd_expects = -1;
-        if (TOKEN_EQ(cmd, "SET") || TOKEN_EQ(cmd, "GET") ||
-            TOKEN_EQ(cmd, "MOD")) cmd_expects = KV_TYPE_STRING;
-        else if (TOKEN_EQ(cmd, "LPUSH") || TOKEN_EQ(cmd, "RPUSH") ||
-                 TOKEN_EQ(cmd, "LPOP")  || TOKEN_EQ(cmd, "RPOP") ||
-                 TOKEN_EQ(cmd, "LLEN")  || TOKEN_EQ(cmd, "LRANGE") ||
-                 TOKEN_EQ(cmd, "LINDEX") || TOKEN_EQ(cmd, "BLPOP") ||
-                 TOKEN_EQ(cmd, "BRPOP")) cmd_expects = KV_TYPE_LIST;
-        else if (TOKEN_EQ(cmd, "SADD") || TOKEN_EQ(cmd, "SREM") ||
-                 TOKEN_EQ(cmd, "SMEMBERS") || TOKEN_EQ(cmd, "SCARD") ||
-                 TOKEN_EQ(cmd, "SISMEMBER") || TOKEN_EQ(cmd, "SPOP") ||
-                 TOKEN_EQ(cmd, "SRANDMEMBER")) cmd_expects = KV_TYPE_SET;
-        else if (TOKEN_EQ(cmd, "HSET") || TOKEN_EQ(cmd, "HGET") ||
-                 TOKEN_EQ(cmd, "HDEL") || TOKEN_EQ(cmd, "HGETALL") ||
-                 TOKEN_EQ(cmd, "HKEYS") || TOKEN_EQ(cmd, "HVALS") ||
-                 TOKEN_EQ(cmd, "HLEN") || TOKEN_EQ(cmd, "HEXISTS") ||
-                 TOKEN_EQ(cmd, "HSETNX") || TOKEN_EQ(cmd, "HINCRBY") ||
-                 TOKEN_EQ(cmd, "HMGET") || TOKEN_EQ(cmd, "HSTRLEN")) cmd_expects = KV_TYPE_HASH;
-        else if (TOKEN_EQ(cmd, "ZADD") || TOKEN_EQ(cmd, "ZREM") ||
-                 TOKEN_EQ(cmd, "ZSCORE") || TOKEN_EQ(cmd, "ZRANGE") ||
-                 TOKEN_EQ(cmd, "ZRANK") || TOKEN_EQ(cmd, "ZCARD") ||
-                 TOKEN_EQ(cmd, "ZCOUNT") || TOKEN_EQ(cmd, "ZRANGEBYSCORE")) cmd_expects = KV_TYPE_ZSET;
-
-        if (cmd_expects != -1 && cmd_expects != (int)entry_type(entry)) {
-            dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
-            return DISPATCH_ERROR;
-        }
-
-        /* Key exists — dispatch by entry type */
-        switch (entry_type(entry)) {
-        case KV_TYPE_STRING:
-            string_cmd(cmd, entry, tokens + 1, argc - 1,
-                       wb, msg_raw, msg_len);
-            r = DISPATCH_OK;
-            break;
-        case KV_TYPE_LIST:
-            r = list_cmd(cmd, entry, tokens + 1, argc - 1,
-                        wb, msg_raw, msg_len, c ? c->client : NULL);
-            break;
-        case KV_TYPE_SET:
-            r = set_cmd(cmd, entry, tokens + 1, argc - 1,
-                       wb, msg_raw, msg_len, c ? c->client : NULL);
-            break;
-        case KV_TYPE_HASH:
-            r = hash_cmd(cmd, entry, tokens + 1, argc - 1,
-                        wb, msg_raw, msg_len, c ? c->client : NULL);
-            break;
-        case KV_TYPE_ZSET:
-            r = zset_cmd(cmd, entry, tokens + 1, argc - 1,
-                        wb, msg_raw, msg_len, c ? c->client : NULL);
-            break;
-        default:
-            dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
-            return DISPATCH_ERROR;
-        }
-    } else {
-        /* New key — dispatch by command name */
-        if (TOKEN_EQ(cmd, "SET") || TOKEN_EQ(cmd, "GET") ||
-            TOKEN_EQ(cmd, "DEL") || TOKEN_EQ(cmd, "MOD") ||
-            TOKEN_EQ(cmd, "EXIST") || TOKEN_EQ(cmd, "EXPIRE")) {
-            string_cmd(cmd, NULL, tokens + 1, argc - 1,
-                       wb, msg_raw, msg_len);
-            r = DISPATCH_OK;
-        } else if (TOKEN_EQ(cmd, "LPUSH") || TOKEN_EQ(cmd, "RPUSH") ||
-                   TOKEN_EQ(cmd, "LPOP")  || TOKEN_EQ(cmd, "RPOP") ||
-                   TOKEN_EQ(cmd, "BLPOP") || TOKEN_EQ(cmd, "BRPOP") ||
-                   TOKEN_EQ(cmd, "LLEN")  || TOKEN_EQ(cmd, "LRANGE") ||
-                   TOKEN_EQ(cmd, "LINDEX")) {
-            r = list_cmd(cmd, NULL, tokens + 1, argc - 1,
-                        wb, msg_raw, msg_len, c ? c->client : NULL);
-        } else if (TOKEN_EQ(cmd, "SADD") || TOKEN_EQ(cmd, "SREM") ||
-                   TOKEN_EQ(cmd, "SMEMBERS") || TOKEN_EQ(cmd, "SCARD") ||
-                   TOKEN_EQ(cmd, "SISMEMBER") || TOKEN_EQ(cmd, "SPOP") ||
-                   TOKEN_EQ(cmd, "SRANDMEMBER")) {
-            r = set_cmd(cmd, NULL, tokens + 1, argc - 1,
-                       wb, msg_raw, msg_len, c ? c->client : NULL);
-        } else if (TOKEN_EQ(cmd, "HSET") || TOKEN_EQ(cmd, "HGET") ||
-                   TOKEN_EQ(cmd, "HDEL") || TOKEN_EQ(cmd, "HGETALL") ||
-                   TOKEN_EQ(cmd, "HKEYS") || TOKEN_EQ(cmd, "HVALS") ||
-                   TOKEN_EQ(cmd, "HLEN") || TOKEN_EQ(cmd, "HEXISTS") ||
-                   TOKEN_EQ(cmd, "HSETNX") || TOKEN_EQ(cmd, "HINCRBY") ||
-                   TOKEN_EQ(cmd, "HMGET") || TOKEN_EQ(cmd, "HSTRLEN")) {
-            r = hash_cmd(cmd, NULL, tokens + 1, argc - 1,
-                        wb, msg_raw, msg_len, c ? c->client : NULL);
-        } else if (TOKEN_EQ(cmd, "ZADD") || TOKEN_EQ(cmd, "ZREM") ||
-                   TOKEN_EQ(cmd, "ZSCORE") || TOKEN_EQ(cmd, "ZRANGE") ||
-                   TOKEN_EQ(cmd, "ZRANK") || TOKEN_EQ(cmd, "ZCARD") ||
-                   TOKEN_EQ(cmd, "ZCOUNT") || TOKEN_EQ(cmd, "ZRANGEBYSCORE")) {
-            r = zset_cmd(cmd, NULL, tokens + 1, argc - 1,
-                        wb, msg_raw, msg_len, c ? c->client : NULL);
-        } else {
-            dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
-            return DISPATCH_ERROR;
-        }
+    switch (cmd_type) {
+    case KV_TYPE_STRING:
+        string_cmd(cmd, entry, tokens + 1, argc - 1, wb, msg_raw, msg_len);
+        r = DISPATCH_OK;
+        break;
+    case KV_TYPE_LIST:
+        r = list_cmd(cmd, entry, tokens + 1, argc - 1, wb,
+                     msg_raw, msg_len, c ? c->client : NULL);
+        break;
+    case KV_TYPE_SET:
+        r = set_cmd(cmd, entry, tokens + 1, argc - 1, wb,
+                    msg_raw, msg_len, c ? c->client : NULL);
+        break;
+    case KV_TYPE_HASH:
+        r = hash_cmd(cmd, entry, tokens + 1, argc - 1, wb,
+                     msg_raw, msg_len, c ? c->client : NULL);
+        break;
+    case KV_TYPE_ZSET:
+        r = zset_cmd(cmd, entry, tokens + 1, argc - 1, wb,
+                     msg_raw, msg_len, c ? c->client : NULL);
+        break;
     }
 
     if (r == DISPATCH_BLOCKED)
         return DISPATCH_BLOCKED;
 
     /* ── Write-command post-processing (AOF + eBPF) ── */
-    if (TOKEN_EQ(cmd, "SET")   || TOKEN_EQ(cmd, "DEL")  ||
-        TOKEN_EQ(cmd, "MOD")   || TOKEN_EQ(cmd, "LPUSH") ||
-        TOKEN_EQ(cmd, "RPUSH") || TOKEN_EQ(cmd, "LPOP")  ||
-        TOKEN_EQ(cmd, "RPOP")  || TOKEN_EQ(cmd, "BLPOP") ||
-        TOKEN_EQ(cmd, "BRPOP") || TOKEN_EQ(cmd, "SADD")  ||
-        TOKEN_EQ(cmd, "SREM")  || TOKEN_EQ(cmd, "SPOP")  ||
-        TOKEN_EQ(cmd, "HSET")  || TOKEN_EQ(cmd, "HDEL")  ||
-        TOKEN_EQ(cmd, "HSETNX") || TOKEN_EQ(cmd, "HINCRBY") ||
-        TOKEN_EQ(cmd, "ZADD")  || TOKEN_EQ(cmd, "ZREM")) {
+    if (is_write) {
         const char *resp = wb->buf + pre_len;
         int rlen = wb->len - pre_len;
         int ok = (rlen > 0 && resp[0] != '-' &&
@@ -339,12 +647,8 @@ void kvs_flush_all(void) {
     kv_iter_t *it = dict_iter_new(&g_dict, 1);
     if (it) {
         kv_entry_t *e;
-        while ((e = dict_iter_next(it)) != NULL) {
-            list_cleanup_entry(e);
-            set_cleanup_entry(e);
-            hash_cleanup_entry(e);
-            zset_cleanup_entry(e);
-        }
+        while ((e = dict_iter_next(it)) != NULL)
+            entry_cleanup_by_type(e);
         dict_iter_free(it);
     }
     dict_clear(&g_dict);

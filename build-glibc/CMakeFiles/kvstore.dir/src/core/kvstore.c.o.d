@@ -136,4 +136,14 @@ CMakeFiles/kvstore.dir/src/core/kvstore.c.o: \
  /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h \
  /usr/lib/gcc/x86_64-linux-gnu/13/include/stdatomic.h \
  /home/xxf/9.1-kvstore/src/persist/persistence.h \
- /home/xxf/9.1-kvstore/src/core/block.h
+ /home/xxf/9.1-kvstore/src/core/block.h \
+ /home/xxf/9.1-kvstore/src/bpf/xdp_manager.h \
+ /home/xxf/9.1-kvstore/src/bpf/xdp_kvs.h /usr/include/linux/types.h \
+ /usr/include/x86_64-linux-gnu/asm/types.h \
+ /usr/include/asm-generic/types.h /usr/include/asm-generic/int-ll64.h \
+ /usr/include/x86_64-linux-gnu/asm/bitsperlong.h \
+ /usr/include/asm-generic/bitsperlong.h /usr/include/linux/posix_types.h \
+ /usr/include/linux/stddef.h \
+ /usr/include/x86_64-linux-gnu/asm/posix_types.h \
+ /usr/include/x86_64-linux-gnu/asm/posix_types_64.h \
+ /usr/include/asm-generic/posix_types.h

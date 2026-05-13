@@ -130,6 +130,19 @@ ntyco/fast:
 .PHONY : ntyco/fast
 
 #=============================================================================
+# Target rules for targets named xdp_kern
+
+# Build rule for target.
+xdp_kern: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 xdp_kern
+.PHONY : xdp_kern
+
+# fast build rule for target.
+xdp_kern/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/xdp_kern.dir/build.make CMakeFiles/xdp_kern.dir/build
+.PHONY : xdp_kern/fast
+
+#=============================================================================
 # Target rules for targets named kvstore
 
 # Build rule for target.
@@ -154,6 +167,30 @@ testcase: cmake_check_build_system
 testcase/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/testcase.dir/build.make CMakeFiles/testcase.dir/build
 .PHONY : testcase/fast
+
+src/bpf/xdp_manager.o: src/bpf/xdp_manager.c.o
+.PHONY : src/bpf/xdp_manager.o
+
+# target to build an object file
+src/bpf/xdp_manager.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/bpf/xdp_manager.c.o
+.PHONY : src/bpf/xdp_manager.c.o
+
+src/bpf/xdp_manager.i: src/bpf/xdp_manager.c.i
+.PHONY : src/bpf/xdp_manager.i
+
+# target to preprocess a source file
+src/bpf/xdp_manager.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/bpf/xdp_manager.c.i
+.PHONY : src/bpf/xdp_manager.c.i
+
+src/bpf/xdp_manager.s: src/bpf/xdp_manager.c.s
+.PHONY : src/bpf/xdp_manager.s
+
+# target to generate assembly for a file
+src/bpf/xdp_manager.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/bpf/xdp_manager.c.s
+.PHONY : src/bpf/xdp_manager.c.s
 
 src/core/block.o: src/core/block.c.o
 .PHONY : src/core/block.o
@@ -596,8 +633,12 @@ help:
 	@echo "... edit_cache"
 	@echo "... rebuild_cache"
 	@echo "... ntyco"
+	@echo "... xdp_kern"
 	@echo "... kvstore"
 	@echo "... testcase"
+	@echo "... src/bpf/xdp_manager.o"
+	@echo "... src/bpf/xdp_manager.i"
+	@echo "... src/bpf/xdp_manager.s"
 	@echo "... src/core/block.o"
 	@echo "... src/core/block.i"
 	@echo "... src/core/block.s"

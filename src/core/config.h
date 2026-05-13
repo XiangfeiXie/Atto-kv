@@ -49,6 +49,10 @@ typedef struct {
 
     /* Both: TCP incremental sync port */
     int  incr_port;
+
+    /* XDP hot-path acceleration */
+    int  xdp_enabled;
+    char xdp_iface[32];
 } KvsConfig;
 
 extern KvsConfig kvs_config;

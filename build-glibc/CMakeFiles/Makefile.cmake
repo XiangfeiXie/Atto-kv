@@ -49,6 +49,7 @@ set(CMAKE_MAKEFILE_PRODUCTS
 # Dependency information for all targets:
 set(CMAKE_DEPEND_INFO_FILES
   "CMakeFiles/ntyco.dir/DependInfo.cmake"
+  "CMakeFiles/xdp_kern.dir/DependInfo.cmake"
   "CMakeFiles/kvstore.dir/DependInfo.cmake"
   "CMakeFiles/testcase.dir/DependInfo.cmake"
   )

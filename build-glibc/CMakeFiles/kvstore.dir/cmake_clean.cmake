@@ -1,4 +1,6 @@
 file(REMOVE_RECURSE
+  "CMakeFiles/kvstore.dir/src/bpf/xdp_manager.c.o"
+  "CMakeFiles/kvstore.dir/src/bpf/xdp_manager.c.o.d"
   "CMakeFiles/kvstore.dir/src/core/block.c.o"
   "CMakeFiles/kvstore.dir/src/core/block.c.o.d"
   "CMakeFiles/kvstore.dir/src/core/config.c.o"

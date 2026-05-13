@@ -27,8 +27,8 @@ CMAKE_BUILD_TYPE:STRING=Release
 //Enable/Disable color output during build.
 CMAKE_COLOR_MAKEFILE:BOOL=ON
 
-//C compiler
-CMAKE_C_COMPILER:STRING=/usr/bin/gcc
+//No help, variable specified on the command line.
+CMAKE_C_COMPILER:UNINITIALIZED=gcc
 
 //A wrapper around 'ar' adding the appropriate '--plugin' option
 // for the GCC compiler
@@ -212,6 +212,9 @@ pkgcfg_lib_FABRIC_fabric:FILEPATH=/usr/lib/x86_64-linux-gnu/libfabric.so
 
 //Path to a library.
 pkgcfg_lib_JEMALLOC_jemalloc:FILEPATH=/usr/lib/x86_64-linux-gnu/libjemalloc.so
+
+//Path to a library.
+pkgcfg_lib_LIBBPF_bpf:FILEPATH=/usr/lib/x86_64-linux-gnu/libbpf.so
 
 //Path to a library.
 pkgcfg_lib_URING_uring:FILEPATH=/usr/lib/x86_64-linux-gnu/liburing.so
@@ -429,6 +432,41 @@ JEMALLOC_jemalloc_INCLUDEDIR:INTERNAL=
 JEMALLOC_jemalloc_LIBDIR:INTERNAL=
 JEMALLOC_jemalloc_PREFIX:INTERNAL=
 JEMALLOC_jemalloc_VERSION:INTERNAL=
+LIBBPF_CFLAGS:INTERNAL=-I/usr/include
+LIBBPF_CFLAGS_I:INTERNAL=
+LIBBPF_CFLAGS_OTHER:INTERNAL=
+LIBBPF_FOUND:INTERNAL=1
+LIBBPF_INCLUDEDIR:INTERNAL=/usr/include
+LIBBPF_INCLUDE_DIRS:INTERNAL=/usr/include
+LIBBPF_LDFLAGS:INTERNAL=-L/usr/lib/x86_64-linux-gnu;-lbpf
+LIBBPF_LDFLAGS_OTHER:INTERNAL=
+LIBBPF_LIBDIR:INTERNAL=/usr/lib/x86_64-linux-gnu
+LIBBPF_LIBRARIES:INTERNAL=bpf
+LIBBPF_LIBRARY_DIRS:INTERNAL=/usr/lib/x86_64-linux-gnu
+LIBBPF_LIBS:INTERNAL=
+LIBBPF_LIBS_L:INTERNAL=
+LIBBPF_LIBS_OTHER:INTERNAL=
+LIBBPF_LIBS_PATHS:INTERNAL=
+LIBBPF_MODULE_NAME:INTERNAL=libbpf
+LIBBPF_PREFIX:INTERNAL=/usr
+LIBBPF_STATIC_CFLAGS:INTERNAL=-I/usr/include
+LIBBPF_STATIC_CFLAGS_I:INTERNAL=
+LIBBPF_STATIC_CFLAGS_OTHER:INTERNAL=
+LIBBPF_STATIC_INCLUDE_DIRS:INTERNAL=/usr/include
+LIBBPF_STATIC_LDFLAGS:INTERNAL=-L/usr/lib/x86_64-linux-gnu;-lbpf;-L/usr/lib/x86_64-linux-gnu;-lelf;-L/usr/lib/x86_64-linux-gnu;-L/usr/lib/x86_64-linux-gnu;-L/usr/lib;-lzstd;-pthread;-lz
+LIBBPF_STATIC_LDFLAGS_OTHER:INTERNAL=-pthread
+LIBBPF_STATIC_LIBDIR:INTERNAL=
+LIBBPF_STATIC_LIBRARIES:INTERNAL=bpf;elf;zstd;z
+LIBBPF_STATIC_LIBRARY_DIRS:INTERNAL=/usr/lib/x86_64-linux-gnu;/usr/lib/x86_64-linux-gnu;/usr/lib/x86_64-linux-gnu;/usr/lib/x86_64-linux-gnu;/usr/lib
+LIBBPF_STATIC_LIBS:INTERNAL=
+LIBBPF_STATIC_LIBS_L:INTERNAL=
+LIBBPF_STATIC_LIBS_OTHER:INTERNAL=
+LIBBPF_STATIC_LIBS_PATHS:INTERNAL=
+LIBBPF_VERSION:INTERNAL=1.3.0
+LIBBPF_libbpf_INCLUDEDIR:INTERNAL=
+LIBBPF_libbpf_LIBDIR:INTERNAL=
+LIBBPF_libbpf_PREFIX:INTERNAL=
+LIBBPF_libbpf_VERSION:INTERNAL=
 //ADVANCED property for variable: PKG_CONFIG_ARGN
 PKG_CONFIG_ARGN-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: PKG_CONFIG_EXECUTABLE
@@ -507,16 +545,20 @@ ZLIB_zlib_VERSION:INTERNAL=
 _CMAKE_LINKER_PUSHPOP_STATE_SUPPORTED:INTERNAL=TRUE
 __pkg_config_arguments_FABRIC:INTERNAL=REQUIRED;libfabric
 __pkg_config_arguments_JEMALLOC:INTERNAL=REQUIRED;jemalloc
+__pkg_config_arguments_LIBBPF:INTERNAL=REQUIRED;libbpf
 __pkg_config_arguments_URING:INTERNAL=REQUIRED;liburing
 __pkg_config_arguments_ZLIB:INTERNAL=REQUIRED;zlib
 __pkg_config_checked_FABRIC:INTERNAL=1
 __pkg_config_checked_JEMALLOC:INTERNAL=1
+__pkg_config_checked_LIBBPF:INTERNAL=1
 __pkg_config_checked_URING:INTERNAL=1
 __pkg_config_checked_ZLIB:INTERNAL=1
 //ADVANCED property for variable: pkgcfg_lib_FABRIC_fabric
 pkgcfg_lib_FABRIC_fabric-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: pkgcfg_lib_JEMALLOC_jemalloc
 pkgcfg_lib_JEMALLOC_jemalloc-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: pkgcfg_lib_LIBBPF_bpf
+pkgcfg_lib_LIBBPF_bpf-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: pkgcfg_lib_URING_uring
 pkgcfg_lib_URING_uring-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: pkgcfg_lib_ZLIB_z

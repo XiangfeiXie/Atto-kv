@@ -4,7 +4,7 @@
 # compile C with /usr/bin/gcc
 C_DEFINES = -DUSE_JEMALLOC
 
-C_INCLUDES = -I/home/xxf/9.1-kvstore/src/util -I/home/xxf/9.1-kvstore/src/core -I/home/xxf/9.1-kvstore/src/engine -I/home/xxf/9.1-kvstore/src/type -I/home/xxf/9.1-kvstore/src/net -I/home/xxf/9.1-kvstore/src/persist -I/home/xxf/9.1-kvstore/src/repl -I/home/xxf/9.1-kvstore/NtyCo/core
+C_INCLUDES = -I/home/xxf/9.1-kvstore/src/util -I/home/xxf/9.1-kvstore/src/core -I/home/xxf/9.1-kvstore/src/engine -I/home/xxf/9.1-kvstore/src/type -I/home/xxf/9.1-kvstore/src/net -I/home/xxf/9.1-kvstore/src/persist -I/home/xxf/9.1-kvstore/src/repl -I/home/xxf/9.1-kvstore/src/bpf -I/home/xxf/9.1-kvstore/NtyCo/core
 
 C_FLAGS = -O3 -DNDEBUG -std=gnu11
 

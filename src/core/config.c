@@ -30,6 +30,9 @@ static void config_default(void) {
             sizeof(kvs_config.rdma_listen_ip) - 1);
     strncpy(kvs_config.rdma_master_ip, "127.0.0.1",
             sizeof(kvs_config.rdma_master_ip) - 1);
+
+    kvs_config.xdp_enabled = 0;
+    strncpy(kvs_config.xdp_iface, "lo", sizeof(kvs_config.xdp_iface) - 1);
 }
 
 /* ================================================================
@@ -152,6 +155,15 @@ int config_load(const char *path) {
         } else if (strcasecmp(key, "incr_port") == 0) {
             kvs_config.incr_port = atoi(val);
 
+        /* ---- XDP ---- */
+        } else if (strcasecmp(key, "xdp") == 0) {
+            int v = parse_bool(val, lineno, "xdp");
+            if (v >= 0) kvs_config.xdp_enabled = v;
+
+        } else if (strcasecmp(key, "xdp_iface") == 0) {
+            strncpy(kvs_config.xdp_iface, val,
+                    sizeof(kvs_config.xdp_iface) - 1);
+
         } else {
             printf("[CONFIG] line %d: unknown key '%s'\n", lineno, key);
         }
@@ -204,5 +216,7 @@ void config_print(void) {
                kvs_config.incr_port);
     }
 
+    if (kvs_config.xdp_enabled)
+        printf("  XDP fast-path : iface=%s\n", kvs_config.xdp_iface);
     printf("========================================\n\n");
 }

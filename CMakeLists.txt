@@ -16,6 +16,7 @@ if(USE_JEMALLOC)
 endif()
 pkg_check_modules(FABRIC   REQUIRED libfabric)
 pkg_check_modules(ZLIB     REQUIRED zlib)
+pkg_check_modules(LIBBPF  REQUIRED libbpf)
 
 # ── NtyCo (third-party coroutine library) ─────────────────────────────
 set(NTYCO_DIR  ${CMAKE_SOURCE_DIR}/NtyCo)
@@ -68,6 +69,28 @@ set(REPL_SRCS
     src/repl/wal_repl.c
 )
 
+set(BPF_SRCS
+    src/bpf/xdp_manager.c
+)
+
+# ── Compile XDP kernel BPF program ────────────────────────────────────
+set(XDP_KERN_SRC  ${CMAKE_SOURCE_DIR}/src/bpf/xdp_kvs.kern.c)
+set(XDP_KERN_OBJ  ${CMAKE_BINARY_DIR}/xdp_kvs.kern.o)
+
+add_custom_command(
+    OUTPUT  ${XDP_KERN_OBJ}
+    COMMAND clang -O2 -g -target bpf
+            -I${CMAKE_SOURCE_DIR}/src/bpf
+            -I/usr/include
+            -I/usr/include/x86_64-linux-gnu
+            -c ${XDP_KERN_SRC}
+            -o ${XDP_KERN_OBJ}
+    DEPENDS ${XDP_KERN_SRC} ${CMAKE_SOURCE_DIR}/src/bpf/xdp_kvs.h
+    COMMENT "Compiling XDP BPF kernel program"
+)
+
+add_custom_target(xdp_kern DEPENDS ${XDP_KERN_OBJ})
+
 set(KVSTORE_SRCS
     ${UTIL_SRCS}
     ${CORE_SRCS}
@@ -76,6 +99,7 @@ set(KVSTORE_SRCS
     ${NET_SRCS}
     ${PERSIST_SRCS}
     ${REPL_SRCS}
+    ${BPF_SRCS}
 )
 
 # ── kvstore target ────────────────────────────────────────────────────
@@ -89,10 +113,12 @@ target_include_directories(kvstore PRIVATE
     src/net
     src/persist
     src/repl
+    src/bpf
     ${NTYCO_DIR}/core
     ${URING_INCLUDE_DIRS}
     ${JEMALLOC_INCLUDE_DIRS}
     ${FABRIC_INCLUDE_DIRS}
+    ${LIBBPF_INCLUDE_DIRS}
 )
 
 target_link_libraries(kvstore PRIVATE
@@ -102,10 +128,12 @@ target_link_libraries(kvstore PRIVATE
     ${JEMALLOC_LIBRARIES}
     ${FABRIC_LIBRARIES}
     ${ZLIB_LIBRARIES}
+    ${LIBBPF_LIBRARIES}
+    elf
     dl
 )
 
-add_dependencies(kvstore ntyco)
+add_dependencies(kvstore ntyco xdp_kern)
 
 # ── testcase target ───────────────────────────────────────────────────
 add_executable(testcase test/testcase.c)

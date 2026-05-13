@@ -16,6 +16,7 @@
 #include "wal_repl.h"
 #include "persistence.h"
 #include "block.h"
+#include "xdp_manager.h"
 
 /* Pack first 4 bytes of a command name into a uint32_t for jump-table dispatch */
 #define CMD4(a,b,c,d) ((uint32_t)(uint8_t)(a) | ((uint32_t)(uint8_t)(b) << 8) | \
@@ -399,6 +400,10 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (ndel > 0 && !g_in_reload) {
             if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
             kvs_rdma_incr_probe(msg_raw, msg_len);
+            if (kvs_config.xdp_enabled) {
+                for (int i = 1; i < argc; i++)
+                    xdp_cache_del(tokens[i].ptr, tokens[i].len);
+            }
         }
         return DISPATCH_OK;
     }
@@ -458,6 +463,9 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (!g_in_reload) {
             if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
             kvs_rdma_incr_probe(msg_raw, msg_len);
+            /* XDP cannot check expiry — evict from hot cache */
+            if (kvs_config.xdp_enabled)
+                xdp_cache_del(key_tok.ptr, key_tok.len);
         }
         return DISPATCH_OK;
     }
@@ -602,7 +610,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     if (r == DISPATCH_BLOCKED)
         return DISPATCH_BLOCKED;
 
-    /* ── Write-command post-processing (AOF + WAL repl) ── */
+    /* ── Write-command post-processing (AOF + WAL repl + XDP cache) ── */
     if (is_write) {
         const char *resp = wb->buf + pre_len;
         int rlen = wb->len - pre_len;
@@ -611,6 +619,21 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (ok && !g_in_reload) {
             if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
             kvs_rdma_incr_probe(msg_raw, msg_len);
+            /* XDP hot-cache: update for string writes, evict for other types */
+            if (kvs_config.xdp_enabled) {
+                if (cmd_type == KV_TYPE_STRING) {
+                    uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
+                    const char *v = string_engine_get(
+                        key_tok.ptr, (uint32_t)key_tok.len, &vlen, &enc);
+                    if (v && enc == KV_ENCODING_RAW &&
+                        vlen > 0 && vlen <= XDP_VAL_MAX)
+                        xdp_cache_put(key_tok.ptr, key_tok.len, v, (int)vlen);
+                    else
+                        xdp_cache_del(key_tok.ptr, key_tok.len);
+                } else {
+                    xdp_cache_del(key_tok.ptr, key_tok.len);
+                }
+            }
         }
     }
 
@@ -706,6 +729,8 @@ int main(int argc, char *argv[]) {
     init_kvengine();
     engine_reload();
     if (ENABLE_AOF) aof_async_init();
+    if (kvs_config.xdp_enabled)
+        xdp_manager_init(kvs_config.xdp_iface, kvs_config.port);
 
     if (kvs_config.rdma_sync_enabled) {
         if (kvs_config.rdma_role == ROLE_MASTER) {
@@ -744,6 +769,7 @@ int main(int argc, char *argv[]) {
     else if (ENABLE_AOF)
         ebpf_incr_stop();  /* standalone WAL started by aof_async_init */
     if (ENABLE_AOF) aof_async_shutdown();
+    if (kvs_config.xdp_enabled) xdp_manager_stop();
     dest_kvengine();
     return 0;
 }

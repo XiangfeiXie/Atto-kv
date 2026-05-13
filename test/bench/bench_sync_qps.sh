@@ -50,7 +50,7 @@ RESULT_CSV="${SCRIPT_DIR}/results_sync_qps.csv"
 
 N=${N:-500000}
 C=${C:-50}
-P_VALUES=(${P_VAL:-1 20 80})
+P_VALUES=(${P_VAL:-16 64 80})
 D_VALUES=(${D_VAL:-16 256 1024})
 
 GREEN='\033[0;32m'; CYAN='\033[0;36m'; RED='\033[0;31m'; NC='\033[0m'
@@ -212,17 +212,17 @@ else
         echo ""
     }
 
-    show_table 20
-    show_table 80
+    show_table 16
+    show_table 64
 
-    # 计算 QPS 损耗百分比 (SET, P=20, d=16 作为代表)
-    echo "── SET QPS 损耗 (P=20, d=16B) ──"
+    # 计算 QPS 损耗百分比 (SET, P=16, d=16 作为代表)
+    echo "── SET QPS 损耗 (P=16, d=16B) ──"
     echo ""
     local kvs_off_qps kvs_on_qps redis_off_qps redis_on_qps
-    kvs_off_qps=$(grep "^kvs-off,set,20,16," "$RESULT_CSV" 2>/dev/null | cut -d',' -f5)
-    kvs_on_qps=$(grep "^kvs-on,set,20,16," "$RESULT_CSV" 2>/dev/null | cut -d',' -f5)
-    redis_off_qps=$(grep "^redis-off,set,20,16," "$RESULT_CSV" 2>/dev/null | cut -d',' -f5)
-    redis_on_qps=$(grep "^redis-on,set,20,16," "$RESULT_CSV" 2>/dev/null | cut -d',' -f5)
+    kvs_off_qps=$(grep "^kvs-off,set,16,16," "$RESULT_CSV" 2>/dev/null | cut -d',' -f5)
+    kvs_on_qps=$(grep "^kvs-on,set,16,16," "$RESULT_CSV" 2>/dev/null | cut -d',' -f5)
+    redis_off_qps=$(grep "^redis-off,set,16,16," "$RESULT_CSV" 2>/dev/null | cut -d',' -f5)
+    redis_on_qps=$(grep "^redis-on,set,16,16," "$RESULT_CSV" 2>/dev/null | cut -d',' -f5)
 
     if [ -n "$kvs_off_qps" ] && [ -n "$kvs_on_qps" ] && [ "$kvs_off_qps" != "0" ]; then
         local kvs_drop=$(echo "scale=1; (1 - $kvs_on_qps / $kvs_off_qps) * 100" | bc -l 2>/dev/null || echo "N/A")

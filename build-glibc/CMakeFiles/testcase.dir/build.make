@@ -73,15 +73,15 @@ CMakeFiles/testcase.dir/test/testcase.c.o: CMakeFiles/testcase.dir/flags.make
 CMakeFiles/testcase.dir/test/testcase.c.o: /home/xxf/9.1-kvstore/test/testcase.c
 CMakeFiles/testcase.dir/test/testcase.c.o: CMakeFiles/testcase.dir/compiler_depend.ts
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building C object CMakeFiles/testcase.dir/test/testcase.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/testcase.dir/test/testcase.c.o -MF CMakeFiles/testcase.dir/test/testcase.c.o.d -o CMakeFiles/testcase.dir/test/testcase.c.o -c /home/xxf/9.1-kvstore/test/testcase.c
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/testcase.dir/test/testcase.c.o -MF CMakeFiles/testcase.dir/test/testcase.c.o.d -o CMakeFiles/testcase.dir/test/testcase.c.o -c /home/xxf/9.1-kvstore/test/testcase.c
 
 CMakeFiles/testcase.dir/test/testcase.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/testcase.dir/test/testcase.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/test/testcase.c > CMakeFiles/testcase.dir/test/testcase.c.i
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/test/testcase.c > CMakeFiles/testcase.dir/test/testcase.c.i
 
 CMakeFiles/testcase.dir/test/testcase.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/testcase.dir/test/testcase.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/test/testcase.c -o CMakeFiles/testcase.dir/test/testcase.c.s
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/test/testcase.c -o CMakeFiles/testcase.dir/test/testcase.c.s
 
 # Object files for target testcase
 testcase_OBJECTS = \

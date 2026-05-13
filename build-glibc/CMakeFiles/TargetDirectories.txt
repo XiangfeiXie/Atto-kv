@@ -1,6 +1,5 @@
 /home/xxf/9.1-kvstore/build-glibc/CMakeFiles/ntyco.dir
 /home/xxf/9.1-kvstore/build-glibc/CMakeFiles/kvstore.dir
 /home/xxf/9.1-kvstore/build-glibc/CMakeFiles/testcase.dir
-/home/xxf/9.1-kvstore/build-glibc/CMakeFiles/bpf.dir
 /home/xxf/9.1-kvstore/build-glibc/CMakeFiles/edit_cache.dir
 /home/xxf/9.1-kvstore/build-glibc/CMakeFiles/rebuild_cache.dir

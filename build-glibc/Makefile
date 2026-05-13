@@ -155,19 +155,6 @@ testcase/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/testcase.dir/build.make CMakeFiles/testcase.dir/build
 .PHONY : testcase/fast
 
-#=============================================================================
-# Target rules for targets named bpf
-
-# Build rule for target.
-bpf: cmake_check_build_system
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 bpf
-.PHONY : bpf
-
-# fast build rule for target.
-bpf/fast:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/bpf.dir/build.make CMakeFiles/bpf.dir/build
-.PHONY : bpf/fast
-
 src/core/block.o: src/core/block.c.o
 .PHONY : src/core/block.o
 
@@ -384,30 +371,6 @@ src/persist/persistence.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/persist/persistence.c.s
 .PHONY : src/persist/persistence.c.s
 
-src/repl/ebpf_incr_repl.o: src/repl/ebpf_incr_repl.c.o
-.PHONY : src/repl/ebpf_incr_repl.o
-
-# target to build an object file
-src/repl/ebpf_incr_repl.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.o
-.PHONY : src/repl/ebpf_incr_repl.c.o
-
-src/repl/ebpf_incr_repl.i: src/repl/ebpf_incr_repl.c.i
-.PHONY : src/repl/ebpf_incr_repl.i
-
-# target to preprocess a source file
-src/repl/ebpf_incr_repl.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.i
-.PHONY : src/repl/ebpf_incr_repl.c.i
-
-src/repl/ebpf_incr_repl.s: src/repl/ebpf_incr_repl.c.s
-.PHONY : src/repl/ebpf_incr_repl.s
-
-# target to generate assembly for a file
-src/repl/ebpf_incr_repl.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.s
-.PHONY : src/repl/ebpf_incr_repl.c.s
-
 src/repl/rdma_repl.o: src/repl/rdma_repl.c.o
 .PHONY : src/repl/rdma_repl.o
 
@@ -431,6 +394,54 @@ src/repl/rdma_repl.s: src/repl/rdma_repl.c.s
 src/repl/rdma_repl.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.s
 .PHONY : src/repl/rdma_repl.c.s
+
+src/repl/wal_repl.o: src/repl/wal_repl.c.o
+.PHONY : src/repl/wal_repl.o
+
+# target to build an object file
+src/repl/wal_repl.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/repl/wal_repl.c.o
+.PHONY : src/repl/wal_repl.c.o
+
+src/repl/wal_repl.i: src/repl/wal_repl.c.i
+.PHONY : src/repl/wal_repl.i
+
+# target to preprocess a source file
+src/repl/wal_repl.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/repl/wal_repl.c.i
+.PHONY : src/repl/wal_repl.c.i
+
+src/repl/wal_repl.s: src/repl/wal_repl.c.s
+.PHONY : src/repl/wal_repl.s
+
+# target to generate assembly for a file
+src/repl/wal_repl.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/repl/wal_repl.c.s
+.PHONY : src/repl/wal_repl.c.s
+
+src/type/kv_type_hash.o: src/type/kv_type_hash.c.o
+.PHONY : src/type/kv_type_hash.o
+
+# target to build an object file
+src/type/kv_type_hash.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.o
+.PHONY : src/type/kv_type_hash.c.o
+
+src/type/kv_type_hash.i: src/type/kv_type_hash.c.i
+.PHONY : src/type/kv_type_hash.i
+
+# target to preprocess a source file
+src/type/kv_type_hash.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.i
+.PHONY : src/type/kv_type_hash.c.i
+
+src/type/kv_type_hash.s: src/type/kv_type_hash.c.s
+.PHONY : src/type/kv_type_hash.s
+
+# target to generate assembly for a file
+src/type/kv_type_hash.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.s
+.PHONY : src/type/kv_type_hash.c.s
 
 src/type/kv_type_list.o: src/type/kv_type_list.c.o
 .PHONY : src/type/kv_type_list.o
@@ -456,6 +467,30 @@ src/type/kv_type_list.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/type/kv_type_list.c.s
 .PHONY : src/type/kv_type_list.c.s
 
+src/type/kv_type_set.o: src/type/kv_type_set.c.o
+.PHONY : src/type/kv_type_set.o
+
+# target to build an object file
+src/type/kv_type_set.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/type/kv_type_set.c.o
+.PHONY : src/type/kv_type_set.c.o
+
+src/type/kv_type_set.i: src/type/kv_type_set.c.i
+.PHONY : src/type/kv_type_set.i
+
+# target to preprocess a source file
+src/type/kv_type_set.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/type/kv_type_set.c.i
+.PHONY : src/type/kv_type_set.c.i
+
+src/type/kv_type_set.s: src/type/kv_type_set.c.s
+.PHONY : src/type/kv_type_set.s
+
+# target to generate assembly for a file
+src/type/kv_type_set.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/type/kv_type_set.c.s
+.PHONY : src/type/kv_type_set.c.s
+
 src/type/kv_type_string.o: src/type/kv_type_string.c.o
 .PHONY : src/type/kv_type_string.o
 
@@ -479,6 +514,30 @@ src/type/kv_type_string.s: src/type/kv_type_string.c.s
 src/type/kv_type_string.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/type/kv_type_string.c.s
 .PHONY : src/type/kv_type_string.c.s
+
+src/type/kv_type_zset.o: src/type/kv_type_zset.c.o
+.PHONY : src/type/kv_type_zset.o
+
+# target to build an object file
+src/type/kv_type_zset.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.o
+.PHONY : src/type/kv_type_zset.c.o
+
+src/type/kv_type_zset.i: src/type/kv_type_zset.c.i
+.PHONY : src/type/kv_type_zset.i
+
+# target to preprocess a source file
+src/type/kv_type_zset.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.i
+.PHONY : src/type/kv_type_zset.c.i
+
+src/type/kv_type_zset.s: src/type/kv_type_zset.c.s
+.PHONY : src/type/kv_type_zset.s
+
+# target to generate assembly for a file
+src/type/kv_type_zset.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/kvstore.dir/build.make CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.s
+.PHONY : src/type/kv_type_zset.c.s
 
 src/util/dynbuf.o: src/util/dynbuf.c.o
 .PHONY : src/util/dynbuf.o
@@ -536,7 +595,6 @@ help:
 	@echo "... depend"
 	@echo "... edit_cache"
 	@echo "... rebuild_cache"
-	@echo "... bpf"
 	@echo "... ntyco"
 	@echo "... kvstore"
 	@echo "... testcase"
@@ -567,18 +625,27 @@ help:
 	@echo "... src/persist/persistence.o"
 	@echo "... src/persist/persistence.i"
 	@echo "... src/persist/persistence.s"
-	@echo "... src/repl/ebpf_incr_repl.o"
-	@echo "... src/repl/ebpf_incr_repl.i"
-	@echo "... src/repl/ebpf_incr_repl.s"
 	@echo "... src/repl/rdma_repl.o"
 	@echo "... src/repl/rdma_repl.i"
 	@echo "... src/repl/rdma_repl.s"
+	@echo "... src/repl/wal_repl.o"
+	@echo "... src/repl/wal_repl.i"
+	@echo "... src/repl/wal_repl.s"
+	@echo "... src/type/kv_type_hash.o"
+	@echo "... src/type/kv_type_hash.i"
+	@echo "... src/type/kv_type_hash.s"
 	@echo "... src/type/kv_type_list.o"
 	@echo "... src/type/kv_type_list.i"
 	@echo "... src/type/kv_type_list.s"
+	@echo "... src/type/kv_type_set.o"
+	@echo "... src/type/kv_type_set.i"
+	@echo "... src/type/kv_type_set.s"
 	@echo "... src/type/kv_type_string.o"
 	@echo "... src/type/kv_type_string.i"
 	@echo "... src/type/kv_type_string.s"
+	@echo "... src/type/kv_type_zset.o"
+	@echo "... src/type/kv_type_zset.i"
+	@echo "... src/type/kv_type_zset.s"
 	@echo "... src/util/dynbuf.o"
 	@echo "... src/util/dynbuf.i"
 	@echo "... src/util/dynbuf.s"

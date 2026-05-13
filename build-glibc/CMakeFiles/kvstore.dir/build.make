@@ -73,197 +73,239 @@ CMakeFiles/kvstore.dir/src/util/dynbuf.c.o: CMakeFiles/kvstore.dir/flags.make
 CMakeFiles/kvstore.dir/src/util/dynbuf.c.o: /home/xxf/9.1-kvstore/src/util/dynbuf.c
 CMakeFiles/kvstore.dir/src/util/dynbuf.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building C object CMakeFiles/kvstore.dir/src/util/dynbuf.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/util/dynbuf.c.o -MF CMakeFiles/kvstore.dir/src/util/dynbuf.c.o.d -o CMakeFiles/kvstore.dir/src/util/dynbuf.c.o -c /home/xxf/9.1-kvstore/src/util/dynbuf.c
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/util/dynbuf.c.o -MF CMakeFiles/kvstore.dir/src/util/dynbuf.c.o.d -o CMakeFiles/kvstore.dir/src/util/dynbuf.c.o -c /home/xxf/9.1-kvstore/src/util/dynbuf.c
 
 CMakeFiles/kvstore.dir/src/util/dynbuf.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/util/dynbuf.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/util/dynbuf.c > CMakeFiles/kvstore.dir/src/util/dynbuf.c.i
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/util/dynbuf.c > CMakeFiles/kvstore.dir/src/util/dynbuf.c.i
 
 CMakeFiles/kvstore.dir/src/util/dynbuf.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/util/dynbuf.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/util/dynbuf.c -o CMakeFiles/kvstore.dir/src/util/dynbuf.c.s
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/util/dynbuf.c -o CMakeFiles/kvstore.dir/src/util/dynbuf.c.s
 
 CMakeFiles/kvstore.dir/src/core/kvstore.c.o: CMakeFiles/kvstore.dir/flags.make
 CMakeFiles/kvstore.dir/src/core/kvstore.c.o: /home/xxf/9.1-kvstore/src/core/kvstore.c
 CMakeFiles/kvstore.dir/src/core/kvstore.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building C object CMakeFiles/kvstore.dir/src/core/kvstore.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/core/kvstore.c.o -MF CMakeFiles/kvstore.dir/src/core/kvstore.c.o.d -o CMakeFiles/kvstore.dir/src/core/kvstore.c.o -c /home/xxf/9.1-kvstore/src/core/kvstore.c
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/core/kvstore.c.o -MF CMakeFiles/kvstore.dir/src/core/kvstore.c.o.d -o CMakeFiles/kvstore.dir/src/core/kvstore.c.o -c /home/xxf/9.1-kvstore/src/core/kvstore.c
 
 CMakeFiles/kvstore.dir/src/core/kvstore.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/core/kvstore.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/core/kvstore.c > CMakeFiles/kvstore.dir/src/core/kvstore.c.i
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/core/kvstore.c > CMakeFiles/kvstore.dir/src/core/kvstore.c.i
 
 CMakeFiles/kvstore.dir/src/core/kvstore.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/core/kvstore.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/core/kvstore.c -o CMakeFiles/kvstore.dir/src/core/kvstore.c.s
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/core/kvstore.c -o CMakeFiles/kvstore.dir/src/core/kvstore.c.s
 
 CMakeFiles/kvstore.dir/src/core/config.c.o: CMakeFiles/kvstore.dir/flags.make
 CMakeFiles/kvstore.dir/src/core/config.c.o: /home/xxf/9.1-kvstore/src/core/config.c
 CMakeFiles/kvstore.dir/src/core/config.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building C object CMakeFiles/kvstore.dir/src/core/config.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/core/config.c.o -MF CMakeFiles/kvstore.dir/src/core/config.c.o.d -o CMakeFiles/kvstore.dir/src/core/config.c.o -c /home/xxf/9.1-kvstore/src/core/config.c
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/core/config.c.o -MF CMakeFiles/kvstore.dir/src/core/config.c.o.d -o CMakeFiles/kvstore.dir/src/core/config.c.o -c /home/xxf/9.1-kvstore/src/core/config.c
 
 CMakeFiles/kvstore.dir/src/core/config.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/core/config.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/core/config.c > CMakeFiles/kvstore.dir/src/core/config.c.i
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/core/config.c > CMakeFiles/kvstore.dir/src/core/config.c.i
 
 CMakeFiles/kvstore.dir/src/core/config.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/core/config.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/core/config.c -o CMakeFiles/kvstore.dir/src/core/config.c.s
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/core/config.c -o CMakeFiles/kvstore.dir/src/core/config.c.s
 
 CMakeFiles/kvstore.dir/src/core/protocol.c.o: CMakeFiles/kvstore.dir/flags.make
 CMakeFiles/kvstore.dir/src/core/protocol.c.o: /home/xxf/9.1-kvstore/src/core/protocol.c
 CMakeFiles/kvstore.dir/src/core/protocol.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building C object CMakeFiles/kvstore.dir/src/core/protocol.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/core/protocol.c.o -MF CMakeFiles/kvstore.dir/src/core/protocol.c.o.d -o CMakeFiles/kvstore.dir/src/core/protocol.c.o -c /home/xxf/9.1-kvstore/src/core/protocol.c
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/core/protocol.c.o -MF CMakeFiles/kvstore.dir/src/core/protocol.c.o.d -o CMakeFiles/kvstore.dir/src/core/protocol.c.o -c /home/xxf/9.1-kvstore/src/core/protocol.c
 
 CMakeFiles/kvstore.dir/src/core/protocol.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/core/protocol.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/core/protocol.c > CMakeFiles/kvstore.dir/src/core/protocol.c.i
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/core/protocol.c > CMakeFiles/kvstore.dir/src/core/protocol.c.i
 
 CMakeFiles/kvstore.dir/src/core/protocol.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/core/protocol.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/core/protocol.c -o CMakeFiles/kvstore.dir/src/core/protocol.c.s
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/core/protocol.c -o CMakeFiles/kvstore.dir/src/core/protocol.c.s
 
 CMakeFiles/kvstore.dir/src/core/block.c.o: CMakeFiles/kvstore.dir/flags.make
 CMakeFiles/kvstore.dir/src/core/block.c.o: /home/xxf/9.1-kvstore/src/core/block.c
 CMakeFiles/kvstore.dir/src/core/block.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Building C object CMakeFiles/kvstore.dir/src/core/block.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/core/block.c.o -MF CMakeFiles/kvstore.dir/src/core/block.c.o.d -o CMakeFiles/kvstore.dir/src/core/block.c.o -c /home/xxf/9.1-kvstore/src/core/block.c
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/core/block.c.o -MF CMakeFiles/kvstore.dir/src/core/block.c.o.d -o CMakeFiles/kvstore.dir/src/core/block.c.o -c /home/xxf/9.1-kvstore/src/core/block.c
 
 CMakeFiles/kvstore.dir/src/core/block.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/core/block.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/core/block.c > CMakeFiles/kvstore.dir/src/core/block.c.i
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/core/block.c > CMakeFiles/kvstore.dir/src/core/block.c.i
 
 CMakeFiles/kvstore.dir/src/core/block.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/core/block.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/core/block.c -o CMakeFiles/kvstore.dir/src/core/block.c.s
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/core/block.c -o CMakeFiles/kvstore.dir/src/core/block.c.s
 
 CMakeFiles/kvstore.dir/src/engine/kv_dict.c.o: CMakeFiles/kvstore.dir/flags.make
 CMakeFiles/kvstore.dir/src/engine/kv_dict.c.o: /home/xxf/9.1-kvstore/src/engine/kv_dict.c
 CMakeFiles/kvstore.dir/src/engine/kv_dict.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_6) "Building C object CMakeFiles/kvstore.dir/src/engine/kv_dict.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/engine/kv_dict.c.o -MF CMakeFiles/kvstore.dir/src/engine/kv_dict.c.o.d -o CMakeFiles/kvstore.dir/src/engine/kv_dict.c.o -c /home/xxf/9.1-kvstore/src/engine/kv_dict.c
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/engine/kv_dict.c.o -MF CMakeFiles/kvstore.dir/src/engine/kv_dict.c.o.d -o CMakeFiles/kvstore.dir/src/engine/kv_dict.c.o -c /home/xxf/9.1-kvstore/src/engine/kv_dict.c
 
 CMakeFiles/kvstore.dir/src/engine/kv_dict.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/engine/kv_dict.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/engine/kv_dict.c > CMakeFiles/kvstore.dir/src/engine/kv_dict.c.i
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/engine/kv_dict.c > CMakeFiles/kvstore.dir/src/engine/kv_dict.c.i
 
 CMakeFiles/kvstore.dir/src/engine/kv_dict.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/engine/kv_dict.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/engine/kv_dict.c -o CMakeFiles/kvstore.dir/src/engine/kv_dict.c.s
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/engine/kv_dict.c -o CMakeFiles/kvstore.dir/src/engine/kv_dict.c.s
 
 CMakeFiles/kvstore.dir/src/type/kv_type_string.c.o: CMakeFiles/kvstore.dir/flags.make
 CMakeFiles/kvstore.dir/src/type/kv_type_string.c.o: /home/xxf/9.1-kvstore/src/type/kv_type_string.c
 CMakeFiles/kvstore.dir/src/type/kv_type_string.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_7) "Building C object CMakeFiles/kvstore.dir/src/type/kv_type_string.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/type/kv_type_string.c.o -MF CMakeFiles/kvstore.dir/src/type/kv_type_string.c.o.d -o CMakeFiles/kvstore.dir/src/type/kv_type_string.c.o -c /home/xxf/9.1-kvstore/src/type/kv_type_string.c
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/type/kv_type_string.c.o -MF CMakeFiles/kvstore.dir/src/type/kv_type_string.c.o.d -o CMakeFiles/kvstore.dir/src/type/kv_type_string.c.o -c /home/xxf/9.1-kvstore/src/type/kv_type_string.c
 
 CMakeFiles/kvstore.dir/src/type/kv_type_string.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/type/kv_type_string.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/type/kv_type_string.c > CMakeFiles/kvstore.dir/src/type/kv_type_string.c.i
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/type/kv_type_string.c > CMakeFiles/kvstore.dir/src/type/kv_type_string.c.i
 
 CMakeFiles/kvstore.dir/src/type/kv_type_string.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/type/kv_type_string.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/type/kv_type_string.c -o CMakeFiles/kvstore.dir/src/type/kv_type_string.c.s
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/type/kv_type_string.c -o CMakeFiles/kvstore.dir/src/type/kv_type_string.c.s
 
 CMakeFiles/kvstore.dir/src/type/kv_type_list.c.o: CMakeFiles/kvstore.dir/flags.make
 CMakeFiles/kvstore.dir/src/type/kv_type_list.c.o: /home/xxf/9.1-kvstore/src/type/kv_type_list.c
 CMakeFiles/kvstore.dir/src/type/kv_type_list.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_8) "Building C object CMakeFiles/kvstore.dir/src/type/kv_type_list.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/type/kv_type_list.c.o -MF CMakeFiles/kvstore.dir/src/type/kv_type_list.c.o.d -o CMakeFiles/kvstore.dir/src/type/kv_type_list.c.o -c /home/xxf/9.1-kvstore/src/type/kv_type_list.c
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/type/kv_type_list.c.o -MF CMakeFiles/kvstore.dir/src/type/kv_type_list.c.o.d -o CMakeFiles/kvstore.dir/src/type/kv_type_list.c.o -c /home/xxf/9.1-kvstore/src/type/kv_type_list.c
 
 CMakeFiles/kvstore.dir/src/type/kv_type_list.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/type/kv_type_list.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/type/kv_type_list.c > CMakeFiles/kvstore.dir/src/type/kv_type_list.c.i
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/type/kv_type_list.c > CMakeFiles/kvstore.dir/src/type/kv_type_list.c.i
 
 CMakeFiles/kvstore.dir/src/type/kv_type_list.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/type/kv_type_list.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/type/kv_type_list.c -o CMakeFiles/kvstore.dir/src/type/kv_type_list.c.s
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/type/kv_type_list.c -o CMakeFiles/kvstore.dir/src/type/kv_type_list.c.s
+
+CMakeFiles/kvstore.dir/src/type/kv_type_set.c.o: CMakeFiles/kvstore.dir/flags.make
+CMakeFiles/kvstore.dir/src/type/kv_type_set.c.o: /home/xxf/9.1-kvstore/src/type/kv_type_set.c
+CMakeFiles/kvstore.dir/src/type/kv_type_set.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_9) "Building C object CMakeFiles/kvstore.dir/src/type/kv_type_set.c.o"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/type/kv_type_set.c.o -MF CMakeFiles/kvstore.dir/src/type/kv_type_set.c.o.d -o CMakeFiles/kvstore.dir/src/type/kv_type_set.c.o -c /home/xxf/9.1-kvstore/src/type/kv_type_set.c
+
+CMakeFiles/kvstore.dir/src/type/kv_type_set.c.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/type/kv_type_set.c.i"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/type/kv_type_set.c > CMakeFiles/kvstore.dir/src/type/kv_type_set.c.i
+
+CMakeFiles/kvstore.dir/src/type/kv_type_set.c.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/type/kv_type_set.c.s"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/type/kv_type_set.c -o CMakeFiles/kvstore.dir/src/type/kv_type_set.c.s
+
+CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.o: CMakeFiles/kvstore.dir/flags.make
+CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.o: /home/xxf/9.1-kvstore/src/type/kv_type_hash.c
+CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_10) "Building C object CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.o"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.o -MF CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.o.d -o CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.o -c /home/xxf/9.1-kvstore/src/type/kv_type_hash.c
+
+CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.i"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/type/kv_type_hash.c > CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.i
+
+CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.s"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/type/kv_type_hash.c -o CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.s
+
+CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.o: CMakeFiles/kvstore.dir/flags.make
+CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.o: /home/xxf/9.1-kvstore/src/type/kv_type_zset.c
+CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_11) "Building C object CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.o"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.o -MF CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.o.d -o CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.o -c /home/xxf/9.1-kvstore/src/type/kv_type_zset.c
+
+CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.i"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/type/kv_type_zset.c > CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.i
+
+CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.s"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/type/kv_type_zset.c -o CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.s
 
 CMakeFiles/kvstore.dir/src/net/reactor.c.o: CMakeFiles/kvstore.dir/flags.make
 CMakeFiles/kvstore.dir/src/net/reactor.c.o: /home/xxf/9.1-kvstore/src/net/reactor.c
 CMakeFiles/kvstore.dir/src/net/reactor.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_9) "Building C object CMakeFiles/kvstore.dir/src/net/reactor.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/net/reactor.c.o -MF CMakeFiles/kvstore.dir/src/net/reactor.c.o.d -o CMakeFiles/kvstore.dir/src/net/reactor.c.o -c /home/xxf/9.1-kvstore/src/net/reactor.c
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_12) "Building C object CMakeFiles/kvstore.dir/src/net/reactor.c.o"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/net/reactor.c.o -MF CMakeFiles/kvstore.dir/src/net/reactor.c.o.d -o CMakeFiles/kvstore.dir/src/net/reactor.c.o -c /home/xxf/9.1-kvstore/src/net/reactor.c
 
 CMakeFiles/kvstore.dir/src/net/reactor.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/net/reactor.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/net/reactor.c > CMakeFiles/kvstore.dir/src/net/reactor.c.i
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/net/reactor.c > CMakeFiles/kvstore.dir/src/net/reactor.c.i
 
 CMakeFiles/kvstore.dir/src/net/reactor.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/net/reactor.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/net/reactor.c -o CMakeFiles/kvstore.dir/src/net/reactor.c.s
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/net/reactor.c -o CMakeFiles/kvstore.dir/src/net/reactor.c.s
 
 CMakeFiles/kvstore.dir/src/net/proactor.c.o: CMakeFiles/kvstore.dir/flags.make
 CMakeFiles/kvstore.dir/src/net/proactor.c.o: /home/xxf/9.1-kvstore/src/net/proactor.c
 CMakeFiles/kvstore.dir/src/net/proactor.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_10) "Building C object CMakeFiles/kvstore.dir/src/net/proactor.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/net/proactor.c.o -MF CMakeFiles/kvstore.dir/src/net/proactor.c.o.d -o CMakeFiles/kvstore.dir/src/net/proactor.c.o -c /home/xxf/9.1-kvstore/src/net/proactor.c
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_13) "Building C object CMakeFiles/kvstore.dir/src/net/proactor.c.o"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/net/proactor.c.o -MF CMakeFiles/kvstore.dir/src/net/proactor.c.o.d -o CMakeFiles/kvstore.dir/src/net/proactor.c.o -c /home/xxf/9.1-kvstore/src/net/proactor.c
 
 CMakeFiles/kvstore.dir/src/net/proactor.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/net/proactor.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/net/proactor.c > CMakeFiles/kvstore.dir/src/net/proactor.c.i
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/net/proactor.c > CMakeFiles/kvstore.dir/src/net/proactor.c.i
 
 CMakeFiles/kvstore.dir/src/net/proactor.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/net/proactor.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/net/proactor.c -o CMakeFiles/kvstore.dir/src/net/proactor.c.s
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/net/proactor.c -o CMakeFiles/kvstore.dir/src/net/proactor.c.s
 
 CMakeFiles/kvstore.dir/src/net/ntyco.c.o: CMakeFiles/kvstore.dir/flags.make
 CMakeFiles/kvstore.dir/src/net/ntyco.c.o: /home/xxf/9.1-kvstore/src/net/ntyco.c
 CMakeFiles/kvstore.dir/src/net/ntyco.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_11) "Building C object CMakeFiles/kvstore.dir/src/net/ntyco.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/net/ntyco.c.o -MF CMakeFiles/kvstore.dir/src/net/ntyco.c.o.d -o CMakeFiles/kvstore.dir/src/net/ntyco.c.o -c /home/xxf/9.1-kvstore/src/net/ntyco.c
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_14) "Building C object CMakeFiles/kvstore.dir/src/net/ntyco.c.o"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/net/ntyco.c.o -MF CMakeFiles/kvstore.dir/src/net/ntyco.c.o.d -o CMakeFiles/kvstore.dir/src/net/ntyco.c.o -c /home/xxf/9.1-kvstore/src/net/ntyco.c
 
 CMakeFiles/kvstore.dir/src/net/ntyco.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/net/ntyco.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/net/ntyco.c > CMakeFiles/kvstore.dir/src/net/ntyco.c.i
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/net/ntyco.c > CMakeFiles/kvstore.dir/src/net/ntyco.c.i
 
 CMakeFiles/kvstore.dir/src/net/ntyco.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/net/ntyco.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/net/ntyco.c -o CMakeFiles/kvstore.dir/src/net/ntyco.c.s
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/net/ntyco.c -o CMakeFiles/kvstore.dir/src/net/ntyco.c.s
 
 CMakeFiles/kvstore.dir/src/persist/persistence.c.o: CMakeFiles/kvstore.dir/flags.make
 CMakeFiles/kvstore.dir/src/persist/persistence.c.o: /home/xxf/9.1-kvstore/src/persist/persistence.c
 CMakeFiles/kvstore.dir/src/persist/persistence.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_12) "Building C object CMakeFiles/kvstore.dir/src/persist/persistence.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/persist/persistence.c.o -MF CMakeFiles/kvstore.dir/src/persist/persistence.c.o.d -o CMakeFiles/kvstore.dir/src/persist/persistence.c.o -c /home/xxf/9.1-kvstore/src/persist/persistence.c
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_15) "Building C object CMakeFiles/kvstore.dir/src/persist/persistence.c.o"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/persist/persistence.c.o -MF CMakeFiles/kvstore.dir/src/persist/persistence.c.o.d -o CMakeFiles/kvstore.dir/src/persist/persistence.c.o -c /home/xxf/9.1-kvstore/src/persist/persistence.c
 
 CMakeFiles/kvstore.dir/src/persist/persistence.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/persist/persistence.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/persist/persistence.c > CMakeFiles/kvstore.dir/src/persist/persistence.c.i
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/persist/persistence.c > CMakeFiles/kvstore.dir/src/persist/persistence.c.i
 
 CMakeFiles/kvstore.dir/src/persist/persistence.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/persist/persistence.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/persist/persistence.c -o CMakeFiles/kvstore.dir/src/persist/persistence.c.s
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/persist/persistence.c -o CMakeFiles/kvstore.dir/src/persist/persistence.c.s
 
 CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.o: CMakeFiles/kvstore.dir/flags.make
 CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.o: /home/xxf/9.1-kvstore/src/repl/rdma_repl.c
 CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_13) "Building C object CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.o -MF CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.o.d -o CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.o -c /home/xxf/9.1-kvstore/src/repl/rdma_repl.c
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_16) "Building C object CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.o"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.o -MF CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.o.d -o CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.o -c /home/xxf/9.1-kvstore/src/repl/rdma_repl.c
 
 CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/repl/rdma_repl.c > CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.i
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/repl/rdma_repl.c > CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.i
 
 CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/repl/rdma_repl.c -o CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.s
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/repl/rdma_repl.c -o CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.s
 
-CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.o: CMakeFiles/kvstore.dir/flags.make
-CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.o: /home/xxf/9.1-kvstore/src/repl/ebpf_incr_repl.c
-CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_14) "Building C object CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.o -MF CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.o.d -o CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.o -c /home/xxf/9.1-kvstore/src/repl/ebpf_incr_repl.c
+CMakeFiles/kvstore.dir/src/repl/wal_repl.c.o: CMakeFiles/kvstore.dir/flags.make
+CMakeFiles/kvstore.dir/src/repl/wal_repl.c.o: /home/xxf/9.1-kvstore/src/repl/wal_repl.c
+CMakeFiles/kvstore.dir/src/repl/wal_repl.c.o: CMakeFiles/kvstore.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_17) "Building C object CMakeFiles/kvstore.dir/src/repl/wal_repl.c.o"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/kvstore.dir/src/repl/wal_repl.c.o -MF CMakeFiles/kvstore.dir/src/repl/wal_repl.c.o.d -o CMakeFiles/kvstore.dir/src/repl/wal_repl.c.o -c /home/xxf/9.1-kvstore/src/repl/wal_repl.c
 
-CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/repl/ebpf_incr_repl.c > CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.i
+CMakeFiles/kvstore.dir/src/repl/wal_repl.c.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/kvstore.dir/src/repl/wal_repl.c.i"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/xxf/9.1-kvstore/src/repl/wal_repl.c > CMakeFiles/kvstore.dir/src/repl/wal_repl.c.i
 
-CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/repl/ebpf_incr_repl.c -o CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.s
+CMakeFiles/kvstore.dir/src/repl/wal_repl.c.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/kvstore.dir/src/repl/wal_repl.c.s"
+	/usr/bin/gcc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/xxf/9.1-kvstore/src/repl/wal_repl.c -o CMakeFiles/kvstore.dir/src/repl/wal_repl.c.s
 
 # Object files for target kvstore
 kvstore_OBJECTS = \
@@ -275,12 +317,15 @@ kvstore_OBJECTS = \
 "CMakeFiles/kvstore.dir/src/engine/kv_dict.c.o" \
 "CMakeFiles/kvstore.dir/src/type/kv_type_string.c.o" \
 "CMakeFiles/kvstore.dir/src/type/kv_type_list.c.o" \
+"CMakeFiles/kvstore.dir/src/type/kv_type_set.c.o" \
+"CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.o" \
+"CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.o" \
 "CMakeFiles/kvstore.dir/src/net/reactor.c.o" \
 "CMakeFiles/kvstore.dir/src/net/proactor.c.o" \
 "CMakeFiles/kvstore.dir/src/net/ntyco.c.o" \
 "CMakeFiles/kvstore.dir/src/persist/persistence.c.o" \
 "CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.o" \
-"CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.o"
+"CMakeFiles/kvstore.dir/src/repl/wal_repl.c.o"
 
 # External object files for target kvstore
 kvstore_EXTERNAL_OBJECTS =
@@ -293,16 +338,19 @@ kvstore: CMakeFiles/kvstore.dir/src/core/block.c.o
 kvstore: CMakeFiles/kvstore.dir/src/engine/kv_dict.c.o
 kvstore: CMakeFiles/kvstore.dir/src/type/kv_type_string.c.o
 kvstore: CMakeFiles/kvstore.dir/src/type/kv_type_list.c.o
+kvstore: CMakeFiles/kvstore.dir/src/type/kv_type_set.c.o
+kvstore: CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.o
+kvstore: CMakeFiles/kvstore.dir/src/type/kv_type_zset.c.o
 kvstore: CMakeFiles/kvstore.dir/src/net/reactor.c.o
 kvstore: CMakeFiles/kvstore.dir/src/net/proactor.c.o
 kvstore: CMakeFiles/kvstore.dir/src/net/ntyco.c.o
 kvstore: CMakeFiles/kvstore.dir/src/persist/persistence.c.o
 kvstore: CMakeFiles/kvstore.dir/src/repl/rdma_repl.c.o
-kvstore: CMakeFiles/kvstore.dir/src/repl/ebpf_incr_repl.c.o
+kvstore: CMakeFiles/kvstore.dir/src/repl/wal_repl.c.o
 kvstore: CMakeFiles/kvstore.dir/build.make
 kvstore: /home/xxf/9.1-kvstore/NtyCo/libntyco.a
 kvstore: CMakeFiles/kvstore.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_15) "Linking C executable kvstore"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/xxf/9.1-kvstore/build-glibc/CMakeFiles --progress-num=$(CMAKE_PROGRESS_18) "Linking C executable kvstore"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/kvstore.dir/link.txt --verbose=$(VERBOSE)
 
 # Rule to build all files generated by this target.

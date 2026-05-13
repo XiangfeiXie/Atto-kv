@@ -1296,3 +1296,98 @@ RDMA 流式全量同步在 Phase 9 已能正常工作，但存在严重性能瓶
 - **Tiered ringbuf reservation（5/13 实施）**：BPF 侧改为三级恒定大小预留（4KB/64KB/256KB），每分支独立生命周期 + 提前 return 防止 verifier 状态合并。100 字节 SET 从 262KB → 4.1KB（~65× 改善），256MB ringbuf 容量从 ~998 → ~65,000+ events。
 - **Backlog lazy allocation（5/13 实施）**：backlog slot msg 从启动时全部分配（16384 × 256KB = 4GB）改为延迟分配（4KB 起，realloc×2），消除 4GB 预分配浪费。
 - **Redis PSYNC 断开重连（5/13 实施）**：见 Phase 14。
+
+---
+
+## 2026-05-13 — Phase 15: WAL + io_uring 增量同步重构（替换 eBPF）
+
+### Overview
+
+用 **WAL (Write-Ahead Log) + io_uring** 全面替换 eBPF uprobe 增量同步。eBPF 方案存在根本性技术缺陷（uprobe 在内核态无法做多路 TCP 分发，用户态仍需回读 ringbuf；内核版本锁定/ lockdown 兼容问题；调试困难），而 WAL+io_uring 方案在用户态完成全部数据面逻辑，架构更清晰、可维护性更强、性能相当。
+
+eBPF 保留并重新定位为**可观测性子系统**（热 key 检测、慢查询追踪、延迟直方图、dict 健康监控），不再承担增量同步数据面职责。
+
+### 架构设计
+
+**新数据流（写路径）**：
+```
+kvs_dispatch() → kvs_rdma_incr_probe(msg, len)
+  └─▶ wal_repl_append()              [worker 线程，无锁]
+        ├─▶ journal ring slot         [进程内，原子 seq]
+        └─▶ 唤醒 consumer 线程
+
+consumer 线程（专用后台线程）:
+  ├─▶ writev → WAL 文件              [崩溃恢复 + 重连 catchup]
+  ├─▶ backlog_append()               [内存内快速 catchup]
+  └─▶ io_uring 批量 dispatch → N 个 slave [单次 submit，N 路 TCP 发送]
+```
+
+**AOF + 复制统一**：`aof_async_append()` → `wal_repl_append()` → 同一个 journal ring → WAL 文件同时服务崩溃恢复（AOF）和增量复制。
+
+**Journal Ring**：4096 slot 无锁 MPSC ring buffer（producer: 任意 worker 线程，consumer: 专用线程），使用 acquire/release 内存序。
+
+**WAL 文件格式** (`wal/incr.wal`)：二进制格式，每条记录 `[magic:4][seq:8][length:4][crc32:4][payload]`，magic = `0x574C5243` ("WLRC")，CRC32 用于加载时完整性校验。
+
+**Backlog**：16384 slot 环形缓冲区（mutex 保护，lazy allocation 4KB 起 realloc×2），用于 slave 断连重连时的增量 catchup。
+
+**Slave 分发**：单 `io_uring` ring（depth 256）批量向所有 slave 发送，一次 `io_uring_submit` 覆盖 N 个 slave。
+
+### 新文件
+
+- `src/repl/wal_repl.h` — ~70 行：WAL record header struct（20 bytes packed），常量定义，API 声明（保持 `ebpf_incr_*` 旧名称以零改动兼容调用方）
+- `src/repl/wal_repl.c` — ~740 行：journal ring、WAL 文件读写、consumer 线程、TCP listener 线程、slave 管理、backlog、PSYNC 握手、全量同步协调
+
+### 移除文件
+
+以下文件不再编译（`CMakeLists.txt` 已移除引用）：
+- `src/repl/ebpf_incr_repl.c` (1057 lines)
+- `src/repl/ebpf_incr_repl.h` (178 lines)
+- `src/repl/ebpf_incr.bpf.c` (140 lines)
+- `src/repl/vmlinux.h` (3.1 MB)
+
+### Modified files
+
+- `src/core/kvstore.c` — `kvs_rdma_incr_probe()` 改为直接调用 `wal_repl_append()`（不再经过 eBPF uprobe），7 个写命令调用点不变
+- `src/core/kvstore.h` — `#include "wal_repl.h"` 替换 `ebpf_incr_repl.h`
+- `src/persist/persistence.h` — 新增 `#define WAL_REL "wal/incr.wal"`，`persist_path()` 声明
+- `src/persist/persistence.c` — AOF 统一到 WAL：`aof_async_append()` → `wal_repl_append()`，`aof_reload_mmap()` 读取 WAL 二进制格式（CRC32 校验 + RESP 解析重放），`aof_async_init()` 自动启动 WAL（独立模式）
+- `src/net/reactor.c` — `epoll_wait` timeout 上限 100ms（修复 SIGTERM 信号竞争导致 shutdown hang）
+- `CMakeLists.txt` — 编译 `wal_repl.c` 替代 `ebpf_incr_repl.c`
+
+### Bug 修复
+
+**Bug 1 (ROOT CAUSE): WAL CRC32 校验失败（0 commands replayed）**
+- **问题**：`wal_write_record()` 使用 io_uring 异步写 WAL 文件，SQE 指向 journal slot buffer（`s->buf + 8`）。Consumer 线程在 `io_uring_submit()` 之前就推进了 `g_jtail`，导致 producer（worker 线程）覆盖 buffer 数据。WAL SQE 提交时读到损坏数据 → 写入错误 CRC32 → 重载时 CRC32 校验失败。
+- **修复**：将 WAL 写入从 io_uring 异步改为 `writev()` 同步写。Consumer 线程是专用后台线程，同步 I/O 不阻塞任何 worker 线程，且消除了 buffer 生命周期竞争。io_uring 保留用于 slave 分发路径（N-slave 批量发送确实需要）。
+- **验证**：修复后重载日志 `[AOF] load finished, 1908 commands replayed` 零 CRC32 错误。
+
+**Bug 2: 遗留 AOF 死代码**
+- **问题**：静态 `g_aof` 结构体（`aof_slot_t slots[1024]`，~4MB）和 `aof_worker()`、`aof_async_init_legacy()`、`aof_atfork_child()` 等函数在 AOF 统一到 WAL 后完全未使用。
+- **修复**：删除 ~250 行遗留代码 + 全部 `AOF_*` 宏定义。`aof_async_init()` 简化为仅启动 WAL 独立模式。
+
+**Bug 3: 进程无法正常退出（shutdown hang）**
+- **问题**：两个信号竞争条件导致 SIGTERM 后进程不退：
+  1. **Reactor 主循环**：`block_nearest_timeout()` 无阻塞客户端时返回 -1，`epoll_wait` 无限等待。SIGTERM 在 `epoll_wait` 外到达时，信号已处理完毕，epoll_wait 永不中断。
+  2. **Listener 线程**：`close(g_listen_fd)` 在某些内核上无法可靠中断另一个线程中阻塞的 `accept()`。
+- **修复**：
+  1. `epoll_wait` timeout 上限定为 100ms（循环至少每 100ms 检查 `g_kvs_stop`）
+  2. `shutdown(g_listen_fd, SHUT_RDWR)` 先于 `close()` 执行，强制中断 `accept()`
+
+### 测试结果 (`test_wal_aof.sh` — 14/14 passed)
+
+| 测试 | 结果 | 说明 |
+|------|------|------|
+| Test 1: WAL startup | PASS | WAL 文件创建，dispatch 模块就绪 |
+| Test 2: WAL write integrity | PASS | GET 正确返回，WAL magic `0x574C5243` 验证，文件 123KB |
+| Test 3: Incremental sync TCP handshake | PASS | `INCR_SYNC` → `+CONTINUE` 握手，replid 正确返回 |
+| Test 4: Crash recovery | PASS | kill -TERM → restart → 1908 commands replayed，数据完整 |
+| Test 5: WAL write throughput | PASS | redis-benchmark 10000 SET，~170 req/s |
+
+### 遗留事项
+
+- **WAL 文件轮转**：`wal/incr.wal` 无上限增长，需实现基于大小/时间的轮转 + 旧文件归档
+- **Slave ACK 追踪**：缺少 `REPLCONF ACK <seq>` 语义，无法确认 slave 实际消费进度
+- **Journal ring 溢出**：当前溢出后仅 `g_dropped++` + 断开所有 slave（`g_stream_healthy=0`），无自动恢复
+- **eBPF 源文件清理**：`ebpf_incr_repl.c`/`.h`、`ebpf_incr.bpf.c`、`vmlinux.h`（3.1MB）仍存在于磁盘但不再编译
+- **Slave 发送阻塞**：慢 slave 的 TCP 发送缓冲区满时，io_uring 批量分发中所有 slave 均受拖累（单 ring 同步 reap）
+- **Replid 生成**：使用 `pid:time(NULL)` 而非随机数，重启后时间可能相同

@@ -290,10 +290,16 @@ int reactor_start(unsigned short port, msg_handler handler) {
 
     struct epoll_event events[1024];
 
-    while (1) {
+    while (!g_kvs_stop) {
         update_cached_time();
         int timeout_ms = block_nearest_timeout();
+        /* Cap timeout so the loop re-checks g_kvs_stop at least every
+         * 100 ms — avoids a race where SIGTERM arrives outside epoll_wait
+         * and the signal has already been delivered before we re-enter. */
+        if (timeout_ms < 0 || timeout_ms > 100)
+            timeout_ms = 100;
         int nready = epoll_wait(epfd, events, 1024, timeout_ms);
+        if (nready < 0 && errno == EINTR) break;
 
         block_check_timeouts();
 

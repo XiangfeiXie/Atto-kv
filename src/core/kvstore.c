@@ -13,6 +13,7 @@
 #include <fcntl.h>
 
 #include "rdma_repl.h"
+#include "wal_repl.h"
 #include "persistence.h"
 #include "block.h"
 
@@ -66,14 +67,8 @@ void free_kvitem(KVItem *item) {
     free(item);
 }
 
-__attribute__((noinline))
 void kvs_rdma_incr_probe(const char *msg, int length) {
-    /*
-     * The compiler barrier prevents -O3 from eliminating call sites.
-     * Without this, the compiler sees an empty pure function and removes
-     * every call as dead code — the uprobe attaches but never fires.
-     */
-    asm volatile("" : : "r"(msg), "r"(length) : "memory");
+    wal_repl_append(msg, length);
 }
 
 /* ── Parse a token as long long (strict). Returns 0 on success, -1 on error. ── */
@@ -607,7 +602,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     if (r == DISPATCH_BLOCKED)
         return DISPATCH_BLOCKED;
 
-    /* ── Write-command post-processing (AOF + eBPF) ── */
+    /* ── Write-command post-processing (AOF + WAL repl) ── */
     if (is_write) {
         const char *resp = wb->buf + pre_len;
         int rlen = wb->len - pre_len;
@@ -660,10 +655,16 @@ void kvs_flush_all(void) {
 }
 
 void engine_reload(void) {
-    if (ENABLE_AOF && access(persist_path(AOF_REL), F_OK) == 0) {
-        printf("Loading AOF (mmap)...\n");
-        aof_reload_mmap();
-    } else if (ENABLE_RDB && access(persist_path(RDB_REL), F_OK) == 0) {
+    if (ENABLE_AOF) {
+        /* Phase 4: WAL takes priority over legacy AOF */
+        if (access(persist_path(WAL_REL), F_OK) == 0 ||
+            access(persist_path(AOF_REL), F_OK) == 0) {
+            printf("Loading AOF/WAL (mmap)...\n");
+            aof_reload_mmap();
+            return;
+        }
+    }
+    if (ENABLE_RDB && access(persist_path(RDB_REL), F_OK) == 0) {
         printf("Loading RDB (mmap)...\n");
         rdb_load_mmap();
     } else {
@@ -671,10 +672,27 @@ void engine_reload(void) {
     }
 }
 
+/* ==================== Shutdown ==================== */
+
+volatile sig_atomic_t g_kvs_stop = 0;
+
+static void sig_shutdown(int signo) {
+    (void)signo;
+    g_kvs_stop = 1;
+}
+
 /* ==================== Main ==================== */
 
 int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN);
+    /* Use sigaction without SA_RESTART so epoll_wait/io_uring_wait
+     * are interrupted (return EINTR) instead of being auto-restarted. */
+    struct sigaction sa;
+    sa.sa_handler = sig_shutdown;
+    sa.sa_flags   = 0;          /* no SA_RESTART */
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
     /* Line-buffer stdout early so all threads inherit it.
      * When stdout is redirected to a file it defaults to fully
      * buffered (4096+ bytes), hiding log messages from bench scripts. */
@@ -720,6 +738,11 @@ int main(int argc, char *argv[]) {
     else if (kvs_config.network_model == NET_NTYCO)
         ntyco_start(kvs_config.port, kvs_protocol_batch);
 
+    /* Graceful WAL flush: stop consumer thread and fsync before exit */
+    if (kvs_config.rdma_sync_enabled && kvs_config.rdma_role == ROLE_MASTER)
+        ebpf_incr_stop();
+    else if (ENABLE_AOF)
+        ebpf_incr_stop();  /* standalone WAL started by aof_async_init */
     if (ENABLE_AOF) aof_async_shutdown();
     dest_kvengine();
     return 0;

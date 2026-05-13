@@ -15,8 +15,6 @@ if(USE_JEMALLOC)
     add_compile_definitions(USE_JEMALLOC)
 endif()
 pkg_check_modules(FABRIC   REQUIRED libfabric)
-pkg_check_modules(BPF      REQUIRED libbpf)
-pkg_check_modules(ELF      REQUIRED libelf)
 pkg_check_modules(ZLIB     REQUIRED zlib)
 
 # ── NtyCo (third-party coroutine library) ─────────────────────────────
@@ -67,7 +65,7 @@ set(PERSIST_SRCS
 
 set(REPL_SRCS
     src/repl/rdma_repl.c
-    src/repl/ebpf_incr_repl.c
+    src/repl/wal_repl.c
 )
 
 set(KVSTORE_SRCS
@@ -95,7 +93,6 @@ target_include_directories(kvstore PRIVATE
     ${URING_INCLUDE_DIRS}
     ${JEMALLOC_INCLUDE_DIRS}
     ${FABRIC_INCLUDE_DIRS}
-    ${BPF_INCLUDE_DIRS}
 )
 
 target_link_libraries(kvstore PRIVATE
@@ -104,8 +101,6 @@ target_link_libraries(kvstore PRIVATE
     ${URING_LIBRARIES}
     ${JEMALLOC_LIBRARIES}
     ${FABRIC_LIBRARIES}
-    ${BPF_LIBRARIES}
-    ${ELF_LIBRARIES}
     ${ZLIB_LIBRARIES}
     dl
 )
@@ -114,19 +109,3 @@ add_dependencies(kvstore ntyco)
 
 # ── testcase target ───────────────────────────────────────────────────
 add_executable(testcase test/testcase.c)
-
-# ── eBPF object ───────────────────────────────────────────────────────
-add_custom_command(
-    OUTPUT ${CMAKE_BINARY_DIR}/ebpf_incr.bpf.o
-    COMMAND clang -O2 -g -target bpf -D__TARGET_ARCH_x86
-            -I/usr/include/bpf
-            -I${CMAKE_SOURCE_DIR}/src/repl
-            -c ${CMAKE_SOURCE_DIR}/src/repl/ebpf_incr.bpf.c
-            -o ${CMAKE_BINARY_DIR}/ebpf_incr.bpf.o
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/repl/ebpf_incr.bpf.c
-            ${CMAKE_SOURCE_DIR}/src/repl/vmlinux.h
-    COMMENT "Compiling eBPF program"
-)
-
-add_custom_target(bpf ALL DEPENDS ${CMAKE_BINARY_DIR}/ebpf_incr.bpf.o)
-add_dependencies(kvstore bpf)

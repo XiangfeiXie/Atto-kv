@@ -2,12 +2,17 @@
 #define __SERVER_H__
 
 #include <stdint.h>
+#include <signal.h>
 #include "dynbuf.h"
 #include "client.h"
 
 #define ENABLE_HTTP      0
 #define ENABLE_WEBSOCKET 0
 #define ENABLE_KVSTORE   1
+
+/* Global graceful-shutdown flag; set by SIGTERM/SIGINT handler.
+ * Network event loops check this flag to exit cleanly. */
+extern volatile sig_atomic_t g_kvs_stop;
 
 /* Callback types */
 typedef int (*RCALLBACK)(int fd);

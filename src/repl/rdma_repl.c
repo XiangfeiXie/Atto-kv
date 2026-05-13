@@ -27,7 +27,7 @@
 #include "kvstore.h"
 #include "config.h"
 #include "server.h"
-#include "ebpf_incr_repl.h"
+#include "wal_repl.h"
 #include "persistence.h"
 
 #include <stdio.h>
@@ -784,9 +784,9 @@ static void *rdma_master_thread(void *arg) {
     RDMA_CHK(fi_pep_bind(pep, &eq->fid, 0),               "fi_pep_bind");
     RDMA_CHK(fi_listen(pep),                              "fi_listen");
 
-    /* Start eBPF incremental sync module + TCP incr listener. */
+    /* Start WAL-based incremental sync module + TCP incr listener. */
     if (ebpf_incr_master_start() != 0) {
-        fprintf(stderr, "[RDMA-REPL] eBPF incr sync unavailable "
+        fprintf(stderr, "[RDMA-REPL] WAL incr sync unavailable "
                         "(full sync only)\n");
     }
 

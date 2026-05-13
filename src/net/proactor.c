@@ -125,7 +125,7 @@ int proactor_start(unsigned short port, msg_handler handler) {
     socklen_t len = sizeof(clientaddr);
     set_event_accept(&ring, sockfd, (struct sockaddr*)&clientaddr, &len);
 
-    while (1) {
+    while (!g_kvs_stop) {
         update_cached_time();
         struct io_uring_cqe *cqes[128];
         int nready = io_uring_peek_batch_cqe(&ring, cqes, 128);

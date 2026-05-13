@@ -37,6 +37,9 @@
 #include <sys/eventfd.h>
 #include <stdatomic.h>
 #include <liburing.h>
+#include <zlib.h>
+#include <inttypes.h>
+#include "wal_repl.h"
 
 /* ── 项目根目录：由 persist_set_basedir 在启动时设置 ── */
 static char  g_basedir[1024] = ".";
@@ -109,236 +112,33 @@ void persist_set_basedir(const char *argv0) {
 KVItem* create_kvitem(char *value_str, char *expire_str);
 
 /* =============================================================================
- * Part 1. AOF 异步写（pthread + io_uring + lock-free ring buffer）
+ * Part 1. AOF — unified with WAL replication
+ *
+ * The legacy AOF async writer (ring buffer + io_uring worker) has been
+ * retired.  Every write command flows through wal_repl_append() which
+ * feeds the unified journal ring.  The consumer thread serialises records
+ * to wal/incr.wal (binary WAL + CRC32) for crash recovery.
+ *
+ * aof_async_append  →  wal_repl_append()      (journal the command)
+ * aof_reload_mmap   →  reads wal/incr.wal      (crash recovery)
  * ============================================================================= */
 
-#define AOF_URING_DEPTH       64
-#define AOF_BATCH_MAX         32
-#define AOF_RING_SIZE         1024          /* power of 2 */
-#define AOF_RING_MASK         (AOF_RING_SIZE - 1)
-#define AOF_SLOT_INIT_CAP     4096          /* grows as needed to fit max command */
-
-typedef struct {
-    char  *buf;
-    int    len;
-    int    cap;
-} aof_slot_t;
-
-static struct {
-    int              fd;
-    pthread_t        tid;
-    aof_slot_t       slots[AOF_RING_SIZE];
-    _Atomic uint32_t head;           /* producer writes here (monotonic) */
-    _Atomic uint32_t tail;           /* consumer writes here (monotonic) */
-    _Atomic int      running;
-    struct io_uring  ring;
-    int              ring_inited;
-    int              evt_fd;         /* eventfd for consumer wakeup */
-} g_aof = {
-    .fd     = -1,
-    .evt_fd = -1,
-};
-
-static void aof_slot_ensure(aof_slot_t *s, int need) {
-    if (s->cap >= need) return;
-    int new_cap = s->cap ? s->cap : AOF_SLOT_INIT_CAP;
-    while (new_cap < need) new_cap *= 2;
-    char *nb = (char *)realloc(s->buf, (size_t)new_cap);
-    if (!nb) return;
-    s->buf = nb;
-    s->cap = new_cap;
-}
-
-/* pthread_atfork: child must not inherit the worker thread.  Close fds
- * and free slot buffers so the child starts with a clean AOF slate. */
-static void aof_atfork_child(void) {
-    if (g_aof.fd >= 0)     { close(g_aof.fd);     g_aof.fd     = -1; }
-    if (g_aof.evt_fd >= 0) { close(g_aof.evt_fd); g_aof.evt_fd = -1; }
-    g_aof.ring_inited = 0;
-    atomic_store_explicit(&g_aof.running, 0, memory_order_relaxed);
-    for (int i = 0; i < AOF_RING_SIZE; i++) {
-        free(g_aof.slots[i].buf);
-        g_aof.slots[i].buf = NULL;
-        g_aof.slots[i].cap = 0;
-    }
-    atomic_store_explicit(&g_aof.head, 0, memory_order_relaxed);
-    atomic_store_explicit(&g_aof.tail, 0, memory_order_relaxed);
-}
-
-/* 后台线程：消费 ring buffer + io_uring 批量写 */
-static void *aof_worker(void *arg) {
-    (void)arg;
-    signal(SIGPIPE, SIG_IGN);
-
-    /* Tracks how far we've consumed (monotonic, local to worker) */
-    uint32_t t = atomic_load_explicit(&g_aof.tail, memory_order_relaxed);
-
-    while (1) {
-        uint32_t h = atomic_load_explicit(&g_aof.head, memory_order_acquire);
-        int batch_n = 0;
-        int submitted = 0;
-
-        /* Drain up to AOF_BATCH_MAX entries from the ring */
-        while (t != h && batch_n < AOF_BATCH_MAX) {
-            aof_slot_t *s = &g_aof.slots[t & AOF_RING_MASK];
-
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&g_aof.ring);
-            if (!sqe) {
-                io_uring_submit(&g_aof.ring);
-                for (int i = 0; i < submitted; i++) {
-                    struct io_uring_cqe *cqe;
-                    if (io_uring_wait_cqe(&g_aof.ring, &cqe) == 0)
-                        io_uring_cqe_seen(&g_aof.ring, cqe);
-                }
-                submitted = 0;
-                sqe = io_uring_get_sqe(&g_aof.ring);
-                if (!sqe) continue;
-            }
-            io_uring_prep_write(sqe, g_aof.fd, s->buf, s->len, (uint64_t)-1);
-            io_uring_sqe_set_data(sqe, NULL);
-            submitted++;
-            batch_n++;
-            t++;
-        }
-
-        /* Commit the batch and wait for completions */
-        if (submitted > 0) {
-            io_uring_submit(&g_aof.ring);
-            for (int i = 0; i < submitted; i++) {
-                struct io_uring_cqe *cqe = NULL;
-                if (io_uring_wait_cqe(&g_aof.ring, &cqe) == 0) {
-                    if (cqe->res < 0) {
-                        fprintf(stderr, "[AOF] io_uring write error: %s\n",
-                                strerror(-cqe->res));
-                    }
-                    io_uring_cqe_seen(&g_aof.ring, cqe);
-                }
-            }
-            /* Publish consumed entries to producer */
-            atomic_store_explicit(&g_aof.tail, t, memory_order_release);
-        }
-
-        /* Check for shutdown */
-        if (!atomic_load_explicit(&g_aof.running, memory_order_relaxed)) {
-            /* Drain any stragglers */
-            h = atomic_load_explicit(&g_aof.head, memory_order_acquire);
-            if (t == h) break;
-            continue;
-        }
-
-        /* Ring still empty after our batch? Wait on eventfd. */
-        h = atomic_load_explicit(&g_aof.head, memory_order_acquire);
-        if (t != h) continue;
-
-        uint64_t cnt;
-        ssize_t nr = read(g_aof.evt_fd, &cnt, sizeof(cnt));
-        if (nr < 0 && errno != EAGAIN && errno != EINTR) break;
-    }
-
-    if (g_aof.fd >= 0) fsync(g_aof.fd);
-    return NULL;
-}
-
 int aof_async_init(void) {
-    if (g_aof.fd >= 0) return 0;
-
-    const char *path = persist_path(AOF_REL);
-    g_aof.fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (g_aof.fd < 0) {
-        fprintf(stderr, "[AOF] open %s failed: %s\n", path, strerror(errno));
-        return -1;
+    /* Standalone WAL mode: when rdma_sync is off, start the WAL module
+     * here so that AOF persistence (wal/incr.wal) still works. */
+    if (!ebpf_incr_is_started()) {
+        ebpf_incr_master_start();
     }
-
-    g_aof.evt_fd = eventfd(0, EFD_NONBLOCK);
-    if (g_aof.evt_fd < 0) {
-        fprintf(stderr, "[AOF] eventfd failed: %s\n", strerror(errno));
-        close(g_aof.fd);
-        g_aof.fd = -1;
-        return -1;
-    }
-
-    if (io_uring_queue_init(AOF_URING_DEPTH, &g_aof.ring, 0) < 0) {
-        fprintf(stderr, "[AOF] io_uring_queue_init failed\n");
-        close(g_aof.evt_fd); g_aof.evt_fd = -1;
-        close(g_aof.fd);     g_aof.fd     = -1;
-        return -1;
-    }
-    g_aof.ring_inited = 1;
-    atomic_store_explicit(&g_aof.running, 1, memory_order_relaxed);
-
-    if (pthread_create(&g_aof.tid, NULL, aof_worker, NULL) != 0) {
-        fprintf(stderr, "[AOF] pthread_create failed\n");
-        io_uring_queue_exit(&g_aof.ring);
-        g_aof.ring_inited = 0;
-        close(g_aof.evt_fd); g_aof.evt_fd = -1;
-        close(g_aof.fd);     g_aof.fd     = -1;
-        return -1;
-    }
-
-    pthread_atfork(NULL, NULL, aof_atfork_child);
-
-    printf("[AOF] async writer started (uring depth=%d, ring=%d slots)\n",
-           AOF_URING_DEPTH, AOF_RING_SIZE);
+    printf("[AOF] unified with WAL — writes go to %s\n", persist_path(WAL_REL));
     return 0;
 }
 
 void aof_async_shutdown(void) {
-    if (g_aof.fd < 0) return;
-
-    atomic_store_explicit(&g_aof.running, 0, memory_order_relaxed);
-    /* Wake worker if it's blocked on eventfd */
-    uint64_t one = 1;
-    ssize_t wr = write(g_aof.evt_fd, &one, sizeof(one));
-    (void)wr;
-
-    pthread_join(g_aof.tid, NULL);
-
-    if (g_aof.ring_inited) {
-        io_uring_queue_exit(&g_aof.ring);
-        g_aof.ring_inited = 0;
-    }
-    if (g_aof.evt_fd >= 0) { close(g_aof.evt_fd); g_aof.evt_fd = -1; }
-    close(g_aof.fd);
-    g_aof.fd = -1;
-
-    /* Free slot buffers */
-    for (int i = 0; i < AOF_RING_SIZE; i++) {
-        free(g_aof.slots[i].buf);
-        g_aof.slots[i].buf = NULL;
-        g_aof.slots[i].cap = 0;
-    }
-    printf("[AOF] async writer stopped\n");
+    /* WAL shutdown is handled by ebpf_incr_stop() */
 }
 
 void aof_async_append(const char *buf, int len) {
-    if (g_aof.fd < 0 || !buf || len <= 0) return;
-
-    uint32_t h = atomic_load_explicit(&g_aof.head, memory_order_relaxed);
-    uint32_t t;
-
-    /* Ring full — spin briefly; consumer should be faster than producer */
-    for (int spin = 0; ; spin++) {
-        t = atomic_load_explicit(&g_aof.tail, memory_order_acquire);
-        if (h - t < AOF_RING_SIZE) break;
-        if (spin < 100) {
-            /* short busy-wait */
-        } else {
-            usleep(1000);  /* back off to let consumer catch up */
-        }
-    }
-
-    uint32_t idx = h & AOF_RING_MASK;
-    aof_slot_t *s = &g_aof.slots[idx];
-    aof_slot_ensure(s, len);
-    memcpy(s->buf, buf, (size_t)len);
-    s->len = len;
-
-    atomic_store_explicit(&g_aof.head, h + 1, memory_order_release);
-
-    /* Wake consumer */
-    uint64_t one = 1;
-    ssize_t wr = write(g_aof.evt_fd, &one, sizeof(one));
-    (void)wr;
+    wal_repl_append(buf, len);
 }
 
 /* =============================================================================
@@ -944,8 +744,13 @@ void rdb_load_mmap(void) {
 }
 
 void aof_reload_mmap(void) {
-    int fd = open(persist_path(AOF_REL), O_RDONLY);
+    /* Phase 4: try WAL file first; fall back to legacy RESP AOF if absent */
+    int fd = open(persist_path(WAL_REL), O_RDONLY);
+    int wal_format = (fd >= 0);
+    if (!wal_format)
+        fd = open(persist_path(AOF_REL), O_RDONLY);
     if (fd < 0) return;
+
     struct stat st;
     if (fstat(fd, &st) < 0 || st.st_size <= 0) { close(fd); return; }
     size_t fsz = (size_t)st.st_size;
@@ -955,33 +760,59 @@ void aof_reload_mmap(void) {
     if (base == MAP_FAILED) return;
     madvise(base, fsz, MADV_SEQUENTIAL);
 
-    printf("[AOF] mmap load start, size=%zu\n", fsz);
+    printf("[AOF] %s load start, size=%zu\n",
+           wal_format ? "WAL" : "legacy AOF", fsz);
 
     g_in_reload = 1;
-
-    const char *p = base;
-    long remaining = (long)fsz;
     DynBuf wb;
     dynbuf_init(&wb, BUF_INIT_CAP);
-
     kvs_token_t tokens[KVS_MAX_TOKENS];
+    int loaded = 0;
 
-    while (remaining > 0) {
-        int argc = 0;
-        int cmd_len = resp_parse_slices(p, (int)remaining,
-                                        tokens, KVS_MAX_TOKENS, &argc);
-        if (cmd_len <= 0) break;
-
-        dynbuf_clear(&wb);
-        /* 零拷贝：直接传递 mmap 指针和 token slice，无需 malloc+memcpy */
-        kvs_dispatch(tokens, argc, p, cmd_len, &wb, NULL);
-
-        p += cmd_len;
-        remaining -= cmd_len;
+    if (wal_format) {
+        const char *p   = base;
+        const char *end = base + fsz;
+        while (p + WAL_HDR_SIZE <= end) {
+            wal_record_hdr_t hdr;
+            memcpy(&hdr, p, (size_t)WAL_HDR_SIZE);
+            if (hdr.magic != WAL_MAGIC) break;
+            if (p + WAL_HDR_SIZE + hdr.length > end) break;
+            const char *payload = p + WAL_HDR_SIZE;
+            uint32_t computed = (uint32_t)crc32(0,
+                (const Bytef *)payload, (uInt)hdr.length);
+            if (hdr.crc32 != computed) {
+                fprintf(stderr, "[AOF] WAL CRC32 mismatch seq=%" PRIu64
+                        ", stopping replay\n", hdr.seq);
+                break;
+            }
+            int argc = 0;
+            int cmd_len = resp_parse_slices(payload, (int)hdr.length,
+                                            tokens, KVS_MAX_TOKENS, &argc);
+            if (cmd_len > 0) {
+                dynbuf_clear(&wb);
+                kvs_dispatch(tokens, argc, payload, cmd_len, &wb, NULL);
+                loaded++;
+            }
+            p += WAL_HDR_SIZE + hdr.length;
+        }
+    } else {
+        const char *p = base;
+        long remaining = (long)fsz;
+        while (remaining > 0) {
+            int argc = 0;
+            int cmd_len = resp_parse_slices(p, (int)remaining,
+                                            tokens, KVS_MAX_TOKENS, &argc);
+            if (cmd_len <= 0) break;
+            dynbuf_clear(&wb);
+            kvs_dispatch(tokens, argc, p, cmd_len, &wb, NULL);
+            p += cmd_len;
+            remaining -= cmd_len;
+            loaded++;
+        }
     }
 
     dynbuf_free(&wb);
     munmap(base, fsz);
     g_in_reload = 0;
-    printf("[AOF] mmap load finished\n");
+    printf("[AOF] load finished, %d commands replayed\n", loaded);
 }

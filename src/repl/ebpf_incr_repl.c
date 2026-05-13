@@ -5,7 +5,7 @@
  * Architecture (refactored):
  *   - eBPF uprobe: captures write commands, assigns atomic seq in kernel,
  *     writes dynamically-sized events into ring buffer
- *   - Consumer thread: polls ring buffer, appends to pre-allocated backlog,
+ *   - Consumer thread: polls ring buffer, appends to lazy-alloc backlog,
  *     pushes to per-slave lock-free SPSC queues
  *   - Per-slave send threads: drain SPSC queues, TCP sendmsg(writev)
  *   - Fullsync state machine: IDLE -> INPROGRESS -> CATCHUP -> IDLE
@@ -15,7 +15,7 @@
  *
  * Copy path (3 user-space copies + kernel TCP):
  *   uprobe capture -> ringbuf (mmap'd, zero-copy to userspace)
- *   -> backlog pre-allocated slot (memcpy) + SPSC slot (memcpy)
+ *   -> backlog lazy-alloc slot (memcpy) + SPSC slot (memcpy)
  *   -> TCP sendmsg(writev) (kernel copy)
  *
  * Contrast with old design: removed g_mu, DynBuf concatenation,
@@ -54,6 +54,11 @@ static slave_spsc_t       g_slaves[INCR_MAX_SLAVES];
 static backlog_slot_t      g_backlog[INCR_BACKLOG_CAP];
 static size_t              g_backlog_start = 0;
 static size_t              g_backlog_count = 0;
+
+/* Replication ID — generated once at master start.
+ * Same semantics as Redis replid: a new ID means the replication
+ * stream is not continuous with a previous one, forcing fullsync. */
+static char                g_replid[INCR_REPL_ID_LEN + 1];
 
 /* Narrow mutex: protects backlog metadata (start/count/valid).
  * Held by consumer thread (backlog_append) and slave/replay paths.
@@ -294,13 +299,59 @@ static void backlog_append(uint64_t seq, const char *payload,
         g_backlog_count++;
     }
 
+    /* Lazy buffer grow (same pattern as spsc_slot_ensure).
+     * Start at 4 KB, double until cmd fits. Typical 100-byte SET
+     * uses 4 KB; only long commands trigger realloc. */
+    if (g_backlog[idx].msg_cap < (int)length) {
+        int new_cap = g_backlog[idx].msg_cap ? g_backlog[idx].msg_cap : 4096;
+        while (new_cap < (int)length)
+            new_cap *= 2;
+        char *nb = (char *)realloc(g_backlog[idx].msg, (size_t)new_cap);
+        if (!nb) {
+            pthread_mutex_unlock(&g_backlog_mu);
+            return;
+        }
+        g_backlog[idx].msg     = nb;
+        g_backlog[idx].msg_cap = new_cap;
+    }
+
     g_backlog[idx].seq    = seq;
     g_backlog[idx].length = length;
     g_backlog[idx].valid  = 1;
-    if (g_backlog[idx].msg && length > 0)
+    if (length > 0)
         memcpy(g_backlog[idx].msg, payload, (size_t)length);
 
     pthread_mutex_unlock(&g_backlog_mu);
+}
+
+/* Returns the oldest seq still in backlog, or 0 if empty.
+ * Caller must hold g_backlog_mu. */
+static uint64_t backlog_oldest_seq_locked(void)
+{
+    if (g_backlog_count == 0)
+        return 0;
+    return g_backlog[g_backlog_start].seq;
+}
+
+/* Check if a given seq is still present in the backlog ring.
+ * Called from TCP listener before accepting a reconnection. */
+static int backlog_has_seq_locked(uint64_t seq)
+{
+    /* Empty backlog: nothing to replay, any seq is acceptable.
+     * Live streaming picks up from the current position. */
+    if (g_backlog_count == 0)
+        return 1;
+    uint64_t oldest = g_backlog[g_backlog_start].seq;
+    uint64_t newest = g_backlog[(g_backlog_start + g_backlog_count - 1)
+                                % INCR_BACKLOG_CAP].seq;
+    /* Accept seq == newest + 1: slave is fully caught up, nothing to
+     * replay but live streaming picks up from the current position. */
+    return (seq >= oldest && seq <= newest + 1);
+}
+
+const char *ebpf_incr_get_replid(void)
+{
+    return g_replid;
 }
 
 /* ================================================================
@@ -360,32 +411,37 @@ uint64_t ebpf_incr_fullsync_begin(void)
 
 void ebpf_incr_fullsync_send_done(void)
 {
+    /* Collect deferred slave info under narrow lock.
+     * Must NOT call slave_start() while holding g_backlog_mu —
+     * slave_start() itself locks g_backlog_mu for backlog replay,
+     * and PTHREAD_MUTEX_INITIALIZER is non-recursive (deadlock). */
+    int deferred_fds[INCR_MAX_SLAVES];
+    int deferred_slots[INCR_MAX_SLAVES];
+    int deferred_count = 0;
+    int waiting_slaves  = 0;
+
     pthread_mutex_lock(&g_backlog_mu);
 
-    int waiting_slaves = 0;
     for (int i = 0; i < INCR_MAX_SLAVES; i++) {
         slave_spsc_t *q = &g_slaves[i];
         if (!q->active)
             continue;
         waiting_slaves++;
 
-        /* If slave was deferred (INPROGRESS), init and replay backlog now */
         if (q->evt_fd < 0) {
-            int fd = q->fd;
-            if (slave_start(q, fd, g_fullsync_base_seq) != 0)
-                continue;
-        } else {
-            /* Replay any backlog entries not yet sent */
-            for (size_t j = 0; j < g_backlog_count; j++) {
-                size_t idx = (g_backlog_start + j) % INCR_BACKLOG_CAP;
-                backlog_slot_t *rec = &g_backlog[idx];
-                if (!rec->valid || rec->seq < g_fullsync_base_seq)
-                    continue;
-                if (rec->msg && spsc_push(q, rec->seq, rec->msg,
-                                          rec->length) != 0)
-                    slave_close(q);
-            }
+            deferred_fds[deferred_count]   = q->fd;
+            deferred_slots[deferred_count] = i;
+            deferred_count++;
         }
+    }
+
+    pthread_mutex_unlock(&g_backlog_mu);
+
+    /* Start deferred slaves outside the lock */
+    for (int j = 0; j < deferred_count; j++) {
+        int slot = deferred_slots[j];
+        slave_start(&g_slaves[slot], deferred_fds[j],
+                    g_fullsync_base_seq);
     }
 
     if (waiting_slaves > 0) {
@@ -399,8 +455,6 @@ void ebpf_incr_fullsync_send_done(void)
                "(base_seq=%llu, waiting for slave)\n",
                (unsigned long long)g_fullsync_base_seq);
     }
-
-    pthread_mutex_unlock(&g_backlog_mu);
 }
 
 void ebpf_incr_fullsync_finish(void)
@@ -486,17 +540,21 @@ static int on_incr_event(void *ctx, void *data, size_t sz)
 {
     (void)ctx;
 
-    /* Ringbuf record is the full struct incr_event (matches BPF side).
-     * Fixed-size reservation: sizeof(incr_event) = 16 + INCR_MAX_CMD. */
-    if (sz < sizeof(incr_event))
+    /* Tiered ringbuf record: 16-byte header + variable payload.
+     * BPF reserves sizeof(hdr) + tier_constant (4K/64K/256K),
+     * so the ringbuf record may be larger than the actual data. */
+    if (sz < INCR_EVENT_HDR_SZ)
         return 0;
 
-    incr_event *e = (incr_event *)data;
+    incr_event_hdr *hdr  = (incr_event_hdr *)data;
+    const char     *payload = (const char *)(hdr + 1);
 
-    if (e->length == 0 || e->length > INCR_MAX_CMD)
+    if (hdr->length == 0 || hdr->length > INCR_MAX_CMD)
+        return 0;
+    if (sz < INCR_EVENT_HDR_SZ + hdr->length)
         return 0;
 
-    uint64_t seq = e->seq;
+    uint64_t seq = hdr->seq;
 
     /* ── Hot path: NO global mutex ── */
 
@@ -507,12 +565,12 @@ static int on_incr_event(void *ctx, void *data, size_t sz)
     if (seq > g_seq)
         g_seq = seq;
 
-    /* Append to pre-allocated backlog (narrow lock, no malloc) */
-    backlog_append(seq, e->msg, e->length);
+    /* Append to lazy-alloc backlog (narrow lock, no malloc) */
+    backlog_append(seq, payload, hdr->length);
 
     /* Phase 2: if kernel-level fanout is registered, use it */
     if (g_fanout_fn) {
-        g_fanout_fn(NULL, seq, e->msg, e->length);
+        g_fanout_fn(NULL, seq, payload, hdr->length);
         return 0;
     }
 
@@ -523,7 +581,7 @@ static int on_incr_event(void *ctx, void *data, size_t sz)
             slave_spsc_t *q = &g_slaves[i];
             if (!q->active)
                 continue;
-            if (spsc_push(q, seq, e->msg, e->length) != 0) {
+            if (spsc_push(q, seq, payload, hdr->length) != 0) {
                 fprintf(stderr, "[INCR-REPL] SPSC full slot %d, closing\n", i);
                 slave_close(q);
             }
@@ -618,8 +676,8 @@ static void *tcp_listener_thread(void *arg)
         printf("[INCR-REPL] incr connection from %s:%d\n", peer,
                ntohs(addr.sin_port));
 
-        /* Read INCR_SYNC <base_seq> handshake line */
-        char line[256];
+        /* Read INCR_SYNC [<replid>] <seq> handshake line */
+        char line[512];
         int line_len = tcp_read_line(fd, line, (int)sizeof(line));
         if (line_len <= 0) {
             fprintf(stderr, "[INCR-REPL] failed to read INCR_SYNC handshake "
@@ -629,15 +687,87 @@ static void *tcp_listener_thread(void *arg)
         }
 
         uint64_t slave_seq = 0;
+        char slave_replid[INCR_REPL_ID_LEN + 1] = {0};
         int is_sync = 0;
+        int has_replid = 0;
+
+        /* Parse: "INCR_SYNC [replid] <seq>" — replid is optional (legacy) */
         if (strncmp(line, INCR_SYNC_CMD, strlen(INCR_SYNC_CMD)) == 0) {
             is_sync = 1;
-            slave_seq = strtoull(line + strlen(INCR_SYNC_CMD), NULL, 10);
+            const char *p = line + strlen(INCR_SYNC_CMD);
+            if (*p == ' ') p++;
+
+            /* Try to parse replid (non-numeric token) + seq, or just seq */
+            const char *after_first = strchr(p, ' ');
+            if (after_first) {
+                size_t token_len = (size_t)(after_first - p);
+                /* If first token looks like a replid (not purely numeric), parse it */
+                int is_numeric = 1;
+                for (size_t k = 0; k < token_len; k++) {
+                    if (p[k] < '0' || p[k] > '9') { is_numeric = 0; break; }
+                }
+                if (!is_numeric && token_len <= INCR_REPL_ID_LEN) {
+                    memcpy(slave_replid, p, token_len);
+                    has_replid = 1;
+                    p = after_first + 1;
+                }
+            }
+            slave_seq = strtoull(p, NULL, 10);
         }
 
-        printf("[INCR-REPL] slave %s handshake: %s seq=%llu\n",
+        /* ── Replid check (Redis PSYNC-style) ── */
+        if (has_replid && strcmp(slave_replid, g_replid) != 0) {
+            printf("[INCR-REPL] slave %s replid mismatch (ours=%s theirs=%s), "
+                   "requesting fullresync\n",
+                   peer, g_replid, slave_replid);
+            char resp[256];
+            int rlen = snprintf(resp, sizeof(resp),
+                                INCR_FULLRESYNC " %s\r\n", g_replid);
+            send(fd, resp, (size_t)rlen, MSG_NOSIGNAL);
+            close(fd);
+            continue;
+        }
+
+        /* ── Backlog eviction check ── */
+        if (is_sync) {
+            pthread_mutex_lock(&g_backlog_mu);
+            int in_backlog = backlog_has_seq_locked(slave_seq);
+            pthread_mutex_unlock(&g_backlog_mu);
+
+            if (!in_backlog && slave_seq > 0) {
+                printf("[INCR-REPL] slave %s seq=%llu evicted from backlog, "
+                       "requesting fullresync\n",
+                       peer, (unsigned long long)slave_seq);
+                char resp[256];
+                int rlen = snprintf(resp, sizeof(resp),
+                                    INCR_FULLRESYNC " %s\r\n", g_replid);
+                send(fd, resp, (size_t)rlen, MSG_NOSIGNAL);
+                close(fd);
+                continue;
+            }
+        }
+
+        printf("[INCR-REPL] slave %s handshake: %s%s seq=%llu\n",
                peer, is_sync ? "INCR_SYNC" : "LEGACY",
+               has_replid ? " (with replid)" : "",
                (unsigned long long)slave_seq);
+
+        /* Send +CONTINUE <replid> before starting the binary stream.
+         * For ALL INCR_SYNC commands so the slave learns the replid
+         * for future reconnections.  Legacy slaves that send a plain
+         * number also get the response. */
+        if (is_sync) {
+            char resp[256];
+            int rlen = snprintf(resp, sizeof(resp),
+                                INCR_CONTINUE " %s\r\n", g_replid);
+            ssize_t nsent = send(fd, resp, (size_t)rlen, MSG_NOSIGNAL);
+            if (nsent != (ssize_t)rlen) {
+                fprintf(stderr, "[INCR-REPL] +CONTINUE send failed: %s\n",
+                        strerror(errno));
+                close(fd);
+                continue;
+            }
+        }
 
         /* Register slave with seq-based catchup */
         if (ebpf_incr_add_slave(fd, slave_seq) != 0) {
@@ -760,12 +890,14 @@ int ebpf_incr_master_start(void)
     g_fullsync_base_seq = 0;
     g_fanout_fn        = NULL;
 
-    /* Pre-allocate backlog slot buffers (no malloc in hot path) */
-    for (size_t i = 0; i < INCR_BACKLOG_CAP; i++) {
-        g_backlog[i].msg     = (char *)malloc(INCR_MAX_CMD);
-        g_backlog[i].msg_cap = g_backlog[i].msg ? INCR_MAX_CMD : 0;
-        g_backlog[i].valid   = 0;
-    }
+    /* Generate replication ID (Redis-style: pid:timestamp).
+     * Changes every master restart → forces fullsync on reconnect. */
+    snprintf(g_replid, sizeof(g_replid), "%d:%lx",
+             getpid(), (unsigned long)time(NULL));
+
+    /* Backlog slots use lazy buffer allocation (4 KB initial, grow
+     * on demand).  Zero-init is enough — backlog_append allocates. */
+    memset(g_backlog, 0, sizeof(g_backlog));
 
     /* Initialize slave SPSC queues */
     for (int i = 0; i < INCR_MAX_SLAVES; i++) {
@@ -824,7 +956,7 @@ int ebpf_incr_master_start(void)
     }
 
     printf("[INCR-REPL] incremental sync module ready (seq in eBPF, "
-           "SPSC fanout active, backlog=%d slots pre-allocated)\n",
+           "SPSC fanout active, backlog=%d slots lazy-alloc)\n",
            INCR_BACKLOG_CAP);
     return 0;
 
@@ -852,7 +984,7 @@ err_close:
         bpf_object__close(g_obj);
         g_obj = NULL;
     }
-    /* Free pre-allocated backlog buffers on error */
+    /* Free lazy-alloc backlog buffers on error */
     for (size_t i = 0; i < INCR_BACKLOG_CAP; i++) {
         free(g_backlog[i].msg);
         g_backlog[i].msg = NULL;
@@ -889,7 +1021,7 @@ void ebpf_incr_stop(void)
             free(g_slaves[i].slots[j].msg);
     }
 
-    /* Free pre-allocated backlog buffers */
+    /* Free lazy-alloc backlog buffers */
     for (size_t i = 0; i < INCR_BACKLOG_CAP; i++) {
         free(g_backlog[i].msg);
         g_backlog[i].msg   = NULL;

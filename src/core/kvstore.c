@@ -693,9 +693,21 @@ int main(int argc, char *argv[]) {
         if (kvs_config.rdma_role == ROLE_MASTER) {
             rdma_repl_master_start();
         } else {
-            if (rdma_repl_slave_run() != 0)
-                fprintf(stderr, "[RDMA-REPL] slave full-sync failed; "
-                                "continuing with local state\n");
+            /* Slave: fullsync + incr loop.
+             * If incr reconnection fails and master requests a fresh
+             * fullsync, re-run the fullsync cycle. */
+            for (int fullsync_attempt = 0; fullsync_attempt < 5; fullsync_attempt++) {
+                if (rdma_repl_slave_run() != 0) {
+                    fprintf(stderr, "[RDMA-REPL] slave full-sync failed; "
+                                    "continuing with local state\n");
+                    break;
+                }
+                if (!rdma_repl_slave_need_fullresync())
+                    break;
+                printf("[RDMA-REPL] slave: fullresync requested, "
+                       "re-running fullsync (attempt %d)\n",
+                       fullsync_attempt + 2);
+            }
         }
     } else {
         printf("[RDMA-REPL] rdma replication disabled by config\n");

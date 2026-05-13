@@ -24,19 +24,22 @@
 #define INCR_BACKLOG_CAP 16384
 
 /* ================================================================
- * Ring buffer event (must match BPF side struct incr_event)
+ * Ring buffer event (must match BPF side struct incr_event_hdr)
  *
- * Fixed-size struct: 16-byte header + INCR_MAX_CMD payload inline.
- * BPF uses this for constant-size ringbuf reservation (kernel 6.8
- * verifier requires compile-time-constant size).
+ * Header (16 bytes) followed by variable-length payload in the
+ * ringbuf record. Total record size = sizeof(incr_event_hdr) + length.
+ * BPF uses tiered constant-size reservations (4K/64K/256K).
  * ================================================================ */
+#define INCR_EVENT_HDR_SZ  16
 
 typedef struct {
     uint64_t seq;
     uint32_t length;
     uint32_t _pad;         /* explicit padding to 16 bytes */
-    char     msg[INCR_MAX_CMD];
-} incr_event;
+} incr_event_hdr;
+
+/* Backward-compat alias */
+#define incr_event incr_event_hdr
 
 /* ================================================================
  * Pre-allocated backlog slot (replaces malloc-based model)
@@ -150,8 +153,26 @@ void ebpf_incr_fullsync_set_base_seq(uint64_t seq);
  * When set, on_incr_event calls this instead of SPSC push. */
 void ebpf_incr_set_fanout(incr_fanout_fn fn);
 
+/* --- Replication ID (Redis-style replid for reconnection) --- */
+
+#define INCR_REPL_ID_LEN  40
+
+/* Returns the master's current replication ID.
+ * Slave stores this and presents it on reconnect — if it changed,
+ * the master will request a fresh fullsync. */
+const char *ebpf_incr_get_replid(void);
+
 /* TCP incr handshake: slave sends this after fullsync to request
- * catchup from a specific base_seq.                               */
-#define INCR_SYNC_CMD  "INCR_SYNC"
+ * catchup from a specific base_seq.
+ *   Slave:  INCR_SYNC <replid> <last_seq>\r\n
+ *   Master: +CONTINUE\r\n            → streaming backlog + live
+ *           -FULLRESYNC <replid>\r\n  → slave must redo fullsync
+ *
+ * The response line is sent BEFORE the binary wire stream,
+ * and only for the new protocol.  Legacy slaves that don't send
+ * a replid get the old behaviour (direct stream, no response).  */
+#define INCR_SYNC_CMD    "INCR_SYNC"
+#define INCR_CONTINUE    "+CONTINUE"
+#define INCR_FULLRESYNC  "-FULLRESYNC"
 
 #endif /* EBPF_INCR_REPL_H */

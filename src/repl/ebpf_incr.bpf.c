@@ -6,10 +6,12 @@
  * sequence number (global_seq) so the user-space fullsync coordinator
  * can precisely determine the cut point for fork-based snapshots.
  *
- * Ring buffer: fixed-size records (INCR_MAX_CMD + header).
- * Kernel 6.8 verifier requires constant-size reservations.
- * 256 MB ringbuf holds ~998 events — sufficient for small MQ workloads
- * with the lock-free userspace SPSC consumer.
+ * Ring buffer: tiered constant-size reservations to satisfy kernel 6.8
+ * verifier's compile-time-constant requirement while keeping records
+ * proportional to actual command size.
+ *   4 KB tier  —  commands   ≤ 4 KB   (~65K events in 256 MB ringbuf)
+ *  64 KB tier  —  commands  ≤ 64 KB   (~4K events)
+ * 256 KB tier  —  commands ≤ 256 KB   (~998 events, fallback)
  */
 
 #include "vmlinux.h"
@@ -19,11 +21,16 @@
 #define INCR_MAX_CMD  262144               /* 256 KB — max RESP command */
 #define RINGBUF_SIZE  (256 * 1024 * 1024)  /* 256 MB */
 
-struct incr_event {
+/* Tiered reservation sizes — each is a compile-time constant.
+ * The verifier accepts these because each branch passes a literal. */
+#define TIER_SMALL    4096                 /* 4 KB */
+#define TIER_MEDIUM   65536                /* 64 KB */
+#define TIER_LARGE    INCR_MAX_CMD         /* 256 KB */
+
+struct incr_event_hdr {
 	__u64    seq;
 	__u32    length;
 	__u32    _pad;
-	char     msg[INCR_MAX_CMD];
 };
 
 struct incr_stats {
@@ -74,34 +81,58 @@ int on_kvs_rdma_incr_probe(struct pt_regs *ctx)
 	__u64 *seq_p = bpf_map_lookup_elem(&global_seq, &zero);
 	__u64 cur_seq = seq_p ? __sync_fetch_and_add(seq_p, 1) : 0;
 
-	/* Fixed-size reservation (kernel 6.8 verifier requires constant).
-	 * 256 MB ringbuf holds ~998 events at 256 KB each.
-	 * Acceptable for small-MQ workloads with our lock-free consumer. */
-	struct incr_event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-	if (!e) {
-		if (st)
-			__sync_fetch_and_add(&st->dropped, 1);
+	/* Tiered constant-size reservation.
+	 * Compare raw_len directly (not (u32)raw_len) so the verifier
+	 * narrows the register that bpf_probe_read_user uses for size.
+	 * Each branch contains the full lifecycle so the verifier checks
+	 * each path independently without cross-branch state merging.  */
+	struct incr_event_hdr *e;
+
+	if (raw_len <= TIER_SMALL) {
+		e = bpf_ringbuf_reserve(&rb, sizeof(*e) + TIER_SMALL, 0);
+		if (!e) goto drop;
+		e->seq    = cur_seq;
+		e->length = (__u32)raw_len;
+		if (bpf_probe_read_user((void *)(e + 1), e->length, msg) < 0) {
+			bpf_ringbuf_discard(e, 0);
+			goto drop;
+		}
+		bpf_ringbuf_submit(e, 0);
+		if (st) __sync_fetch_and_add(&st->emitted, 1);
 		return 0;
 	}
 
-	e->seq    = cur_seq;
-	e->length = (__u32)raw_len;
-
-	if (e->length == 0 || e->length > INCR_MAX_CMD) {
-		bpf_ringbuf_discard(e, 0);
+	if (raw_len <= TIER_MEDIUM) {
+		e = bpf_ringbuf_reserve(&rb, sizeof(*e) + TIER_MEDIUM, 0);
+		if (!e) goto drop;
+		e->seq    = cur_seq;
+		e->length = (__u32)raw_len;
+		if (bpf_probe_read_user((void *)(e + 1), e->length, msg) < 0) {
+			bpf_ringbuf_discard(e, 0);
+			goto drop;
+		}
+		bpf_ringbuf_submit(e, 0);
+		if (st) __sync_fetch_and_add(&st->emitted, 1);
 		return 0;
 	}
 
-	if (bpf_probe_read_user(e->msg, e->length, msg) < 0) {
-		bpf_ringbuf_discard(e, 0);
-		if (st)
-			__sync_fetch_and_add(&st->dropped, 1);
+	/* TIER_LARGE fallback */
+	{
+		e = bpf_ringbuf_reserve(&rb, sizeof(*e) + TIER_LARGE, 0);
+		if (!e) goto drop;
+		e->seq    = cur_seq;
+		e->length = (__u32)raw_len;
+		if (bpf_probe_read_user((void *)(e + 1), e->length, msg) < 0) {
+			bpf_ringbuf_discard(e, 0);
+			goto drop;
+		}
+		bpf_ringbuf_submit(e, 0);
+		if (st) __sync_fetch_and_add(&st->emitted, 1);
 		return 0;
 	}
 
-	bpf_ringbuf_submit(e, 0);
-	if (st)
-		__sync_fetch_and_add(&st->emitted, 1);
+drop:
+	if (st) __sync_fetch_and_add(&st->dropped, 1);
 	return 0;
 }
 

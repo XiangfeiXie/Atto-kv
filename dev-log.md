@@ -1161,6 +1161,72 @@ RDMA 流式全量同步在 Phase 9 已能正常工作，但存在严重性能瓶
 
 ---
 
+## 2026-05-13 — Phase 14: Redis PSYNC 风格断开重连 + BPF Tiered Ringbuf + 延迟 Backlog
+
+### Overview
+
+实现 Redis PSYNC 风格的增量同步断开重连机制。Master 侧生成 replid（`pid:timestamp`），通过 `+CONTINUE <replid>` 握手响应传给 Slave。Slave 储存 replid 后在重连时发送 `INCR_SYNC <replid> <next_seq>`，Master 验证 replid 一致性 + backlog 是否仍含该 seq，决定继续增量或请求全量同步。同时实施 tiered ringbuf（4KB/64KB/256KB 三级预留）和 backlog lazy allocation（4KB 起 realloc×2），消除 4GB 预分配浪费。
+
+### 协议设计 (PSYNC-style)
+
+```
+首次连接（fullsync 之后）:
+  Slave → Master:  INCR_SYNC <base_seq>\r\n
+  Master → Slave:  +CONTINUE <replid>\r\n     ← Slave 从此行提取并储存 replid
+  Master → Slave:  [binary wire frames...]
+
+重连:
+  Slave → Master:  INCR_SYNC <replid> <next_seq>\r\n
+  replid 匹配 + seq 未淘汰 → +CONTINUE <replid>\r\n  → 二进制流
+  replid 不匹配          → -FULLRESYNC <new_replid>\r\n → Slave 重新全量
+  seq 已被 backlog 淘汰   → -FULLRESYNC <new_replid>\r\n → Slave 重新全量
+```
+
+### 修改文件
+
+- **`src/repl/ebpf_incr.bpf.c`** — Tiered constant-size ringbuf reservation：
+  - 三级预留：`TIER_SMALL=4KB`、`TIER_MEDIUM=64KB`、`TIER_LARGE=256KB`
+  - 每分支完整生命周期（reserve→probe_read→submit→return），防止 verifier 状态合并
+  - 100B SET 命令从 262KB → 4.1KB（~65× 改善），256MB ringbuf 容量 ~65,000 events
+  - 关键技巧：直接比较 `raw_len`（非 `(u32)raw_len`）使 verifier 能缩小同一寄存器的范围
+
+- **`src/repl/ebpf_incr_repl.h`** — 新增常量/API：
+  - `INCR_REPL_ID_LEN 40`、`INCR_SYNC_CMD`、`INCR_CONTINUE`、`INCR_FULLRESYNC`
+  - `ebpf_incr_get_replid()` / `ebpf_incr_fullsync_set_base_seq()`
+
+- **`src/repl/ebpf_incr_repl.c`** — Master 侧重连逻辑：
+  - `g_replid[41]`：master 启动时 `snprintf("%d:%lx", getpid(), time(NULL))`
+  - Backlog lazy allocation：slot msg 从全局预分配 → 按需 realloc（4KB ×2 增长）
+  - `backlog_oldest_seq_locked()` / `backlog_has_seq_locked()`：淘汰检测辅助函数
+  - `tcp_listener_thread()`：解析 replid + seq + 淘汰检测 + 发送 `+CONTINUE`/`-FULLRESYNC`
+  - **Deadlock fix**：`ebpf_incr_fullsync_send_done()` 在锁内收集延迟 slave，释放锁后才调用 `slave_start()`（避免 `g_backlog_mu` 重入死锁）
+
+- **`src/repl/rdma_repl.c`** — Slave 侧重连 + 全量再同步循环：
+  - `g_slave_replid` / `g_slave_base_seq` / `g_slave_need_fullresync`：重连状态
+  - `incr_tcp_slave_recv_thread()` 完全重写：
+    - 外层循环：连接生命周期管理（connect→recv→reconnect）
+    - 内层循环：wire frame 读取（`[uint64_t len][payload]`）
+    - 重连逻辑：指数退避（250ms→8s，最多 20 次），发送 `INCR_SYNC <replid> <next_seq>`，解析响应
+  - `rdma_repl_slave_run()`：全量同步后储存 `g_slave_base_seq`，发送 INCR_SYNC，读取 `+CONTINUE <replid>`，储存 replid
+  - `rdma_repl_slave_need_fullresync()`：新增公共访问器
+
+- **`src/repl/rdma_repl.h`** — 新增 `rdma_repl_slave_need_fullresync()` 声明
+
+- **`src/core/kvstore.c`** — Slave 主循环支持全量再同步：
+  - `rdma_repl_slave_run()` 返回后检查 `need_fullresync` 标志，最多重试 5 次
+
+### 验证状态
+
+- 编译：通过，零 warning ✓
+- **eBPF 加载**：Master 启动时 consumer thread 正常启动，"seq in eBPF, SPSC fanout active" ✓
+- **全量同步**：Slave 通过 RDMA (SoftRoCE rxe0) 接收 0-key DB，731ms ✓
+- **增量同步**：10000 SET 命令通过 eBPF uprobe → ringbuf → SPSC → TCP incr → slave，slave 验证 10000/10000 key 完全一致 ✓
+- **重连测试**：kill incr TCP 连接 → slave 自动重连，发送 `INCR_SYNC <replid> <next_seq=10000>` → master 返回 `+CONTINUE` → slave 恢复接收 ✓
+- **Replid 变更**：Master 重启 (PID 6450→6900) → slave 重连发送旧 replid → master 检测不匹配，发送 `-FULLRESYNC <new_replid>` → slave 储存新 replid ✓
+- **已知限制**：`g_slave_need_fullresync` 在 slave 运行期间被设置后，需外部 watchdog 重新触发全量同步。当前仅在 `kvstore.c` 初始化循环中检查（最多 5 次），服务启动后无后台监控
+
+---
+
 ## 2026-05-12 — Phase 13: eBPF 增量同步重构（无锁 SPSC + 预分配 Backlog）
 
 ### Overview
@@ -1223,5 +1289,10 @@ RDMA 流式全量同步在 Phase 9 已能正常工作，但存在严重性能瓶
 
 ### 已知限制
 
-- **固定大小 ringbuf record**：kernel 6.8 verifier 不接受 `bpf_ringbuf_reserve()` 的动态大小，每个事件仍占用 262KB。256MB ringbuf 容纳 ~998 events。后续 per-CPU array 模式可解决此限制
 - **SPSC 满队列退避**：当前自旋 100 次后 usleep(100)，高负载下可能需要更精细的退避策略
+
+### 后续优化（已实施）
+
+- **Tiered ringbuf reservation（5/13 实施）**：BPF 侧改为三级恒定大小预留（4KB/64KB/256KB），每分支独立生命周期 + 提前 return 防止 verifier 状态合并。100 字节 SET 从 262KB → 4.1KB（~65× 改善），256MB ringbuf 容量从 ~998 → ~65,000+ events。
+- **Backlog lazy allocation（5/13 实施）**：backlog slot msg 从启动时全部分配（16384 × 256KB = 4GB）改为延迟分配（4KB 起，realloc×2），消除 4GB 预分配浪费。
+- **Redis PSYNC 断开重连（5/13 实施）**：见 Phase 14。

@@ -38,4 +38,9 @@ int rdma_repl_master_start(void);
  * success, -1 on failure. */
 int rdma_repl_slave_run(void);
 
+/* Returns non-zero if the incremental replication thread has
+ * determined that a fresh fullsync is required (e.g. replid
+ * mismatch or backlog eviction on reconnect). */
+int rdma_repl_slave_need_fullresync(void);
+
 #endif /* __RDMA_REPL_H__ */

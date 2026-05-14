@@ -262,6 +262,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (!g_in_reload) {
             if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
             kvs_rdma_incr_probe(msg_raw, msg_len);
+            if (kvs_config.xdp_enabled) xdp_cache_flush_all();
         }
         return DISPATCH_OK;
     }
@@ -330,6 +331,17 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (!g_in_reload) {
             if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
             kvs_rdma_incr_probe(msg_raw, msg_len);
+            if (kvs_config.xdp_enabled) {
+                for (int i = 1; i + 1 < argc; i += 2) {
+                    uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
+                    const char *v = string_engine_get(
+                        tokens[i].ptr, (uint32_t)tokens[i].len, &vlen, &enc);
+                    if (v && enc == KV_ENCODING_RAW && vlen > 0 && vlen <= XDP_VAL_MAX)
+                        xdp_cache_put(tokens[i].ptr, tokens[i].len, v, (int)vlen);
+                    else
+                        xdp_cache_del(tokens[i].ptr, tokens[i].len);
+                }
+            }
         }
         return DISPATCH_OK;
     }
@@ -361,6 +373,17 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (!g_in_reload) {
             if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
             kvs_rdma_incr_probe(msg_raw, msg_len);
+            if (kvs_config.xdp_enabled) {
+                for (int i = 1; i + 1 < argc; i += 2) {
+                    uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
+                    const char *v = string_engine_get(
+                        tokens[i].ptr, (uint32_t)tokens[i].len, &vlen, &enc);
+                    if (v && enc == KV_ENCODING_RAW && vlen > 0 && vlen <= XDP_VAL_MAX)
+                        xdp_cache_put(tokens[i].ptr, tokens[i].len, v, (int)vlen);
+                    else
+                        xdp_cache_del(tokens[i].ptr, tokens[i].len);
+                }
+            }
         }
         return DISPATCH_OK;
     }

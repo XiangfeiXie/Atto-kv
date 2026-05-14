@@ -96,10 +96,19 @@ static __always_inline int parse_resp_get(const char *p, const char *end,
     /* key bytes */
     if (p + klen + 2 > end) return 0;
 
-    /* Bounded copy — BPF verifier needs the mask trick */
+    /* Direct bounded copy from packet data.
+     * bpf_probe_read_kernel is a tracing-only helper and must NOT be used
+     * in XDP programs — XDP packet memory is directly accessible. */
     __u32 n = (__u32)klen & (XDP_KEY_MAX - 1);
     if (n == 0) return 0;
-    bpf_probe_read_kernel(dst, n, p);
+    for (__u32 _i = 0; _i < XDP_KEY_MAX; _i++) {
+        if (_i >= n) break;
+        /* Per-iteration bounds re-check: the BPF verifier does not carry
+         * the outer `p+klen+2<=end` constraint across loop back-edges with
+         * a variable index.  This check re-establishes the safe range. */
+        if (p + _i + 1 > end) break;
+        dst[_i] = ((const __u8 *)p)[_i];
+    }
 
     if (p[klen] != '\r' || p[klen + 1] != '\n') return 0;
     return klen;

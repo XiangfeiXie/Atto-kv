@@ -1,5 +1,0 @@
-# Hashes of file build rules.
-c25173958f4c17d06e933371955ac881 /home/xxf/9.1-kvstore/NtyCo/libntyco.a
-c68254f6a0f28f15ce57ffc754119526 CMakeFiles/ntyco
-c68254f6a0f28f15ce57ffc754119526 CMakeFiles/xdp_kern
-759bc0e7bc89aba8cb21af16e1481d47 xdp_kvs.kern.o

@@ -202,11 +202,21 @@ void xdp_manager_stats(uint64_t *hits, uint64_t *misses, uint64_t *bypass) {
     }
 
     __u32 k;
-    __u64 v;
+    __u64 v = 0;
 
-    if (hits)   { k = XDP_STAT_HITS;   bpf_map_lookup_elem(g_stats_fd, &k, &v); *hits   = v; }
-    if (misses) { k = XDP_STAT_MISSES; bpf_map_lookup_elem(g_stats_fd, &k, &v); *misses = v; }
-    if (bypass) { k = XDP_STAT_BYPASS; bpf_map_lookup_elem(g_stats_fd, &k, &v); *bypass = v; }
+    if (hits)   { k = XDP_STAT_HITS;   v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *hits   = v; }
+    if (misses) { k = XDP_STAT_MISSES; v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *misses = v; }
+    if (bypass) { k = XDP_STAT_BYPASS; v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *bypass = v; }
+}
+
+void xdp_cache_flush_all(void) {
+    if (!g_xdp_ready || g_cache_fd < 0) return;
+    struct xdp_kvs_key next;
+    /* Always pass NULL as prev_key so we restart from the first entry after
+     * each deletion; this is the safe iteration-with-deletion pattern for
+     * BPF LRU hash maps. */
+    while (bpf_map_get_next_key(g_cache_fd, NULL, &next) == 0)
+        bpf_map_delete_elem(g_cache_fd, &next);
 }
 
 void xdp_manager_stop(void) {

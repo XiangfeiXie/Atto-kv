@@ -59,8 +59,9 @@ static _Atomic uint32_t  g_jhead = 0;   /* producer writes */
 static uint32_t          g_jtail = 0;   /* consumer owns   */
 static int               g_jevt  = -1;  /* eventfd wakeup  */
 
-static _Atomic uint64_t  g_journal_seq  = 0;  /* global seq counter */
-static _Atomic uint64_t  g_dropped      = 0;  /* overrun counter    */
+static _Atomic uint64_t  g_journal_seq     = 0;  /* global seq counter */
+static _Atomic uint64_t  g_dropped         = 0;  /* overrun counter    */
+static _Atomic int       g_consumer_sleeping = 0; /* 1 = blocked on eventfd read */
 
 /* ── WAL file state ── */
 static int              g_wal_fd       = -1;
@@ -255,9 +256,13 @@ void wal_repl_append(const char *msg, int length)
     memcpy(s->buf + 8, msg,  (size_t)length);
     atomic_store_explicit(&g_jhead, h + 1, memory_order_release);
 
-    uint64_t one = 1;
-    ssize_t wr = write(g_jevt, &one, sizeof(one));
-    (void)wr;
+    /* Only write eventfd when consumer is actually sleeping — avoids one
+     * syscall per write command when consumer is actively draining. */
+    if (atomic_load_explicit(&g_consumer_sleeping, memory_order_acquire)) {
+        uint64_t one = 1;
+        ssize_t wr = write(g_jevt, &one, sizeof(one));
+        (void)wr;
+    }
 }
 
 /* ======================================================================
@@ -342,11 +347,23 @@ static void *consumer_thread(void *arg)
     while (g_running) {
         uint32_t h = atomic_load_explicit(&g_jhead, memory_order_acquire);
         if (g_jtail == h) {
-            /* Ring empty: sync WAL to disk before sleeping */
+            /* Ring empty: sync WAL to disk, then sleep on eventfd.
+             * Set sleeping flag BEFORE re-checking head to prevent a
+             * lost-wakeup race: producer checks the flag after publishing
+             * to jhead, so if producer wins the race we still see the
+             * updated head and skip the read. */
             if (g_wal_fd >= 0) fdatasync(g_wal_fd);
-            uint64_t cnt;
-            ssize_t nr = read(g_jevt, &cnt, sizeof(cnt));
-            if (nr < 0 && errno != EAGAIN && errno != EINTR) break;
+            atomic_store_explicit(&g_consumer_sleeping, 1, memory_order_release);
+            h = atomic_load_explicit(&g_jhead, memory_order_acquire);
+            if (g_jtail == h) {
+                uint64_t cnt;
+                ssize_t nr = read(g_jevt, &cnt, sizeof(cnt));
+                if (nr < 0 && errno != EAGAIN && errno != EINTR) {
+                    atomic_store_explicit(&g_consumer_sleeping, 0, memory_order_relaxed);
+                    break;
+                }
+            }
+            atomic_store_explicit(&g_consumer_sleeping, 0, memory_order_relaxed);
             continue;
         }
 

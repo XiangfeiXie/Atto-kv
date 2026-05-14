@@ -4,6 +4,7 @@
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
+#include <errno.h>
 
 KvsConfig kvs_config;
 
@@ -52,6 +53,20 @@ static void trim_val(char *val) {
     rtrim(val);
 }
 
+static int parse_int(const char *val, int lineno, const char *key,
+                     long lo, long hi, int *out) {
+    char *end;
+    errno = 0;
+    long v = strtol(val, &end, 10);
+    if (*end != '\0' || errno != 0 || v < lo || v > hi) {
+        printf("[CONFIG] line %d: invalid value '%s' for '%s' "
+               "(expected integer %ld-%ld)\n", lineno, val, key, lo, hi);
+        return -1;
+    }
+    *out = (int)v;
+    return 0;
+}
+
 static int parse_bool(const char *val, int lineno, const char *key) {
     if (strcasecmp(val, "on")   == 0 || strcasecmp(val, "yes") == 0 ||
         strcasecmp(val, "1")    == 0 || strcasecmp(val, "true") == 0)
@@ -82,6 +97,15 @@ int config_load(const char *path) {
 
     while (fgets(line, sizeof(line), fp)) {
         lineno++;
+        /* Detect lines longer than the buffer: fgets filled the buffer and
+         * the last stored char is not '\n'. Drain the rest and warn. */
+        if (strlen(line) == sizeof(line) - 1 && line[sizeof(line) - 2] != '\n') {
+            printf("[CONFIG] line %d: line too long (>%d chars), skipped\n",
+                   lineno, (int)(sizeof(line) - 2));
+            int c;
+            while ((c = fgetc(fp)) != EOF && c != '\n') {}
+            continue;
+        }
 
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
@@ -98,7 +122,7 @@ int config_load(const char *path) {
 
         /* ---- Service ---- */
         if (strcasecmp(key, "port") == 0) {
-            kvs_config.port = atoi(val);
+            parse_int(val, lineno, "port", 1, 65535, &kvs_config.port);
 
         } else if (strcasecmp(key, "loglevel") == 0) {
             if      (strcasecmp(val, "debug") == 0) kvs_config.loglevel = LOG_DEBUG;
@@ -108,9 +132,7 @@ int config_load(const char *path) {
             else printf("[CONFIG] line %d: unknown loglevel '%s'\n", lineno, val);
 
         } else if (strcasecmp(key, "maxclients") == 0) {
-            kvs_config.maxclients = atoi(val);
-            if (kvs_config.maxclients < 64)  kvs_config.maxclients = 64;
-            if (kvs_config.maxclients > 65536) kvs_config.maxclients = 65536;
+            parse_int(val, lineno, "maxclients", 64, 65536, &kvs_config.maxclients);
 
         } else if (strcasecmp(key, "network") == 0) {
             if      (strcasecmp(val, "reactor")  == 0) kvs_config.network_model = NET_REACTOR;
@@ -143,17 +165,17 @@ int config_load(const char *path) {
                     sizeof(kvs_config.rdma_listen_ip) - 1);
 
         } else if (strcasecmp(key, "rdma_listen_port") == 0) {
-            kvs_config.rdma_listen_port = atoi(val);
+            parse_int(val, lineno, "rdma_listen_port", 1, 65535, &kvs_config.rdma_listen_port);
 
         } else if (strcasecmp(key, "rdma_master_ip") == 0) {
             strncpy(kvs_config.rdma_master_ip, val,
                     sizeof(kvs_config.rdma_master_ip) - 1);
 
         } else if (strcasecmp(key, "rdma_master_port") == 0) {
-            kvs_config.rdma_master_port = atoi(val);
+            parse_int(val, lineno, "rdma_master_port", 1, 65535, &kvs_config.rdma_master_port);
 
         } else if (strcasecmp(key, "incr_port") == 0) {
-            kvs_config.incr_port = atoi(val);
+            parse_int(val, lineno, "incr_port", 1, 65535, &kvs_config.incr_port);
 
         /* ---- XDP ---- */
         } else if (strcasecmp(key, "xdp") == 0) {

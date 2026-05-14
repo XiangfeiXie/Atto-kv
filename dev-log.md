@@ -1391,3 +1391,93 @@ consumer 线程（专用后台线程）:
 - **eBPF 源文件清理**：`ebpf_incr_repl.c`/`.h`、`ebpf_incr.bpf.c`、`vmlinux.h`（3.1MB）仍存在于磁盘但不再编译
 - **Slave 发送阻塞**：慢 slave 的 TCP 发送缓冲区满时，io_uring 批量分发中所有 slave 均受拖累（单 ring 同步 reap）
 - **Replid 生成**：使用 `pid:time(NULL)` 而非随机数，重启后时间可能相同
+
+---
+
+## 2026-05-14 — Phase 16: XDP 热路径加速（Phase 3 完整实现）
+
+### Overview
+
+完成 XDP 程序的 Phase 3 实现：对热缓存命中的 GET 请求，在 XDP 层直接构造 RESP bulk-string 回复并返回 `XDP_TX`，短路内核 TCP 栈（~2μs vs ~15μs）。BPF verifier 通过，程序可成功挂载至网卡。
+
+### 新增结构与 Map
+
+**Per-CPU scratch buffer（`resp_scratch` map）：**
+- 类型：`BPF_MAP_TYPE_PERCPU_ARRAY`，1 个 slot
+- 结构：`struct resp_buf { __u8 data[XDP_RESP_MAX]; __u32 len; }`
+- `XDP_RESP_MAX = 8 + XDP_VAL_MAX + 2 = 266` 字节（vs=272，含对齐 padding）
+- 避免在 BPF 栈上声明大型局部缓冲区（BPF 栈限 512 字节）
+
+**新增 checksum helper：**
+- `csum_fold(__u32 s)` — one's-complement 32→16 折叠
+- `ip4_csum(struct iphdr *ip)` — 手动展开 ihl=5 的 IPv4 头部 checksum（10 个 u16 累加）
+
+### Phase 3 实现逻辑（3 步骤）
+
+```
+STEP 1 (Phase-1 指针有效时):
+  构造 RESP bulk-string 至 scratch（"$N\r\n<value>\r\n"）
+  修改 ETH/IP/TCP 头部（交换 src/dst，更新 ip->tot_len，重算 ip checksum + tcp checksum）
+
+STEP 2:
+  bpf_xdp_adjust_tail(ctx, delta)  ← 截断/扩展 packet 至正好 payload_off + slen 字节
+
+STEP 3 (重新推导指针):
+  重新读取 ctx->data / ctx->data_end
+  用 p++  pointer-walk 逐字节从 scratch 复制 RESP 至 packet payload
+
+  return XDP_TX
+```
+
+**为何 STEP 1 必须在 STEP 2 之前：** `bpf_xdp_adjust_tail()` 是 BPF helper 调用，调用后 verifier 将所有 map-value 寄存器范围重置。Phase-1 建立的 `tcp`、`ip` 指针在 STEP 2 后对 verifier 不再安全，因此所有头部修改必须在 STEP 2 之前完成。
+
+### BPF Verifier Bug 修复（3 个）
+
+**Bug 1：STEP 3 payload 指针越界**
+
+- **现象**：`value -2147483648 makes pkt pointer be out of bounds`（`r1 += r4`，r1=pkt, r4=payload_off）
+- **根因**：`payload_off = (char*)payload - (char*)data`，两个 pkt 指针相减，verifier 将结果视为无界 `scalar()`，加到 pkt 指针上被拒绝
+- **修复**：丢弃 `payload_off`，改用常量+有界变量：`p = (char*)data + 34; p += tcp_hdr_len`（eth=14 + ip=20 常量，tcp_hdr_len ∈ [20,60] 有显式守卫）
+
+**Bug 2：vlen & 0xff 在 vlen=256 时为零（off-by-one）**
+
+- **现象**：`invalid access to map value, value_size=272 off=518 size=1`（trail 最大值超出 scratch 大小）
+- **根因**：用户将 `vlen >= XDP_VAL_MAX` 改为 `vlen > XDP_VAL_MAX`，允许 vlen=256 进入快速路径，但 `vlen & 0xff` → `256 & 0xff = 0`，trail=pfx+0 计算出错误的 \r\n 位置；改用 `& 0x1ff` 后，verifier 看到 vlen_c ∈ [0,511]，trail 最大值 517 > 272，被 verifier 拒绝
+
+**Bug 3：trail++ 导致 slen 变成精确常量，verifier 展开 264 次循环**
+
+- **现象**：`BPF program is too large. Processed 1000001 insn`
+- **根因**：`trail++` 方案让 verifier 对 `slen = trail + 2` 精确追踪（如 slen=264），verifier 对 STEP 3 的 `for (ri < XDP_RESP_MAX = 266)` 循环按精确值完整展开 264 次迭代，超过 1M 指令上限
+- **修复**：保留 `scratch->data[pfx + vi]` 的原始 copy loop；在 loop 后重新从 map value 指针读取 `val->len`（`vlen2 = val->len`），并加守卫 `if (vlen2 > XDP_VAL_MAX) goto tx_pass`。verifier 看到 slen 为范围 [7,264]（非精确常量），对 STEP 3 循环使用 fixpoint 分析而非完整展开
+
+### RESP 构造格式
+
+```
+"$<N>\r\n<value>\r\n"
+
+vlen < 10:   pfx=4  "$D\r\n"         (D = '0'+vlen)
+vlen < 100:  pfx=5  "$DD\r\n"
+vlen ≤ 256:  pfx=6  "$DDD\r\n"
+
+scratch->len = pfx + vlen + 2   ∈ [7, 264]
+```
+
+### 修改文件
+
+| 文件 | 变更 |
+|------|------|
+| `src/bpf/xdp_kvs.kern.c` | 新增 `resp_scratch` per-CPU map、`csum_fold/ip4_csum` helper、完整 Phase 3 XDP_TX 逻辑（~170 行） |
+
+### 关键约束（production 注意事项）
+
+- 仅支持标准 IPv4（ihl=5），有 IP options 的包走 `tx_pass → XDP_PASS`
+- 绕过内核 TCP 状态机（无 TCP 窗口管理、无重传、无拥塞控制）；适用 demo/benchmark，生产环境需配合 AF_XDP 做完整状态管理
+- xdp_iface 配置在 `conf/kvstore-master.conf`（`xdp yes / xdp_iface ens33`），需 `CAP_NET_ADMIN`
+
+### 验证
+
+- BPF 编译：`clang -O2 -target bpf`，零 warning
+- BPF 加载：`bpftool prog load`，verifier 通过（5184B xlated, 3052B jited，4 maps）
+- 网卡挂载：`ip link set lo xdp pinned ...` 成功，`ip link set lo xdp off` 正常卸载
+- cmake 全量构建：通过
+- Smoke 测试：295/295（STRING:54, LIST:62, HASH:55, SET:49, ZSET:75）全部通过

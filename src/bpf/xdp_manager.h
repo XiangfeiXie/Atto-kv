@@ -26,8 +26,9 @@ void xdp_cache_flush_all(void);
  * Safe to call even if xdp_manager_init() failed. */
 void xdp_manager_stop(void);
 
-/* Fill *hits, *misses, *bypass with cumulative counters from the BPF stats map.
- * Any pointer may be NULL to skip that counter. */
-void xdp_manager_stats(uint64_t *hits, uint64_t *misses, uint64_t *bypass);
+/* Fill *hits, *misses, *bypass, *tx_drop with cumulative counters from the
+ * BPF stats map.  Any pointer may be NULL to skip that counter. */
+void xdp_manager_stats(uint64_t *hits, uint64_t *misses,
+                        uint64_t *tx_drop, uint64_t *bypass);
 
 #endif /* XDP_MANAGER_H */

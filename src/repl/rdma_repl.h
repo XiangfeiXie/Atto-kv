@@ -12,7 +12,7 @@
  *     a 4-slot pipeline. Pipelining hides serialization latency.
  *   - Slave: pre-posts 4 recv buffers, receives chunks incrementally,
  *     loads entries via rdb_load_stream_append(). No disk I/O.
- *   - Incremental sync is handled by ebpf_incr_repl (TCP, not RDMA).
+ *   - Incremental sync is handled by wal_repl (WAL + io_uring + TCP, not RDMA).
  *   - Fullsync and incremental use independent connections.
  *   - Controlled by kvs_config.rdma_sync_enabled.
  *

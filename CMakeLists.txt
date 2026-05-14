@@ -135,5 +135,38 @@ target_link_libraries(kvstore PRIVATE
 
 add_dependencies(kvstore ntyco xdp_kern)
 
+# ── kvs_slowlog: uprobe slow-command monitor ──────────────────────────
+set(SLOWLOG_BPF_SRC  ${CMAKE_SOURCE_DIR}/src/tools/kvs_slowlog.bpf.c)
+set(SLOWLOG_BPF_OBJ  ${CMAKE_BINARY_DIR}/kvs_slowlog.bpf.o)
+
+add_custom_command(
+    OUTPUT  ${SLOWLOG_BPF_OBJ}
+    COMMAND clang -O2 -g -target bpf
+            -D__TARGET_ARCH_x86
+            -I${CMAKE_SOURCE_DIR}/src/repl
+            -I/usr/include
+            -I/usr/include/x86_64-linux-gnu
+            -c ${SLOWLOG_BPF_SRC}
+            -o ${SLOWLOG_BPF_OBJ}
+    DEPENDS ${SLOWLOG_BPF_SRC}
+    COMMENT "Compiling kvs_slowlog BPF kernel program"
+)
+
+add_custom_target(kvs_slowlog_bpf DEPENDS ${SLOWLOG_BPF_OBJ})
+
+add_executable(kvs_slowlog src/tools/kvs_slowlog.c)
+
+target_include_directories(kvs_slowlog PRIVATE
+    ${LIBBPF_INCLUDE_DIRS}
+)
+
+target_link_libraries(kvs_slowlog PRIVATE
+    ${LIBBPF_LIBRARIES}
+    elf
+    dl
+)
+
+add_dependencies(kvs_slowlog kvs_slowlog_bpf)
+
 # ── testcase target ───────────────────────────────────────────────────
 add_executable(testcase test/testcase.c)

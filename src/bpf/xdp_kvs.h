@@ -20,9 +20,10 @@
 #define XDP_CACHE_MAX_ENTRIES  65536
 
 /* Stats map keys */
-#define XDP_STAT_HITS    0
-#define XDP_STAT_MISSES  1
-#define XDP_STAT_BYPASS  2   /* packets not targeting our port */
+#define XDP_STAT_HITS     0
+#define XDP_STAT_MISSES   1
+#define XDP_STAT_TX_DROP  2   /* cache hit but XDP_TX impossible (e.g. IPv4 opts) */
+#define XDP_STAT_BYPASS   3   /* packets not targeting our port / not a GET */
 
 struct xdp_kvs_key {
     __u16 len;

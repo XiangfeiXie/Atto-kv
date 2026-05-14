@@ -155,7 +155,7 @@ int xdp_manager_init(const char *iface, int port) {
     /* Zero out stats */
     if (g_stats_fd >= 0) {
         __u64 zero = 0;
-        for (__u32 i = 0; i < 3; i++)
+        for (__u32 i = 0; i < 4; i++)
             bpf_map_update_elem(g_stats_fd, &i, &zero, BPF_ANY);
     }
 
@@ -193,20 +193,23 @@ void xdp_cache_del(const char *key, int klen) {
     bpf_map_delete_elem(g_cache_fd, &k);
 }
 
-void xdp_manager_stats(uint64_t *hits, uint64_t *misses, uint64_t *bypass) {
+void xdp_manager_stats(uint64_t *hits, uint64_t *misses,
+                        uint64_t *tx_drop, uint64_t *bypass) {
     if (!g_xdp_ready || g_stats_fd < 0) {
-        if (hits)   *hits   = 0;
-        if (misses) *misses = 0;
-        if (bypass) *bypass = 0;
+        if (hits)    *hits    = 0;
+        if (misses)  *misses  = 0;
+        if (tx_drop) *tx_drop = 0;
+        if (bypass)  *bypass  = 0;
         return;
     }
 
     __u32 k;
     __u64 v = 0;
 
-    if (hits)   { k = XDP_STAT_HITS;   v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *hits   = v; }
-    if (misses) { k = XDP_STAT_MISSES; v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *misses = v; }
-    if (bypass) { k = XDP_STAT_BYPASS; v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *bypass = v; }
+    if (hits)    { k = XDP_STAT_HITS;    v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *hits    = v; }
+    if (misses)  { k = XDP_STAT_MISSES;  v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *misses  = v; }
+    if (tx_drop) { k = XDP_STAT_TX_DROP; v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *tx_drop = v; }
+    if (bypass)  { k = XDP_STAT_BYPASS;  v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *bypass  = v; }
 }
 
 void xdp_cache_flush_all(void) {

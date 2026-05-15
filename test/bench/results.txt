@@ -1,24 +1,27 @@
-# KVStore Performance Benchmark Results — 2026-05-09 12:58:37
-=== 内存分配器对比测试 (500000 keys × 64B value) ===
+# KVStore Performance Benchmark Results — 2026-05-15 11:02:48
+=== XDP GET 热路径加速性能对比 ===
+参数: N=100000, C=50, -r 20000 (keyspace), d=16B
+测试时间: 2026-05-15 11:02:48
+场景 A: kvstore XDP off (proactor, 标准 TCP 路径)
+场景 B: kvstore XDP on  (proactor + XDP_TX, lo SKB mode)
+场景 C: Redis           (单线程, 无 XDP 能力)
+Pipeline 深度: 1 4 10  (XDP 仅加速 P=1; P>1 透传到 kvstore)
 
-  jemalloc 空闲态: VmSize=23036 kB, VmRSS=6792 kB
-  jemalloc 峰值态: VmSize=103932 kB, VmRSS=71456 kB
-  jemalloc 稳定态: VmSize=103932 kB, VmRSS=71404 kB
-  内存增长: 63.1 MB, 归还: 0 MB, 残留: 63.0 MB
+XDP-P1-GET | kvs-noXDP: 22810.22 req/s
+XDP-P4-GET | kvs-noXDP: 79365.08 req/s
+XDP-P10-GET | kvs-noXDP: 225225.22 req/s
+XDP-P1-GET | kvs-XDP: 0 req/s
+XDP-P4-GET | kvs-XDP: 74349.44 req/s
+XDP-P10-GET | kvs-XDP: 210970.47 req/s
+XDP-P1-GET | Redis: 23228.80 req/s
+XDP-P4-GET | Redis: 99403.58 req/s
+XDP-P10-GET | Redis: 316455.69 req/s
 
-  glibc 空闲态: VmSize=1057736 kB, VmRSS=4032 kB
-  glibc 峰值态: VmSize=1129188 kB, VmRSS=75292 kB
-  glibc 稳定态: VmSize=1129188 kB, VmRSS=75292 kB
-  内存增长: 69.5 MB, 归还: 0 MB, 残留: 69.5 MB
+=== XDP 汇总 (GET QPS) ===
 
+  P      |    kvs-noXDP |      kvs-XDP | XDP加速 |        Redis | XDP/Redis
+  ------ | ------------ | ------------ | -------- | ------------ | --------
+  P=1    |     22810.22 |            0 |    0.00x |     23228.80 |    0.00x
+  P=4    |     79365.08 |     74349.44 |    0.94x |     99403.58 |    0.75x
+  P=10   |    225225.22 |    210970.47 |    0.94x |    316455.69 |    0.67x
 
-=== 内存方案对比汇总 ===
-
-  分配器   | 阶段     | VmSize (kB) | VmRSS (kB)
-  ---------|----------|-------------|------------
-  jemalloc | idle     |       23036 |       6792
-  jemalloc | peak     |      103932 |      71456
-  jemalloc | stable   |      103932 |      71404
-  glibc    | idle     |     1057736 |       4032
-  glibc    | peak     |     1129188 |      75292
-  glibc    | stable   |     1129188 |      75292

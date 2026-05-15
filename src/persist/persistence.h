@@ -24,7 +24,7 @@ void persist_set_basedir(const char *argv0);
 /* 持久化文件相对路径常量 */
 #define AOF_REL  "build/appendonly.aof"
 #define RDB_REL  "build/dump.rdb"
-#define WAL_REL  "wal/incr.wal"     /* Phase 4: WAL unified with AOF */
+#define WAL_REL  "build/incr.wal"   /* Phase 4: WAL unified with AOF */
 
 /* 将相对路径拼接到项目根目录，返回静态 buffer（调用方不可 free） */
 const char *persist_path(const char *rel);

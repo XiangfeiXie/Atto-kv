@@ -187,6 +187,16 @@ int xdp_kvs_handler(struct xdp_md *ctx)
     char *payload = (char *)tcp + tcp->doff * 4;
     if ((void *)payload >= data_end) return XDP_PASS;
 
+    /* O(1) fast-bypass for pipelined requests:
+     * a single "*2\r\n$3\r\nGET\r\n$<N>\r\n<key>\r\n" is at most
+     * 19 + XDP_KEY_MAX (=64) + 1(2-digit) = 84 bytes.  If the TCP payload
+     * exceeds this, it must contain multiple commands → bypass to kvstore
+     * without paying the full parse cost. */
+    if ((char *)data_end - payload > (long)(20 + XDP_KEY_MAX)) {
+        stat_inc(XDP_STAT_BYPASS);
+        return XDP_PASS;
+    }
+
     /* ── Parse RESP GET ── */
     struct xdp_kvs_key map_key = {};
     int klen = parse_resp_get(payload, (char *)data_end, map_key.data);
@@ -196,6 +206,25 @@ int xdp_kvs_handler(struct xdp_md *ctx)
         return XDP_PASS;
     }
     map_key.len = (__u16)klen;
+
+    /* Detect pipelined requests (P>1): more than one RESP command in
+     * this segment.  XDP can only emit one TX response per ingress
+     * packet — if we serve only the first GET, the client hangs waiting
+     * for the remaining responses.  Bypass to kvstore in this case.
+     *
+     * Bytes consumed by one "*2\r\n$3\r\nGET\r\n$<N>\r\n<key>\r\n":
+     *   13 (fixed) + 3+ndigits (length prefix) + klen + 2 (\r\n)
+     *   = 19+klen           (klen<10, ndigits=1)
+     *   = 20+klen           (klen>=10, ndigits=2) */
+    {
+        __u32 consumed = 19u + (__u32)klen + ((__u32)klen >= 10u ? 1u : 0u);
+        const char *next = payload + consumed;
+        if ((void *)next < data_end) {
+            /* Pipelined request — let kvstore handle the whole segment */
+            stat_inc(XDP_STAT_BYPASS);
+            return XDP_PASS;
+        }
+    }
 
     /* ── Hot-cache lookup ── */
     struct xdp_kvs_val *val = bpf_map_lookup_elem(&hot_cache, &map_key);

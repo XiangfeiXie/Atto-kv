@@ -1481,3 +1481,78 @@ scratch->len = pfx + vlen + 2   ∈ [7, 264]
 - 网卡挂载：`ip link set lo xdp pinned ...` 成功，`ip link set lo xdp off` 正常卸载
 - cmake 全量构建：通过
 - Smoke 测试：295/295（STRING:54, LIST:62, HASH:55, SET:49, ZSET:75）全部通过
+
+---
+
+## 2026-05-15 — Phase 16.X: XDP 热路径 Bug 修复与性能优化
+
+### Overview
+
+对 Phase 16 的 XDP 内核程序进行代码审查，修复 4 个 bug 和 2 处性能冗余，新增 `XDP_STAT_TX_DROP` 统计维度。
+
+### Bug 修复
+
+**Bug 1：`parse_resp_get` 中 key 长度掩码错误 —— klen=64 被错误拒绝**
+
+- 位置：`src/bpf/xdp_kvs.kern.c:133`
+- 现象：`__u32 n = (__u32)klen & (XDP_KEY_MAX - 1)` → klen=64 → n=0 → `if (n == 0) return 0;` — 64 字节 key 被误判为无效
+- 根因：`64 & 63 = 0`，掩码丢失了合法长度
+- 修复：移除 `& 63` 掩码，klen 已在行 122 通过 `klen > XDP_KEY_MAX` 校验，直接使用 `klen` 作为循环上限
+
+**Bug 2：`tx_pass` 标签统计 HIT 而非 drop**
+
+- 位置：`src/bpf/xdp_kvs.kern.c:362`
+- 现象：缓存命中但无法完成 XDP_TX（IPv4 options、scratch 分配失败等）时错误计入 `XDP_STAT_HITS`
+- 修复：新增 `XDP_STAT_TX_DROP = 2` 计数器，`tx_pass` 路径使用该计数器；`XDP_STAT_BYPASS` 索引调整为 3
+
+**Bug 3：缺少 `tcp->doff` 早期校验**
+
+- 位置：`src/bpf/xdp_kvs.kern.c:172`
+- 现象：`payload = (char*)tcp + tcp->doff * 4` 在 doff<5 时产生错误的 payload 偏移，导致在损坏/非标准 TCP 包上浪费 CPU 做无效 RESP 解析
+- 修复：在计算 payload 之前增加 `if (tcp->doff < 5) { stat_inc(BYPASS); return XDP_PASS; }`
+
+**Bug 4：`vlen >= XDP_VAL_MAX` 与 `xdp_cache_put` 不一致**
+
+- 位置：`src/bpf/xdp_kvs.kern.c:208`
+- 现象：用户态 `xdp_cache_put` 允许 `vlen == XDP_VAL_MAX (256)`，但内核侧通过 `vlen >= XDP_VAL_MAX` 拒绝 vlen=256，导致符合条件的数据仍走 `tx_pass`
+- 修复：统一为 `vlen > XDP_VAL_MAX`
+
+### 性能优化
+
+**Optimization 1：移除 scratch 拷贝循环中的冗余边界检查**
+
+- 位置：`src/bpf/xdp_kvs.kern.c:241-245`
+- 分析：`pfx ≤ 8, vi < 256 → off = pfx+vi ≤ 263 < XDP_RESP_MAX(266)`，`off < XDP_RESP_MAX` 恒为真
+- 变更：删除 `if (off < XDP_RESP_MAX)` 分支，减少每次迭代的比较指令
+
+**Optimization 2：TCP checksum 循环预计算边界**
+
+- 位置：`src/bpf/xdp_kvs.kern.c:310-317`
+- 分析：每次迭代计算 `i * 2 >= tcp_hdr_len` 产生乘法指令
+- 变更：预计算 `tcp_u16 = tcp_hdr_len >> 1`，使用 `i >= tcp_u16` 作 break 条件
+
+### 统计系统变更
+
+| 常量 | 旧值 | 新值 | 含义 |
+|------|------|------|------|
+| `XDP_STAT_HITS` | 0 | 0 | XDP_TX 成功回复 |
+| `XDP_STAT_MISSES` | 1 | 1 | 缓存未命中 |
+| `XDP_STAT_TX_DROP` | — | 2 | 缓存命中但无法 XDP_TX |
+| `XDP_STAT_BYPASS` | 2 | 3 | 非目标包 / 非 GET 命令 |
+
+API 变更：`xdp_manager_stats()` 签名新增 `tx_drop` 参数（无外部调用者）。
+
+### 修改文件
+
+| 文件 | 变更 |
+|------|------|
+| `src/bpf/xdp_kvs.h` | 新增 `XDP_STAT_TX_DROP=2`，BYPASS 调整为 3 |
+| `src/bpf/xdp_kvs.kern.c` | 4 个 bug 修复 + 2 处性能优化，stats_map max_entries 3→4 |
+| `src/bpf/xdp_manager.h` | `xdp_manager_stats` 签名新增 `tx_drop` 参数 |
+| `src/bpf/xdp_manager.c` | stats 初始化/查询支持 4 条目 |
+
+### 验证
+
+- BPF 编译：`clang -O2 -target bpf`，零 warning、零 error
+- 用户态编译：`gcc -fsyntax-only`，零 error
+- 签名兼容性：`xdp_manager_stats` 无下游调用者，零 breakage

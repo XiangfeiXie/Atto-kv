@@ -26,10 +26,10 @@ RESULT_CSV="${PROJECT_DIR}/test/bench/results.csv"
 # ---- 颜色 ----
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 
-log()  { echo -e "${GREEN}[INFO]${NC}  $(date +%H:%M:%S) $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC}  $(date +%H:%M:%S) $*"; }
-err()  { echo -e "${RED}[ERROR]${NC} $(date +%H:%M:%S) $*"; }
-step() { echo -e "${CYAN}[STEP]${NC}  $(date +%H:%M:%S) $*"; }
+log()  { echo -e "${GREEN}[INFO]${NC}  $(date +%H:%M:%S) $*" >&2; }
+warn() { echo -e "${YELLOW}[WARN]${NC}  $(date +%H:%M:%S) $*" >&2; }
+err()  { echo -e "${RED}[ERROR]${NC} $(date +%H:%M:%S) $*" >&2; }
+step() { echo -e "${CYAN}[STEP]${NC}  $(date +%H:%M:%S) $*" >&2; }
 
 # ---- 预检 ----
 require_root() {
@@ -98,7 +98,7 @@ start_kvs() {
     stop_kvs
     # 清理旧持久化文件
     rm -f "${PROJECT_DIR}/build/dump.rdb" "${PROJECT_DIR}/build/dump.rdb.tmp" \
-          "${PROJECT_DIR}/build/appendonly.aof"
+          "${PROJECT_DIR}/build/appendonly.aof" "${PROJECT_DIR}/build/incr.wal"
     # 提取配置中 port 的值
     local port=$(grep '^port ' "$conf_path" | awk '{print $2}')
     port=${port:-$KVS_PORT}

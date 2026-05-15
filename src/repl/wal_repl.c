@@ -43,7 +43,10 @@
 #include <zlib.h>
 
 /* ── Journal ring (in-memory, producer: main thread, consumer: consumer thread) ── */
-#define JOURNAL_RING_SIZE  4096
+/* 131072 slots: at 300K QPS each slot is filled in ~3.3us; the ring can absorb
+ * ~437ms of consumer stall (e.g. fdatasync on slow VM disk ~272ms) without
+ * overflowing.  Memory cost: 131072 * ~32 bytes = ~4 MB (BSS). */
+#define JOURNAL_RING_SIZE  131072
 #define JOURNAL_RING_MASK  (JOURNAL_RING_SIZE - 1)
 
 typedef struct {
@@ -103,11 +106,15 @@ static incr_fanout_fn   g_fanout_fn     = NULL;
  * Slave management (io_uring dispatch, no per-slave threads)
  * ====================================================================== */
 
+/* Counts active slaves; allows backlog_append to be skipped when zero. */
+static _Atomic int g_n_active_slaves = 0;
+
 static void slave_close(int i)
 {
     if (!g_slaves[i].active) return;
     g_slaves[i].active = 0;
     if (g_slaves[i].fd >= 0) { close(g_slaves[i].fd); g_slaves[i].fd = -1; }
+    atomic_fetch_sub_explicit(&g_n_active_slaves, 1, memory_order_relaxed);
 }
 
 /* Drain completed dispatch CQEs; blocks until at least n_wait are reaped. */
@@ -171,6 +178,7 @@ static int slave_start(int i, int fd, uint64_t start_seq)
     pthread_mutex_unlock(&g_backlog_mu);
 
     g_slaves[i].active = 1;
+    atomic_fetch_add_explicit(&g_n_active_slaves, 1, memory_order_relaxed);
     return 0;
 }
 
@@ -181,7 +189,9 @@ static int slave_start(int i, int fd, uint64_t start_seq)
 static void backlog_slot_ensure(backlog_slot_t *s, int need)
 {
     if (s->msg_cap >= need) return;
-    int nc = s->msg_cap ? s->msg_cap : 4096;
+    /* Same rationale as journal_slot_ensure: 128 bytes covers typical commands.
+     * 16384*4096=64MB was excessive heap; 16384*128=2MB is L3-friendly. */
+    int nc = s->msg_cap ? s->msg_cap : 128;
     while (nc < need) nc *= 2;
     free(s->msg);
     s->msg = (char *)malloc((size_t)nc);
@@ -190,6 +200,11 @@ static void backlog_slot_ensure(backlog_slot_t *s, int need)
 
 static void backlog_append(uint64_t seq, const char *msg, uint32_t len)
 {
+    /* Fast path: no slaves connected → backlog serves no purpose.
+     * Skips mutex + memcpy, which at 300K QPS is a meaningful saving. */
+    if (atomic_load_explicit(&g_n_active_slaves, memory_order_relaxed) == 0)
+        return;
+
     pthread_mutex_lock(&g_backlog_mu);
     uint64_t idx = (g_backlog_start + g_backlog_count) & INCR_BACKLOG_MASK;
     backlog_slot_t *s = &g_backlog[idx];
@@ -221,7 +236,10 @@ static int backlog_has_seq_locked(uint64_t seq)
 static void journal_slot_ensure(journal_slot_t *s, int need)
 {
     if (s->cap >= need) return;
-    int nc = s->cap ? s->cap : 4096;
+    /* Start at 128 bytes (covers typical SET/GET ~65 bytes + 8-byte plen header).
+     * Previous 4096-byte minimum caused 131072*4096=512MB heap, exceeding L3 cache
+     * and causing DRAM misses on every hot-path memcpy. */
+    int nc = s->cap ? s->cap : 128;
     while (nc < need) nc *= 2;
     free(s->buf);
     s->buf = (char *)malloc((size_t)nc);
@@ -327,11 +345,47 @@ static void check_dropped_health(void)
 {
     uint64_t d = atomic_load_explicit(&g_dropped, memory_order_relaxed);
     if (d > 0) {
-        g_stream_healthy = 0;
-        fprintf(stderr, "[WAL-REPL] stream unhealthy: journal ring dropped "
-                "%" PRIu64 " events\n", d);
+        /* Ring overflow: log and reset counter, but keep writing future
+         * records.  AOF persistence is best-effort — a gap is logged so
+         * the operator knows the WAL may be incomplete.
+         * Replication slaves cannot tolerate gaps, so we close them. */
+        fprintf(stderr, "[WAL-REPL] WARNING: journal ring overflowed, dropped "
+                "%" PRIu64 " records — WAL incomplete; closing slaves\n", d);
+        atomic_store_explicit(&g_dropped, 0, memory_order_relaxed);
         for (int i = 0; i < INCR_MAX_SLAVES; i++)
             slave_close(i);
+        /* Do NOT set g_stream_healthy = 0: AOF writes continue after overflow */
+    }
+}
+
+/* ── WAL batch write buffers ─────────────────────────────────────────────
+ * Consumer accumulates up to WAL_BATCH_MAX records before issuing a single
+ * writev(), reducing syscall overhead from O(records) to O(records/128).
+ * Headers are built in g_wal_hdrs[] because ring slots have no room for them.
+ * Both arrays are file-scope (not stack) to avoid 16KB stack pressure. */
+#define WAL_BATCH_MAX  128
+static wal_record_hdr_t g_wal_hdrs[WAL_BATCH_MAX];
+static struct iovec     g_wal_iov [WAL_BATCH_MAX * 2];
+
+/* Periodic fdatasync: flush WAL at most once per second.
+ * Calling fdatasync on every ring-empty event blocks the consumer for
+ * ~272ms on VM disks, during which the ring can overflow at 300K QPS.
+ * One-second batching (similar to Redis appendfsync everysec) is safe
+ * for AOF persistence and avoids blocking the consumer. */
+#define WAL_SYNC_INTERVAL_NS  1000000000LL   /* 1 second */
+
+static struct timespec g_last_sync;   /* zero-initialised at program start */
+
+static void wal_maybe_sync(void)
+{
+    if (g_wal_fd < 0) return;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long long elapsed = (long long)(now.tv_sec  - g_last_sync.tv_sec)  * 1000000000LL
+                      + (long long)(now.tv_nsec - g_last_sync.tv_nsec);
+    if (elapsed >= WAL_SYNC_INTERVAL_NS) {
+        fdatasync(g_wal_fd);
+        g_last_sync = now;
     }
 }
 
@@ -343,16 +397,17 @@ static void *consumer_thread(void *arg)
     sigaddset(&ss, SIGTERM); sigaddset(&ss, SIGINT);
     pthread_sigmask(SIG_BLOCK, &ss, NULL);
     printf("[WAL-REPL] consumer thread started\n");
+    clock_gettime(CLOCK_MONOTONIC, &g_last_sync);   /* initialise sync timer */
 
     while (g_running) {
         uint32_t h = atomic_load_explicit(&g_jhead, memory_order_acquire);
         if (g_jtail == h) {
-            /* Ring empty: sync WAL to disk, then sleep on eventfd.
+            /* Ring empty: periodic fdatasync (at most 1/s), then sleep.
+             * We do NOT call fdatasync unconditionally here — on slow VM
+             * disks it takes ~272ms and the ring can overflow while we wait.
              * Set sleeping flag BEFORE re-checking head to prevent a
-             * lost-wakeup race: producer checks the flag after publishing
-             * to jhead, so if producer wins the race we still see the
-             * updated head and skip the read. */
-            if (g_wal_fd >= 0) fdatasync(g_wal_fd);
+             * lost-wakeup race. */
+            wal_maybe_sync();
             atomic_store_explicit(&g_consumer_sleeping, 1, memory_order_release);
             h = atomic_load_explicit(&g_jhead, memory_order_acquire);
             if (g_jtail == h) {
@@ -367,61 +422,83 @@ static void *consumer_thread(void *arg)
             continue;
         }
 
+        /* Drain ring in batches: one writev per WAL_BATCH_MAX records. */
         while (g_jtail != h) {
-            journal_slot_t *s = &g_jslots[g_jtail & JOURNAL_RING_MASK];
-
-            /* 1. Update seq tracking */
-            if (s->seq > g_seq) g_seq = s->seq;
-
-            /* 2. Write to WAL file — sync writev, data is safe
-             *    before we return, so journal slot can be reused. */
-            wal_write_record(s->seq, s->buf + 8, s->length);
-
-            /* 3. Append to in-memory backlog */
-            backlog_append(s->seq, s->buf + 8, s->length);
-
-            /* 4. Batch-dispatch to all slaves via io_uring (1 submit for N slaves) */
-            if (g_fullsync_status == FULLSYNC_IDLE && g_dispatch_uring_ok) {
-                int nsq = 0;
-                for (int i = 0; i < INCR_MAX_SLAVES; i++) {
-                    if (!g_slaves[i].active) continue;
-                    struct io_uring_sqe *sqe =
-                        io_uring_get_sqe(&g_dispatch_ring);
-                    if (!sqe) {
-                        /* Ring full mid-batch: flush first */
-                        io_uring_submit(&g_dispatch_ring);
-                        dispatch_reap_cqes(g_dispatch_pending);
-                        sqe = io_uring_get_sqe(&g_dispatch_ring);
-                    }
-                    if (sqe) {
-                        io_uring_prep_send(sqe, g_slaves[i].fd,
-                                           s->buf, s->wire_len,
-                                           MSG_NOSIGNAL);
-                        io_uring_sqe_set_data64(sqe, (uint64_t)i);
-                        nsq++;
-                        g_dispatch_pending++;
-                    } else {
-                        slave_close(i);
-                    }
-                }
-                if (nsq > 0) {
-                    /* ONE submit syscall covers all N slave sends */
-                    io_uring_submit(&g_dispatch_ring);
-                    /* Wait for completions so s->buf stays valid */
-                    dispatch_reap_cqes(nsq);
-                }
-                if (g_fanout_fn)
-                    g_fanout_fn(NULL, s->seq, s->buf + 8, s->length);
+            /* ── Pass 1: build WAL iov batch (g_jtail NOT advanced yet).
+             * Slots [g_jtail, scan) are owned by consumer — producer
+             * cannot overwrite them until we advance g_jtail. */
+            int nbatch = 0;
+            uint32_t scan = g_jtail;
+            while (scan != h && nbatch < WAL_BATCH_MAX) {
+                journal_slot_t *s = &g_jslots[scan & JOURNAL_RING_MASK];
+                wal_record_hdr_t *hdr = &g_wal_hdrs[nbatch];
+                hdr->magic  = WAL_MAGIC;
+                hdr->seq    = s->seq;
+                hdr->length = s->length;
+                hdr->crc32  = (uint32_t)crc32(0,
+                                  (const Bytef *)(s->buf + 8), (uInt)s->length);
+                g_wal_iov[nbatch * 2 + 0] = (struct iovec){
+                    .iov_base = hdr,         .iov_len = WAL_HDR_SIZE };
+                g_wal_iov[nbatch * 2 + 1] = (struct iovec){
+                    .iov_base = s->buf + 8,  .iov_len = s->length    };
+                scan++;
+                nbatch++;
             }
 
-            g_jtail++;
+            /* Single writev for all nbatch record headers + payloads */
+            if (g_wal_fd >= 0 && nbatch > 0)
+                writev(g_wal_fd, g_wal_iov, nbatch * 2);
+
+            /* ── Pass 2: backlog + slave dispatch; advance g_jtail ── */
+            for (int bi = 0; bi < nbatch; bi++) {
+                journal_slot_t *s = &g_jslots[g_jtail & JOURNAL_RING_MASK];
+
+                if (s->seq > g_seq) g_seq = s->seq;
+
+                /* 3. Append to in-memory backlog */
+                backlog_append(s->seq, s->buf + 8, s->length);
+
+                /* 4. Batch-dispatch to all slaves via io_uring */
+                if (g_fullsync_status == FULLSYNC_IDLE && g_dispatch_uring_ok) {
+                    int nsq = 0;
+                    for (int i = 0; i < INCR_MAX_SLAVES; i++) {
+                        if (!g_slaves[i].active) continue;
+                        struct io_uring_sqe *sqe =
+                            io_uring_get_sqe(&g_dispatch_ring);
+                        if (!sqe) {
+                            io_uring_submit(&g_dispatch_ring);
+                            dispatch_reap_cqes(g_dispatch_pending);
+                            sqe = io_uring_get_sqe(&g_dispatch_ring);
+                        }
+                        if (sqe) {
+                            io_uring_prep_send(sqe, g_slaves[i].fd,
+                                               s->buf, s->wire_len,
+                                               MSG_NOSIGNAL);
+                            io_uring_sqe_set_data64(sqe, (uint64_t)i);
+                            nsq++;
+                            g_dispatch_pending++;
+                        } else {
+                            slave_close(i);
+                        }
+                    }
+                    if (nsq > 0) {
+                        io_uring_submit(&g_dispatch_ring);
+                        dispatch_reap_cqes(nsq);
+                    }
+                    if (g_fanout_fn)
+                        g_fanout_fn(NULL, s->seq, s->buf + 8, s->length);
+                }
+
+                g_jtail++;
+            }
         }
 
         check_dropped_health();
+        wal_maybe_sync();   /* flush WAL at most once per second */
         h = atomic_load_explicit(&g_jhead, memory_order_acquire);
     }
 
-    wal_flush();
+    wal_flush();   /* final fdatasync on exit — ensures last records hit disk */
     printf("[WAL-REPL] consumer thread stopped\n");
     return NULL;
 }

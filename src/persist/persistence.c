@@ -524,8 +524,22 @@ static void rdb_write_uring(int fd, const char *data, size_t total) {
         }
     }
 
+    /* 用 io_uring fdatasync（IOSQE_IO_DRAIN 保证所有写入完成后才执行）
+     * 比阻塞 fsync() 少一次内核切换，且只刷数据不刷文件元数据 */
+    {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+        if (sqe) {
+            io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
+            sqe->flags |= IOSQE_IO_DRAIN;   /* 等前面所有写 SQE 完成 */
+            io_uring_submit(&ring);
+            struct io_uring_cqe *cqe = NULL;
+            if (io_uring_wait_cqe(&ring, &cqe) == 0)
+                io_uring_cqe_seen(&ring, cqe);
+        } else {
+            fdatasync(fd);   /* SQ 满时回退 */
+        }
+    }
     io_uring_queue_exit(&ring);
-    fsync(fd);
 }
 
 void rdb_save_sync(void) {
@@ -545,9 +559,14 @@ void rdb_save_sync(void) {
     dict_scan(&g_dict, rdb_save_callback_buf, &b);
 
     /* 2) 写临时文件 + rename，保证原子性 */
-    const char *tmp = persist_path(RDB_TMP);
-    const char *dst = persist_path(RDB_REL);
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    /* persist_path() 返回同一 static buffer，必须先拷贝再调用第二次，
+     * 否则 tmp 和 dst 均指向同一内存，rename 变成 no-op。 */
+    char tmp_path[1024], dst_path[1024];
+    strncpy(tmp_path, persist_path(RDB_TMP), sizeof(tmp_path) - 1);
+    tmp_path[sizeof(tmp_path) - 1] = '\0';
+    strncpy(dst_path, persist_path(RDB_REL), sizeof(dst_path) - 1);
+    dst_path[sizeof(dst_path) - 1] = '\0';
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         fprintf(stderr, "[RDB] open tmp failed: %s\n", strerror(errno));
         free(b.buf);
@@ -556,7 +575,7 @@ void rdb_save_sync(void) {
 
     rdb_write_uring(fd, b.buf, b.len);
     close(fd);
-    rename(tmp, dst);
+    rename(tmp_path, dst_path);
 
     free(b.buf);
     printf("[RDB] saved via io_uring, %zu bytes\n", b.len);

@@ -89,7 +89,7 @@ echo ""
 # ---------------------------------------------------------------------------
 # 1. 停止 KV Store
 # ---------------------------------------------------------------------------
-info "1/8  停止 KV Store..."
+info "1/6  停止 KV Store..."
 # 先结束所有 kvstore 进程（匹配多种启动路径）
 KILLED=0
 for sig in TERM KILL; do
@@ -117,7 +117,7 @@ done
 # ---------------------------------------------------------------------------
 # 2. 停止 Redis
 # ---------------------------------------------------------------------------
-info "2/8  停止 Redis..."
+info "2/6  停止 Redis..."
 if systemctl is-active --quiet redis-server 2>/dev/null; then
     systemctl stop redis-server
     sleep 1
@@ -136,11 +136,12 @@ fi
 # ---------------------------------------------------------------------------
 # 3. 删除 KV Store 持久化文件
 # ---------------------------------------------------------------------------
-info "3/8  清理 KV Store 持久化文件..."
+info "3/6  清理 KV Store 持久化文件..."
 KVS_FILES=(
     "${KVS_BUILD_DIR}/dump.rdb"
     "${KVS_BUILD_DIR}/dump.rdb.tmp"
     "${KVS_BUILD_DIR}/appendonly.aof"
+    "${KVS_BUILD_DIR}/incr.wal"
 )
 cleaned=0
 for f in "${KVS_FILES[@]}"; do
@@ -157,7 +158,7 @@ fi
 # ---------------------------------------------------------------------------
 # 4. 删除 Redis 持久化文件
 # ---------------------------------------------------------------------------
-info "4/8  清理 Redis 持久化文件..."
+info "4/6  清理 Redis 持久化文件..."
 REDIS_FILES=(
     "${REDIS_DATA_DIR}/dump.rdb"
     "${REDIS_DATA_DIR}/appendonly.aof"
@@ -177,7 +178,7 @@ fi
 # ---------------------------------------------------------------------------
 # 5. 启动 Redis
 # ---------------------------------------------------------------------------
-info "5/8  启动 Redis..."
+info "5/6  启动 Redis..."
 systemctl start redis-server
 sleep 1
 
@@ -192,62 +193,21 @@ fi
 # ---------------------------------------------------------------------------
 # 6. 清空 Redis
 # ---------------------------------------------------------------------------
-info "6/8  清空 Redis 数据..."
+info "6/6  清空 Redis 数据..."
 redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" FLUSHALL >/dev/null
 log "Redis FLUSHALL 完成"
 
 # ---------------------------------------------------------------------------
-# 7. 启动 KV Store
-# ---------------------------------------------------------------------------
-info "7/8  启动 KV Store (proactor, persistence=none)..."
-cd "$PROJECT_DIR"
-nohup "$KVS_BIN" "$KVS_CONF" > /tmp/kvstore.log 2>&1 &
-KVS_PID=$!
-sleep 2
-
-# 验证 KV Store 启动（进程是否存活）
-if ! kill -0 "$KVS_PID" 2>/dev/null; then
-    err "KV Store 进程启动后立即退出，查看日志:"
-    tail -20 /tmp/kvstore.log
-    exit 1
-fi
-
-# 验证端口是否在监听
-if ! ss -tlnp | grep -q ":${KVS_PORT} "; then
-    err "KV Store 未在端口 ${KVS_PORT} 上监听"
-    exit 1
-fi
-
-# 验证能否响应 PING
-if echo -ne "*1\r\n\$4\r\nPING\r\n" | nc -w2 "$KVS_HOST" "$KVS_PORT" >/dev/null 2>&1; then
-    log "KV Store 已启动 (${KVS_HOST}:${KVS_PORT}, pid=${KVS_PID})"
-else
-    err "KV Store PING 无响应"
-    exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# 8. 清空 KV Store
-# ---------------------------------------------------------------------------
-info "8/8  清空 KV Store 数据..."
-echo -ne "*1\r\n\$8\r\nFLUSHALL\r\n" | nc -w2 "$KVS_HOST" "$KVS_PORT" >/dev/null 2>&1
-log "KV Store FLUSHALL 完成"
-
-# ---------------------------------------------------------------------------
-# 最终验证：确认两边都是空的
+# 最终验证
 # ---------------------------------------------------------------------------
 echo ""
 echo "============================================"
-echo "  验证: 确认两边均无残留数据"
+echo "  验证"
 echo "============================================"
 
 # Redis DBSIZE
 REDIS_SIZE=$(redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" DBSIZE 2>/dev/null)
-echo "  Redis DBSIZE:    ${REDIS_SIZE}"
-
-# KV Store: 用 SET 后 GET 来验证空状态（没有 DBSIZE 命令，用 EXIST 探测典型 key）
-KVS_EXIST=$(echo -ne "*2\r\n\$5\r\nEXIST\r\n\$7\r\nstrkey1\r\n" | nc -w2 "$KVS_HOST" "$KVS_PORT" 2>/dev/null | head -c 10)
-echo "  KV Store EXIST:  ${KVS_EXIST} (:-1 表示空)"
+echo "  Redis DBSIZE: ${REDIS_SIZE}"
 
 # 持久化文件确认
 echo ""
@@ -265,21 +225,16 @@ done
 # ---------------------------------------------------------------------------
 echo ""
 echo "============================================"
-echo "  重置完成 — 两个服务均处于原始状态"
+echo "  重置完成"
 echo "============================================"
 echo ""
-echo "  KV Store : ${KVS_HOST}:${KVS_PORT}  (proactor, persistence=none)"
-echo "  Redis    : ${REDIS_HOST}:${REDIS_PORT}"
+echo "  KV Store : 已停止（持久化文件已清理）"
+echo "  Redis    : ${REDIS_HOST}:${REDIS_PORT}  (已重启，数据已清空)"
 echo ""
-echo "  ── redis-benchmark 性能对比命令 ──"
+echo "  ── 启动 KV Store 后可运行基准测试 ──"
 echo ""
-echo "  # 测试 KV Store"
+echo "  sudo ./build/kvstore conf/kvstore-master.conf"
+echo ""
 echo "  redis-benchmark -h ${KVS_HOST} -p ${KVS_PORT} -t set,get -n 100000 -q"
-echo ""
-echo "  # 测试 Redis"
 echo "  redis-benchmark -h ${REDIS_HOST} -p ${REDIS_PORT} -t set,get -n 100000 -q"
-echo ""
-echo "  # 完整对比测试（常用组合）"
-echo "  redis-benchmark -h ${KVS_HOST} -p ${KVS_PORT} -t set,get,lpush,lrange -n 100000 -q --csv"
-echo "  redis-benchmark -h ${REDIS_HOST} -p ${REDIS_PORT} -t set,get,lpush,lrange -n 100000 -q --csv"
 echo ""

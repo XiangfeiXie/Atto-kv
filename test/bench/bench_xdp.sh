@@ -1,24 +1,27 @@
 #!/bin/bash
 # =============================================================================
-# bench_xdp.sh — XDP GET 加速性能对比
+# bench_xdp.sh — XDP 被动监控开销对比 (Phase 1)
 #
 # 用法:
 #   sudo ./test/bench/bench_xdp.sh           # 默认深度组合
 #   sudo ./test/bench/bench_xdp.sh 1 4 10    # 只测指定深度
 #
-# 测试场景 (GET only — XDP 仅加速读路径):
-#   A. kvstore (XDP off)  — proactor, 标准用户态 TCP 路径
-#   B. kvstore (XDP on)   — proactor + XDP_TX 内核热路径 (lo, SKB mode)
-#   C. Redis              — 单线程 ae 事件循环, 无 XDP 能力
+# 测试场景 (GET only):
+#   A. kvstore (XDP off)     — proactor, 标准用户态 TCP 路径 (baseline)
+#   B. kvstore (XDP monitor) — proactor + XDP 被动监控 (仅统计, 不加速)
+#   C. Redis                  — 单线程 ae 事件循环
 #
-# XDP 设计:
-#   - 单 TCP segment 单条 GET (P=1) 命中 hot_cache 时由 XDP_TX 直接回包
-#     (跳过内核 TCP 栈, 跳过 kvstore 用户态), 极低延迟.
-#   - 一个 segment 内多条命令 (P>1, 即 redis-benchmark pipelining) 整包
-#     回落到 XDP_PASS, 由 kvstore 正常处理 (因为 BPF 程序每个入包只能发
-#     一个 XDP_TX 响应; 处理多条会导致客户端阻塞等待剩余响应).
-#   - 任意命令 cache miss 回落到 XDP_PASS.
-#   keyspace < 65536 槽, 预热一次填充 hot_cache; 同场景服务只启动一次.
+# Phase 1 设计说明:
+#   - XDP 程序始终返回 XDP_PASS, 不会拦截任何包.
+#   - 在 RX 路径上解析 RESP GET 并查 hot_cache, 记录 hit / miss
+#     计数 —— 为 Phase 2 (sockmap fast-path) 提供命中率实测基线.
+#   - 原有 XDP_TX 方案 (在内核里直接构造响应) 引发内核 TCP 状态双
+#     轨漂移问题, P=1 场景会超时 — 已彻底下线, 等待 sockmap 接手.
+#
+# 预期结果:
+#   - 场景 B 吞吐量 ≈ 场景 A (误差 ±5%, 即 XDP 监控开销 ≤ 5%)
+#   - bpftool map dump name stats_map 可看到真实的 hits/misses 计数
+#
 #   结果覆盖 results.txt 和 results_xdp.csv.
 # =============================================================================
 
@@ -29,17 +32,14 @@ require_root
 require_tools
 
 # ---- 参数 ----
-BENCH_N=100000     # 每轮请求数 (10万/轮, 兼顾精度与 XDP 持久连接稳定性)
+BENCH_N=200000     # 每轮请求数 (20万/轮；Phase 1 XDP 全部 PASS, 不再需要超时折中)
 BENCH_C=50         # 并发连接数
 XDP_KEYSPACE=20000 # key 空间 (< hot_cache 65536 槽)
-WARMUP_N=$((XDP_KEYSPACE * 10))   # 10x keyspace, 覆盖率 ≈ 1-e^-10 ≈ 99.995%
-                                  # XDP 场景下任何一次 cache miss 都会让该
-                                  # 持久连接的内核 TCP RX seq 与 XDP 注入的
-                                  # ACK 失步, 后续 GET 必然超时, 故必须保证
-                                  # 命中率严格接近 100%.
-# XDP 只加速 P=1 的 GET (单 segment 单命令); P>1 时 XDP_PASS 到 kvstore.
-# 默认同时测 P=1,4,10 以全面展示 XDP 代价/收益: P=1 XDP 加速,
-# P>1 XDP 退化为透传 (与 XDP off 场景同带宽, 不带加速也不带堆堈).
+WARMUP_N=$((XDP_KEYSPACE * 5))    # 5x keyspace 足够填充绝大多数 key。
+                                  # Phase 1 XDP 不会拦截, 偶发 cache miss
+                                  # 不再引发连接卡死, 不需严格足 100% 命中.
+# Phase 1 XDP 仅监控不加速, 各 P 值下场景 B 吞吐量预期 ≈ 场景 A.
+# P=1,4,10 覆盖从请求密集 → pipelining 、一路验证监控开销趋近零.
 PIPELINES=(1 4 10)
 if [ $# -ge 1 ]; then
     PIPELINES=("$@")
@@ -105,22 +105,23 @@ verify_xdp_attached() {
 declare -A R_NOXDP R_XDP R_REDIS
 
 init_results
-echo "pipeline,kvs_noXDP_get,kvs_XDP_get,xdp_speedup,redis_get,xdp_vs_redis" \
+echo "pipeline,kvs_noXDP_get,kvs_XDPmon_get,monitor_overhead,redis_get,kvs_vs_redis" \
     > "$XDP_CSV"
 
-record_raw "=== XDP GET 热路径加速性能对比 ==="
+record_raw "=== XDP 被动监控开销对比 (Phase 1) ==="
 record_raw "参数: N=$BENCH_N, C=$BENCH_C, -r $XDP_KEYSPACE (keyspace), d=16B"
 record_raw "测试时间: $(date '+%Y-%m-%d %H:%M:%S')"
-record_raw "场景 A: kvstore XDP off (proactor, 标准 TCP 路径)"
-record_raw "场景 B: kvstore XDP on  (proactor + XDP_TX, lo SKB mode)"
-record_raw "场景 C: Redis           (单线程, 无 XDP 能力)"
-record_raw "Pipeline 深度: ${PIPELINES[*]}  (XDP 仅加速 P=1; P>1 透传到 kvstore)"
+record_raw "场景 A: kvstore XDP off     (proactor, 标准 TCP 路径) — baseline"
+record_raw "场景 B: kvstore XDP monitor (proactor + XDP 被动监控, 始终 XDP_PASS)"
+record_raw "场景 C: Redis              (单线程, 无 XDP 能力)"
+record_raw "Pipeline 深度: ${PIPELINES[*]}"
+record_raw "预期: 场景 B 与场景 A 误差 ±5% (XDP 监控开销)"
 record_raw ""
 
 echo ""
-log "XDP GET 性能对比  —  Pipeline 深度: ${PIPELINES[*]}"
-log "keyspace=$XDP_KEYSPACE (< hot_cache 65536 槽, 预热后命中率接近 100%)"
-log "XDP 模式: P=1 命中走 XDP_TX 快路径; P>1 / cache miss 透传到 kvstore; C=${BENCH_C}"
+log "XDP Phase 1 监控开销对比  —  Pipeline 深度: ${PIPELINES[*]}"
+log "keyspace=$XDP_KEYSPACE, hot_cache=65536 槽, 预热=${WARMUP_N} SET"
+log "XDP 模式: 被动监控 (始终 XDP_PASS), 只记录 hits/misses/bypass; C=${BENCH_C}"
 log "同场景只启动一次服务, 预热一次, 连续测所有 Pipeline 深度"
 echo ""
 
@@ -153,7 +154,7 @@ echo ""
 # 场景 B: kvstore XDP on  (启动一次, 预热一次填充 hot_cache)
 # ============================================================
 echo "════════════════════════════════════════════════════════"
-step "场景 B: kvstore XDP on — XDP_TX 内核热路径 (lo)"
+step "场景 B: kvstore XDP monitor — 被动监控 (lo SKB mode)"
 echo "════════════════════════════════════════════════════════"
 
 start_kvs "kvstore-xdp.conf"
@@ -163,12 +164,36 @@ step "预热: SET ${WARMUP_N} 请求 / -r ${XDP_KEYSPACE} keyspace (同步填充
 do_warmup 127.0.0.1 "$KVS_PORT"
 
 for P in "${PIPELINES[@]}"; do
-    step "P=$P  GET (kvstore, XDP on)"
+    step "P=$P  GET (kvstore, XDP monitor)"
     v=$(run_bench_r 127.0.0.1 "$KVS_PORT" get \
         "$BENCH_N" "$BENCH_C" "$P" 16 "$XDP_KEYSPACE")
     R_XDP[$P]=$v
-    record_result "XDP-P${P}-GET" "kvs-XDP" "$v"
+    record_result "XDP-P${P}-GET" "kvs-XDPmon" "$v"
 done
+
+# 在 stop 之前输出一份 hot_cache 命中统计
+if command -v bpftool >/dev/null 2>&1; then
+    record_raw ""
+    record_raw "=== XDP stats_map (Phase 1 被动监控计数) ==="
+    bpftool map dump name stats_map 2>/dev/null \
+        | python3 -c '
+import sys, json
+try:
+    arr = json.loads(sys.stdin.read())
+    labels = {0: "hits", 1: "misses", 2: "tx_drop", 3: "bypass"}
+    for e in arr:
+        k = e.get("key", e.get("formatted", {}).get("key"))
+        v = e.get("value", e.get("formatted", {}).get("value"))
+        print(f"  {labels.get(int(k), k):<8} = {v}")
+    hits = next((int(e.get("value", 0)) for e in arr if int(e.get("key", -1)) == 0), 0)
+    misses = next((int(e.get("value", 0)) for e in arr if int(e.get("key", -1)) == 1), 0)
+    if hits + misses > 0:
+        print(f"  hit_rate = {100.0 * hits / (hits + misses):.2f}%")
+except Exception as e:
+    print(f"  (解析失败: {e})", file=sys.stderr)
+' 2>&1 | tee -a "$RESULT_FILE" || true
+    record_raw ""
+fi
 
 stop_kvs
 echo ""
@@ -205,7 +230,7 @@ record_raw "=== XDP 汇总 (GET QPS) ==="
 record_raw ""
 
 HDR=$(printf "  %-6s | %12s | %12s | %8s | %12s | %8s" \
-    "P" "kvs-noXDP" "kvs-XDP" "XDP加速" "Redis" "XDP/Redis")
+    "P" "kvs-noXDP" "kvs-XDPmon" "监控比" "Redis" "kvs/Redis")
 SEP=$(printf "  %-6s | %12s | %12s | %8s | %12s | %8s" \
     "------" "------------" "------------" "--------" "------------" "--------")
 
@@ -234,6 +259,9 @@ log "完成。结果已保存至:"
 log "  文本: $RESULT_FILE"
 log "  CSV : $XDP_CSV"
 log ""
-log "XDP hot_cache 命中率 (需要 kvstore 以 XDP on 运行时查看):"
+log "如需实时查看 XDP 监控计数 (kvstore 运行中):"
 log "  sudo bpftool map dump name stats_map"
-log "  key 0=hits  key 1=misses  key 2=tx_drop  key 3=bypass"
+log "  key 0=hits  key 1=misses  key 2=tx_drop(未使用)  key 3=bypass"
+log ""
+log "预期 Phase 1 现象: kvs-XDPmon 与 kvs-noXDP 吞吐量误差 ≤ 5%"
+log "  (证明 XDP 被动监控本身几乎不引入额外开销, 为 Phase 2 提供干净 baseline)"

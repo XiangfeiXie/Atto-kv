@@ -71,6 +71,8 @@ set(REPL_SRCS
 
 set(BPF_SRCS
     src/bpf/xdp_manager.c
+    src/bpf/sockmap_manager.c
+    src/bpf/bpf_pin.c
 )
 
 # ── Compile XDP kernel BPF program ────────────────────────────────────
@@ -90,6 +92,24 @@ add_custom_command(
 )
 
 add_custom_target(xdp_kern DEPENDS ${XDP_KERN_OBJ})
+
+# ── Compile sockmap kernel BPF program ────────────────────────────────
+set(SOCKMAP_KERN_SRC  ${CMAKE_SOURCE_DIR}/src/bpf/sockmap_kvs.kern.c)
+set(SOCKMAP_KERN_OBJ  ${CMAKE_BINARY_DIR}/sockmap_kvs.kern.o)
+
+add_custom_command(
+    OUTPUT  ${SOCKMAP_KERN_OBJ}
+    COMMAND clang -O2 -g -target bpf
+            -I${CMAKE_SOURCE_DIR}/src/bpf
+            -I/usr/include
+            -I/usr/include/x86_64-linux-gnu
+            -c ${SOCKMAP_KERN_SRC}
+            -o ${SOCKMAP_KERN_OBJ}
+    DEPENDS ${SOCKMAP_KERN_SRC} ${CMAKE_SOURCE_DIR}/src/bpf/sockmap_kvs.h
+    COMMENT "Compiling sockmap BPF kernel program"
+)
+
+add_custom_target(sockmap_kern DEPENDS ${SOCKMAP_KERN_OBJ})
 
 set(KVSTORE_SRCS
     ${UTIL_SRCS}
@@ -133,7 +153,7 @@ target_link_libraries(kvstore PRIVATE
     dl
 )
 
-add_dependencies(kvstore ntyco xdp_kern)
+add_dependencies(kvstore ntyco xdp_kern sockmap_kern)
 
 # ── kvs_slowlog: uprobe slow-command monitor ──────────────────────────
 set(SLOWLOG_BPF_SRC  ${CMAKE_SOURCE_DIR}/src/tools/kvs_slowlog.bpf.c)
@@ -167,6 +187,25 @@ target_link_libraries(kvs_slowlog PRIVATE
 )
 
 add_dependencies(kvs_slowlog kvs_slowlog_bpf)
+
+# ── kvs-top: live three-layer observability dashboard ────────────────
+add_executable(kvs_top
+    src/tools/kvs_top.c
+    src/bpf/bpf_pin.c
+)
+
+target_include_directories(kvs_top PRIVATE
+    src/bpf
+    ${LIBBPF_INCLUDE_DIRS}
+)
+
+target_link_libraries(kvs_top PRIVATE
+    ${LIBBPF_LIBRARIES}
+    elf
+    dl
+)
+
+set_target_properties(kvs_top PROPERTIES OUTPUT_NAME "kvs-top")
 
 # ── testcase target ───────────────────────────────────────────────────
 add_executable(testcase test/testcase.c)

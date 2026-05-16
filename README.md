@@ -15,7 +15,7 @@
 - [网络模型](#网络模型)
 - [持久化](#持久化)
 - [主从复制](#主从复制)
-- [XDP 热路径加速](#xdp-热路径加速)
+- [三层 BPF 可观测栈](#三层-bpf-可观测栈)
 - [可观测性工具](#可观测性工具)
 - [性能数据](#性能数据)
 - [测试](#测试)
@@ -31,11 +31,11 @@
 | **3 种网络模型** | Reactor (epoll)、Proactor (io_uring)、NtyCo (协程)，配置切换 |
 | **双持久化** | RDB 二进制快照 + AOF 命令日志，io_uring 异步写入，mmap 加速加载 |
 | **主从复制** | RDMA 零拷贝全量同步 + WAL journal 增量复制，consumer 线程 io_uring 分发 |
-| **XDP 热路径** | eBPF XDP 程序在网卡驱动层拦截 GET，热缓存命中直接 XDP_TX 回包，延迟 ~2 μs |
+| **三层 BPF 观测栈** | XDP (L2/L3 包层 hit/miss/bypass) + sockmap sk_skb (L4/L7 流层 per-cmd / per-conn) + uprobe (应用函数延迟)，全部 `XDP_PASS` / `SK_PASS` 被动监控，单边开销 < 8% |
 | **CMD4 跳表** | 命令分发 O(1)，4 字节整数 switch，无 strcmp 循环 |
 | **jemalloc** | 默认内存分配器，峰值内存比 glibc malloc 低 4%，支持 `arenas.purge` 手动归还 |
 | **阻塞命令** | BLPOP / BRPOP，key→waiter 哈希表 + 超时扫描，消息队列语义 |
-| **慢命令监控** | `kvs_slowlog` eBPF uprobe 工具，零侵入采集超阈值命令 |
+| **可观测工具** | `kvs-top` 实时仪表盘聚合三层数据；`kvs_slowlog` eBPF uprobe 抓慢命令 |
 
 ---
 
@@ -43,9 +43,10 @@
 
 ```
                            ┌──── NIC (ens33 / lo) ────┐
-                           │  eBPF XDP 程序             │
-                           │  热缓存命中 → XDP_TX 2μs  │
-                           │  未命中    → XDP_PASS ↓   │
+                           │  XDP 程序（被动监控 L2/L3）│
+                           │  hits / misses / bypass    │
+                           │  hot_cache LRU 65536 槽    │
+                           │  → 始终 XDP_PASS           │
                            └───────────────────────────┘
                                          │
 ┌────────────────────────────────────────▼──────────────────────────────────┐
@@ -75,6 +76,17 @@
 │  │  RDB: fork + io_uring│    │  Slave: RDMA read → 直接内存加载         │   │
 │  │  AOF: mmap ring buf  │    │  全程不落盘，无 RESP 文本解析             │   │
 │  └──────────────────────┘    └──────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌──────────────────────┐    ┌──────────────────────────────────────────┐   │
+│  │   sockmap 流层观测    │    │       userspace 工具                      │   │
+│  │                      │    │                                          │   │
+│  │  cgroup sockops →    │◀───┤  kvs-top: 1Hz TUI                        │   │
+│  │   sockmap 自动注册   │    │   读 /sys/fs/bpf/kvstore/<map>           │   │
+│  │  sk_skb stream_      │    │   渲染三层聚合 + delta rate              │   │
+│  │   verdict 解析 RESP  │    │  kvs_slowlog: uprobe 慢命令              │   │
+│  │  per-cmd / per-conn  │    └──────────────────────────────────────────┘   │
+│  │  全程 SK_PASS         │                                                  │
+│  └──────────────────────┘                                                   │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -105,13 +117,18 @@ src/
 ├── repl/          主从复制
 │   ├── rdma_repl.c/h        RDMA 全量同步（libfabric）
 │   └── wal_repl.c/h         WAL journal 增量复制，io_uring 批量分发
-├── bpf/           eBPF/XDP
-│   ├── xdp_kvs.kern.c       XDP 内核程序（BPF）
-│   ├── xdp_kvs.h            共享常量（BPF maps、RESP 格式）
-│   └── xdp_manager.c/h      用户态管理 API（加载/挂载/缓存操作）
+├── bpf/           eBPF / XDP / sockmap
+│   ├── xdp_kvs.kern.c       XDP 内核程序（被动监控 hot_cache hit/miss）
+│   ├── xdp_kvs.h            XDP 共享常量
+│   ├── xdp_manager.c/h      XDP 用户态管理 API（加载/缓存操作）
+│   ├── sockmap_kvs.kern.c   sockmap 内核程序（sockops + sk_skb 流层观测）
+│   ├── sockmap_kvs.h        sockmap 共享结构（per-cmd / per-conn）
+│   ├── sockmap_manager.c/h  sockmap 用户态加载器 + 迭代 API
+│   └── bpf_pin.c/h          BPF map pin 助手 (/sys/fs/bpf/kvstore/)
 ├── tools/         工具
 │   ├── kvs_slowlog.bpf.c    慢命令 eBPF uprobe 内核程序
-│   └── kvs_slowlog.c        用户态采集输出
+│   ├── kvs_slowlog.c        慢命令用户态采集
+│   └── kvs_top.c            实时三层 BPF 观测仪表盘 (kvs-top)
 └── util/
     └── dynbuf.c/h            动态缓冲区（reserve 预分配）
 ```
@@ -183,6 +200,8 @@ make -j$(nproc)
 |------|------|
 | `build/kvstore` | 主进程 |
 | `build/xdp_kvs.kern.o` | XDP BPF 内核程序（需与 kvstore 同目录） |
+| `build/sockmap_kvs.kern.o` | sockmap BPF 内核程序（需与 kvstore 同目录） |
+| `build/kvs-top` | 三层 BPF 观测仪表盘 |
 | `build/kvs_slowlog` | 慢命令监控工具 |
 
 ---
@@ -212,9 +231,10 @@ rdma_master_ip    127.0.0.1  # 从机填主机地址
 rdma_master_port  2100
 incr_port         6382       # WAL 增量同步端口
 
-# ── XDP 热路径 ───────────────────────────────────────────
-xdp         no            # yes | no（需 CAP_NET_ADMIN）
-xdp_iface   lo            # 挂载网卡：本地测试用 lo，远端压测用实际网卡
+# ── 三层 BPF 可观测栈 ────────────────────────────────────
+xdp         no            # XDP 包层观测：yes | no（需 CAP_NET_ADMIN）
+xdp_iface   lo            # XDP 挂载网卡：本地测试用 lo，远端用实际网卡
+sockmap     no            # sockmap 流层观测：yes | no（需 cgroup v2）
 ```
 
 > **注意**：`xdp_iface` 必须与流量实际经过的网卡一致。  
@@ -337,61 +357,105 @@ Master                              Slave
 
 ---
 
-## XDP 热路径加速
+## 三层 BPF 可观测栈
 
-### 工作原理
+kvstore 在三个不同的内核挂载点同时运行 eBPF 程序，构成端到端的零侵入可观测栈。所有
+程序均为 **被动监控**（`XDP_PASS` / `SK_PASS`），不改包不丢包，**单边总开销 < 8%**。
 
-XDP 程序挂载在指定网卡，在驱动层（`sk_buff` 分配之前）处理数据包：
+### 设计演进：为什么 XDP 现在是被动监控
 
-```
-网卡收包
-  └─▶ XDP 程序
-        ├─ 解析 Eth/IPv4/TCP 头
-        ├─ 匹配目标端口（kvstore port）
-        ├─ 解析 RESP GET 命令
-        ├─ 查询 hot_cache BPF map
-        │     命中 → 构造 RESP bulk-string 回包
-        │             修改 Eth/IP/TCP 头（交换 src/dst）
-        │             重算 checksum（BPF helper）
-        │             bpf_xdp_adjust_tail 调整包长
-        │             XDP_TX 直接从网卡发出  ← ~2μs
-        └─ 未命中 / 非 GET → XDP_PASS → 内核协议栈 → kvstore 进程
-```
+最初版本曾尝试 XDP_TX 在内核内构造 RESP 回包，绕过 TCP 协议栈以达到 ~2μs 延迟。
+该方案在 redis-benchmark 长连接场景下出现 **TCP "双轨" 状态不一致**：内核 TCP 的
+`rcv_nxt` 不会因 XDP 消费的包而前进，连接最终会因序号失配而停滞。
+
+最终方案放弃 XDP_TX，采用 **三层并联观测**：每层只做不会破坏 TCP 语义的工作，
+聚合后的可观测能力反而比单点提速更有价值。
+
+### 各层职责
+
+| 层 | 挂载点 | 程序 | 职责 |
+|---|---|---|---|
+| **L2/L3 包层** | XDP (driver / SKB) | `xdp_kvs.kern.c` | 解析以太网/IP/TCP 头，按端口过滤 + 解析 RESP GET，查询 `hot_cache` 计 hit/miss/bypass，**始终 XDP_PASS** |
+| **L4/L7 流层** | sockops (cgroup) + sk_skb (sockmap) | `sockmap_kvs.kern.c` | 监听 `BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB`，将 accept 的 socket 自动注册进 `sockhash`；流到达时 `sk_skb/stream_verdict` 调用 `bpf_skb_pull_data` 拉直 64 字节，解析 RESP 命令名（大写归一），更新 per-cmd 哈希计数 + per-conn LRU 画像，**始终 SK_PASS** |
+| **应用函数层** | uprobe | `kvs_slowlog.bpf.c` | uprobe 挂在命令分发入口/出口函数，超阈值的命令上报延迟 + 入参（**只在超时触发**，零开销路径） |
 
 ### BPF Maps
 
-| Map | 类型 | 说明 |
-|-----|------|------|
-| `hot_cache` | `BPF_MAP_TYPE_HASH` | key→value 热缓存（最多 65536 条） |
-| `xdp_stats` | `BPF_MAP_TYPE_ARRAY` | 命中/未命中/bypass/tx_drop 统计 |
-| `resp_scratch` | `BPF_MAP_TYPE_PERCPU_ARRAY` | 每 CPU 构造回包的临时缓冲区 |
-| `kvs_port` | `BPF_MAP_TYPE_ARRAY` | 目标端口配置 |
+| Map | 类型 | 内容 | 由谁写 |
+|---|---|---|---|
+| `hot_cache` | `LRU_HASH` | key→value 热缓存（≤65536 条） | 用户态 SET/DEL 后写入 |
+| `xdp_stats` | `ARRAY` | hits / misses / bypass / tx_drop 计数 | XDP |
+| `config_map` | `ARRAY` | 目标端口 | 用户态 |
+| `sockmap` | `SOCKHASH` | cookie→sock\_fd | sockops |
+| `sockmap_config` | `ARRAY` | 目标端口 | 用户态 |
+| `sockmap_stats` | `ARRAY` | added / verdict / parsed / parse\_skip 计数 | sk\_skb |
+| `cmd_counts` | `HASH` | RESP 命令名 → (count, bytes) | sk\_skb |
+| `conn_profiles` | `LRU_HASH` | cookie → (first_seen, last_seen, cmds, bytes_in) | sk\_skb |
+
+### Map Pinning
+
+`xdp_manager` / `sockmap_manager` 在加载完成后调用 `bpf_obj_pin(2)` 把所有
+观测 map 钉到 `/sys/fs/bpf/kvstore/<map_name>`，让 `kvs-top` 这类外部工具
+通过 `bpf_obj_get(2)` 只读打开即可读数据，不需要重新加载 BPF 对象。
+kvstore 关闭时自动 `unlink(2)` 清除 pin。
 
 ### 使用条件
 
-- 需要 `CAP_NET_ADMIN` 权限（或 root 运行）
-- 仅支持标准 IPv4（`ihl=5`），含 IP options 的包自动 fallback
-- value 长度上限 **256 字节**，超长 key 自动 fallback
-- 本质绕过内核 TCP 状态机（无重传/拥塞控制），适用于 demo / benchmark
-- 虚拟机 / loopback 接口自动降级为 SKB（generic XDP）模式
+- 需要 `CAP_BPF` / `CAP_NET_ADMIN`（或 root 运行）
+- XDP：仅支持标准 IPv4（`ihl=5`），lo / 虚拟机自动降级为 SKB-generic 模式
+- sockmap：需要 cgroup v2（统一层级），需要内核 ≥ 5.6（`bpf_skb_pull_data` 在 sk_skb 可用）
+- 配置项：`xdp yes` + `xdp_iface lo` 启用 XDP 层；`sockmap yes` 启用流层；
+  二者完全独立，可任意组合（见 `conf/bench/kvstore-observability.conf`）
 
-### 缓存管理
+### 性能开销（实测，redis-benchmark `-t set,get`，C=50）
 
-kvstore 进程在写命令执行后自动同步 XDP 热缓存：
-- `SET` / `HSET` 等写操作 → `xdp_cache_set()` 更新
-- `DEL` / `EXPIRE` 等删除/过期操作 → `xdp_cache_del()` 淘汰
+| Pipeline | 无 BPF (req/s) | sockmap-on (req/s) | Δ |
+|---|---|---|---|
+| P=1 SET | 20088 | 17908 | -10.9% |
+| P=1 GET | 19956 | 19164 | -4.0% |
+| P=4 GET | 75301 | 68775 | -8.7% |
+| P=10 SET/GET | 187k / 173k | 183k / 180k | < 噪声 |
+
+每条 verdict 调用 ~200ns；P=1 时最显眼，pipelined 场景被摊薄到测量噪声水平。
 
 ---
 
 ## 可观测性工具
 
-### kvs_slowlog
-
-eBPF uprobe 挂载在 kvstore 二进制的命令分发函数上，零侵入采集执行超过阈值的命令：
+### kvs-top — 三层 BPF 实时仪表盘
 
 ```bash
-# 采集执行时间 > 1ms 的命令
-sudo ./build/kvs_slowlog ./build/kvstore 1000
+sudo ./build/kvs-top                # 1Hz 刷新，每段 top-10
+sudo ./build/kvs-top -d 0.5 -n 20   # 2Hz 刷新，每段 top-20
+sudo ./build/kvs-top --once         # 单帧快照（脚本友好）
+```
+
+输出布局（聚合三层）：
+```
+[L2/L3] XDP hot-cache
+  hits=360000   misses=0   hit_rate=100.00%   bypass=1.95M   tx_drop=0
+
+[L4/L7] sockmap stream-verdict
+  socks_added=303   verdict=1.15M (17708/s)
+  parsed=1.15M (17708/s, 99.98%)   add_fail=0   parse_skip=253
+
+[L7] Top N commands (sorted by rate)
+  CMD     count    rate(/s)    bytes
+  SET     492236   17707.8     21.12MB
+  GET     360000        0.0    12.36MB
+
+[L4] Top N connections (sorted by recent activity)
+  cookie   cmds   bytes_in   age(s)   idle(ms)
+  16808    2655   116.67KB   7.1      0.6
+```
+
+工作原理：从 `/sys/fs/bpf/kvstore/` 打开 pinned maps，比较两次快照算 delta rate。
+未启用某层时该 section 显示 `(not loaded)`，不强制依赖三层全开。
+
+### kvs_slowlog — 慢命令 uprobe 抓取
+
+```bash
+sudo ./build/kvs_slowlog ./build/kvstore 1000   # 抓 >1ms 的命令
 ```
 
 输出格式：
@@ -435,12 +499,11 @@ sudo ./build/kvs_slowlog ./build/kvstore 1000
 
 > 条件唤醒优化后，高负载下 WAL 路径热路径零 syscall，影响在测试误差范围内。
 
-### XDP 热路径延迟
+### 三层 BPF 观测栈开销
 
-| 路径 | 延迟 |
-|------|------|
-| 完整内核协议栈（kvstore 进程处理） | ~15 μs |
-| XDP 热缓存命中（XDP_TX） | **~2 μs** |
+> 见 [#三层 BPF 可观测栈 → 性能开销](#三层-bpf-可观测栈) 章节。摘要：sockmap 流层
+> 单边开销 P=1 < 11%，P≥4 进入 redis-benchmark 测量噪声范围；XDP 被动监控开销
+> 在测量噪声内（约每包 60ns 的 helper 开销）。
 
 ---
 
@@ -470,8 +533,9 @@ bash test/test_wal_aof.sh
 # P=20，50 并发，30万请求
 redis-benchmark -p 2000 -t set,get -c 50 -P 20 -n 300000
 
-# XDP 热路径（需先开启 xdp=yes 并预热缓存）
-redis-benchmark -p 2000 -t get -c 1 -n 100000
+# 启动三层 BPF 观测栈 + 实时仪表盘
+sudo build/kvstore conf/bench/kvstore-observability.conf &
+sudo build/kvs-top                                  # 实时观察
 ```
 
 ---

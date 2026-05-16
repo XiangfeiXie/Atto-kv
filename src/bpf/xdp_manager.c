@@ -11,6 +11,7 @@
 #define _GNU_SOURCE
 #include "xdp_manager.h"
 #include "xdp_kvs.h"
+#include "bpf_pin.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -159,6 +160,10 @@ int xdp_manager_init(const char *iface, int port) {
             bpf_map_update_elem(g_stats_fd, &i, &zero, BPF_ANY);
     }
 
+    /* Pin maps so external observers (kvs-top) can read them. Best-effort. */
+    if (g_stats_fd >= 0) kvs_bpf_pin_map(g_stats_fd, "xdp_stats");
+    if (g_cache_fd >= 0) kvs_bpf_pin_map(g_cache_fd, "xdp_hot_cache");
+
     g_xdp_ready = 1;
     printf("[XDP] attached to %s (ifindex=%d) port=%d, hot_cache=%d slots\n",
            iface, g_ifindex, port, XDP_CACHE_MAX_ENTRIES);
@@ -223,6 +228,11 @@ void xdp_cache_flush_all(void) {
 }
 
 void xdp_manager_stop(void) {
+    if (g_xdp_ready) {
+        kvs_bpf_unpin_map("xdp_stats");
+        kvs_bpf_unpin_map("xdp_hot_cache");
+    }
+
     if (g_link) {
         bpf_link__destroy(g_link);
         g_link = NULL;

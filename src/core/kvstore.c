@@ -17,6 +17,7 @@
 #include "persistence.h"
 #include "block.h"
 #include "xdp_manager.h"
+#include "sockmap_manager.h"
 
 /* Pack first 4 bytes of a command name into a uint32_t for jump-table dispatch */
 #define CMD4(a,b,c,d) ((uint32_t)(uint8_t)(a) | ((uint32_t)(uint8_t)(b) << 8) | \
@@ -754,6 +755,8 @@ int main(int argc, char *argv[]) {
     if (ENABLE_AOF) aof_async_init();
     if (kvs_config.xdp_enabled)
         xdp_manager_init(kvs_config.xdp_iface, kvs_config.port);
+    if (kvs_config.sockmap_enabled)
+        sockmap_manager_init(kvs_config.port);
 
     if (kvs_config.rdma_sync_enabled) {
         if (kvs_config.rdma_role == ROLE_MASTER) {
@@ -792,6 +795,7 @@ int main(int argc, char *argv[]) {
     else if (ENABLE_AOF)
         ebpf_incr_stop();  /* standalone WAL started by aof_async_init */
     if (ENABLE_AOF) aof_async_shutdown();
+    if (kvs_config.sockmap_enabled) sockmap_manager_stop();
     if (kvs_config.xdp_enabled) xdp_manager_stop();
     dest_kvengine();
     return 0;

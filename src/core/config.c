@@ -34,6 +34,8 @@ static void config_default(void) {
 
     kvs_config.xdp_enabled = 0;
     strncpy(kvs_config.xdp_iface, "lo", sizeof(kvs_config.xdp_iface) - 1);
+
+    kvs_config.sockmap_enabled = 0;
 }
 
 /* ================================================================
@@ -186,6 +188,11 @@ int config_load(const char *path) {
             strncpy(kvs_config.xdp_iface, val,
                     sizeof(kvs_config.xdp_iface) - 1);
 
+        /* ---- sockmap (Phase 2) ---- */
+        } else if (strcasecmp(key, "sockmap") == 0) {
+            int v = parse_bool(val, lineno, "sockmap");
+            if (v >= 0) kvs_config.sockmap_enabled = v;
+
         } else {
             printf("[CONFIG] line %d: unknown key '%s'\n", lineno, key);
         }
@@ -240,5 +247,7 @@ void config_print(void) {
 
     if (kvs_config.xdp_enabled)
         printf("  XDP fast-path : iface=%s\n", kvs_config.xdp_iface);
+    if (kvs_config.sockmap_enabled)
+        printf("  sockmap       : enabled (stream-layer observability)\n");
     printf("========================================\n\n");
 }

@@ -53,6 +53,9 @@ typedef struct {
     /* XDP hot-path acceleration */
     int  xdp_enabled;
     char xdp_iface[32];
+
+    /* sockmap stream-layer observability (Phase 2) */
+    int  sockmap_enabled;
 } KvsConfig;
 
 extern KvsConfig kvs_config;

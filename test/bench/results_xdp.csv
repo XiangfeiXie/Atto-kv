@@ -1,4 +1,4 @@
-pipeline,kvs_noXDP_get,kvs_XDP_get,xdp_speedup,redis_get,xdp_vs_redis
-1,22810.22,0,0.00x,23228.80,0.00x
-4,79365.08,74349.44,0.94x,99403.58,0.75x
-10,225225.22,210970.47,0.94x,316455.69,0.67x
+pipeline,kvs_noXDP_get,kvs_XDPmon_get,monitor_overhead,redis_get,kvs_vs_redis
+1,22361.36,20078.30,0.90x,28640.99,0.70x
+4,81433.22,94607.38,1.16x,103680.66,0.91x
+10,198609.73,235294.11,1.18x,226757.36,1.04x

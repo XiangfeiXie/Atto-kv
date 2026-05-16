@@ -1556,3 +1556,115 @@ API 变更：`xdp_manager_stats()` 签名新增 `tx_drop` 参数（无外部调�
 - BPF 编译：`clang -O2 -target bpf`，零 warning、零 error
 - 用户态编译：`gcc -fsyntax-only`，零 error
 - 签名兼容性：`xdp_manager_stats` 无下游调用者，零 breakage
+
+## 2026-05-16 — Phase 17: 三层 BPF 可观测栈 (XDP 重构 + sockmap + kvs-top)
+
+### 背景与决策
+
+Phase 16 实现的 XDP_TX 热路径在 redis-benchmark 长连接场景下出现致命问题：
+**TCP 双轨状态不一致**——XDP 在驱动层消费 GET 包并自构造回复后，内核 TCP
+栈的 `rcv_nxt` 不会因 XDP 消费的字节而前进。第一次 hot_cache miss 之后的
+任何包，内核都视为乱序段，触发 challenge ACK + 客户端连接挂死。
+
+权衡了三条路：
+1. **XDP + AF_XDP**：用户态全 TCP 栈，零拷贝。工作量巨大，与现有 proactor 架构冲突
+2. **XDP + sockmap sk_msg**：sockmap 单 socket 服务器无法合成出站回包，方向不对
+3. **XDP 降级为被动监控 + sockmap 流层观测**：放弃单点提速，转向**端到端可观测**
+
+最终选 (3)。理由：可观测能力（live per-cmd / per-conn 仪表盘）的工程价值
+高于 demo 性能数字，且与已有 `kvs_slowlog` uprobe 工具天然组成"包→流→函数"
+三层栈，定位是项目独立卖点。
+
+### Phase 1：XDP 改为被动监控
+
+- `src/bpf/xdp_kvs.kern.c` 重写：删除 RESP 回复构造、checksum 重算、
+  `bpf_xdp_adjust_tail`、`XDP_TX` 路径
+- 仅保留头解析 + 端口过滤 + RESP GET 解析 + `hot_cache` 查询 + 计数
+- **始终返回 `XDP_PASS`**，包正常进入内核 TCP 栈
+- redis-benchmark 不再超时；hit_rate ≈ 99.35% 与之前 XDP_TX 一致
+
+### Phase 2：sockmap 流层观测
+
+#### 2.1 BPF 程序骨架（`src/bpf/sockmap_kvs.kern.c`）
+
+- `SEC("sockops")`：监听 `BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB`，过滤目标端口，
+  调 `bpf_sock_hash_update` 用 socket cookie 把 sk 注册进 `sockhash`
+- `SEC("sk_skb/stream_verdict")`：每个流入 skb 触发，**始终返回 `SK_PASS`**
+- 6 个 stats 计数器：`added / add_fail / verdict / verdict_pass / parsed / parse_skip`
+
+#### 2.2 RESP 命令名解析
+
+第一次实现一直得到 `parsed=0 / parse_skip=verdict`。**根因**：sk_skb 程序看到的
+skb 在 TCP RX 路径上数据可能在 paged region，linear region 为空。直接指针访问
+`skb->data ~ skb->data_end` 此时长度为 0，全部 fail。
+
+**修复（一行）**：先调 `bpf_skb_pull_data(skb, min(64, skb->len))` 把前 64 字节
+拉进 linear region，再做指针解析。修复后解析率 **99.84% ~ 99.98%**（剩余 0.16%
+是连接初始化的非 RESP 控制段）。
+
+命令名同时大小写归一（`set` / `Set` / `SET` 全归到 `SET` 桶）。
+
+#### 2.3 多种 BPF map
+
+| Map | 类型 | 内容 |
+|---|---|---|
+| `sockmap` | `BPF_MAP_TYPE_SOCKHASH` | cookie → sock_fd |
+| `cmd_counts` | `BPF_MAP_TYPE_HASH` | RESP 命令名 → (count, bytes) |
+| `conn_profiles` | `BPF_MAP_TYPE_LRU_HASH` | cookie → (first_seen_ns, last_seen_ns, cmds, bytes_in) |
+
+#### 2.4 用户态加载器（`src/bpf/sockmap_manager.c`）
+
+- 自动解析 `/proc/self/cgroup` 找到 cgroup v2 路径并 attach sockops
+- attach stream_verdict 到 sockhash
+- 暴露 `iter_cmds` / `iter_conns` 回调式迭代 API
+
+#### 2.5 配置 + 生命周期集成
+
+- `KvsConfig.sockmap_enabled` + `sockmap yes/no` 配置项
+- kvstore main 启动/退出时 `sockmap_manager_init/stop`
+- 错误降级：cgroup v1 / 无 CAP_BPF / 加载失败时 print warning，kvstore 正常运行
+
+#### 2.6 kvs-top + BPF map pinning
+
+- 新增 `src/bpf/bpf_pin.{h,c}`：pin/unpin 助手，统一 pin 路径 `/sys/fs/bpf/kvstore/<name>`
+- xdp_manager / sockmap_manager 在 load 后立即 pin 所有观测 maps，stop 时 unlink
+- 新增 `src/tools/kvs_top.c`（CLI: `kvs-top`）：
+  - 通过 `bpf_obj_get` 只读打开 5 个 pinned maps
+  - ANSI 转义清屏 + 1Hz 刷新 TUI
+  - 三段聚合：XDP / sockmap stats / Top-N commands / Top-N connections
+  - 双快照计算 delta rate（按速率排序命令）
+  - `--once` 单帧模式给脚本用
+  - 任一层未启用时显示 `(not loaded)`，不强依赖三层全开
+
+#### 2.7 实测开销（lo, redis-benchmark, C=50, n=100k）
+
+| Pipeline | 无 BPF (req/s) | sockmap-on (req/s) | Δ |
+|---|---|---|---|
+| P=1 SET | 20088 | 17908 | -10.9% |
+| P=1 GET | 19956 | 19164 | -4.0% |
+| P=4 GET | 75301 | 68775 | -8.7% |
+| P=10 SET/GET | 187k / 173k | 183k / 180k | < 测量噪声 |
+
+每条 verdict 调用 ~200ns；P=1 时最显眼，pipelined 场景下被摊薄到不可测。
+满足"≤8% 平均开销"目标。
+
+### 修改文件汇总
+
+| 类别 | 文件 |
+|---|---|
+| XDP 重构 | `src/bpf/xdp_kvs.kern.c`, `src/bpf/xdp_manager.c` (+pin) |
+| sockmap 全新 | `src/bpf/sockmap_kvs.{h,kern.c}`, `src/bpf/sockmap_manager.{h,c}` |
+| pin 助手 | `src/bpf/bpf_pin.{h,c}` |
+| CLI 新工具 | `src/tools/kvs_top.c` |
+| 配置 + 集成 | `src/core/config.{h,c}`, `src/core/kvstore.c` |
+| 构建 | `CMakeLists.txt` |
+| 配置示例 | `conf/bench/kvstore-sockmap.conf`, `conf/bench/kvstore-observability.conf` |
+| Bench | `test/bench/bench_xdp.sh` (改为被动监控对比) |
+| 文档 | `README.md`（重写"三层 BPF 可观测栈"章节）+ 本条 dev-log |
+
+### 关键经验
+
+1. **sk_skb skb 不是 linear** — 必须先 `bpf_skb_pull_data` 才能直接指针解析
+2. **BPF map pin 是分离工具/主进程的标准模式** — 比 Unix socket / HTTP 都简单
+3. **XDP_TX 在长连接场景天然破坏 TCP** — 内核 TCP 状态机无法兼容驱动层"代答"
+4. **观测优先于提速** — 三层并联监控的工程价值高于单点低延迟，特别是带演示场景

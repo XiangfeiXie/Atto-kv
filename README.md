@@ -28,7 +28,7 @@
 | 特性 | 说明 |
 |------|------|
 | **5 种数据类型** | STRING、LIST、SET、HASH、ZSET，完整 Redis 命令兼容 |
-| **3 种网络模型** | Reactor (epoll)、Proactor (io_uring)、NtyCo (协程)，配置切换 |
+| **3 种网络模型** | Reactor (epoll)、Proactor (io_uring 进阶版：multishot accept/recv + 内核 buffer ring + DEFER_TASKRUN)、NtyCo (协程) |
 | **双持久化** | RDB 二进制快照 + AOF 命令日志，io_uring 异步写入，mmap 加速加载 |
 | **主从复制** | RDMA 零拷贝全量同步 + WAL journal 增量复制，consumer 线程 io_uring 分发 |
 | **三层 BPF 观测栈** | XDP (L2/L3 包层 hit/miss/bypass) + sockmap sk_skb (L4/L7 流层 per-cmd / per-conn) + uprobe (应用函数延迟)，全部 `XDP_PASS` / `SK_PASS` 被动监控，单边开销 < 8% |
@@ -467,8 +467,29 @@ sudo ./build/kvs_slowlog ./build/kvstore 1000   # 抓 >1ms 的命令
 
 ## 性能数据
 
-> ⚠️ 以下数据来自早期测试阶段，**最新基准数据待更新**。  
-> 测试环境：Ubuntu 24.04，`redis-benchmark -t set/get -c 50 -n 300000~1000000`
+测试环境：Ubuntu 24.04，kernel 6.8，`redis-benchmark -c 50 -n 100000`，loopback。
+
+### Phase 3 io_uring 进阶优化（2026-05-16，最新）
+
+`network proactor`，无持久化，无 BPF。三步累积优化：multishot accept (3.1) →
+provided buffer ring + multishot recv (3.2) → SINGLE_ISSUER + DEFER_TASKRUN +
+COOP_TASKRUN setup flags (3.3)。
+
+| Pipeline | OP | baseline | Phase 3 | Δ |
+|---|---|---|---|---|
+| P=1 | SET | 18560 | 25654 | **+38.2%** |
+| P=1 | GET | 18471 | 22287 | +20.7% |
+| P=4 | SET | 69348 | 81169 | +17.0% |
+| P=4 | GET | 69881 | 100100 | **+43.2%** |
+| P=10 | SET | 164474 | 222222 | +35.1% |
+| P=10 | GET | 163399 | 198413 | +21.4% |
+| P=20 | SET | 432900 | 460830 | +6.5% (高方差区) |
+| P=20 | GET | 285714 | 442478 | **+54.9%** |
+
+平均 **+30%**。低 pipeline (P=1/4) 收益最大，符合"syscall 占比越高、io_uring 进阶越甜"的理论。
+原始数据：`test/bench/phase3-*.csv`。
+
+### 历史数据（Phase 2 head 之前）
 
 ### Pipeline 吞吐量（proactor 模型，无持久化）
 

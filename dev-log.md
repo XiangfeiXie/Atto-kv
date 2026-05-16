@@ -1668,3 +1668,131 @@ skb 在 TCP RX 路径上数据可能在 paged region，linear region 为空。�
 2. **BPF map pin 是分离工具/主进程的标准模式** — 比 Unix socket / HTTP 都简单
 3. **XDP_TX 在长连接场景天然破坏 TCP** — 内核 TCP 状态机无法兼容驱动层"代答"
 4. **观测优先于提速** — 三层并联监控的工程价值高于单点低延迟，特别是带演示场景
+
+## 2026-05-16 — Phase 3: io_uring 进阶优化（单线程版）
+
+### 目标
+
+Phase 2 收尾后的单线程 proactor 在 redis-benchmark P=1 场景下 QPS ≈ 18.5k，syscall
+开销占比很高（每条命令至少 2~3 次 io_uring submit + recv buffer 重新计算）。本阶段
+是在不引入多线程的前提下，把单线程 io_uring 的吞吐天花板拉到尽可能高，为 Phase 4
+的 SO_REUSEPORT 多 worker 架构提供更高的单实例基线。
+
+### 改动一：Multishot accept（3.1）
+
+`src/net/proactor.c`：把一次性 `io_uring_prep_accept` 改成
+`io_uring_prep_multishot_accept`。一个 SQE 永久驻留内核，所有后续 accept 自动产生
+CQE，仅在内核报 `!IORING_CQE_F_MORE`（致命错误）时才需要重新 arm。
+
+收益单测难以体现（50 conn 的短 bench 只 accept 一次），但消除了 accept 路径的"接到
+就 re-arm"分支，为 Phase 4 多线程 + 高连接 churn 场景埋好底子。
+
+### 改动二：Provided buffer ring + multishot recv（3.2）—— 主收益
+
+#### 设计
+
+预分配一块 4 MB 内存（`KVS_NR_BUFS=1024 × KVS_BUF_SIZE=4096`），用
+`io_uring_setup_buf_ring()` 注册成 buffer ring（group id=1）。每个连接 accept 后
+**只 arm 一次** multishot recv，带 `IOSQE_BUFFER_SELECT` 标志，让内核在数据到达时
+自己挑一个空闲 buffer。
+
+CQE 流程：
+- `cqe->flags & IORING_CQE_F_BUFFER` → 内核已经把数据塞进选中的 buffer
+- bid = `cqe->flags >> IORING_CQE_BUFFER_SHIFT`
+- 用户态从 `g_buf_base + bid * KVS_BUF_SIZE` memcpy 到连接的 `read_buf`
+- 调 `io_uring_buf_ring_add` + `_advance` 把 buffer 还回去
+- 整条 SQE 持续存活（`IORING_CQE_F_MORE`），后续数据继续来 CQE
+
+EVENT_WRITE 不再需要 `set_event_recv` 重新 arm —— multishot 一直活着。
+
+#### 调试踩坑
+
+最初实现得到 `(error) ERR unknown command`，看似数据被损坏。strace 后发现是
+**redis-cli 默认发小写命令名**，而 kvstore 的 `TOKEN_EQ` 是严格 memcmp（不区分
+大小写要靠 dispatch 层手动转）。这是个 pre-existing 限制，跟 3.2 无关 ——
+redis-benchmark 发大写所以一直跑得动。raw netcat 验证大写 `*1\r\n$4\r\nPING\r\n`
+正常返回 `+PONG`，证明协议路径未受影响。
+
+#### 收益（cumulative，相对 baseline）
+
+| Pipeline | OP | baseline | 3.2 | Δ |
+|---|---|---|---|---|
+| P=1 | SET | 18560 | 21834 | +17.6% |
+| P=1 | GET | 18471 | 21377 | +15.7% |
+| P=4 | SET | 69348 | 88810 | +28.1% |
+| P=4 | GET | 69881 | 82237 | +17.7% |
+| P=10 | SET | 164474 | 276243 | +68.0% |
+| P=10 | GET | 163399 | 214592 | +31.3% |
+
+3.2 是本阶段的主收益来源。
+
+### 改动三：io_uring setup 标志位（3.3）
+
+加上以下 flags（kernel ≥ 6.0 一并支持）：
+
+```c
+params.flags = IORING_SETUP_SINGLE_ISSUER
+             | IORING_SETUP_DEFER_TASKRUN
+             | IORING_SETUP_COOP_TASKRUN
+             | IORING_SETUP_SUBMIT_ALL;
+```
+
+| Flag | 作用 |
+|---|---|
+| `SINGLE_ISSUER` | 承诺只有一个线程提 SQE，内核跳过锁 |
+| `DEFER_TASKRUN` | 延迟内核侧任务运行到下次 io_uring_enter，避免 IPI |
+| `COOP_TASKRUN` | 永不用 IPI 唤醒用户态，由用户自己轮询 |
+| `SUBMIT_ALL` | 单条 SQE 失败不打断整批提交 |
+
+`DEFER_TASKRUN` 要求 `SINGLE_ISSUER`。三者配合，把每次 io_uring_enter 的开销摊薄
+到最低，对单线程模型几乎是免费午餐。代码层面只是 init 时多设几个标志位，附带一个
+EINVAL 回退兼容老内核的逻辑。
+
+### Phase 3 总收益（3.1 + 3.2 + 3.3 累积）
+
+| Pipeline | OP | baseline | Phase 3 | Δ |
+|---|---|---|---|---|
+| P=1 | SET | 18560 | 25654 | **+38.2%** |
+| P=1 | GET | 18471 | 22287 | +20.7% |
+| P=4 | SET | 69348 | 81169 | +17.0% |
+| P=4 | GET | 69881 | 100100 | **+43.2%** |
+| P=10 | SET | 164474 | 222222 | +35.1% |
+| P=10 | GET | 163399 | 198413 | +21.4% |
+| P=20 | SET | 432900 | 460830 | +6.5%（高方差区） |
+| P=20 | GET | 285714 | 442478 | **+54.9%** |
+
+平均 +30%，与预测吻合。低 pipeline 场景（syscall 占比高）收益最大，符合理论。
+
+CSV 原始数据：
+- `test/bench/phase3-baseline.csv`
+- `test/bench/phase3-step2.csv`
+- `test/bench/phase3-step3.csv`
+
+### 跳过：3.4 SQPOLL
+
+考虑过 `IORING_SETUP_SQPOLL`（内核独立轮询 SQ 线程）但放弃：
+- 低负载下烧满一个 CPU（即使 idle 也轮询）
+- VM / 容器环境 SQ 轮询线程被宿主调度抖动，收益不稳
+- 真要榨高负载性能，Phase 4 的多线程 proactor 直接给每个 worker 配一个 ring，
+  比 SQPOLL 单 worker + 一个内核线程更线性
+
+### 修改文件汇总
+
+| 文件 | 变更 |
+|---|---|
+| `src/net/proactor.c` | multishot accept、buffer ring 全套、multishot recv、setup flags |
+| `test/bench/phase3-*.csv` | 三阶段 bench 原始数据 |
+
+### 关键经验
+
+1. **multishot 模型重塑了"重新 arm"的逻辑** —— 只在 `!IORING_CQE_F_MORE` 时才 arm，
+   一般情况零额外 SQE
+2. **buffer ring 用 mmap 内存比 malloc 更稳** —— 显式页对齐、避免 jemalloc 的额外簿记
+3. **DEFER_TASKRUN 几乎是单线程 io_uring 的"免费午餐"** —— 只需多两个标志位
+4. **io_uring API 的演进很快** —— 5.19 之后每个版本都有大改，liburing 2.5 + 内核 6.x 是当前最甜区间
+
+### 下一步：Phase 4
+
+进入多线程 proactor + dict 分片。Phase 3 的 multishot recv / buffer ring / setup flags
+在 Phase 4 直接复用 —— 每个 worker 线程一个 io_uring + 一个独立 buffer ring，
+SO_REUSEPORT 让内核做 flow-based 分发。

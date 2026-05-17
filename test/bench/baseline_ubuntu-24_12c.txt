@@ -1,0 +1,19 @@
+============================================================
+kvstore baseline — captured 2026-05-17T02:31:47+00:00
+  host       : ubuntu-24
+  nproc      : 12
+  kernel     : 6.8.0-111-generic
+  bench      : redis-benchmark -c 400 -n 1000000 -P 10 --threads 12
+  build hash : 207828e
+============================================================
+
+  Build type  : Release
+  Build flags : -O3 -DNDEBUG -fno-omit-frame-pointer
+
+Sweep (SET / GET QPS, requests-per-second):
+
+  t=1 pin=off   SET=  13129.73  GET=  12970.17
+  t=1 pin=auto  SET=  12289.09  GET=  10355.40
+  t=2 pin=off   SET=  12562.81  GET=  15795.29
+  t=2 pin=auto  SET=  16494.30  GET=  15897.49
+  t=4 pin=off   SET=  17364.43  GET=  17504.24

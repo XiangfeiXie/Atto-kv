@@ -24,20 +24,28 @@
                         ((uint32_t)(uint8_t)(c) << 16) | ((uint32_t)(uint8_t)(d) << 24))
 
 /* ──────────────────────────────────────────────────────────────────
- * Phase 4 — shard lock guard.
+ * Phase 6.2 — shard lock guard with read/write differentiation.
  *
- * Single-key dispatch acquires the relevant shard's wrlock just before
- * the dict_find at the top of the keyed-command flow and releases it
- * after the type engine has populated the reply.  We always wrlock
- * (rather than rdlock for read commands) because:
+ * Single-key dispatch classifies the incoming command as read/write
+ * BEFORE locking, then takes rdlock for reads and wrlock for writes.
+ * The cleanup attribute auto-releases on every return path.
  *
- *   - Most read paths still bump LRU / lazy expire, so they mutate.
- *   - With 32 shards, contention is already 1/32 — wrlock vs rdlock
- *     savings are negligible compared to the simplification.
+ * Why this matters: with N workers and 32 shards, an all-write workload
+ * has expected wait time ≈ N/32 per request once N > 32.  Adding more
+ * workers past that point only adds contention, no throughput.  For
+ * read-heavy workloads (the common case: GET/HGET/LRANGE) rdlock lets
+ * an arbitrary number of readers run concurrently inside one shard,
+ * so the per-shard ceiling becomes "writer-bound" not "worker-bound".
  *
- * The cleanup attribute auto-releases on every return path; callers
- * that need to drop the lock early (e.g. before block_wake which may
- * recursively dispatch) call SHARD_RELEASE() explicitly.
+ * Lazy-expire upgrade: if a reader finds an expired entry under rdlock,
+ * we call SHARD_UPGRADE_TO_WR() to drop rdlock + take wrlock + re-find.
+ * Same hash, same shard, just stronger lock.  The "re-find" is needed
+ * because between drop-rd and take-wr, another writer may have already
+ * deleted the entry — so we re-check rather than blindly delete.
+ *
+ * Callers that need to drop the lock early (e.g. before block_wake
+ * which may recursively dispatch into a different shard) call
+ * SHARD_RELEASE() explicitly.
  * ────────────────────────────────────────────────────────────────── */
 typedef struct {
     uint64_t hash;
@@ -51,10 +59,30 @@ static inline void kvs_shard_guard_release(kvs_shard_guard_t *g) {
     }
 }
 
-#define SHARD_WRLOCK(h) \
+/* Take the shard lock in either rdlock (write_mode==0) or wrlock mode.
+ * Declares _sg in the enclosing scope; cleanup attribute auto-releases.
+ * Use exactly once per scope. */
+#define SHARD_LOCK(h, write_mode)                                            \
     kvs_shard_guard_t _sg __attribute__((cleanup(kvs_shard_guard_release))) \
-        = { .hash = (h), .held = 1 }; \
-    kv_shard_wrlock_h(h)
+        = { .hash = (h), .held = 1 };                                       \
+    do {                                                                     \
+        if (write_mode) kv_shard_wrlock_h(h);                                \
+        else            kv_shard_rdlock_h(h);                                \
+    } while (0)
+
+/* Back-compat: existing callers that need wrlock-only paths
+ * (e.g. multi-key MGET/MSET loops in keyless handling). */
+#define SHARD_WRLOCK(h) SHARD_LOCK((h), 1)
+
+/* Upgrade an existing _sg (currently held as rdlock) to wrlock.
+ * Drops the rdlock, then takes the wrlock on the same shard.
+ * The guard remains armed so cleanup still fires on scope exit. */
+#define SHARD_UPGRADE_TO_WR()                                                \
+    do {                                                                     \
+        if (_sg.held) { kv_shard_unlock_h(_sg.hash); _sg.held = 0; }         \
+        kv_shard_wrlock_h(_sg.hash);                                         \
+        _sg.held = 1;                                                        \
+    } while (0)
 
 #define SHARD_RELEASE() kvs_shard_guard_release(&_sg)
 
@@ -316,7 +344,11 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         for (int i = 1; i < argc; i++) {
             uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                   (uint32_t)tokens[i].len);
-            SHARD_WRLOCK(kh);
+            /* Phase 6.2 — MGET is pure read; take rdlock to allow concurrent
+             * readers on the same shard.  string_engine_get only does dict_find
+             * (no mutation), so rdlock is safe even though it'd skip the lazy
+             * lazy-expire delete — an expired key just reads as nil here. */
+            SHARD_LOCK(kh, 0);
             uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
             const char *val = string_engine_get(tokens[i].ptr, (uint32_t)tokens[i].len,
                                                 &vlen, &enc);
@@ -372,7 +404,10 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                 for (int i = 1; i + 1 < argc; i += 2) {
                     uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                           (uint32_t)tokens[i].len);
-                    SHARD_WRLOCK(kh);
+                    /* XDP cache update is read-only (just reads back the
+                     * value we just wrote); rdlock allows other readers
+                     * to continue concurrently. */
+                    SHARD_LOCK(kh, 0);
                     uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
                     const char *v = string_engine_get(
                         tokens[i].ptr, (uint32_t)tokens[i].len, &vlen, &enc);
@@ -400,7 +435,9 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         for (int i = 1; i + 1 < argc; i += 2) {
             uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                   (uint32_t)tokens[i].len);
-            SHARD_WRLOCK(kh);
+            /* Phase 6.2 — MSETNX pre-check is read-only (only deciding
+             * whether to abort); use rdlock for concurrent inspection. */
+            SHARD_LOCK(kh, 0);
             kv_entry_t *ke = dict_find(kv_dict_for(kh), tokens[i].ptr, (uint32_t)tokens[i].len, kh);
             if (ke && (!ke->expire || get_time_now() <= ke->expire)) {
                 reply_integer(wb, 0);
@@ -423,7 +460,8 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                 for (int i = 1; i + 1 < argc; i += 2) {
                     uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                           (uint32_t)tokens[i].len);
-                    SHARD_WRLOCK(kh);
+                    /* MSETNX XDP-cache read-back: rdlock (read-only). */
+                    SHARD_LOCK(kh, 0);
                     uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
                     const char *v = string_engine_get(
                         tokens[i].ptr, (uint32_t)tokens[i].len, &vlen, &enc);
@@ -467,7 +505,10 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
-    /* ── EXISTS — multi-key, integer reply, per-key wrlock (lazy expire). ── */
+    /* ── EXISTS — multi-key, integer reply.  Phase 6.2: rdlock — purely
+     * read-only.  We don't even delete expired keys here (they'd need an
+     * upgrade and EXISTS is supposed to be cheap); they're just reported
+     * as absent, and lazy-deleted on the next single-key access. ── */
     if (TOKEN_EQ(cmd, "EXISTS") || TOKEN_EQ(cmd, "EXIST")) {
         if (argc < 2) {
             dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
@@ -477,7 +518,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         for (int i = 1; i < argc; i++) {
             kvs_token_t kt = tokens[i];
             uint64_t kh = kv_hash((const uint8_t *)kt.ptr, (uint32_t)kt.len);
-            SHARD_WRLOCK(kh);
+            SHARD_LOCK(kh, 0);
             kv_entry_t *ke = dict_find(kv_dict_for(kh), kt.ptr, (uint32_t)kt.len, kh);
             if (!ke) continue;
             if (ke->expire && get_time_now() > ke->expire) continue;
@@ -496,18 +537,115 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     kvs_token_t key_tok = tokens[1];
     uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
 
-    /* Phase 4: lock the shard for tokens[1] until we leave the keyed-command
-     * scope.  Released early before block_wake (which may recursively
-     * dispatch into a different shard). */
-    SHARD_WRLOCK(hash);
+    /* Phase 6.2 — classify command BEFORE locking, so we can choose rdlock
+     * (for reads) vs wrlock (for writes).  cmd_type < 0 means unknown,
+     * cmd_type == -2 means "generic" (TYPE/TTL/PTTL/EXPIRE/PERSIST — no
+     * value-type engine, handled inline below). */
+    int cmd_type = -1;
+    int is_write = 0;
+    if (TOKEN_EQ(cmd, "TYPE") || TOKEN_EQ(cmd, "TTL") || TOKEN_EQ(cmd, "PTTL")) {
+        cmd_type = -2; is_write = 0;
+    } else if (TOKEN_EQ(cmd, "EXPIRE") || TOKEN_EQ(cmd, "PERSIST")) {
+        cmd_type = -2; is_write = 1;
+    } else {
+        uint32_t c4 = 0;
+        memcpy(&c4, cmd.ptr, (size_t)(cmd.len < 4 ? cmd.len : 4));
+        switch (c4) {
+        /* ── STRING ── */
+        case CMD4('S','E','T',0):   cmd_type = KV_TYPE_STRING; is_write = 1; break;
+        case CMD4('S','E','T','N'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* SETNX */
+        case CMD4('S','E','T','E'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* SETEX */
+        case CMD4('G','E','T',0):   cmd_type = KV_TYPE_STRING; break;              /* GET */
+        case CMD4('G','E','T','S'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* GETSET */
+        case CMD4('A','P','P','E'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* APPEND */
+        case CMD4('I','N','C','R'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* INCR / INCRBY / INCRBYFLOAT */
+        case CMD4('D','E','C','R'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* DECR / DECRBY */
+        case CMD4('M','O','D',0):   cmd_type = KV_TYPE_STRING; is_write = 1; break; /* MOD */
+        case CMD4('S','T','R','L'): cmd_type = KV_TYPE_STRING; break;              /* STRLEN */
+        /* ── SET ── */
+        case CMD4('S','A','D','D'): cmd_type = KV_TYPE_SET; is_write = 1; break;
+        case CMD4('S','R','E','M'): cmd_type = KV_TYPE_SET; is_write = 1; break;
+        case CMD4('S','P','O','P'): cmd_type = KV_TYPE_SET; is_write = 1; break;
+        case CMD4('S','M','O','V'): cmd_type = KV_TYPE_SET; is_write = 1; break;
+        case CMD4('S','M','E','M'): cmd_type = KV_TYPE_SET; break;              /* SMEMBERS */
+        case CMD4('S','C','A','R'): cmd_type = KV_TYPE_SET; break;              /* SCARD */
+        case CMD4('S','I','S','M'): cmd_type = KV_TYPE_SET; break;              /* SISMEMBER */
+        case CMD4('S','M','I','S'): cmd_type = KV_TYPE_SET; break;              /* SMISMEMBER */
+        case CMD4('S','R','A','N'): cmd_type = KV_TYPE_SET; break;              /* SRANDMEMBER */
+        case CMD4('S','I','N','T'):
+            cmd_type = KV_TYPE_SET; is_write = (cmd.len > 6); break;
+        case CMD4('S','U','N','I'):
+            cmd_type = KV_TYPE_SET; is_write = (cmd.len > 6); break;
+        case CMD4('S','D','I','F'):
+            cmd_type = KV_TYPE_SET; is_write = (cmd.len > 5); break;
+        /* ── HASH ── */
+        case CMD4('H','S','E','T'): cmd_type = KV_TYPE_HASH; is_write = 1; break;
+        case CMD4('H','D','E','L'): cmd_type = KV_TYPE_HASH; is_write = 1; break;
+        case CMD4('H','M','S','E'): cmd_type = KV_TYPE_HASH; is_write = 1; break;
+        case CMD4('H','I','N','C'): cmd_type = KV_TYPE_HASH; is_write = 1; break;
+        case CMD4('H','G','E','T'): cmd_type = KV_TYPE_HASH; break;              /* HGET / HGETALL */
+        case CMD4('H','K','E','Y'): cmd_type = KV_TYPE_HASH; break;              /* HKEYS */
+        case CMD4('H','V','A','L'): cmd_type = KV_TYPE_HASH; break;              /* HVALS */
+        case CMD4('H','L','E','N'): cmd_type = KV_TYPE_HASH; break;              /* HLEN */
+        case CMD4('H','E','X','I'): cmd_type = KV_TYPE_HASH; break;              /* HEXISTS */
+        case CMD4('H','M','G','E'): cmd_type = KV_TYPE_HASH; break;              /* HMGET */
+        case CMD4('H','S','T','R'): cmd_type = KV_TYPE_HASH; break;              /* HSTRLEN */
+        case CMD4('H','R','A','N'): cmd_type = KV_TYPE_HASH; break;              /* HRANDFIELD */
+        /* ── ZSET ── */
+        case CMD4('Z','A','D','D'): cmd_type = KV_TYPE_ZSET; is_write = 1; break;
+        case CMD4('Z','R','E','M'): cmd_type = KV_TYPE_ZSET; is_write = 1; break;
+        case CMD4('Z','I','N','C'): cmd_type = KV_TYPE_ZSET; is_write = 1; break;
+        case CMD4('Z','P','O','P'): cmd_type = KV_TYPE_ZSET; is_write = 1; break;
+        case CMD4('Z','S','C','O'): cmd_type = KV_TYPE_ZSET; break;              /* ZSCORE */
+        case CMD4('Z','M','S','C'): cmd_type = KV_TYPE_ZSET; break;              /* ZMSCORE */
+        case CMD4('Z','R','A','N'): cmd_type = KV_TYPE_ZSET; break;              /* ZRANGE / ZRANK / ZRANGEBYSCORE / ZRANDMEMBER */
+        case CMD4('Z','R','E','V'): cmd_type = KV_TYPE_ZSET; break;              /* ZREVRANGE / ZREVRANK / ZREVRANGEBYSCORE */
+        case CMD4('Z','C','A','R'): cmd_type = KV_TYPE_ZSET; break;              /* ZCARD */
+        case CMD4('Z','C','O','U'): cmd_type = KV_TYPE_ZSET; break;              /* ZCOUNT */
+        /* ── LIST ── */
+        case CMD4('L','P','U','S'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
+        case CMD4('L','P','O','P'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
+        case CMD4('L','S','E','T'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
+        case CMD4('L','R','E','M'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
+        case CMD4('L','T','R','I'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
+        case CMD4('L','I','N','S'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
+        case CMD4('L','M','O','V'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
+        case CMD4('L','L','E','N'): cmd_type = KV_TYPE_LIST; break;              /* LLEN */
+        case CMD4('L','R','A','N'): cmd_type = KV_TYPE_LIST; break;              /* LRANGE */
+        case CMD4('L','I','N','D'): cmd_type = KV_TYPE_LIST; break;              /* LINDEX */
+        case CMD4('L','P','O','S'): cmd_type = KV_TYPE_LIST; break;              /* LPOS */
+        case CMD4('R','P','U','S'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
+        case CMD4('R','P','O','P'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
+        case CMD4('B','L','P','O'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
+        case CMD4('B','R','P','O'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
+        }
+        if (cmd_type < 0) {
+            dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
+            return DISPATCH_ERROR;
+        }
+    }
+
+    /* Acquire the shard lock — rdlock for reads, wrlock for writes.
+     * Auto-released on every return path via the cleanup attribute on _sg.
+     * Released early before block_wake (which may recursively dispatch). */
+    SHARD_LOCK(hash, is_write);
 
     kv_entry_t *entry = dict_find(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
 
-    /* Treat already-expired entry as absent. */
+    /* Lazy-expire: if we found an expired entry under rdlock, we must upgrade
+     * to wrlock before deleting (otherwise the dict mutation would race with
+     * other readers).  After upgrade, re-find — another writer may have
+     * already deleted the entry while we were waiting for the wrlock. */
     if (entry && entry->expire && get_time_now() > entry->expire) {
-        entry_cleanup_by_type(entry);
-        dict_delete(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
-        entry = NULL;
+        if (!is_write) {
+            SHARD_UPGRADE_TO_WR();
+            entry = dict_find(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
+        }
+        if (entry && entry->expire && get_time_now() > entry->expire) {
+            entry_cleanup_by_type(entry);
+            dict_delete(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
+            entry = NULL;
+        }
     }
 
     int pre_len = wb->len;
@@ -582,88 +720,9 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
-    /* ── Resolve command → expected type via CMD4 jump table.
-         Pack first 4 bytes into a uint32_t and switch directly.
-         Only 3 conflict pairs (SINTER/SINTERSTORE, SUNION/SUNIONSTORE,
-         SDIFF/SDIFFSTORE) need a secondary cmd.len check. ── */
-    uint32_t c4 = 0;
-    memcpy(&c4, cmd.ptr, (size_t)(cmd.len < 4 ? cmd.len : 4));
-    int cmd_type = -1;
-    int is_write = 0;
-    switch (c4) {
-    /* ── STRING ── */
-    case CMD4('S','E','T',0):   cmd_type = KV_TYPE_STRING; is_write = 1; break;
-    case CMD4('S','E','T','N'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* SETNX */
-    case CMD4('S','E','T','E'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* SETEX */
-    case CMD4('G','E','T',0):   cmd_type = KV_TYPE_STRING; break;              /* GET */
-    case CMD4('G','E','T','S'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* GETSET */
-    case CMD4('A','P','P','E'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* APPEND */
-    case CMD4('I','N','C','R'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* INCR / INCRBY / INCRBYFLOAT */
-    case CMD4('D','E','C','R'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* DECR / DECRBY */
-    case CMD4('M','O','D',0):   cmd_type = KV_TYPE_STRING; is_write = 1; break; /* MOD */
-    case CMD4('S','T','R','L'): cmd_type = KV_TYPE_STRING; break;              /* STRLEN */
-    /* ── SET ── */
-    case CMD4('S','A','D','D'): cmd_type = KV_TYPE_SET; is_write = 1; break; /* SADD */
-    case CMD4('S','R','E','M'): cmd_type = KV_TYPE_SET; is_write = 1; break; /* SREM */
-    case CMD4('S','P','O','P'): cmd_type = KV_TYPE_SET; is_write = 1; break; /* SPOP */
-    case CMD4('S','M','O','V'): cmd_type = KV_TYPE_SET; is_write = 1; break; /* SMOVE */
-    case CMD4('S','M','E','M'): cmd_type = KV_TYPE_SET; break;              /* SMEMBERS */
-    case CMD4('S','C','A','R'): cmd_type = KV_TYPE_SET; break;              /* SCARD */
-    case CMD4('S','I','S','M'): cmd_type = KV_TYPE_SET; break;              /* SISMEMBER */
-    case CMD4('S','M','I','S'): cmd_type = KV_TYPE_SET; break;              /* SMISMEMBER */
-    case CMD4('S','R','A','N'): cmd_type = KV_TYPE_SET; break;              /* SRANDMEMBER */
-    case CMD4('S','I','N','T'):                                           /* SINTER / SINTERSTORE */
-        cmd_type = KV_TYPE_SET; is_write = (cmd.len > 6); break;
-    case CMD4('S','U','N','I'):                                           /* SUNION / SUNIONSTORE */
-        cmd_type = KV_TYPE_SET; is_write = (cmd.len > 6); break;
-    case CMD4('S','D','I','F'):                                           /* SDIFF / SDIFFSTORE */
-        cmd_type = KV_TYPE_SET; is_write = (cmd.len > 5); break;
-    /* ── HASH ── */
-    case CMD4('H','S','E','T'): cmd_type = KV_TYPE_HASH; is_write = 1; break; /* HSET / HSETNX */
-    case CMD4('H','D','E','L'): cmd_type = KV_TYPE_HASH; is_write = 1; break; /* HDEL */
-    case CMD4('H','M','S','E'): cmd_type = KV_TYPE_HASH; is_write = 1; break; /* HMSET */
-    case CMD4('H','I','N','C'): cmd_type = KV_TYPE_HASH; is_write = 1; break; /* HINCRBY / HINCRBYFLOAT */
-    case CMD4('H','G','E','T'): cmd_type = KV_TYPE_HASH; break;              /* HGET / HGETALL */
-    case CMD4('H','K','E','Y'): cmd_type = KV_TYPE_HASH; break;              /* HKEYS */
-    case CMD4('H','V','A','L'): cmd_type = KV_TYPE_HASH; break;              /* HVALS */
-    case CMD4('H','L','E','N'): cmd_type = KV_TYPE_HASH; break;              /* HLEN */
-    case CMD4('H','E','X','I'): cmd_type = KV_TYPE_HASH; break;              /* HEXISTS */
-    case CMD4('H','M','G','E'): cmd_type = KV_TYPE_HASH; break;              /* HMGET */
-    case CMD4('H','S','T','R'): cmd_type = KV_TYPE_HASH; break;              /* HSTRLEN */
-    case CMD4('H','R','A','N'): cmd_type = KV_TYPE_HASH; break;              /* HRANDFIELD */
-    /* ── ZSET ── */
-    case CMD4('Z','A','D','D'): cmd_type = KV_TYPE_ZSET; is_write = 1; break; /* ZADD */
-    case CMD4('Z','R','E','M'): cmd_type = KV_TYPE_ZSET; is_write = 1; break; /* ZREM / ZREMRANGEBYRANK / ZREMRANGEBYSCORE */
-    case CMD4('Z','I','N','C'): cmd_type = KV_TYPE_ZSET; is_write = 1; break; /* ZINCRBY */
-    case CMD4('Z','P','O','P'): cmd_type = KV_TYPE_ZSET; is_write = 1; break; /* ZPOPMIN / ZPOPMAX */
-    case CMD4('Z','S','C','O'): cmd_type = KV_TYPE_ZSET; break;              /* ZSCORE */
-    case CMD4('Z','M','S','C'): cmd_type = KV_TYPE_ZSET; break;              /* ZMSCORE */
-    case CMD4('Z','R','A','N'): cmd_type = KV_TYPE_ZSET; break;              /* ZRANGE / ZRANK / ZRANGEBYSCORE / ZRANDMEMBER */
-    case CMD4('Z','R','E','V'): cmd_type = KV_TYPE_ZSET; break;              /* ZREVRANGE / ZREVRANK / ZREVRANGEBYSCORE */
-    case CMD4('Z','C','A','R'): cmd_type = KV_TYPE_ZSET; break;              /* ZCARD */
-    case CMD4('Z','C','O','U'): cmd_type = KV_TYPE_ZSET; break;              /* ZCOUNT */
-    /* ── LIST ── */
-    case CMD4('L','P','U','S'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* LPUSH / LPUSHX */
-    case CMD4('L','P','O','P'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* LPOP */
-    case CMD4('L','S','E','T'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* LSET */
-    case CMD4('L','R','E','M'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* LREM */
-    case CMD4('L','T','R','I'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* LTRIM */
-    case CMD4('L','I','N','S'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* LINSERT */
-    case CMD4('L','M','O','V'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* LMOVE */
-    case CMD4('L','L','E','N'): cmd_type = KV_TYPE_LIST; break;              /* LLEN */
-    case CMD4('L','R','A','N'): cmd_type = KV_TYPE_LIST; break;              /* LRANGE */
-    case CMD4('L','I','N','D'): cmd_type = KV_TYPE_LIST; break;              /* LINDEX */
-    case CMD4('L','P','O','S'): cmd_type = KV_TYPE_LIST; break;              /* LPOS */
-    case CMD4('R','P','U','S'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* RPUSH / RPUSHX */
-    case CMD4('R','P','O','P'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* RPOP / RPOPLPUSH */
-    case CMD4('B','L','P','O'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* BLPOP */
-    case CMD4('B','R','P','O'): cmd_type = KV_TYPE_LIST; is_write = 1; break; /* BRPOP */
-    }
-
-    if (cmd_type < 0) {
-        dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
-        return DISPATCH_ERROR;
-    }
+    /* Phase 6.2 — cmd_type / is_write were already resolved before locking.
+     * If we reach here, cmd_type is a valid KV_TYPE_* (not -2 generic, since
+     * those would have returned early via TYPE/TTL/PTTL/EXPIRE/PERSIST). */
 
     /* WRONGTYPE if key exists but with a different type */
     if (entry && (int)entry_type(entry) != cmd_type) {

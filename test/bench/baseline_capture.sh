@@ -30,7 +30,9 @@ fi
 BENCH_C=400
 BENCH_N=1000000
 BENCH_P=10
-BENCH_THREADS=6
+# Bench client threads: scale with available cores so the client side isn't
+# artificially the bottleneck.  On a 12c box we want bench --threads 12.
+BENCH_THREADS=${BENCH_THREADS:-$NPROC}
 
 mkconf() {
   local t=$1 pin=$2
@@ -94,7 +96,10 @@ run_one() {
   echo ""
   echo "Sweep (SET / GET QPS, requests-per-second):"
   echo ""
-  for t in 1 2 4 5; do
+  # Worker sweep: include 1 (single-core baseline), 2/4 (mid scaling),
+  # nproc-1 (max workers leaving 1 core for system/softirq), and nproc.
+  WORKER_SWEEP="${WORKER_SWEEP:-1 2 4 $((NPROC-1)) $NPROC}"
+  for t in $WORKER_SWEEP; do
     for pin in off auto; do
       run_one $t $pin
     done

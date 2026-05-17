@@ -220,8 +220,7 @@ static int pk_update_value(kv_entry_t **pe, char *data, uint32_t *data_len,
             memcpy(vp + 1 + 4, value, (size_t)value_len);
         }
 
-        kv_entry_t *ne = dict_resize_entry(&g_dict, *pe,
-                                           (*pe)->val_len + delta);
+        kv_entry_t *ne = dict_resize_entry(kv_dict_for((*pe)->hash), *pe, (*pe)->val_len + delta);
         if (!ne) return -1;
         *pe = ne;
         *data_len = ne->val_len - 2;
@@ -234,8 +233,7 @@ static int pk_update_value(kv_entry_t **pe, char *data, uint32_t *data_len,
     if (!saved_field) return -1;
     memcpy(saved_field, p + 4, flen);
 
-    kv_entry_t *ne = dict_resize_entry(&g_dict, *pe,
-                                       (*pe)->val_len + delta);
+    kv_entry_t *ne = dict_resize_entry(kv_dict_for((*pe)->hash), *pe, (*pe)->val_len + delta);
     if (!ne) { free(saved_field); return -1; }
     *pe = ne;
 
@@ -306,7 +304,7 @@ static int parse_int64(const char *p, int len, int64_t *out) {
  * Engine access
  * ===================================================================== */
 
-extern kv_dict_t g_dict;
+/* g_dict replaced by sharded g_shards (kv_dict.h) */
 extern long long get_time_now(void);
 
 static const char *key_from_token(kvs_token_t t, char *buf, int sz) {
@@ -319,7 +317,7 @@ static const char *key_from_token(kvs_token_t t, char *buf, int sz) {
 static int check_expiry(kv_entry_t *e, const char *key, uint64_t hash) {
     if (e && e->expire && get_time_now() > e->expire) {
         hash_cleanup_entry(e);
-        dict_delete(&g_dict, key, (uint32_t)strlen(key), hash);
+        dict_delete(kv_dict_for(hash), key, (uint32_t)strlen(key), hash);
         return 1;
     }
     return 0;
@@ -358,7 +356,7 @@ static kv_entry_t *hash_convert_to_dict(kv_entry_t *e) {
     uint32_t old_count = pk_read_u32(e->data + 2);
 
     if (old_count == 0) {
-        kv_entry_t *ne = dict_resize_entry(&g_dict, e, HASH_DICT_HEADER_SIZE);
+        kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, HASH_DICT_HEADER_SIZE);
         if (!ne) return NULL;
         ne->data[0] = (char)KV_TYPE_HASH;
         ne->data[1] = (char)KV_ENCODING_DICT;
@@ -391,7 +389,7 @@ static kv_entry_t *hash_convert_to_dict(kv_entry_t *e) {
         if (p > end) break;
     }
 
-    kv_entry_t *ne = dict_resize_entry(&g_dict, e, HASH_DICT_HEADER_SIZE);
+    kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, HASH_DICT_HEADER_SIZE);
     if (!ne) goto err;
     e = ne;
 
@@ -467,7 +465,7 @@ static kv_entry_t *hash_contract_to_packed(kv_entry_t *e) {
     dict_clear(d);
     dict_destroy(d);
 
-    kv_entry_t *ne = dict_resize_entry(&g_dict, e, pk_size);
+    kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, pk_size);
     if (!ne) {
         dict_init(d);
         for (uint32_t i = 0; i < count; i++) {
@@ -580,7 +578,7 @@ static int hash_set(kv_entry_t **pe, const char *field, int field_len,
         }
 
         uint32_t new_dlen = (uint32_t)(2 + pk_len + need);
-        kv_entry_t *ne = dict_resize_entry(&g_dict, e, new_dlen);
+        kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, new_dlen);
         if (!ne) return -1;
         e = ne;
         *pe = e;
@@ -674,7 +672,7 @@ static int hash_del(kv_entry_t **pe, const char *field, int field_len,
         pk_remove_field(e->data + 2, &pk_len, fp);
 
         uint32_t new_dlen = pk_len + 2;
-        kv_entry_t *ne = dict_resize_entry(&g_dict, e, new_dlen);
+        kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, new_dlen);
         if (ne) { ne->val_len = new_dlen; *pe = ne; }
         else    { e->val_len = new_dlen; }
         *removed = 1;
@@ -1017,7 +1015,7 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
             if (!e) {
                 char data[16];
                 hash_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
+                e = dict_add(kv_dict_for(h), key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
                 if (!e) { dynbuf_cat(wb, "-ERR create hash failed\r\n", 24); return DISPATCH_ERROR; }
             } else {
                 if (entry_type(e) != KV_TYPE_HASH) {
@@ -1028,7 +1026,7 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
                     existed = 1;
                     char data[16];
                     hash_build_empty(data);
-                    e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
+                    e = dict_add(kv_dict_for(h), key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
                     if (!e) { dynbuf_cat(wb, "-ERR create hash failed\r\n", 24); return DISPATCH_ERROR; }
                 }
             }
@@ -1060,11 +1058,11 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
             kv_entry_t *e = entry;
             if (!e) {
                 char data[16]; hash_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
+                e = dict_add(kv_dict_for(h), key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
                 if (!e) { dynbuf_cat(wb, "-ERR create hash failed\r\n", 24); return DISPATCH_ERROR; }
             } else if (check_expiry(e, key, h)) {
                 char data[16]; hash_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
+                e = dict_add(kv_dict_for(h), key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
                 if (!e) { dynbuf_cat(wb, "-ERR create hash failed\r\n", 24); return DISPATCH_ERROR; }
             }
             for (int i = 1; i + 1 < argc; i += 2) {
@@ -1088,7 +1086,7 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
             if (!e) {
                 char data[16];
                 hash_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
+                e = dict_add(kv_dict_for(h), key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
                 if (!e) { dynbuf_cat(wb, "-ERR create hash failed\r\n", 24); return DISPATCH_ERROR; }
             } else {
                 if (entry_type(e) != KV_TYPE_HASH) {
@@ -1098,7 +1096,7 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 if (check_expiry(e, key, h)) {
                     char data[16];
                     hash_build_empty(data);
-                    e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
+                    e = dict_add(kv_dict_for(h), key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
                     if (!e) { dynbuf_cat(wb, "-ERR create hash failed\r\n", 24); return DISPATCH_ERROR; }
                 }
             }
@@ -1243,7 +1241,7 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
             if (!e) {
                 char data[16];
                 hash_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
+                e = dict_add(kv_dict_for(h), key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
                 if (!e) { dynbuf_cat(wb, "-ERR create hash failed\r\n", 24); return DISPATCH_ERROR; }
             } else {
                 if (entry_type(e) != KV_TYPE_HASH) {
@@ -1253,7 +1251,7 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 if (check_expiry(e, key, h)) {
                     char data[16];
                     hash_build_empty(data);
-                    e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
+                    e = dict_add(kv_dict_for(h), key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
                     if (!e) { dynbuf_cat(wb, "-ERR create hash failed\r\n", 24); return DISPATCH_ERROR; }
                 }
             }
@@ -1294,11 +1292,11 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
             kv_entry_t *e = entry;
             if (!e) {
                 char data[16]; hash_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
+                e = dict_add(kv_dict_for(h), key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
                 if (!e) { dynbuf_cat(wb, "-ERR create hash failed\r\n", 24); return DISPATCH_ERROR; }
             } else if (check_expiry(e, key, h)) {
                 char data[16]; hash_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
+                e = dict_add(kv_dict_for(h), key, (uint32_t)strlen(key), data, HASH_EMPTY_SIZE, h);
                 if (!e) { dynbuf_cat(wb, "-ERR create hash failed\r\n", 24); return DISPATCH_ERROR; }
             }
 

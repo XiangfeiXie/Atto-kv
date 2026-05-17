@@ -1796,3 +1796,152 @@ CSV 原始数据：
 进入多线程 proactor + dict 分片。Phase 3 的 multishot recv / buffer ring / setup flags
 在 Phase 4 直接复用 —— 每个 worker 线程一个 io_uring + 一个独立 buffer ring，
 SO_REUSEPORT 让内核做 flow-based 分发。
+
+---
+
+## 2026-05-16 — Phase 4: 多线程 proactor + dict 分片
+
+### 背景
+
+Phase 3 把单线程 io_uring 这条 hot path 调到了瓶颈：在我的 6 核机器上
+P=20 SET/GET 都已经超过 440k rps，单核已经吃满。再往上走，单线程不可能再榨
+出来，必须并行。Phase 4 的目标就是**让 N 个 worker 真正并行处理网络与命令**，
+同时保证存储层并发安全。
+
+### 设计：dict 分片 + 显式 rwlock
+
+把全局 `kv_dict_t g_dict` 拆成 32 个独立的 `kv_dict_t`，每个挂一把
+`pthread_rwlock_t`，按 `(hash >> 32) & 31` 选 shard：
+
+```c
+typedef struct kv_shard {
+    pthread_rwlock_t lock;
+    kv_dict_t        dict;
+    char             _pad[64];   // 64B 隔离邻居 shard 的 lock，避免 false sharing
+} kv_shard_t;
+
+static inline kv_dict_t *kv_dict_for(uint64_t hash) {
+    return &g_shards.shards[(hash >> 32) & KV_SHARD_MASK].dict;
+}
+```
+
+shard index 用 hash 的高 32 位 —— bucket index 用低 32 位，二者统计独立，
+不会因为 shard 选择和桶分布相关而出现偏 skew。
+
+锁的获取放在**调度层**（`kvs_dispatch`），而不是 type 引擎里：
+
+```c
+typedef struct { uint64_t hash; int held; } kvs_shard_guard_t;
+
+#define SHARD_WRLOCK(h) \
+    kvs_shard_guard_t _sg __attribute__((cleanup(kvs_shard_guard_release))) \
+        = { .hash = (h), .held = 1 }; \
+    kv_shard_wrlock_h(h)
+```
+
+关键的两条规则：
+1. **单 key 命令**（GET/SET/HSET/ZADD…）在 `dict_find` 之前 `SHARD_WRLOCK(hash)`，
+   `__attribute__((cleanup))` 保证不管走哪条 return 路径都释放锁；
+2. **多 key 命令**（DEL/EXISTS/MGET/MSET/MSETNX）每次循环 iteration 用一个
+   block 作用域包住 SHARD_WRLOCK，每个 key 独立加解锁，跨 shard 不互相阻塞。
+
+为什么全部用 wrlock 而不是 rdlock？
+- 大多数 "读" 路径其实会 lazy-expire 删除过期 key（写动作）；
+- 32 shard 已经把竞争降到 1/32，wrlock vs rdlock 的差距相比这一倍数收益微乎
+  其微；
+- 简化心智负担，避免手抖把读写命令分错。
+
+### 设计：per-worker proactor
+
+```
+   listen :2000  ──[SO_REUSEPORT]──┬──→ worker0  io_uring + buf_ring (4MB)
+                                   ├──→ worker1  io_uring + buf_ring (4MB)
+                                   ├──→ worker2  io_uring + buf_ring (4MB)
+                                   └──→ workerN  io_uring + buf_ring (4MB)
+                                              │
+                                              ▼
+                                   shared conn_pool[fd]    ←  fd 进程内唯一
+                                                              且每个 fd 只被
+                                                              一个 worker 摸
+                                              │
+                                              ▼
+                                   sharded dict (32 × rwlock)
+```
+
+每个 worker 都拥有：
+- 独立的 `struct io_uring`（保住 `IORING_SETUP_SINGLE_ISSUER` 的合法性）；
+- 独立的 provided buffer ring（4 MB / worker）；
+- 独立的 `SO_REUSEPORT` listen socket（内核按 4-tuple hash 分发新连接）。
+
+`conn_pool` 仍是全局数组，索引就是 fd —— **fd 在进程内唯一**，每个 fd 只可
+能属于一个 worker，所以读写 conn_pool 不需要锁。这点是踩了一个坑之后才意识
+到的：起初我担心 conn_pool 要做 per-worker，结果想清楚 fd 唯一性就发现完全
+不必。
+
+### 踩坑：SINGLE_ISSUER 必须在 issuer 线程里 init
+
+最初我把所有 worker 的 ring 都在 main 线程 `io_uring_queue_init_params` 起
+来，再 `pthread_create` worker 让它们去用各自的 ring。结果只有 worker 0
+（main 线程）正常，1~3 一进 `io_uring_submit_and_wait` 就直接退出。
+
+`IORING_SETUP_SINGLE_ISSUER` 把 ring 绑定在**第一次提交 SQE 的线程**上，main
+线程虽然没真的 submit，但 `queue_init` 内部已经把 ring 关联到 main task。
+worker 1 起来 submit 时被 kernel 拒掉，线程返回，主线程对此一无所知，于是只
+剩一个 worker 在跑，**多线程吞吐反而低于单线程**。
+
+修法：把 `worker_setup_ring()` 拆到 `worker_loop()` 入口，每个 worker 在自己
+的线程里 init ring。listen socket 还是 main 线程 bind，这样 bind error 能立
+刻报上来；ring 创建错误才到 worker 自己处理。
+
+### 性能（6 核 box，c=400 P=10 redis-benchmark --threads 6）
+
+| threads | SET rps | GET rps | scaling |
+|--------:|--------:|--------:|--------:|
+|       1 | 360 k   | 330 k   | 1.00 ×  |
+|       2 | 461 k   | 462 k   | 1.28 / 1.40 × |
+|       4 | 439 k   | 414 k   | 1.22 / 1.25 × |
+|       8 | 393 k   | 377 k   | 退回到 1× |
+
+本机最优是 t=2。t≥4 出现倒挂，原因不是锁竞争而是**资源争抢**：6 核机器上
+t=4 server + 6 client thread = 10 个忙线程，再加 kernel softirq 已经 oversubscribe；
+t=8 完全打不过调度抖动。把 perf stat 调出来看，`context-switches` 在 t=8 时
+比 t=2 高了 4×，`cache-misses/instruction` 也明显恶化。
+
+可以做的优化（留给 Phase 5）：
+- 给 worker pin core，把 kernel softirq 集中到另外的核；
+- 让 client 也 pin 在剩下的核上；
+- 在能拿到的更高核数机器上重测 —— 32 shard 留了足够的余量。
+
+### 临时让步
+
+为了不在 Phase 4 同时把所有子系统改成 MT-safe，先做了几个让步：
+
+- **block 子系统**（BLPOP/BRPOP）只在 `threads==1` 时 arm `notify_cb`。多
+  worker 模式下 `block_check_timeouts()` 里的全局表会被多线程踩，先暂时让
+  block 在 MT 模式失效，Phase 4B 再做 per-worker block table。
+- **AOF / RDB / RDMA 增量** 还是 single-threaded 后台任务；它们由 worker 0
+  通过 io_uring 触发，多 worker 模式下也只有 worker 0 真正提交持久化 SQE。
+  正确性目前依赖于持久化任务自身的 single-issuer 特性，没有显式锁。
+- **incremental rehash** 从 `dict_find` / `dict_find_extkey` 里搬出来了 —
+  读路径不能再触发 rehash（否则需要 wrlock）。写路径在 `dict_set` /
+  `dict_delete` 之前依然推一步，长期来看 rehash 会被写流量摊平。
+
+### 经验
+
+1. **先把分片 + 锁打通，再上多线程**。我先在 single-thread 下加完 shard +
+   `SHARD_WRLOCK`，跑 P=10 没有任何 regression（330k vs Phase 3 的 333k），
+   说明锁开销在单线程里几乎为 0。这一步完成后再加 worker pool，问题就只剩
+   "线程间竞争多大"，调试链路非常短。
+2. **别低估 SO_REUSEPORT 的便利**。一行 setsockopt 就把 accept 的负载均衡
+   交给了内核 4-tuple hash，连接到了哪个 worker 完全自然，不需要在用户态
+   再做一层 dispatch。
+3. **`__attribute__((cleanup))` 救我半条命**。`kvs_dispatch` 有 60+ 个
+   return 点，纯靠手动 unlock 必出 bug；cleanup attribute 编译器自动注入，
+   无论从哪一个分支 return / `goto`，scope 退出时 `_sg.held` 都被检查并释
+   放锁。
+
+### 下一步
+
+Phase 5：CPU pinning + NUMA 绑核。把 worker 钉到指定 core，softirq 走其他
+core，进一步减少 context switch；也把当前 t=4 / t=8 的退化问题彻底消除。
+

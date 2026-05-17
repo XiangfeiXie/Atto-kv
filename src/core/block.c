@@ -3,6 +3,7 @@
 #include "server.h"
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #define BLOCK_TABLE_SIZE 256
 
@@ -21,6 +22,13 @@ typedef struct block_entry_s {
 static block_entry_t *block_table[BLOCK_TABLE_SIZE];
 static block_notify_cb g_notify_cb = NULL;
 
+/* Phase 4B.2 — single coarse mutex protecting the entire block_table.
+ * BLPOP traffic is rare; a fine-grained scheme would not pay back its
+ * complexity.  All public block_* functions take this lock for the
+ * duration of their work; notify dispatch is hoisted *out* of the lock
+ * before being delivered to avoid recursive acquisition. */
+static pthread_mutex_t g_block_mu = PTHREAD_MUTEX_INITIALIZER;
+
 void block_set_notify_cb(block_notify_cb cb) { g_notify_cb = cb; }
 
 /* djb2 hash */
@@ -32,13 +40,16 @@ static unsigned int block_hash(const char *key, uint32_t len) {
 }
 
 void block_init(void) {
+    pthread_mutex_lock(&g_block_mu);
     memset(block_table, 0, sizeof(block_table));
+    pthread_mutex_unlock(&g_block_mu);
 }
 
 void block_add(const char *key, uint32_t key_len, client_t *c) {
     if (!key || !c) return;
 
     unsigned int idx = block_hash(key, key_len);
+    pthread_mutex_lock(&g_block_mu);
     block_entry_t *e = block_table[idx];
 
     while (e) {
@@ -48,9 +59,9 @@ void block_add(const char *key, uint32_t key_len, client_t *c) {
     }
     if (!e) {
         e = (block_entry_t *)calloc(1, sizeof(*e));
-        if (!e) return;
+        if (!e) goto out;
         e->key = (char *)malloc(key_len + 1);
-        if (!e->key) { free(e); return; }
+        if (!e->key) { free(e); goto out; }
         memcpy(e->key, key, key_len);
         e->key[key_len] = '\0';
         e->key_len = key_len;
@@ -59,23 +70,29 @@ void block_add(const char *key, uint32_t key_len, client_t *c) {
     }
 
     block_waiter_t *w = (block_waiter_t *)malloc(sizeof(*w));
-    if (!w) return;
+    if (!w) goto out;
     w->client = c;
     w->next = e->waiters;
     e->waiters = w;
+out:
+    pthread_mutex_unlock(&g_block_mu);
 }
 
 client_t *block_wake_one(const char *key, uint32_t key_len) {
     if (!key) return NULL;
 
     unsigned int idx = block_hash(key, key_len);
+    pthread_mutex_lock(&g_block_mu);
     block_entry_t *e = block_table[idx];
     while (e) {
         if (e->key_len == key_len && memcmp(e->key, key, key_len) == 0)
             break;
         e = e->next;
     }
-    if (!e || !e->waiters) return NULL;
+    if (!e || !e->waiters) {
+        pthread_mutex_unlock(&g_block_mu);
+        return NULL;
+    }
 
     block_waiter_t *w = e->waiters;
     client_t *c = w->client;
@@ -105,12 +122,14 @@ client_t *block_wake_one(const char *key, uint32_t key_len) {
         c->block_key_count = 0;
         c->state = CLIENT_IDLE;
     }
+    pthread_mutex_unlock(&g_block_mu);
     return c;
 }
 
 void block_remove_client(client_t *c) {
     if (!c) return;
 
+    pthread_mutex_lock(&g_block_mu);
     for (int i = 0; i < BLOCK_TABLE_SIZE; i++) {
         block_entry_t *e = block_table[i];
         while (e) {
@@ -131,19 +150,23 @@ void block_remove_client(client_t *c) {
     }
     c->state = CLIENT_IDLE;
     c->block_key_count = 0;
+    pthread_mutex_unlock(&g_block_mu);
 }
 
 void block_notify_woken(client_t *c) {
     if (c && g_notify_cb) g_notify_cb(c);
 }
 
-/* Extern from kvstore.c */
-extern long long get_time_now(void);
+/* Extern from kvstore.c — use real wall clock here so the deadline
+ * arithmetic agrees with whichever worker registered the BLPOP. */
+extern long long get_time_now_real(void);
+#define get_time_now get_time_now_real
 
 int block_nearest_timeout(void) {
     long long now = get_time_now();
     long long nearest = -1;
 
+    pthread_mutex_lock(&g_block_mu);
     for (int i = 0; i < BLOCK_TABLE_SIZE; i++) {
         for (block_entry_t *e = block_table[i]; e; e = e->next) {
             for (block_waiter_t *w = e->waiters; w; w = w->next) {
@@ -157,30 +180,39 @@ int block_nearest_timeout(void) {
             }
         }
     }
+    pthread_mutex_unlock(&g_block_mu);
     return (int)nearest;
 }
 
 void block_check_timeouts(void) {
     long long now = get_time_now();
 
-    for (int i = 0; i < BLOCK_TABLE_SIZE; i++) {
+    /* Two-phase to avoid notify-under-lock and avoid re-entering
+     * block_remove_client (which would deadlock on the same mutex):
+     *   1. Under the lock: collect timed-out clients into a local list
+     *      and unlink them from the table.
+     *   2. Outside the lock: write reply + dispatch notify per client. */
+    enum { MAX_BATCH = 64 };
+    client_t *expired[MAX_BATCH];
+    int n_expired = 0;
+
+    pthread_mutex_lock(&g_block_mu);
+    for (int i = 0; i < BLOCK_TABLE_SIZE && n_expired < MAX_BATCH; i++) {
         block_entry_t *e = block_table[i];
-        while (e) {
+        while (e && n_expired < MAX_BATCH) {
             block_waiter_t **prev = &e->waiters;
             block_waiter_t *w = e->waiters;
-            while (w) {
+            while (w && n_expired < MAX_BATCH) {
                 client_t *c = w->client;
                 if (c && c->state == CLIENT_BLOCKED && c->block_until_ms <= now) {
-                    /* Unlink from current key's waiter list */
                     *prev = w->next;
                     free(w);
                     w = *prev;
-
-                    /* Write timeout response and clean up */
-                    dynbuf_cat(&c->conn->write_buf, "$-1\r\n", 5);
-                    /* Remove from all other keys too */
-                    block_remove_client(c);
-                    if (g_notify_cb) g_notify_cb(c);
+                    /* Mark as not blocked so a parallel block_wake_one
+                     * doesn't re-fire the callback for this client. */
+                    c->state = CLIENT_IDLE;
+                    c->block_key_count = 0;
+                    expired[n_expired++] = c;
                 } else {
                     prev = &w->next;
                     w = w->next;
@@ -188,5 +220,15 @@ void block_check_timeouts(void) {
             }
             e = e->next;
         }
+    }
+    pthread_mutex_unlock(&g_block_mu);
+
+    /* Phase 2 — outside the lock: scrub remaining waiter entries (uses
+     * its own lock acquisition) and dispatch notify_cb. */
+    for (int i = 0; i < n_expired; i++) {
+        client_t *c = expired[i];
+        block_remove_client(c);
+        if (c->conn) dynbuf_cat(&c->conn->write_buf, "$-1\r\n", 5);
+        if (g_notify_cb) g_notify_cb(c);
     }
 }

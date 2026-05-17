@@ -29,7 +29,7 @@ S(REP_WRONGTYPE, "-WRONGTYPE Operation against a key holding the wrong kind of v
  * Key is passed as (ptr, len), no null-termination required.
  * ===================================================================== */
 
-extern kv_dict_t g_dict;
+/* g_dict replaced by sharded g_shards (kv_dict.h) */
 extern long long get_time_now(void);
 
 /* =====================================================================
@@ -71,10 +71,10 @@ static int engine_set_raw(const char *key, uint32_t key_len,
                           long long expire, int mode)
 {
     uint64_t hash = kv_hash((const uint8_t *)key, key_len);
-    kv_entry_t *existing = dict_find(&g_dict, key, key_len, hash);
+    kv_entry_t *existing = dict_find(kv_dict_for(hash), key, key_len, hash);
     if (existing && existing->expire && get_time_now() > existing->expire) {
         kvs_cleanup_entry(existing);  /* free nested structures for collection types */
-        dict_delete(&g_dict, key, key_len, hash);
+        dict_delete(kv_dict_for(hash), key, key_len, hash);
         existing = NULL;
     }
     if (mode == 1 && existing) return 1;   /* NX failed */
@@ -96,7 +96,7 @@ static int engine_set_raw(const char *key, uint32_t key_len,
 
     if (existing) {
         uint32_t nd = (uint32_t)(2 + plen);
-        kv_entry_t *e = dict_resize_entry(&g_dict, existing, nd);
+        kv_entry_t *e = dict_resize_entry(kv_dict_for(hash), existing, nd);
         if (!e) return -1;
         e->data[0] = (char)KV_TYPE_STRING;
         e->data[1] = (char)enc;
@@ -105,7 +105,7 @@ static int engine_set_raw(const char *key, uint32_t key_len,
         return 0;
     }
 
-    kv_entry_t *e = dict_add_raw(&g_dict, key, key_len,
+    kv_entry_t *e = dict_add_raw(kv_dict_for(hash), key, key_len,
                                  KV_TYPE_STRING, enc,
                                  pload, plen, hash);
     if (!e) return -1;
@@ -118,11 +118,11 @@ static const char *engine_get_raw(const char *key, uint32_t key_len,
                                   uint8_t *enc_out)
 {
     uint64_t hash = kv_hash((const uint8_t *)key, key_len);
-    kv_entry_t *e = dict_find(&g_dict, key, key_len, hash);
+    kv_entry_t *e = dict_find(kv_dict_for(hash), key, key_len, hash);
     if (!e) return NULL;
 
     if (e->expire && get_time_now() > e->expire) {
-        dict_delete(&g_dict, key, key_len, e->hash);
+        dict_delete(kv_dict_for(hash), key, key_len, e->hash);
         return NULL;
     }
     if (vlen_out)   *vlen_out   = entry_payload_len(e);
@@ -136,11 +136,11 @@ static int engine_mod_raw(const char *key, uint32_t key_len,
                           long long expire)
 {
     uint64_t hash = kv_hash((const uint8_t *)key, key_len);
-    kv_entry_t *e = dict_find(&g_dict, key, key_len, hash);
+    kv_entry_t *e = dict_find(kv_dict_for(hash), key, key_len, hash);
     if (!e) return 1;
 
     if (e->expire && get_time_now() > e->expire) {
-        dict_delete(&g_dict, key, key_len, hash);
+        dict_delete(kv_dict_for(hash), key, key_len, hash);
         return 1;
     }
     int64_t iv;
@@ -157,7 +157,7 @@ static int engine_mod_raw(const char *key, uint32_t key_len,
         plen  = val_len;
     }
     uint32_t nd = (uint32_t)(2 + plen);
-    e = dict_resize_entry(&g_dict, e, nd);
+    e = dict_resize_entry(kv_dict_for(hash), e, nd);
     if (!e) return -1;
     e->data[0] = (char)KV_TYPE_STRING;
     e->data[1] = (char)enc;
@@ -169,22 +169,22 @@ static int engine_mod_raw(const char *key, uint32_t key_len,
 static int engine_del_raw(const char *key, uint32_t key_len)
 {
     uint64_t hash = kv_hash((const uint8_t *)key, key_len);
-    kv_entry_t *e = dict_find(&g_dict, key, key_len, hash);
+    kv_entry_t *e = dict_find(kv_dict_for(hash), key, key_len, hash);
     if (!e) return 1;
     if (e->expire && get_time_now() > e->expire) {
-        dict_delete(&g_dict, key, key_len, hash);
+        dict_delete(kv_dict_for(hash), key, key_len, hash);
         return 1;
     }
-    return dict_delete(&g_dict, key, key_len, hash);
+    return dict_delete(kv_dict_for(hash), key, key_len, hash);
 }
 
 static int engine_exist_raw(const char *key, uint32_t key_len)
 {
     uint64_t hash = kv_hash((const uint8_t *)key, key_len);
-    kv_entry_t *e = dict_find(&g_dict, key, key_len, hash);
+    kv_entry_t *e = dict_find(kv_dict_for(hash), key, key_len, hash);
     if (!e) return -1;
     if (e->expire && get_time_now() > e->expire) {
-        dict_delete(&g_dict, key, key_len, hash);
+        dict_delete(kv_dict_for(hash), key, key_len, hash);
         return -1;
     }
     return 0;

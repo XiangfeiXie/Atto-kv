@@ -1,0 +1,182 @@
+Roadmap (revised 2026-05-16, supersedes progress-phase4.txt)
+=============================================================
+
+Goal: 8-core box → ~2.5-3.0M QPS, with each phase having explicit
+correctness boundary and a measurable before/after.  Each phase is a
+small, reversible step that "lays the groundwork" for the next one
+rather than chasing peak numbers.
+
+Phase 4 — Multi-thread proactor + dict sharding   [DONE]
+========================================================
+  [x] 32-shard kv_dict + per-shard pthread_rwlock
+  [x] kvs_dispatch SHARD_WRLOCK guard via __cleanup__
+  [x] DEL/EXISTS/MGET/MSET/MSETNX per-key shard locks
+  [x] proactor: per-worker io_uring + buf_ring, SO_REUSEPORT
+  [x] kvs_config.threads
+  [x] bench_phase4.sh + perf table
+
+  Result on 6c: t=1 → 360k, t=2 → 461k, t=4 → 439k, t=8 → 393k.
+  Optimal t=2 (1.28-1.40x).  t≥4 regress because of core contention
+  with the bench client + softirq — unlocked in Phase 5.
+
+Phase 4B — Correctness completion (no perf target)   [DONE 2026-05-17]
+======================================================================
+Make every feature work under threads>1 so subsequent perf phases
+don't trip over a "BLPOP / AOF reload broken in MT mode" pothole.
+
+  [x] 4B.1  Auto threads + startup sanity warn  (DONE 2026-05-16)
+        - kvs_config.threads default 0; resolved in config_postprocess
+        - 0 → max(1, nproc-1); banner shows [auto]/[manual] + nproc + shards
+        - 3 warnings: nproc oversubscribe / shard contention (8x rule) /
+          cgroup cpu.max overrun
+        - Verified on 6c box: threads 0 → "Workers: 5 [auto] (nproc=6)"
+                              threads 1 → "single-thread proactor"
+                              threads 64 → both warnings fire
+
+  [x] 4B.2  block subsystem MT-safe  (DONE 2026-05-17)
+        - g_block_mu coarse mutex around block_table; two-phase
+          block_check_timeouts (collect under lock, deliver outside)
+          to avoid recursive lock + notify-under-lock
+        - struct conn gains owner_worker_id set on accept
+        - per-worker pending wake queue (wake_head + wake_mu) + eventfd;
+          cross-worker notify enqueues + writes 1 to target evfd, target
+          worker handles EVENT_WAKE CQE and drains queue
+        - new proactor_kick_worker(id) so BLPOP register can prod
+          worker 0 to recompute block_nearest_timeout immediately
+        - BLPOP deadline uses get_time_now_real() instead of cached ms
+          (only worker 0 updates the cache; stale cache caused early
+          timeout firing)
+        - dropped `if (g_n_workers == 1)` guard on block_set_notify_cb
+        - Verified t=4 (smoke /tmp/blpop_test.sh):
+            * BLPOP 2s timeout on empty list  → 2020 ms, nil reply
+            * Pre-pushed list, BLPOP returns immediately
+            * BLPOP on conn A, RPUSH on conn B (different worker) →
+              cross-worker wakeup ~28 ms after push
+        - Perf bench at t=2 still in 380-450k SET range; revisit after
+          Phase 5 pinning with proper isolation
+
+  [x] 4B.3  AOF / WAL / sockmap_record MT-safe  (DONE 2026-05-17)
+        - root cause: wal_repl.c journal ring was SPSC; multiple
+          proactor workers racing on (g_jhead load, slot fill, store)
+          would lose entries and corrupt slots
+        - fix: g_journal_producer_mu guards the slot reservation +
+          fill + g_jhead publish; eventfd write stays outside the mutex
+        - aof_async_append → wal_repl_append, so this single fix covers
+          both "persistence aof" and "rdma_sync on" paths
+        - sockmap_record_cmd untouched: BPF per-CPU maps are MT-safe
+          by construction
+        - Default-config bench (persistence=none, rdma_sync=off):
+          mutex never acquired (early-return on g_running==0), perf
+          unchanged at 394k/395k SET/GET, t=2
+        - Verified t=4 + persistence aof:
+          200k SETs across 50k random keys → DBSIZE=49064 pre and
+          post restart, sampled key values round-trip cleanly
+
+  [x] 4B.4  RDB BGSAVE: point-in-time snapshot under MT  (DONE 2026-05-17)
+        - root cause #1: fork() in MT mode inherits any held shard
+          wrlock state into the child; the child is single-threaded
+          and would deadlock on the first kv_shards_iter rdlock attempt
+        - root cause #2: walking shards with per-shard rdlock yields a
+          per-shard but not cross-shard consistent snapshot
+        - design: take ALL shard wrlocks → fork → parent unlocks
+          immediately; child runs a no-lock iterator on its frozen
+          COW image
+        - new helpers in kv_dict:
+            kv_shards_lock_all_for_snapshot()
+            kv_shards_unlock_all_snapshot()
+            kv_shards_iter_init_nolock()
+        - persistence.c: g_rdb_in_fork_child flag flips shards_scan to
+          the no-lock iterator inside the child
+        - banner now logs: "BGSAVE started, child pid=N (snapshot stall:
+          X ms acquire, Y ms total)"
+        - Verified t=4, persistence rdb:
+          * pre-load 18,914 keys, BGSAVE, concurrent writes during save
+            grow DB to 29,985, reload yields 28,174 — within
+            [pre, post] snapshot window  → point-in-time intact
+          * snapshot stall: 0 ms wrlock acquire, 4 ms total (fork+release)
+          * concurrent SET throughput during BGSAVE: 260k/s (no stall)
+        - No regression on default-config bench: 436k/394k SET/GET, t=2
+
+  [x] 4B.5  Document & verify rehash MT-safety  (DONE 2026-05-17)
+        - audited: dict_rehash_step() called only from dict_add /
+          dict_replace / dict_delete; all three are write APIs
+        - dict_find() is read-only, never invokes rehash_step, safe
+          under a shared shard rdlock (its existing comment already
+          says so)
+        - added MT-safety contract block on dict_rehash_step in
+          kv_dict.c:133-148 explicitly stating "MUST run with the
+          owning shard's wrlock held" — locks the contract before
+          Phase 6.2 splits read paths to rdlock
+        - no code change required; current dispatcher uses SHARD_WRLOCK
+          on every keyed command so the contract is automatically
+          satisfied
+
+  [x] 4B.6  test/bench/multi_thread_smoke.sh   (DONE 2026-05-17)
+        - 12 checks under threads=4, all PASS:
+          banner, STRING SET/GET/DEL, HASH/LIST/SET/ZSET basic ops,
+          BLPOP timeout, BLPOP cross-worker wakeup, AOF reload
+          (24,416 keys round-trip), RDB BGSAVE (26,295 in [12,634,
+          29,383] window), snapshot stall log present
+        - this script is the gate: any future Phase 4B-touching
+          change must keep "Phase 4B smoke results: PASS=12  FAIL=0"
+
+Phase 5 — CPU affinity (the real perf jump)   [next]
+=====================================================
+  [ ] 5.1  pthread_setaffinity_np per worker
+        - cpu_pin {auto|off|0,2,4,6}
+        - auto: worker_i → core (i+1) mod nproc, leaving core 0 free
+  [ ] 5.2  tools/setup_affinity.sh
+        - pin NIC IRQ + loopback softirq to cores not used by workers
+        - verify with /proc/interrupts before/after
+  [ ] 5.3  kv_shard_t cacheline isolation re-check
+        - bump _pad to 128B, perf c2c verify HitM gone
+  [ ] 5.4  NUMA-aware conn_pool/buf_ring allocation skeleton
+        - KVS_USE_NUMA macro (default off)
+        - mmap + numa_set_membind on big-machine path
+        - leave NUMA tests for later, just make the code path exist
+
+  Expected: 8c box t=7 → 1.5-2.0M (matches old plan's "Phase 4")
+            6c box t=5 → 1.0-1.4M
+
+Phase 6 — Single-core dispatcher efficiency
+============================================
+  [ ] 6.1  Eliminate double dict_find (entry threading through engines)
+  [ ] 6.2  Split read-only commands to rdlock
+        - strict-RO: STRLEN HLEN HEXISTS LLEN SCARD ZCARD ZCOUNT TYPE
+        - lazy-expire-RO: GET HGET LRANGE SMEMBERS (rdlock-then-upgrade)
+  [ ] 6.3  perfect-hash command dispatch (gperf), if perf top warrants
+  [ ] 6.4  per-shard incremental rehash batching
+
+  Expected: single-core +20-30%, hot-key (zipfian) workload +30-50%.
+            8c → 2.0-2.5M
+
+Phase 6.5 — XDP hot-path re-enable (replaces "sockmap accel" myth)
+==================================================================
+  Bring back XDP_TX in-place RESP reply for cache-hit GETs while
+  keeping sockmap purely as observation.  Sockmap CANNOT synthesize
+  replies (wrong hook, wrong API) — XDP can.
+  [ ] xdp_accel {on|off} config (off by default, observation always on)
+  [ ] xdp_kvs.kern.c: hit-then-XDP_TX branch on top of current
+        XDP_PASS observation
+  [ ] BPF verifier re-pass with batch-GET helper from earlier work
+  [ ] hot_cache invalidation already wired in kvstore.c — verify
+
+  Expected: hit GET ~5-10μs (no user-space hop), 8c → 2.5-3.0M.
+
+Phase 7 — Software-stall elimination (long-term)
+================================================
+  [ ] fork-based RDB snapshot (replaces 4B.4 stop-the-world)
+  [ ] AOF rewrite background-thread
+  [ ] online config reload (except threads count)
+  [ ] replication backlog mt-safe push
+
+  Expected: 8c → 2.8-3.3M (hardware ceiling on this kind of box).
+
+Notes / risks
+=============
+  * threads vs shard ratio rule-of-thumb: shards ≥ 8×threads.
+    32 shards comfortable up to 16-worker; revisit at ≥32 cores.
+  * NUMA: skeleton lands in 5.4 but real validation needs a
+    multi-socket machine.
+  * sockmap "+30%" in original plan was conflated with XDP_TX.
+    Sockmap remains observation-only; perf comes from 6.5 instead.

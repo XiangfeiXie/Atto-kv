@@ -377,7 +377,7 @@ void list_cleanup_entry(kv_entry_t *e) {
  * Engine access
  * ===================================================================== */
 
-extern kv_dict_t g_dict;
+/* g_dict replaced by sharded g_shards (kv_dict.h) */
 extern long long get_time_now(void);
 
 static const char *key_from_token(kvs_token_t t, char *buf, int sz) {
@@ -390,7 +390,7 @@ static const char *key_from_token(kvs_token_t t, char *buf, int sz) {
 static int check_expiry(kv_entry_t *e, const char *key, uint64_t hash) {
     if (e && e->expire && get_time_now() > e->expire) {
         list_cleanup_entry(e);
-        dict_delete(&g_dict, key, (uint32_t)strlen(key), hash);
+        dict_delete(kv_dict_for(hash), key, (uint32_t)strlen(key), hash);
         return 1;
     }
     return 0;
@@ -459,7 +459,7 @@ static kv_entry_t *list_convert_to_quicklist(kv_entry_t *e) {
 
     if (old_count == 0) {
         /* Empty list: just resize to quicklist header */
-        kv_entry_t *ne = dict_resize_entry(&g_dict, e, QL_HEADER_SIZE);
+        kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, QL_HEADER_SIZE);
         if (!ne) return NULL;
         ql_init_header(ne);
         pk_write_u32(ne->data + QL_OFF_NODE_MAX, LIST_QL_NODE_MAX_ELEMS);
@@ -487,7 +487,7 @@ static kv_entry_t *list_convert_to_quicklist(kv_entry_t *e) {
     }
 
     /* Now safe to resize */
-    kv_entry_t *ne = dict_resize_entry(&g_dict, e, QL_HEADER_SIZE);
+    kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, QL_HEADER_SIZE);
     if (!ne) goto err;
     e = ne;
 
@@ -570,7 +570,7 @@ static int list_push(kv_entry_t **pe, const char *key,
 
         /* Resize entry to fit new element */
         uint32_t new_dlen = (uint32_t)(2 + pk_len + need);
-        kv_entry_t *ne = dict_resize_entry(&g_dict, e, new_dlen);
+        kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, new_dlen);
         if (!ne) return -1;
         e = ne;
         *pe = e;
@@ -607,7 +607,7 @@ static int list_pop(kv_entry_t **pe, const char *key,
 
         /* Shrink entry */
         uint32_t new_dlen = pk_len + 2;
-        kv_entry_t *ne = dict_resize_entry(&g_dict, e, new_dlen);
+        kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, new_dlen);
         if (ne) { ne->val_len = new_dlen; *pe = ne; }
         else    { e->val_len = new_dlen; }
         return 0;
@@ -845,7 +845,7 @@ static int list_rewrite(kv_entry_t **pe, const char *key,
         list_cleanup_entry(e);
 
     /* Reset entry to empty PACKED list. */
-    kv_entry_t *ne = dict_resize_entry(&g_dict, e, LIST_EMPTY_SIZE);
+    kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, LIST_EMPTY_SIZE);
     if (!ne) return -1;
     list_build_empty(ne->data);
     ne->expire = saved_expire;
@@ -864,7 +864,7 @@ static int list_rewrite(kv_entry_t **pe, const char *key,
 static void list_maybe_delete_empty(kv_entry_t *e, const char *key, uint64_t hash) {
     if (!e || list_len(e) != 0) return;
     list_cleanup_entry(e);
-    dict_delete(&g_dict, key, (uint32_t)strlen(key), hash);
+    dict_delete(kv_dict_for(hash), key, (uint32_t)strlen(key), hash);
 }
 
 /* Locate a list-typed entry by token; returns 0 if absent or wrong type
@@ -876,7 +876,7 @@ static int list_lookup(kvs_token_t key_tok, kv_entry_t **out_e,
     const char *k = key_from_token(key_tok, kbuf, kbuf_sz);
     uint32_t kl = (uint32_t)strlen(k);
     uint64_t h = kv_hash((const uint8_t *)k, kl);
-    kv_entry_t *e = dict_find(&g_dict, k, kl, h);
+    kv_entry_t *e = dict_find(kv_dict_for(h), k, kl, h);
     *out_hash = h;
     if (!e) { *out_e = NULL; return 0; }
     if (entry_type(e) != KV_TYPE_LIST) {
@@ -917,12 +917,12 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
             if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
 
             uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
-            kv_entry_t *e = dict_find(&g_dict, key, (uint32_t)strlen(key), hash);
+            kv_entry_t *e = dict_find(kv_dict_for(hash), key, (uint32_t)strlen(key), hash);
 
             if (!e) {
                 char data[16];
                 list_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, LIST_EMPTY_SIZE, hash);
+                e = dict_add(kv_dict_for(hash), key, (uint32_t)strlen(key), data, LIST_EMPTY_SIZE, hash);
                 if (!e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24); return DISPATCH_ERROR; }
             } else if (entry_type(e) != KV_TYPE_LIST) {
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
@@ -932,7 +932,7 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
             if (check_expiry(e, key, hash)) {
                 char data[16];
                 list_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, LIST_EMPTY_SIZE, hash);
+                e = dict_add(kv_dict_for(hash), key, (uint32_t)strlen(key), data, LIST_EMPTY_SIZE, hash);
                 if (!e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24); return DISPATCH_ERROR; }
             }
 
@@ -1397,8 +1397,7 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
 
             if (!dst_e) {
                 char data[16]; list_build_empty(data);
-                dst_e = dict_add(&g_dict, dst_k, (uint32_t)strlen(dst_k),
-                                 data, LIST_EMPTY_SIZE, dst_h);
+                dst_e = dict_add(kv_dict_for(dst_h), dst_k, (uint32_t)strlen(dst_k), data, LIST_EMPTY_SIZE, dst_h);
                 if (!dst_e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24);
                               return DISPATCH_ERROR; }
             }
@@ -1423,12 +1422,12 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
             if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
 
             uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
-            kv_entry_t *e = dict_find(&g_dict, key, (uint32_t)strlen(key), hash);
+            kv_entry_t *e = dict_find(kv_dict_for(hash), key, (uint32_t)strlen(key), hash);
 
             if (!e) {
                 char data[16];
                 list_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, LIST_EMPTY_SIZE, hash);
+                e = dict_add(kv_dict_for(hash), key, (uint32_t)strlen(key), data, LIST_EMPTY_SIZE, hash);
                 if (!e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24); return DISPATCH_ERROR; }
             } else if (entry_type(e) != KV_TYPE_LIST) {
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
@@ -1438,7 +1437,7 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
             if (check_expiry(e, key, hash)) {
                 char data[16];
                 list_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, LIST_EMPTY_SIZE, hash);
+                e = dict_add(kv_dict_for(hash), key, (uint32_t)strlen(key), data, LIST_EMPTY_SIZE, hash);
                 if (!e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24); return DISPATCH_ERROR; }
             }
 
@@ -1536,8 +1535,7 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
             /* Create dst if absent */
             if (!dst_e) {
                 char data[16]; list_build_empty(data);
-                dst_e = dict_add(&g_dict, dst_k, (uint32_t)strlen(dst_k),
-                                 data, LIST_EMPTY_SIZE, dst_h);
+                dst_e = dict_add(kv_dict_for(dst_h), dst_k, (uint32_t)strlen(dst_k), data, LIST_EMPTY_SIZE, dst_h);
                 if (!dst_e) { dynbuf_cat(wb, "-ERR create list failed\r\n", 24);
                               return DISPATCH_ERROR; }
             }
@@ -1594,7 +1592,7 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 char kb[256];
                 const char *k = key_from_token(args[i], kb, (int)sizeof(kb));
                 uint64_t hash = kv_hash((const uint8_t *)k, (uint32_t)strlen(k));
-                kv_entry_t *e = dict_find(&g_dict, k, (uint32_t)strlen(k), hash);
+                kv_entry_t *e = dict_find(kv_dict_for(hash), k, (uint32_t)strlen(k), hash);
 
                 if (!e || entry_type(e) != KV_TYPE_LIST) continue;
                 if (check_expiry(e, k, hash)) continue;
@@ -1642,10 +1640,19 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 client->block_key_count++;
             }
 
+            /* Phase 4B.2: use real wall clock (not the cached ms — only
+             * worker 0 updates the cache, so other workers may register
+             * with a stale base, causing the timeout to fire early). */
             if (timeout_sec > 0)
-                client->block_until_ms = get_time_now() + timeout_sec * 1000;
+                client->block_until_ms = get_time_now_real() + timeout_sec * 1000;
             else
                 client->block_until_ms = 0;  /* 0 means no timeout */
+
+            /* Phase 4B.2: ask worker 0 (the timeout sweeper) to recompute
+             * its nearest-timeout SQE.  Without this, worker 0 may already
+             * be parked in io_uring_submit_and_wait() with no timeout
+             * armed and would only wake on the next data CQE. */
+            if (timeout_sec > 0) proactor_kick_worker(0);
 
             if (msg_raw && msg_len > 0 && msg_len < (int)sizeof(client->block_cmd_buf)) {
                 memcpy(client->block_cmd_buf, msg_raw, msg_len);

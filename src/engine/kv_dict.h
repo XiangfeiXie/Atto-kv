@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 /* =====================================================================
  * Unified Dict Engine — the single storage engine for KVStore.
@@ -118,5 +119,95 @@ void        dict_iter_free(kv_iter_t *it);
 
 /* --- Stats --- */
 uint32_t    dict_count(kv_dict_t *d);
+
+/* =====================================================================
+ * Phase 4: sharded dict wrapper.
+ *
+ * The keyspace is split into KV_NR_SHARDS independent kv_dict_t instances,
+ * each protected by its own pthread_rwlock_t.  Callers compute the key
+ * hash once, take the appropriate shard's lock (read or write), call the
+ * regular dict_* helpers on `kv_dict_for(hash)`, then release the lock.
+ *
+ * The shard index is derived from the *upper* hash bits so it is
+ * statistically independent of the bucket index inside the shard's
+ * hashtable (which uses lower bits).
+ * ===================================================================== */
+
+#define KV_NR_SHARDS_LOG2  5
+#define KV_NR_SHARDS       (1u << KV_NR_SHARDS_LOG2)
+#define KV_SHARD_MASK      (KV_NR_SHARDS - 1u)
+
+typedef struct kv_shard {
+    pthread_rwlock_t lock;
+    kv_dict_t        dict;
+    /* Pad to a typical cacheline to dampen false sharing between
+     * adjacent shards' locks under heavy multi-threaded write traffic. */
+    char             _pad[64];
+} kv_shard_t;
+
+typedef struct {
+    kv_shard_t shards[KV_NR_SHARDS];
+} kv_shards_t;
+
+extern kv_shards_t g_shards;
+
+static inline kv_shard_t *kv_shard_for(uint64_t hash) {
+    return &g_shards.shards[(hash >> 32) & KV_SHARD_MASK];
+}
+static inline kv_dict_t *kv_dict_for(uint64_t hash) {
+    return &kv_shard_for(hash)->dict;
+}
+
+static inline void kv_shard_rdlock_h(uint64_t hash) {
+    pthread_rwlock_rdlock(&kv_shard_for(hash)->lock);
+}
+static inline void kv_shard_wrlock_h(uint64_t hash) {
+    pthread_rwlock_wrlock(&kv_shard_for(hash)->lock);
+}
+static inline void kv_shard_unlock_h(uint64_t hash) {
+    pthread_rwlock_unlock(&kv_shard_for(hash)->lock);
+}
+
+void     kv_shards_init(void);
+void     kv_shards_destroy(void);
+uint32_t kv_shards_count(void);     /* sum dict_count across all shards   */
+void     kv_shards_clear(void);     /* FLUSHDB / FLUSHALL: wrlock+clear   */
+
+/* Multi-shard iteration helper.
+ *
+ *   kv_shards_iter_t it; kv_shards_iter_init(&it);
+ *   while ((e = kv_shards_iter_next(&it)) != NULL) { use e; }
+ *
+ * Each shard is rdlocked while being walked; the lock is released as
+ * soon as iteration moves to the next shard.  Snapshots are *not*
+ * globally consistent across shards (acceptable for KEYS / RDB save). */
+typedef struct {
+    uint32_t   shard_idx;        /* next shard to enter            */
+    kv_iter_t *cur_iter;         /* current shard's iterator (or NULL) */
+    int        no_lock;          /* if 1, skip per-shard rdlock — use only
+                                    when caller already holds all shard
+                                    wrlocks or runs single-threaded
+                                    (e.g. fork child for RDB save) */
+} kv_shards_iter_t;
+
+void        kv_shards_iter_init(kv_shards_iter_t *it);
+void        kv_shards_iter_init_nolock(kv_shards_iter_t *it);
+kv_entry_t *kv_shards_iter_next(kv_shards_iter_t *it);
+void        kv_shards_iter_free(kv_shards_iter_t *it);
+
+/* Phase 4B.4 — point-in-time snapshot helpers.
+ *
+ *   kv_shards_lock_all_for_snapshot();
+ *   pid_t pid = fork();
+ *   if (pid == 0) {                     // child: locks frozen in COW image
+ *       use kv_shards_iter_init_nolock(); read; _exit;
+ *   }
+ *   kv_shards_unlock_all_snapshot();    // parent: workers resume
+ *
+ * Locks are taken in shard-index order; dispatch only ever holds one
+ * shard wrlock at a time (per the dispatcher contract), so this fixed
+ * order cannot deadlock against the dispatcher. */
+void kv_shards_lock_all_for_snapshot(void);
+void kv_shards_unlock_all_snapshot(void);
 
 #endif

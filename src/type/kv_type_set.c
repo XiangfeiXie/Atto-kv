@@ -154,7 +154,7 @@ static void pk_swap_remove(char *data, uint32_t *data_len, uint32_t idx) {
  * Engine access
  * ===================================================================== */
 
-extern kv_dict_t g_dict;
+/* g_dict replaced by sharded g_shards (kv_dict.h) */
 extern long long get_time_now(void);
 
 static const char *key_from_token(kvs_token_t t, char *buf, int sz) {
@@ -167,7 +167,7 @@ static const char *key_from_token(kvs_token_t t, char *buf, int sz) {
 static int check_expiry(kv_entry_t *e, const char *key, uint64_t hash) {
     if (e && e->expire && get_time_now() > e->expire) {
         set_cleanup_entry(e);
-        dict_delete(&g_dict, key, (uint32_t)strlen(key), hash);
+        dict_delete(kv_dict_for(hash), key, (uint32_t)strlen(key), hash);
         return 1;
     }
     return 0;
@@ -207,7 +207,7 @@ static kv_entry_t *set_convert_to_dict(kv_entry_t *e) {
     uint32_t old_count = pk_read_u32(e->data + 2);
 
     if (old_count == 0) {
-        kv_entry_t *ne = dict_resize_entry(&g_dict, e, SET_DICT_HEADER_SIZE);
+        kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, SET_DICT_HEADER_SIZE);
         if (!ne) return NULL;
         ne->data[0] = (char)KV_TYPE_SET;
         ne->data[1] = (char)KV_ENCODING_DICT;
@@ -233,7 +233,7 @@ static kv_entry_t *set_convert_to_dict(kv_entry_t *e) {
         p += 4 + elen;
     }
 
-    kv_entry_t *ne = dict_resize_entry(&g_dict, e, SET_DICT_HEADER_SIZE);
+    kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, SET_DICT_HEADER_SIZE);
     if (!ne) goto err;
     e = ne;
 
@@ -303,7 +303,7 @@ static kv_entry_t *set_contract_to_packed(kv_entry_t *e) {
     dict_clear(d);
     dict_destroy(d);
 
-    kv_entry_t *ne = dict_resize_entry(&g_dict, e, pk_size);
+    kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, pk_size);
     if (!ne) {
         /* Can't shrink — reinit dict and restore */
         dict_init(d);
@@ -392,7 +392,7 @@ static int set_add(kv_entry_t **pe, const char *key,
 
         /* Resize entry */
         uint32_t new_dlen = (uint32_t)(2 + pk_len + need);
-        kv_entry_t *ne = dict_resize_entry(&g_dict, e, new_dlen);
+        kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, new_dlen);
         if (!ne) return -1;
         e = ne;
         *pe = e;
@@ -437,7 +437,7 @@ static int set_remove(kv_entry_t **pe, const char *key,
         pk_remove_at(e->data + 2, &pk_len, (uint32_t)idx);
 
         uint32_t new_dlen = pk_len + 2;
-        kv_entry_t *ne = dict_resize_entry(&g_dict, e, new_dlen);
+        kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, new_dlen);
         if (ne) { ne->val_len = new_dlen; *pe = ne; }
         else    { e->val_len = new_dlen; }
         *removed = 1;
@@ -694,12 +694,12 @@ static int resolve_set_key(const char *key, int klen, kv_entry_t **out_entry) {
     *out_entry = NULL;
     if (klen <= 0) return 0;
     uint64_t h = kv_hash((const uint8_t *)key, (uint32_t)klen);
-    kv_entry_t *e = dict_find(&g_dict, key, (uint32_t)klen, h);
+    kv_entry_t *e = dict_find(kv_dict_for(h), key, (uint32_t)klen, h);
     if (!e) return 0;
     if (entry_type(e) != KV_TYPE_SET) return -1;
     if (e->expire && get_time_now() > e->expire) {
         set_cleanup_entry(e);
-        dict_delete(&g_dict, key, (uint32_t)klen, h);
+        dict_delete(kv_dict_for(h), key, (uint32_t)klen, h);
         return 0;
     }
     *out_entry = e;
@@ -723,16 +723,16 @@ static int set_store_overwrite(const char *key, int klen,
                                const uint32_t *lens, uint32_t count)
 {
     uint64_t h = kv_hash((const uint8_t *)key, (uint32_t)klen);
-    kv_entry_t *existing = dict_find(&g_dict, key, (uint32_t)klen, h);
+    kv_entry_t *existing = dict_find(kv_dict_for(h), key, (uint32_t)klen, h);
     if (existing) {
         if (entry_type(existing) == KV_TYPE_SET) set_cleanup_entry(existing);
-        dict_delete(&g_dict, key, (uint32_t)klen, h);
+        dict_delete(kv_dict_for(h), key, (uint32_t)klen, h);
     }
     if (count == 0) return 0;
 
     char init[16];
     set_build_empty(init);
-    kv_entry_t *e = dict_add(&g_dict, key, (uint32_t)klen, init, SET_EMPTY_SIZE, h);
+    kv_entry_t *e = dict_add(kv_dict_for(h), key, (uint32_t)klen, init, SET_EMPTY_SIZE, h);
     if (!e) return -1;
 
     for (uint32_t i = 0; i < count; i++) {
@@ -771,13 +771,13 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
             if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
 
             uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
-            kv_entry_t *e = dict_find(&g_dict, key, (uint32_t)strlen(key), hash);
+            kv_entry_t *e = dict_find(kv_dict_for(hash), key, (uint32_t)strlen(key), hash);
             int existed = 0;
 
             if (!e) {
                 char data[16];
                 set_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, SET_EMPTY_SIZE, hash);
+                e = dict_add(kv_dict_for(hash), key, (uint32_t)strlen(key), data, SET_EMPTY_SIZE, hash);
                 if (!e) { dynbuf_cat(wb, "-ERR create set failed\r\n", 23); return DISPATCH_ERROR; }
             } else {
                 if (entry_type(e) != KV_TYPE_SET) {
@@ -790,7 +790,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
             if (existed) {
                 char data[16];
                 set_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key), data, SET_EMPTY_SIZE, hash);
+                e = dict_add(kv_dict_for(hash), key, (uint32_t)strlen(key), data, SET_EMPTY_SIZE, hash);
                 if (!e) { dynbuf_cat(wb, "-ERR create set failed\r\n", 23); return DISPATCH_ERROR; }
             }
 
@@ -1061,8 +1061,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 char init[16];
                 set_build_empty(init);
                 uint64_t dh = kv_hash((const uint8_t *)dkey, (uint32_t)strlen(dkey));
-                de = dict_add(&g_dict, dkey, (uint32_t)strlen(dkey),
-                              init, SET_EMPTY_SIZE, dh);
+                de = dict_add(kv_dict_for(dh), dkey, (uint32_t)strlen(dkey), init, SET_EMPTY_SIZE, dh);
                 if (!de) { dynbuf_cat(wb, "-ERR smove failed\r\n", 18); return DISPATCH_ERROR; }
             }
             int added = 0;
@@ -1255,7 +1254,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
             {
                 uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
                 set_cleanup_entry(entry);
-                int ret = dict_delete(&g_dict, key, (uint32_t)strlen(key), hash);
+                int ret = dict_delete(kv_dict_for(hash), key, (uint32_t)strlen(key), hash);
                 dynbuf_cat(wb, ret == 0 ? REP_OK : REP_NIL,
                                 ret == 0 ? REP_OK_LEN : REP_NIL_LEN);
             }

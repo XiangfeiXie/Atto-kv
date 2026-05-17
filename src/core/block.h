@@ -29,4 +29,9 @@ int block_nearest_timeout(void);
 /* ── Wake all clients whose timeout has expired ── */
 void block_check_timeouts(void);
 
+/* ── proactor.c — wake the given worker out of io_uring_submit_and_wait.
+ * Used so worker 0 immediately re-evaluates block_nearest_timeout() after
+ * a new BLPOP/BRPOP registers from another worker. */
+void proactor_kick_worker(int id);
+
 #endif

@@ -235,6 +235,11 @@ incr_port         6382       # WAL 增量同步端口
 xdp         no            # XDP 包层观测：yes | no（需 CAP_NET_ADMIN）
 xdp_iface   lo            # XDP 挂载网卡：本地测试用 lo，远端用实际网卡
 sockmap     no            # sockmap 流层观测：yes | no（需 cgroup v2）
+
+# ── Phase 4：多线程 proactor ─────────────────────────────
+threads     0             # 0 = auto (nproc-1); 1 = 单线程；N = 显式 N worker
+                          # 启动时按 nproc / KV_NR_SHARDS / cgroup cpu.max 做 sanity warn
+                          # >1 时启用 SO_REUSEPORT + 32 shard 锁
 ```
 
 > **注意**：`xdp_iface` 必须与流量实际经过的网卡一致。  
@@ -488,6 +493,24 @@ COOP_TASKRUN setup flags (3.3)。
 
 平均 **+30%**。低 pipeline (P=1/4) 收益最大，符合"syscall 占比越高、io_uring 进阶越甜"的理论。
 原始数据：`test/bench/phase3-*.csv`。
+
+### Phase 4 多线程 proactor + dict 分片（2026-05-16）
+
+`threads N` 配合 `SO_REUSEPORT` 多 worker，dict 分成 32 shard 各自带
+`pthread_rwlock`，`SHARD_WRLOCK` 用 `__attribute__((cleanup))` 自动释放。
+压测：`redis-benchmark -c 400 -n 2000000 -P 10 --threads 6`（6 核机器，
+loopback）。
+
+| threads | SET rps | GET rps | scaling |
+|---:|---:|---:|---|
+| 1 | 360 k | 330 k | 1.00× |
+| 2 | **461 k** | **462 k** | 1.28× / 1.40× |
+| 4 | 439 k | 414 k | 1.22× / 1.25× |
+| 8 | 393 k | 377 k | 退化 |
+
+6 核机器最优 t=2；t≥4 时 server 线程与 client/softirq 在同一组 core 上互
+相争抢，退化明显。Phase 5 计划 CPU pinning 解决这个退化（在更高核数机器上
+也会重测，32 shard 留了足够余量）。原始数据：`test/bench/phase4-mt.csv`。
 
 ### 历史数据（Phase 2 head 之前）
 

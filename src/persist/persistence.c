@@ -453,21 +453,35 @@ static void rdb_serialize_cb_dynbuf(kv_entry_t *e, void *priv) {
     serialize_entry_to_buf((DynBuf *)priv, e);
 }
 
-/* Iterate all dict entries, calling cb for each. */
-static void dict_scan(kv_dict_t *d, void (*cb)(kv_entry_t *e, void *priv), void *priv) {
-    kv_iter_t *it = dict_iter_new(d, 1);
-    if (!it) return;
+/* Set to 1 inside the BGSAVE fork child so shards_scan() switches to
+ * the no-lock iterator.  Crucial for MT mode: at fork time some worker
+ * may have held a shard wrlock; the child inherits the locked state
+ * with no thread to release it, so the regular rdlock-walking iterator
+ * would deadlock. */
+static int g_rdb_in_fork_child = 0;
+
+/* Iterate every entry across all shards.  In the BGSAVE fork child the
+ * caller has already serialised access via kv_shards_lock_all_for_snapshot
+ * before fork; the child sees a frozen COW image and walks it without
+ * touching any rwlocks.  In the parent (sync save / replication
+ * full-sync) the iterator takes a per-shard rdlock as it goes. */
+static void shards_scan(void (*cb)(kv_entry_t *e, void *priv), void *priv) {
+    kv_shards_iter_t it;
+    if (g_rdb_in_fork_child)
+        kv_shards_iter_init_nolock(&it);
+    else
+        kv_shards_iter_init(&it);
     kv_entry_t *e;
-    while ((e = dict_iter_next(it)) != NULL)
+    while ((e = kv_shards_iter_next(&it)) != NULL)
         cb(e, priv);
-    dict_iter_free(it);
+    kv_shards_iter_free(&it);
 }
 
 void rdb_serialize_to_buf(DynBuf *out) {
     int magic = 0x524442;
     int version = 2;
     int db_num = 0;
-    int key_count = (int)dict_count(&g_dict);
+    int key_count = (int)kv_shards_count();
 
     /* Reserve: header (16) + per-entry estimate (key + value + overhead ~= 256) */
     dynbuf_reserve(out, 16 + key_count * 256);
@@ -477,7 +491,7 @@ void rdb_serialize_to_buf(DynBuf *out) {
     dynbuf_append(out, (const char *)&db_num,    sizeof(int));
     dynbuf_append(out, (const char *)&key_count, sizeof(int));
 
-    dict_scan(&g_dict, rdb_serialize_cb_dynbuf, out);
+    shards_scan(rdb_serialize_cb_dynbuf, out);
 }
 
 /* 子进程：使用 io_uring 将整个 buffer 分块写入，最后 fsync */
@@ -549,14 +563,14 @@ void rdb_save_sync(void) {
     int magic = 0x524442;
     int version = 2;
     int db_num = 0;
-    int key_count = (int)dict_count(&g_dict);
+    int key_count = (int)kv_shards_count();
 
     rdb_buf_put(&b, &magic, sizeof(int));
     rdb_buf_put(&b, &version, sizeof(int));
     rdb_buf_put(&b, &db_num, sizeof(int));
     rdb_buf_put(&b, &key_count, sizeof(int));
 
-    dict_scan(&g_dict, rdb_save_callback_buf, &b);
+    shards_scan(rdb_save_callback_buf, &b);
 
     /* 2) 写临时文件 + rename，保证原子性 */
     /* persist_path() 返回同一 static buffer，必须先拷贝再调用第二次，
@@ -613,22 +627,42 @@ void rdb_save_async_uring(void) {
         return;
     }
 
+    /* Phase 4B.4: take all shard wrlocks before fork so the child
+     * inherits a point-in-time consistent snapshot.  Workers stall
+     * here for the duration of: 32 wrlock acquisitions + fork() +
+     * 32 wrlock releases (a few hundred microseconds typically). */
+    long long t_lock = get_time_now_real();
+    kv_shards_lock_all_for_snapshot();
+    long long t_locked = get_time_now_real();
+
     pid_t pid = fork();
     if (pid < 0) {
-        fprintf(stderr, "[RDB] fork failed, fallback sync\n");
+        fprintf(stderr, "[RDB] fork failed (%s), falling back to sync save\n",
+                strerror(errno));
+        kv_shards_unlock_all_snapshot();
+        /* Fallback runs in the parent without the snapshot guarantee;
+         * acceptable because fork-fail is rare and we still produce a
+         * per-shard-consistent dump. */
         rdb_save_sync();
         return;
     }
     if (pid == 0) {
-        /* 子进程: flush stdio so printf output is not lost with _exit */
+        /* Child: locks are "held" in our COW memory image, but no
+         * thread will ever release them.  Switch shards_scan to the
+         * no-lock iterator and serialise. */
+        g_rdb_in_fork_child = 1;
         rdb_save_sync();
         fflush(stdout);
         fflush(stderr);
         _exit(0);
     }
-    /* 父进程立即返回 —— 主线程零阻塞 */
+    /* Parent: release the snapshot locks immediately so workers resume.
+     * The child continues against its frozen COW image. */
+    kv_shards_unlock_all_snapshot();
+    long long t_done = get_time_now_real();
     g_rdb_child_pid = pid;
-    printf("[RDB] BGSAVE started, child pid=%d\n", (int)pid);
+    printf("[RDB] BGSAVE started, child pid=%d (snapshot stall: %lld ms acquire, %lld ms total)\n",
+           (int)pid, t_locked - t_lock, t_done - t_lock);
 }
 
 /* =============================================================================
@@ -690,7 +724,7 @@ int rdb_load_stream_append(const char *buf, size_t len) {
         if (p + dlen > end) break;
 
         uint64_t h = kv_hash((const uint8_t *)ks, (uint32_t)klen);
-        kv_entry_t *e = dict_add(&g_dict, ks, (uint32_t)klen, p, (uint32_t)dlen, h);
+        kv_entry_t *e = dict_add(kv_dict_for(h), ks, (uint32_t)klen, p, (uint32_t)dlen, h);
         p += dlen;
 
         if (!(p = mread(p, end, &expire, sizeof(long long)))) break;
@@ -704,10 +738,9 @@ int rdb_load_stream_append(const char *buf, size_t len) {
 /* Rebuild encodings for all loaded entries. After streaming load, SET/HASH/ZSET
  * entries are PACKED; this upgrades them to DICT/SKIPLIST when thresholds met. */
 void rdb_rebuild_all_encodings(void) {
-    kv_iter_t *it = dict_iter_new(&g_dict, 1);
-    if (!it) return;
+    kv_shards_iter_t it; kv_shards_iter_init(&it);
     kv_entry_t *e;
-    while ((e = dict_iter_next(it)) != NULL) {
+    while ((e = kv_shards_iter_next(&it)) != NULL) {
         switch (entry_type(e)) {
         case KV_TYPE_SET:  set_rebuild_encoding(e);  break;
         case KV_TYPE_HASH: hash_rebuild_encoding(e); break;
@@ -715,7 +748,7 @@ void rdb_rebuild_all_encodings(void) {
         default: break;
         }
     }
-    dict_iter_free(it);
+    kv_shards_iter_free(&it);
 }
 
 /* In-memory RDB loader: parses the same binary format as rdb_load_mmap()
@@ -729,7 +762,7 @@ int rdb_load_from_buf(const char *buf, size_t len) {
     if (key_count < 0) return -1;
 
     int loaded = rdb_load_stream_append(buf + 16, len - 16);
-    if (loaded < 0) { dict_clear(&g_dict); return -1; }
+    if (loaded < 0) { kv_shards_clear(); return -1; }
 
     rdb_rebuild_all_encodings();
 

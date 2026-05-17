@@ -307,7 +307,7 @@ static void child_serialize_loop(shm_ring_t *shm,
      * [magic:4][version:4][db_num:4][key_count:4][base_seq:8] = 24 bytes */
     {
         int magic = 0x524442, version = 2, db_num = 0;
-        int key_count = (int)dict_count(&g_dict);
+        int key_count = (int)kv_shards_count();
         char *p = s->data;
         memcpy(p, &magic,     4); p += 4;
         memcpy(p, &version,   4); p += 4;
@@ -319,18 +319,10 @@ static void child_serialize_loop(shm_ring_t *shm,
     /* Write pointer: entries start after the 24-byte header */
     char *wp = s->data + 24;
 
-    kv_iter_t *it = dict_iter_new(&g_dict, 1);
-    if (!it) {
-        /* dict_iter_new failed — send header-only chunk + EOF */
-        s->chunk_len  = 24;
-        s->chunk_type = CHUNK_TYPE_DATA;
-        s->state      = SLOT_READY;
-        eventfd_write(child_evt_fd, 1);
-        goto send_eof;
-    }
+    kv_shards_iter_t it_s; kv_shards_iter_init(&it_s);
 
     kv_entry_t *e;
-    while ((e = dict_iter_next(it)) != NULL) {
+    while ((e = kv_shards_iter_next(&it_s)) != NULL) {
         /* Try to serialize into remaining slot space */
         size_t room = (size_t)(s->data + CHUNK_DATA_SIZE - wp);
         int n = serialize_entry_inline(wp, room, e);
@@ -373,7 +365,7 @@ static void child_serialize_loop(shm_ring_t *shm,
         eventfd_write(child_evt_fd, 1);
     }
 
-    dict_iter_free(it);
+    kv_shards_iter_free(&it_s);
 
 send_eof:
     {

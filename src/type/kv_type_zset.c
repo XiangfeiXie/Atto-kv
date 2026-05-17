@@ -117,7 +117,7 @@ static inline int score_in_range(double s, double mn, int mn_excl,
  * Engine access
  * ===================================================================== */
 
-extern kv_dict_t g_dict;
+/* g_dict replaced by sharded g_shards (kv_dict.h) */
 extern long long get_time_now(void);
 
 static const char *key_from_token(kvs_token_t t, char *buf, int sz) {
@@ -130,7 +130,7 @@ static const char *key_from_token(kvs_token_t t, char *buf, int sz) {
 static int check_expiry(kv_entry_t *e, const char *key, uint64_t hash) {
     if (e && e->expire && get_time_now() > e->expire) {
         zset_cleanup_entry(e);
-        dict_delete(&g_dict, key, (uint32_t)strlen(key), hash);
+        dict_delete(kv_dict_for(hash), key, (uint32_t)strlen(key), hash);
         return 1;
     }
     return 0;
@@ -500,7 +500,7 @@ static kv_entry_t *zset_convert_to_skiplist(kv_entry_t *e) {
     }
 
     /* Resize to skiplist header */
-    kv_entry_t *ne = dict_resize_entry(&g_dict, e, ZSET_HEADER_SIZE);
+    kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, ZSET_HEADER_SIZE);
     if (!ne) goto err;
     e = ne;
 
@@ -593,7 +593,7 @@ static kv_entry_t *zset_contract_to_packed(kv_entry_t *e) {
     dict_destroy(d);
 
     /* Resize to packed */
-    kv_entry_t *ne = dict_resize_entry(&g_dict, e, pk_size);
+    kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, pk_size);
     if (!ne) {
         /* Restore skiplist */
         ne = e;
@@ -706,7 +706,7 @@ static int zset_add_packed(kv_entry_t **pe, double score,
 
     /* Resize */
     uint32_t new_dlen = (uint32_t)(2 + pk_len + need);
-    kv_entry_t *ne = dict_resize_entry(&g_dict, e, new_dlen);
+    kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, new_dlen);
     if (!ne) return -1;
     e = ne;
     *pe = e;
@@ -809,7 +809,7 @@ static int zset_remove_member(kv_entry_t **pe, const char *m, uint32_t ml) {
         if (!fp) return 0;
         pk_zset_remove_at(e->data + 2, &pk_len, fp);
         uint32_t new_dlen = pk_len + 2;
-        kv_entry_t *ne = dict_resize_entry(&g_dict, e, new_dlen);
+        kv_entry_t *ne = dict_resize_entry(kv_dict_for((e)->hash), e, new_dlen);
         if (ne) { ne->val_len = new_dlen; *pe = ne; }
         else    { e->val_len  = new_dlen; }
         return 1;
@@ -1040,8 +1040,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                     return DISPATCH_OK;
                 }
                 char data[16]; zset_build_empty(data);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key),
-                             data, ZSET_EMPTY_SIZE, khash);
+                e = dict_add(kv_dict_for(khash), key, (uint32_t)strlen(key), data, ZSET_EMPTY_SIZE, khash);
                 if (!e) {
                     dynbuf_cat(wb, "-ERR create zset failed\r\n", 24);
                     return DISPATCH_ERROR;
@@ -1120,7 +1119,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                     if (fp) {
                         pk_zset_remove_at(entry->data + 2, &pk_len, fp);
                         uint32_t new_dlen = pk_len + 2;
-                        kv_entry_t *ne = dict_resize_entry(&g_dict, entry, new_dlen);
+                        kv_entry_t *ne = dict_resize_entry(kv_dict_for((entry)->hash), entry, new_dlen);
                         if (ne) { ne->val_len = new_dlen; entry = ne; }
                         else    { entry->val_len = new_dlen; }
                         total_removed++;
@@ -1523,8 +1522,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
             kv_entry_t *e = entry;
             if (!e || check_expiry(e, key, khash)) {
                 char init[16]; zset_build_empty(init);
-                e = dict_add(&g_dict, key, (uint32_t)strlen(key),
-                             init, ZSET_EMPTY_SIZE, khash);
+                e = dict_add(kv_dict_for(khash), key, (uint32_t)strlen(key), init, ZSET_EMPTY_SIZE, khash);
                 if (!e) { dynbuf_cat(wb, "-ERR zincrby failed\r\n", 21); return DISPATCH_ERROR; }
             }
             double cur = 0;
@@ -1825,7 +1823,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
             {
                 uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
                 zset_cleanup_entry(entry);
-                int ret = dict_delete(&g_dict, key, (uint32_t)strlen(key), hash);
+                int ret = dict_delete(kv_dict_for(hash), key, (uint32_t)strlen(key), hash);
                 dynbuf_cat(wb, ret == 0 ? REP_OK : REP_NIL,
                                 ret == 0 ? REP_OK_LEN : REP_NIL_LEN);
             }

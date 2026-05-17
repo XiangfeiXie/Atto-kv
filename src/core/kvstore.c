@@ -23,8 +23,43 @@
 #define CMD4(a,b,c,d) ((uint32_t)(uint8_t)(a) | ((uint32_t)(uint8_t)(b) << 8) | \
                         ((uint32_t)(uint8_t)(c) << 16) | ((uint32_t)(uint8_t)(d) << 24))
 
+/* ──────────────────────────────────────────────────────────────────
+ * Phase 4 — shard lock guard.
+ *
+ * Single-key dispatch acquires the relevant shard's wrlock just before
+ * the dict_find at the top of the keyed-command flow and releases it
+ * after the type engine has populated the reply.  We always wrlock
+ * (rather than rdlock for read commands) because:
+ *
+ *   - Most read paths still bump LRU / lazy expire, so they mutate.
+ *   - With 32 shards, contention is already 1/32 — wrlock vs rdlock
+ *     savings are negligible compared to the simplification.
+ *
+ * The cleanup attribute auto-releases on every return path; callers
+ * that need to drop the lock early (e.g. before block_wake which may
+ * recursively dispatch) call SHARD_RELEASE() explicitly.
+ * ────────────────────────────────────────────────────────────────── */
+typedef struct {
+    uint64_t hash;
+    int      held;
+} kvs_shard_guard_t;
+
+static inline void kvs_shard_guard_release(kvs_shard_guard_t *g) {
+    if (g->held) {
+        kv_shard_unlock_h(g->hash);
+        g->held = 0;
+    }
+}
+
+#define SHARD_WRLOCK(h) \
+    kvs_shard_guard_t _sg __attribute__((cleanup(kvs_shard_guard_release))) \
+        = { .hash = (h), .held = 1 }; \
+    kv_shard_wrlock_h(h)
+
+#define SHARD_RELEASE() kvs_shard_guard_release(&_sg)
+
 /* ==================== Global dict (single storage engine) ==================== */
-kv_dict_t g_dict;
+/* g_dict has been replaced by sharded g_shards (see kv_dict.h). */
 int g_in_reload = 0;    /* set by persistence layer during AOF/RDB reload */
 
 /* ==================== Utility ==================== */
@@ -35,7 +70,7 @@ void kvs_free(void *ptr)       { free(ptr); }
 /* ── Cached time: updated once per event-loop iteration ── */
 static long long g_cached_ms;
 
-static long long get_time_now_real(void) {
+long long get_time_now_real(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000LL + tv.tv_usec / 1000;
@@ -240,7 +275,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
 
     /* DBSIZE — count of keys in dict. */
     if (TOKEN_EQ(cmd, "DBSIZE")) {
-        reply_integer(wb, (long long)dict_count(&g_dict));
+        reply_integer(wb, (long long)kv_shards_count());
         return DISPATCH_OK;
     }
 
@@ -251,14 +286,13 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     }
 
     if (TOKEN_EQ(cmd, "FLUSHALL") || TOKEN_EQ(cmd, "FLUSHDB")) {
-        kv_iter_t *it = dict_iter_new(&g_dict, 1);
-        if (it) {
-            kv_entry_t *e;
-            while ((e = dict_iter_next(it)) != NULL)
-                entry_cleanup_by_type(e);
-            dict_iter_free(it);
-        }
-        dict_clear(&g_dict);
+        /* Walk every shard under its own rdlock, then wrlock-clear all. */
+        kv_shards_iter_t it; kv_shards_iter_init(&it);
+        kv_entry_t *e;
+        while ((e = kv_shards_iter_next(&it)) != NULL)
+            entry_cleanup_by_type(e);
+        kv_shards_iter_free(&it);
+        kv_shards_clear();
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         if (!g_in_reload) {
             if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
@@ -280,6 +314,9 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         int hl = snprintf(hdr, sizeof(hdr), "*%d\r\n", argc - 1);
         dynbuf_cat(wb, hdr, hl);
         for (int i = 1; i < argc; i++) {
+            uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
+                                  (uint32_t)tokens[i].len);
+            SHARD_WRLOCK(kh);
             uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
             const char *val = string_engine_get(tokens[i].ptr, (uint32_t)tokens[i].len,
                                                 &vlen, &enc);
@@ -317,12 +354,11 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
              * overwrite is type-safe (Redis MSET replaces any existing type). */
             uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                   (uint32_t)tokens[i].len);
-            kv_entry_t *ke = dict_find(&g_dict, tokens[i].ptr,
-                                        (uint32_t)tokens[i].len, kh);
+            SHARD_WRLOCK(kh);
+            kv_entry_t *ke = dict_find(kv_dict_for(kh), tokens[i].ptr, (uint32_t)tokens[i].len, kh);
             if (ke && entry_type(ke) != KV_TYPE_STRING) {
                 entry_cleanup_by_type(ke);
-                dict_delete(&g_dict, tokens[i].ptr,
-                            (uint32_t)tokens[i].len, kh);
+                dict_delete(kv_dict_for(kh), tokens[i].ptr, (uint32_t)tokens[i].len, kh);
             }
             string_engine_set(tokens[i].ptr, (uint32_t)tokens[i].len,
                               tokens[i+1].ptr, (uint32_t)tokens[i+1].len,
@@ -334,6 +370,9 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             kvs_rdma_incr_probe(msg_raw, msg_len);
             if (kvs_config.xdp_enabled) {
                 for (int i = 1; i + 1 < argc; i += 2) {
+                    uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
+                                          (uint32_t)tokens[i].len);
+                    SHARD_WRLOCK(kh);
                     uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
                     const char *v = string_engine_get(
                         tokens[i].ptr, (uint32_t)tokens[i].len, &vlen, &enc);
@@ -354,18 +393,24 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                 "-ERR wrong number of arguments for 'msetnx' command\r\n", 53);
             return DISPATCH_ERROR;
         }
-        /* First pass: any existing (non-expired) key aborts the whole op. */
+        /* First pass: any existing (non-expired) key aborts the whole op.
+         * Note: with multiple workers, two concurrent MSETNX on overlapping
+         * key-sets may both succeed if their pre-checks interleave; this is
+         * the same as Redis's documented behaviour without WATCH. */
         for (int i = 1; i + 1 < argc; i += 2) {
             uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                   (uint32_t)tokens[i].len);
-            kv_entry_t *ke = dict_find(&g_dict, tokens[i].ptr,
-                                        (uint32_t)tokens[i].len, kh);
+            SHARD_WRLOCK(kh);
+            kv_entry_t *ke = dict_find(kv_dict_for(kh), tokens[i].ptr, (uint32_t)tokens[i].len, kh);
             if (ke && (!ke->expire || get_time_now() <= ke->expire)) {
                 reply_integer(wb, 0);
                 return DISPATCH_OK;
             }
         }
         for (int i = 1; i + 1 < argc; i += 2) {
+            uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
+                                  (uint32_t)tokens[i].len);
+            SHARD_WRLOCK(kh);
             string_engine_set(tokens[i].ptr, (uint32_t)tokens[i].len,
                               tokens[i+1].ptr, (uint32_t)tokens[i+1].len,
                               0, 0);
@@ -376,6 +421,9 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             kvs_rdma_incr_probe(msg_raw, msg_len);
             if (kvs_config.xdp_enabled) {
                 for (int i = 1; i + 1 < argc; i += 2) {
+                    uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
+                                          (uint32_t)tokens[i].len);
+                    SHARD_WRLOCK(kh);
                     uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
                     const char *v = string_engine_get(
                         tokens[i].ptr, (uint32_t)tokens[i].len, &vlen, &enc);
@@ -389,35 +437,22 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
-    /* ── Key-based commands ── */
-    if (argc < 2) {
-        dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
-        return DISPATCH_ERROR;
-    }
-
-    kvs_token_t key_tok = tokens[1];
-    uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
-    kv_entry_t *entry = dict_find(&g_dict, key_tok.ptr, (uint32_t)key_tok.len, hash);
-
-    /* Treat already-expired entry as absent. */
-    if (entry && entry->expire && get_time_now() > entry->expire) {
-        entry_cleanup_by_type(entry);
-        dict_delete(&g_dict, key_tok.ptr, (uint32_t)key_tok.len, hash);
-        entry = NULL;
-    }
-
-    int pre_len = wb->len;
-
-    /* ── DEL — type-agnostic, integer reply (Redis-compat) ── */
+    /* ── DEL / UNLINK — multi-key, type-agnostic, integer reply (Redis-compat).
+     *    Locking is per-key so concurrent DELs across shards do not block. ── */
     if (TOKEN_EQ(cmd, "DEL") || TOKEN_EQ(cmd, "UNLINK")) {
+        if (argc < 2) {
+            dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
+            return DISPATCH_ERROR;
+        }
         long long ndel = 0;
         for (int i = 1; i < argc; i++) {
             kvs_token_t kt = tokens[i];
             uint64_t kh = kv_hash((const uint8_t *)kt.ptr, (uint32_t)kt.len);
-            kv_entry_t *ke = dict_find(&g_dict, kt.ptr, (uint32_t)kt.len, kh);
+            SHARD_WRLOCK(kh);
+            kv_entry_t *ke = dict_find(kv_dict_for(kh), kt.ptr, (uint32_t)kt.len, kh);
             if (!ke) continue;
             entry_cleanup_by_type(ke);
-            if (dict_delete(&g_dict, kt.ptr, (uint32_t)kt.len, kh) == 0)
+            if (dict_delete(kv_dict_for(kh), kt.ptr, (uint32_t)kt.len, kh) == 0)
                 ndel++;
         }
         reply_integer(wb, ndel);
@@ -432,14 +467,18 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
-    /* ── EXISTS — type-agnostic, integer reply (Redis-compat).
-         EXIST kept as a 1-arg alias for legacy callers. ── */
+    /* ── EXISTS — multi-key, integer reply, per-key wrlock (lazy expire). ── */
     if (TOKEN_EQ(cmd, "EXISTS") || TOKEN_EQ(cmd, "EXIST")) {
+        if (argc < 2) {
+            dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
+            return DISPATCH_ERROR;
+        }
         long long nfound = 0;
         for (int i = 1; i < argc; i++) {
             kvs_token_t kt = tokens[i];
             uint64_t kh = kv_hash((const uint8_t *)kt.ptr, (uint32_t)kt.len);
-            kv_entry_t *ke = dict_find(&g_dict, kt.ptr, (uint32_t)kt.len, kh);
+            SHARD_WRLOCK(kh);
+            kv_entry_t *ke = dict_find(kv_dict_for(kh), kt.ptr, (uint32_t)kt.len, kh);
             if (!ke) continue;
             if (ke->expire && get_time_now() > ke->expire) continue;
             nfound++;
@@ -447,6 +486,31 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         reply_integer(wb, nfound);
         return DISPATCH_OK;
     }
+
+    /* ── Single-key commands (lock the relevant shard for the duration). ── */
+    if (argc < 2) {
+        dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
+        return DISPATCH_ERROR;
+    }
+
+    kvs_token_t key_tok = tokens[1];
+    uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
+
+    /* Phase 4: lock the shard for tokens[1] until we leave the keyed-command
+     * scope.  Released early before block_wake (which may recursively
+     * dispatch into a different shard). */
+    SHARD_WRLOCK(hash);
+
+    kv_entry_t *entry = dict_find(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
+
+    /* Treat already-expired entry as absent. */
+    if (entry && entry->expire && get_time_now() > entry->expire) {
+        entry_cleanup_by_type(entry);
+        dict_delete(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
+        entry = NULL;
+    }
+
+    int pre_len = wb->len;
 
     /* ── TYPE — Redis returns simple string "+string"/"+list"/etc, "+none" if absent ── */
     if (TOKEN_EQ(cmd, "TYPE")) {
@@ -661,7 +725,10 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         }
     }
 
-    /* ── After LPUSH/RPUSH, wake any client blocked on this key ── */
+    /* ── After LPUSH/RPUSH, wake any client blocked on this key ──
+     *  Drop the shard lock first: the woken client's saved command may target
+     *  a different shard, and block_retry_client recurses into kvs_dispatch. */
+    SHARD_RELEASE();
     if (r == DISPATCH_OK && (TOKEN_EQ(cmd, "LPUSH") || TOKEN_EQ(cmd, "RPUSH"))) {
         client_t *wc = block_wake_one(key_tok.ptr, (uint32_t)key_tok.len);
         if (wc) {
@@ -676,26 +743,24 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
 /* ==================== Engine lifecycle ==================== */
 
 int init_kvengine(void) {
-    dict_init(&g_dict);
+    kv_shards_init();
     block_init();
-    printf("Using unified dict engine\n");
+    printf("Using unified dict engine (%u shards)\n", KV_NR_SHARDS);
     return 0;
 }
 
 void dest_kvengine(void) {
     kvs_flush_all();  /* clean up nested structures before freeing entries */
-    dict_destroy(&g_dict);
+    kv_shards_destroy();
 }
 
 void kvs_flush_all(void) {
-    kv_iter_t *it = dict_iter_new(&g_dict, 1);
-    if (it) {
-        kv_entry_t *e;
-        while ((e = dict_iter_next(it)) != NULL)
-            entry_cleanup_by_type(e);
-        dict_iter_free(it);
-    }
-    dict_clear(&g_dict);
+    kv_shards_iter_t it; kv_shards_iter_init(&it);
+    kv_entry_t *e;
+    while ((e = kv_shards_iter_next(&it)) != NULL)
+        entry_cleanup_by_type(e);
+    kv_shards_iter_free(&it);
+    kv_shards_clear();
 #ifdef USE_JEMALLOC
     mallctl("arenas.purge", NULL, NULL, NULL, 0);
 #endif

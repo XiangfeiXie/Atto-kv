@@ -56,6 +56,11 @@ typedef struct {
 
     /* sockmap stream-layer observability (Phase 2) */
     int  sockmap_enabled;
+
+    /* Phase 4 — multi-worker proactor (0 = auto: nproc-1, 1 = single,
+     * N = manual).  Auto/manual flag set after config_load. */
+    int  threads;
+    int  threads_auto;
 } KvsConfig;
 
 extern KvsConfig kvs_config;

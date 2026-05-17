@@ -25,7 +25,9 @@ extern int reactor_start(unsigned short port, msg_handler handler);
 extern int proactor_start(unsigned short port, msg_handler handler);
 extern int ntyco_start(unsigned short port, msg_handler handler);
 
-long long get_time_now(void);
+long long get_time_now(void);          /* cached, ~loop-iteration granularity */
+long long get_time_now_real(void);     /* gettimeofday(); use when accuracy matters
+                                          (e.g. cross-worker BLPOP deadlines) */
 void update_cached_time(void);  /* call once per event-loop iteration */
 
 /* ── Command dispatch ── */
@@ -52,7 +54,7 @@ KVItem* create_kvitem_len(const char *value, int vlen);
 void    free_kvitem(KVItem *item);
 
 /* ── Global dict ── */
-extern kv_dict_t g_dict;
+/* g_dict replaced by sharded g_shards (kv_dict.h) */
 extern int g_in_reload;   /* 1 during AOF/RDB reload — suppress AOF append + eBPF */
 
 #endif

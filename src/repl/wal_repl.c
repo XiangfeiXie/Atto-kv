@@ -66,6 +66,18 @@ static _Atomic uint64_t  g_journal_seq     = 0;  /* global seq counter */
 static _Atomic uint64_t  g_dropped         = 0;  /* overrun counter    */
 static _Atomic int       g_consumer_sleeping = 0; /* 1 = blocked on eventfd read */
 
+/* Phase 4B.3 — the journal ring was originally designed for a single
+ * producer (the main proactor thread).  Phase 4 introduced multiple
+ * proactor workers that all funnel writes through wal_repl_append();
+ * concurrent producers would race on (g_jhead load, slot write,
+ * g_jhead store), losing entries and corrupting slots.
+ *
+ * The simplest correct fix is a producer mutex.  This path only runs
+ * when persistence != none OR rdma_sync is enabled (g_running == 1),
+ * so default-config benches are unaffected.  A lock-free MPSC ring
+ * could replace this in Phase 7 if persistence-on benches need it. */
+static pthread_mutex_t   g_journal_producer_mu = PTHREAD_MUTEX_INITIALIZER;
+
 /* ── WAL file state ── */
 static int              g_wal_fd       = -1;
 
@@ -248,9 +260,24 @@ static void journal_slot_ensure(journal_slot_t *s, int need)
 
 void wal_repl_append(const char *msg, int length)
 {
+    /* Fast path: WAL/repl module not running.  In default config
+     * (persistence=none, rdma_sync=off) g_running stays 0, so this
+     * function is a single-load + branch and adds zero contention to
+     * multi-worker SET/GET.  No mutex needed for the fast-path check. */
     if (!g_running || !g_stream_healthy || length <= 0) return;
 
-    /* Assign sequence atomically — no mutex needed */
+    /* Phase 4B.3: producer mutex — see comment at g_journal_producer_mu.
+     * Only contended when WAL/repl is actually enabled, which is the
+     * AOF / replication code path, not the perf-bench path. */
+    pthread_mutex_lock(&g_journal_producer_mu);
+
+    /* Re-check g_running under the lock — shutdown may have flipped it
+     * between the early-return check and the lock acquisition. */
+    if (!g_running || !g_stream_healthy) {
+        pthread_mutex_unlock(&g_journal_producer_mu);
+        return;
+    }
+
     uint64_t seq = atomic_fetch_add_explicit(&g_journal_seq, 1,
                                              memory_order_relaxed);
     uint32_t h = atomic_load_explicit(&g_jhead, memory_order_relaxed);
@@ -260,12 +287,19 @@ void wal_repl_append(const char *msg, int length)
                                  memory_order_acquire);
         if (h - t < JOURNAL_RING_SIZE) break;
         if (spin < 200) { /* busy wait */ }
-        else { atomic_fetch_add(&g_dropped, 1); return; }
+        else {
+            atomic_fetch_add(&g_dropped, 1);
+            pthread_mutex_unlock(&g_journal_producer_mu);
+            return;
+        }
     }
 
     journal_slot_t *s = &g_jslots[h & JOURNAL_RING_MASK];
     journal_slot_ensure(s, (int)(length + 8));
-    if (!s->buf) return;
+    if (!s->buf) {
+        pthread_mutex_unlock(&g_journal_producer_mu);
+        return;
+    }
     s->seq      = seq;
     s->length   = (uint32_t)length;
     s->wire_len = (uint32_t)(length + 8);
@@ -274,8 +308,14 @@ void wal_repl_append(const char *msg, int length)
     memcpy(s->buf + 8, msg,  (size_t)length);
     atomic_store_explicit(&g_jhead, h + 1, memory_order_release);
 
+    pthread_mutex_unlock(&g_journal_producer_mu);
+
     /* Only write eventfd when consumer is actually sleeping — avoids one
-     * syscall per write command when consumer is actively draining. */
+     * syscall per write command when consumer is actively draining.
+     * Safe outside the producer mutex: eventfd writes are themselves
+     * serialised by the kernel; the only effect of multiple workers
+     * writing here is at most a few extra wakeup events, which the
+     * consumer collapses on the next read. */
     if (atomic_load_explicit(&g_consumer_sleeping, memory_order_acquire)) {
         uint64_t one = 1;
         ssize_t wr = write(g_jevt, &one, sizeof(one));

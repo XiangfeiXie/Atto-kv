@@ -120,63 +120,262 @@ don't trip over a "BLPOP / AOF reload broken in MT mode" pothole.
         - this script is the gate: any future Phase 4B-touching
           change must keep "Phase 4B smoke results: PASS=12  FAIL=0"
 
-Phase 5 — CPU affinity (the real perf jump)   [next]
-=====================================================
-  [ ] 5.1  pthread_setaffinity_np per worker
-        - cpu_pin {auto|off|0,2,4,6}
-        - auto: worker_i → core (i+1) mod nproc, leaving core 0 free
-  [ ] 5.2  tools/setup_affinity.sh
-        - pin NIC IRQ + loopback softirq to cores not used by workers
-        - verify with /proc/interrupts before/after
-  [ ] 5.3  kv_shard_t cacheline isolation re-check
-        - bump _pad to 128B, perf c2c verify HitM gone
-  [ ] 5.4  NUMA-aware conn_pool/buf_ring allocation skeleton
-        - KVS_USE_NUMA macro (default off)
-        - mmap + numa_set_membind on big-machine path
-        - leave NUMA tests for later, just make the code path exist
+Phase 5 — CPU affinity (the real perf jump)   [in progress]
+===========================================================
+  [x] 5.1  pthread_setaffinity_np per worker  (DONE 2026-05-17)
+        - config: cpu_pin {off|auto|N,N,N} parsed in config.c
+        - default mode = auto; defaults respect what 4B.1 already set up
+        - worker_pin_self() called at top of worker_loop BEFORE
+          io_uring init, so the ring binds to the right NUMA / cache
+          domain from creation
+        - auto rule: worker_i -> core ((i+1) % nproc).  Core 0 left
+          for kernel softirq + system; bench / client lives wherever
+          it wants
+        - banner now shows "CPU pin : auto (worker i -> core ...)"
+          plus per-worker "[proactor] worker N pinned to core M"
+        - Verified on 6c box, t=4 + cpu_pin auto:
+          per-thread Cpus_allowed_list = 1, 2, 3, 4 (one core each)
+        - Perf sweep, persistence=none, c=400 P=10 --threads 6:
+          t=1  off=330k  auto=282k  (-15%, single worker locked away
+                                     from where roaming softirq lands)
+          t=2  off=437k  auto=435k  (tie)
+          t=4  off=439k  auto=429k  (-2%)
+          t=5  off=435k  auto=437k  (tie)
+        - Conclusion: pinning alone is essentially neutral on
+          loopback because bench/softirq still roam across cores.
+          The pay-off lands when 5.2 pins IRQs/softirq AWAY from
+          worker cores so workers get exclusive cycles.  The previously
+          observed t>=4 regression is gone either way (4B already
+          smoothed it out).
 
-  Expected: 8c box t=7 → 1.5-2.0M (matches old plan's "Phase 4")
-            6c box t=5 → 1.0-1.4M
+  [x] 5.2  tools/setup_affinity.sh  (DONE 2026-05-17)
+        - new script: stops irqbalance, walks /proc/irq/*/smp_affinity
+          and writes a hex mask for the chosen cores (default: core 0)
+        - also writes /sys/class/net/*/queues/rx-*/rps_cpus so loopback
+          softirq lands on the IRQ cores rather than the worker cores
+        - flags: --cores N,N --iface NAME --restore
+        - mask math validated (cores [0]->0x1, [0,5]->0x21, [1,2,3,4]->0x1e)
+        - actual /proc write needs root, untested in this session;
+          run on a server-only box during Phase 5 perf re-test
+
+  [x] 5.3  kv_shard_t cacheline isolation re-check  (DONE 2026-05-17)
+        - measured: pthread_rwlock_t=56, kv_dict_t=64 → 120 base
+        - before: trailing _pad[64] → sizeof=184, align=8;
+          adjacent shards COULD share cachelines
+        - after: _pad[8] + __attribute__((aligned(128))) → sizeof=128,
+          align=128.  Each shard owns exactly 2 cachelines exclusively,
+          defeating Intel L2 spatial prefetcher's 128-byte stride
+        - _Static_assert pins sizeof + alignof at build time so any
+          future struct change that breaks isolation fails to compile
+        - 4B.6 smoke regression: PASS=12 FAIL=0 (unchanged)
+        - perf-c2c on this loopback box is too noisy to be conclusive
+          for false sharing; will revisit on a quieter machine
+  [x] 5.4  NUMA-aware buf_ring allocation skeleton  (DONE 2026-05-17)
+        - new header src/core/numa_alloc.h with three helpers:
+            kvs_numa_alloc_local(size)
+            kvs_numa_free(p, size)
+            kvs_numa_bind_local(addr, size)   ← used in proactor.c
+        - compile switch -DKVS_USE_NUMA=1 (default 0); when unset, all
+          helpers reduce to plain libc malloc/free or no-op
+        - proactor.c: per-worker buf_base mmap now followed by
+          kvs_numa_bind_local() so on multi-socket machines the buf
+          ring is on the worker's local NUMA node from creation
+        - skeleton only; on this single-NUMA box behaviour is identical
+          to before.  Verified by 4B.6 smoke: PASS=12 FAIL=0
+        - to enable on big machines: rebuild with
+            cmake -DCMAKE_C_FLAGS="-DKVS_USE_NUMA=1" + link -lnuma
+
+Phase 5 — exit criteria
+=======================
+  Status: 5.1-5.4 all DONE.  On this 6-core loopback box pinning is
+  perf-neutral because bench client + softirq still roam.  The structural
+  work (per-worker pin, IRQ script, cacheline isolation, NUMA hook) is in
+  place and zero-regression; the actual perf jump will land when run on
+  a server-only machine with 5.2's IRQ script applied.
+
+  Expected on 8c box (workers cores 1..7, IRQ core 0, client elsewhere):
+    t=7 → 1.5-2.0M    (matches old plan's "Phase 4" target)
+  Expected on 6c box, same setup:
+    t=5 → 1.0-1.4M
+
+Re-plan (2026-05-17) — split into "do-now on 6c" and "wait-for-bigger-box".
+The principle: any work that is pure single-core CPU savings or correctness
+must be done on the current 6c box, because it will benefit every worker
+equally once we move to a larger machine.  Anything that requires real
+NICs, more cores, or multi-NUMA waits.
+
+═══════════════════════════════════════════════════════════════════════════
+DO NOW (6-core loopback box)
+═══════════════════════════════════════════════════════════════════════════
+
+Phase 8 — Baseline lock-in + test hardening   [start here]
+==========================================================
+Done first because (a) baseline numbers must be captured BEFORE further
+changes, otherwise we lose the experimental control group; (b) finding
+TSAN bugs is cheaper than chasing perf regressions across machines.
+
+  [x] 8.4  Lock in 6c baseline numbers   (DONE 2026-05-17)
+        - new: test/bench/baseline_capture.sh sweeps t×pin and writes
+          to test/bench/baseline_<host>_<nproc>c.txt
+        - DISCOVERED: build was previously using zero optimization
+          flags (CMAKE_BUILD_TYPE unset → no -O, no -DNDEBUG).  EVERY
+          benchmark in this repo prior to today was measuring debug.
+          Fix: CMakeLists.txt now defaults to Release (-O3 -DNDEBUG
+          -fno-omit-frame-pointer); override with -DCMAKE_BUILD_TYPE=...
+        - Locked numbers on 6c, persistence=none, c=400 P=10 t=6:
+            t=1 pin=auto   SET=330k  GET=304k
+            t=2 pin=auto   SET=491k  GET=492k  ← current best
+            t=4 pin=auto   SET=434k  GET=431k
+            t=5 pin=auto   SET=435k  GET=434k
+        - vs Phase 3 single-thread baseline (~330k SET):
+            +50% at the t=2 sweet spot purely from architecture
+            +12% extra from finally building with -O3
+        - smoke regression after -O3 rebuild: PASS=12 FAIL=0
+  [ ] 8.2  ASAN + TSAN scan
+        - rebuild with -fsanitize=address run multi_thread_smoke.sh,
+          expect PASS=12 FAIL=0 + no leak report
+        - rebuild with -fsanitize=thread, same smoke; expect zero
+          TSAN warnings (any warning = real bug, fix before moving on)
+  [ ] 8.1  make smoke / CI hook
+        - add Makefile target `make smoke` that runs the smoke test;
+          fail the build on smoke FAIL>0
+  [ ] 8.3  30-min soak
+        - redis-benchmark looped 30 min + BGSAVE × 5 + FLUSHDB ×1
+        - sample VmRSS, fd count, slowlog every 60s; check monotonic
 
 Phase 6 — Single-core dispatcher efficiency
 ============================================
-  [ ] 6.1  Eliminate double dict_find (entry threading through engines)
+Each item is core-count independent.  Each worker on the future big box
+inherits the same speedup, so doing this on 6c first is correct.
+
+  [x] 6.1  Eliminate double dict_find — STRING engine done  (DONE 2026-05-17)
+        - root cause: string_cmd received `entry` from dispatcher but did
+          `(void)entry;`, then engine_set_raw/engine_get_raw re-hashed
+          and re-dict_find'd from scratch on every SET/GET/INCR/etc.
+          Dispatcher also already cleared expired entries, making the
+          expire-check inside engine_get_raw redundant
+        - signature change: string_cmd(cmd, entry, hash, args, ...)
+          plumbs both pre-computed pieces through
+        - new engine_set_pre() / engine_get_pre() use the pre-found
+          entry directly; engine_*_raw remain as thin wrappers for the
+          MGET/MSET batch paths in kvstore.c (no pre-found entry)
+        - Verified on 6c, persistence=none, c=400 P=10 t=6:
+            t=1 SET 330k → 396k  (+20%)
+            t=1 GET 304k → 396k  (+30%)
+            t=2 SET 491k → 491k  (tie — already bench-bound)
+            t=4 SET 434k → 438k  (tie)
+        - 4B.6 smoke regression: PASS=12 FAIL=0 unchanged
+        - Snapshot saved as test/bench/snapshot_phase6.1_*.txt;
+          baseline file made write-protected (capture script now
+          needs --baseline to overwrite)
+        - HASH/LIST/SET/ZSET engines still have the same pattern;
+          deferred to 6.1b (lower priority, those aren't the hot path
+          on the SET/GET-dominated benchmark)
+
   [ ] 6.2  Split read-only commands to rdlock
-        - strict-RO: STRLEN HLEN HEXISTS LLEN SCARD ZCARD ZCOUNT TYPE
-        - lazy-expire-RO: GET HGET LRANGE SMEMBERS (rdlock-then-upgrade)
-  [ ] 6.3  perfect-hash command dispatch (gperf), if perf top warrants
+        - strict-RO  (rdlock only):
+            STRLEN HLEN HEXISTS HKEYS HVALS LLEN LINDEX SCARD SMEMBERS
+            SISMEMBER ZCARD ZSCORE ZCOUNT TYPE EXISTS DBSIZE
+        - lazy-expire-RO (rdlock-then-upgrade):
+            GET HGET LRANGE SMEMBERS ZRANGE  — read under rdlock; if
+            entry found expired, drop rdlock, take wrlock, re-check,
+            then expire + return nil
+        - 6c can't fully show the gain (heavy shared-shard rdlock
+          contention needs many workers), but code is ready for
+          big-box scaling validation
+
+  [ ] 6.3  perfect-hash command dispatch (gperf) — gated by perf top
+        - only do if `perf top` of running kvstore shows command-name
+          comparison in top 10; otherwise skip
+
   [ ] 6.4  per-shard incremental rehash batching
+        - currently dict_add/del runs `dict_rehash_step(d, 1)`;
+          change to `dict_rehash_step(d, REHASH_BATCH)` where
+          REHASH_BATCH = 8.  Amortises rehash cost when many writes
+          arrive at the same shard
 
-  Expected: single-core +20-30%, hot-key (zipfian) workload +30-50%.
-            8c → 2.0-2.5M
+Phase 7 — Software-stall elimination
+=====================================
+  [ ] 7.1  AOF rewrite background-thread (mirror 4B.4 BGSAVE pattern)
+        - fork + COW snapshot, child rewrites, parent renames
+        - acquires all shard wrlocks briefly, like BGSAVE does
+  [ ] 7.2  Online CONFIG SET for selected runtime params
+        - safe: loglevel, maxclients (grow only), persistence switch
+        - rejected: threads, cpu_pin, port, network (need restart)
+  [ ] 7.3  Replication backlog MT-safe audit
+        - currently the WAL/repl backlog push is in the dispatcher's
+          write path; audit whether the producer mu from 4B.3 covers
+          this or if backlog needs its own lock
 
-Phase 6.5 — XDP hot-path re-enable (replaces "sockmap accel" myth)
-==================================================================
-  Bring back XDP_TX in-place RESP reply for cache-hit GETs while
-  keeping sockmap purely as observation.  Sockmap CANNOT synthesize
-  replies (wrong hook, wrong API) — XDP can.
-  [ ] xdp_accel {on|off} config (off by default, observation always on)
-  [ ] xdp_kvs.kern.c: hit-then-XDP_TX branch on top of current
-        XDP_PASS observation
-  [ ] BPF verifier re-pass with batch-GET helper from earlier work
-  [ ] hot_cache invalidation already wired in kvstore.c — verify
+═══════════════════════════════════════════════════════════════════════════
+WAIT FOR BIGGER MACHINE
+═══════════════════════════════════════════════════════════════════════════
 
-  Expected: hit GET ~5-10μs (no user-space hop), 8c → 2.5-3.0M.
+Phase 5-validate — verify code that's already written
+=====================================================
+Code is already in main; needs real-hardware sign-off.
+  [ ] sudo tools/setup_affinity.sh --cores 0  (5.2 IRQ pin)
+  [ ] perf c2c verify HitM=0 on kv_shard_t   (5.3 cacheline)
+  [ ] -DKVS_USE_NUMA=1 build, multi-socket smoke (5.4 NUMA)
+  [ ] Phase 4 perf sweep on 8c / 16c: t={1,2,4,8,16}, compare to
+        test/bench/baseline_6c.txt locked in by 8.4
 
-Phase 7 — Software-stall elimination (long-term)
-================================================
-  [ ] fork-based RDB snapshot (replaces 4B.4 stop-the-world)
-  [ ] AOF rewrite background-thread
-  [ ] online config reload (except threads count)
-  [ ] replication backlog mt-safe push
+Phase 9 — BPF acceleration (replaces old "6.5 XDP")
+====================================================
+Two-step, gated by observed cache hit rate.
 
-  Expected: 8c → 2.8-3.3M (hardware ceiling on this kind of box).
+  [ ] 9.0  cache-hit observability prog
+        - 30-line BPF prog that just counts (GET requests with key
+          length ≤ 32 AND previously SET) over real workload
+        - run overnight; need ≥30% to justify any further work
+
+  [ ] 9.1  sockmap + sk_skb short-path (the "easy half")
+        - sockmap_kvs.kern.c upgraded from observation-only to a
+          BPF_SK_SKB_STREAM_VERDICT program that:
+            * parses incoming RESP frames in kernel (one frame per
+              verdict callback — kernel handles TCP reassembly)
+            * looks up short hot key in BPF kv_hot_cache map
+            * on hit: bpf_sk_redirect_map to a userspace fast-reply
+              socket, bypassing kvs_dispatch + shard locks
+            * on miss: SK_PASS, unchanged path
+        - kvstore.c SET hook populates kv_hot_cache when key ≤ 32B
+          and value ≤ 256B; DEL/expire removes
+        - works on loopback, ~5-15% expected, zero correctness risk
+
+  [ ] 9.2  XDP_TX zero-syscall path (the "hard half")
+        - only after 9.1 stable and cache hit rate ≥ 60%
+        - xdp_kvs.kern.c: parse RESP, lookup cache, XDP_TX a fully
+          formed TCP reply, mark socket bytes for userspace drain
+        - sock_ops prog tracks per-conn ISN + 5-tuple
+        - userspace consults kv_pending_drain before dispatch
+        - needs real NIC to show benefit; loopback ≈ 0
+
+═══════════════════════════════════════════════════════════════════════════
+Execution order (recommended)
+═══════════════════════════════════════════════════════════════════════════
+  1.  Phase 8.4   baseline 6c lock-in       (20 min, do first)
+  2.  Phase 6.1   double dict_find          (half day, +10-15%)
+  3.  Phase 6.2   rdlock split              (1 day, structural)
+  4.  Phase 8.2   ASAN/TSAN scan            (half day, after 6.1+6.2)
+  5.  Phase 7.1   AOF rewrite bg fork       (1 day, reuse 4B.4 pattern)
+  6.  Phase 6.3   gperf — only if perf top warrants
+  7.  Phase 6.4   rehash batching           (30 min)
+  8.  Phase 7.2   online CONFIG SET         (half day)
+  9.  Phase 7.3   repl backlog audit        (half day)
+  10. Phase 8.1   make smoke target         (30 min)
+  11. Phase 8.3   30-min soak               (background run)
+  ───── move to bigger box ─────
+  12. Phase 5-validate (five items)
+  13. Phase 9.0   BPF observability
+  14. Phase 9.1   sk_skb short-path
+  15. Phase 9.2   XDP_TX (only if 9.0 says yes)
 
 Notes / risks
 =============
-  * threads vs shard ratio rule-of-thumb: shards ≥ 8×threads.
-    32 shards comfortable up to 16-worker; revisit at ≥32 cores.
-  * NUMA: skeleton lands in 5.4 but real validation needs a
-    multi-socket machine.
-  * sockmap "+30%" in original plan was conflated with XDP_TX.
-    Sockmap remains observation-only; perf comes from 6.5 instead.
+  * threads vs shard ratio: shards ≥ 8×threads.  32 shards comfortable
+    up to 16-worker; revisit at ≥32 cores.
+  * NUMA: skeleton lands in 5.4; real validation in Phase 5-validate.
+  * Old "sockmap accel +30%" was a myth (sockmap can't synthesize
+    replies).  Real perf jump on hits comes from Phase 9.2 XDP_TX.
+  * Phase 7.1 AOF-rewrite-bg is the only remaining "fork-based"
+    software-stall item; the RDB equivalent was already done in 4B.4.

@@ -43,6 +43,11 @@ static void config_default(void) {
     /* 0 = auto: max(1, nproc - 1).  Resolved in config_postprocess(). */
     kvs_config.threads = 0;
     kvs_config.threads_auto = 0;
+
+    /* Phase 5.1 — cpu_pin defaults to auto (1).  Explicit `cpu_pin off`
+     * disables affinity.  Manual list parsed at load time. */
+    kvs_config.cpu_pin_mode  = 1;
+    kvs_config.cpu_pin_count = 0;
 }
 
 /* Best-effort cgroup v2 cpu.max read.  Returns -1 if unbounded /
@@ -251,6 +256,40 @@ int config_load(const char *path) {
             /* 0 = auto (nproc-1), resolved in config_postprocess() */
             parse_int(val, lineno, "threads", 0, 64, &kvs_config.threads);
 
+        /* ---- Phase 5.1: CPU pinning ----
+         *   cpu_pin off            -> mode=0
+         *   cpu_pin auto           -> mode=1 (default)
+         *   cpu_pin 1,2,3,4        -> mode=2, list parsed
+         */
+        } else if (strcasecmp(key, "cpu_pin") == 0) {
+            if (strcasecmp(val, "off") == 0) {
+                kvs_config.cpu_pin_mode = 0;
+            } else if (strcasecmp(val, "auto") == 0) {
+                kvs_config.cpu_pin_mode = 1;
+            } else {
+                kvs_config.cpu_pin_mode  = 2;
+                kvs_config.cpu_pin_count = 0;
+                char *dup = strdup(val); if (!dup) continue;
+                char *save = NULL;
+                for (char *tok = strtok_r(dup, ",", &save); tok;
+                     tok = strtok_r(NULL, ",", &save)) {
+                    while (*tok == ' ' || *tok == '\t') tok++;
+                    if (!*tok) continue;
+                    int v = atoi(tok);
+                    if (v < 0 || v > 1023) continue;
+                    if (kvs_config.cpu_pin_count <
+                        (int)(sizeof(kvs_config.cpu_pin_list) /
+                              sizeof(kvs_config.cpu_pin_list[0])))
+                        kvs_config.cpu_pin_list[kvs_config.cpu_pin_count++] = v;
+                }
+                free(dup);
+                if (kvs_config.cpu_pin_count == 0) {
+                    printf("[CONFIG] line %d: cpu_pin list empty, falling back to auto\n",
+                           lineno);
+                    kvs_config.cpu_pin_mode = 1;
+                }
+            }
+
         } else {
             printf("[CONFIG] line %d: unknown key '%s'\n", lineno, key);
         }
@@ -316,6 +355,18 @@ void config_print(void) {
                nproc, KV_NR_SHARDS);
     } else {
         printf("  Workers       : 1 (single-thread proactor)\n");
+    }
+    if (kvs_config.threads >= 1) {
+        if (kvs_config.cpu_pin_mode == 0) {
+            printf("  CPU pin       : off\n");
+        } else if (kvs_config.cpu_pin_mode == 1) {
+            printf("  CPU pin       : auto (worker i → core (i+1) mod nproc)\n");
+        } else {
+            printf("  CPU pin       : manual [");
+            for (int i = 0; i < kvs_config.cpu_pin_count; i++)
+                printf("%s%d", i ? "," : "", kvs_config.cpu_pin_list[i]);
+            printf("]\n");
+        }
     }
     printf("========================================\n\n");
 }

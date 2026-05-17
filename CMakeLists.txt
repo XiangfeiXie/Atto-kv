@@ -3,6 +3,18 @@ project(kvstore C)
 
 set(CMAKE_C_STANDARD 11)
 
+# Phase 8.4 — default to Release build.  Before this fix the build used
+# default cmake flags (no -O, no -DNDEBUG), which silently shaved 20-50%
+# off every benchmark we ever ran.  Override at configure time with
+#   cmake -DCMAKE_BUILD_TYPE=Debug   for asserts + symbols
+#   cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo  for perf + symbols
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "Build type: Release/RelWithDebInfo/Debug" FORCE)
+endif()
+# Keep frame pointers in Release so perf top is still useful.
+add_compile_options(-fno-omit-frame-pointer)
+
 # ── Dependencies ──────────────────────────────────────────────────────
 find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)

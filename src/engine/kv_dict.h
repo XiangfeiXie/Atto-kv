@@ -137,13 +137,30 @@ uint32_t    dict_count(kv_dict_t *d);
 #define KV_NR_SHARDS       (1u << KV_NR_SHARDS_LOG2)
 #define KV_SHARD_MASK      (KV_NR_SHARDS - 1u)
 
+/* Phase 5.3 — cacheline-isolated shard.
+ *
+ *   pthread_rwlock_t       56 bytes
+ *   kv_dict_t              64 bytes  (ht[0..1] + rehash_idx + iterators)
+ *   tail pad                8 bytes
+ *   ─────────────────────────────────
+ *   total                 128 bytes,  aligned to 128.
+ *
+ * 128 bytes (2 × 64-byte cachelines) ensures adjacent shards never share
+ * a line AND defeats the Intel L2 spatial prefetcher's 128-byte stride —
+ * a writer on shard N+1 will not invalidate a reader on shard N.
+ * Before Phase 5.3 the struct was 184 B / align-8, so two shards could
+ * land in the same cacheline pair under hot multi-writer workloads. */
 typedef struct kv_shard {
     pthread_rwlock_t lock;
     kv_dict_t        dict;
-    /* Pad to a typical cacheline to dampen false sharing between
-     * adjacent shards' locks under heavy multi-threaded write traffic. */
-    char             _pad[64];
-} kv_shard_t;
+    char             _pad[8];
+} __attribute__((aligned(128))) kv_shard_t;
+
+_Static_assert(sizeof(struct kv_shard) == 128,
+               "kv_shard_t must be exactly 128 bytes (2 cachelines) — "
+               "see Phase 5.3 cacheline-isolation comment");
+_Static_assert(_Alignof(struct kv_shard) == 128,
+               "kv_shard_t must be 128-byte aligned for cacheline isolation");
 
 typedef struct {
     kv_shard_t shards[KV_NR_SHARDS];

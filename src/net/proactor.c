@@ -1,4 +1,6 @@
+#define _GNU_SOURCE          /* pthread_setaffinity_np, CPU_SET, etc. */
 #include <stdio.h>
+#include <sched.h>
 #include <liburing.h>
 #include <netinet/in.h>
 #include <string.h>
@@ -13,6 +15,7 @@
 #include "protocol.h"
 #include "block.h"
 #include "kvstore.h"
+#include "numa_alloc.h"     /* Phase 5.4 — NUMA-aware allocation skeleton */
 
 #define EVENT_ACCEPT    0
 #define EVENT_READ      1
@@ -293,7 +296,10 @@ static int worker_setup_ring(proactor_worker_t *w)
         return -1;
     }
 
-    /* Phase 3.2 buffer ring */
+    /* Phase 3.2 buffer ring (Phase 5.4: bind to worker's local NUMA node
+     * so io_uring submissions on this worker hit local memory.  On a
+     * 1-node box and when KVS_USE_NUMA is unset, kvs_numa_bind_local is
+     * a no-op and behaviour is identical to plain mmap.) */
     w->buf_pool_bytes = (size_t)KVS_NR_BUFS * KVS_BUF_SIZE;
     w->buf_base = mmap(NULL, w->buf_pool_bytes, PROT_READ | PROT_WRITE,
                        MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -302,6 +308,7 @@ static int worker_setup_ring(proactor_worker_t *w)
         io_uring_queue_exit(&w->ring);
         return -1;
     }
+    kvs_numa_bind_local(w->buf_base, w->buf_pool_bytes);
     int br_err = 0;
     w->buf_ring = io_uring_setup_buf_ring(&w->ring, KVS_NR_BUFS,
                                           KVS_BUF_RING_BGID, 0, &br_err);
@@ -351,9 +358,47 @@ static void worker_teardown(proactor_worker_t *w) {
     if (w->listen_fd >= 0) close(w->listen_fd);
 }
 
+/* Phase 5.1 — choose a core for worker `id` according to the cpu_pin
+ * config, then bind the current thread to it.  Returns the chosen core,
+ * or -1 if pinning is disabled / not applicable. */
+static int worker_pin_self(int id) {
+    if (kvs_config.cpu_pin_mode == 0) return -1;            /* off */
+
+    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+    if (nproc < 1) return -1;
+
+    int core;
+    if (kvs_config.cpu_pin_mode == 2 && kvs_config.cpu_pin_count > 0) {
+        /* Manual list: worker i -> cpu_pin_list[i % count]. */
+        core = kvs_config.cpu_pin_list[id % kvs_config.cpu_pin_count];
+    } else {
+        /* Auto: leave core 0 for softirq + bench client.  Worker i lands
+         * on core ((i + 1) mod nproc).  With threads=nproc-1 this packs
+         * workers onto cores 1..nproc-1 exactly. */
+        core = (int)((id + 1) % nproc);
+    }
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    int rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    if (rc != 0) {
+        fprintf(stderr, "[proactor] worker %d: pthread_setaffinity_np(core=%d) failed: %s\n",
+                id, core, strerror(rc));
+        return -1;
+    }
+    return core;
+}
+
 static void *worker_loop(void *arg) {
     proactor_worker_t *w = (proactor_worker_t *)arg;
     tls_worker = w;
+
+    /* Bind to a CPU core BEFORE setting up the io_uring ring so the ring
+     * is associated with this core's NUMA / cache domain from creation. */
+    int pinned = worker_pin_self(w->id);
+    if (pinned >= 0)
+        printf("[proactor] worker %d pinned to core %d\n", w->id, pinned);
 
     /* Init the ring inside the issuing thread — IORING_SETUP_SINGLE_ISSUER
      * binds the ring to whichever task first submits an SQE. */

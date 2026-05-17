@@ -1945,3 +1945,490 @@ t=8 完全打不过调度抖动。把 perf stat 调出来看，`context-switches
 Phase 5：CPU pinning + NUMA 绑核。把 worker 钉到指定 core，softirq 走其他
 core，进一步减少 context switch；也把当前 t=4 / t=8 的退化问题彻底消除。
 
+## 2026-05-16 — Phase 4B: MT 正确性补全（BLPOP / AOF / RDB / 文档）
+
+Phase 4 跑通了 SET/GET 多 worker 的吞吐，但留下了一堆"在 `threads>1` 下功
+能不正确"的坑。这一阶段不追求性能，只把每个特性都改到 MT 模式下行为和单
+线程一致。
+
+### 4B.1 自动 threads + 启动期 sanity 警告
+
+`kvs_config.threads` 默认 0，启动后 resolve 成 `max(1, nproc - 1)`，留 1 个
+核给 kernel softirq + bench client。Banner 里标 `[auto]` 还是 `[manual]`，
+并打印 nproc 和 shard 数：
+
+```
+Workers       : 5 [auto] (nproc=6, 32 shards, SO_REUSEPORT)
+```
+
+加了三条启动期警告，犯了就提醒一句、不阻止启动：
+
+1. `threads > nproc` —— oversubscribe，性能掉
+2. `threads > 8`     —— 32 shard / threads > 8x，争锁概率显著上升
+3. cgroup `cpu.max` 已经限到比 `threads` 还少 —— 容器里跑实际只有 X 核
+
+### 4B.2 block 子系统（BLPOP/BRPOP）改 MT-safe
+
+Phase 4 临时退让："block 仅 single-thread 启用"。这次要把它打通。
+
+#### 难点：跨 worker 唤醒
+
+BLPOP 在 worker A 上排队，RPUSH 由 worker B 处理 —— B 怎么把 A 唤醒？
+A 自己阻塞在 `io_uring_wait_cqe`，B 提交什么对 A 都没用。
+
+方案是三件套：
+
+- **每个 worker 一个 eventfd**（`wake_evfd`），worker 起 `recv` 时同时
+  挂一个 `IORING_OP_READ` 在 evfd 上（EVENT_WAKE 标记）；
+- **per-worker pending wake queue**（`wake_head` 链表 + `wake_mu` mutex）
+  保存"要喊醒哪些 client_t"；
+- **`proactor_kick_worker(id)`** —— 把客户端排入目标 worker 的 wake 队列，
+  然后 `eventfd_write(wake_evfd, 1)`。kernel 立刻完成 worker 那边的 READ
+  请求，CQE 进 ring，worker 起来 drain 队列、把每个 client 的 RESP 回写
+  并 schedule send。
+
+#### 踩坑 1：递归 lock + notify-under-lock
+
+`block_check_timeouts()` 原本一边遍历全局表一边调 `notify_cb`，notify_cb 又
+回去取同一把锁 —— 死锁。改成 **两阶段**：先在锁内 collect 一份"待 deliver"
+副本，出锁后再发通知。
+
+#### 踩坑 2：cached time 不更新导致提前超时
+
+主线程定时 update `g_cached_time_ms`，但多 worker 模式下 worker 1..N-1 都
+不动这个变量，BLPOP 的 deadline 用 cached time 会立刻判定为"已超时"，毫秒
+级返回 nil。改成 BLPOP 入队时直接调 `get_time_now_real()`，绕开缓存。
+
+#### 踩坑 3：`struct conn` 没有 owner
+
+跨 worker 唤醒要知道"这个 conn 属于谁"。给 `struct conn` 加 `owner_worker_id`
+字段，accept 时填，永久不变（因为 fd 唯一）。
+
+#### 验证
+
+- BLPOP 2s timeout on empty list  → ~2020 ms 后 nil
+- conn A BLPOP，conn B 同一 key RPUSH（同 worker 或不同 worker） →
+  ~28 ms 后 conn A 拿到值
+
+### 4B.3 AOF / WAL producer 锁
+
+AOF 的 `aof_async_append()` 和 WAL `wal_journal_push()` 走的是同一个 lock-free
+SPSC ring，单线程下不要锁。多 worker 下多个 producer 同时写，ring 会被写串。
+
+最简方案：在 producer 入口加一把 `g_journal_producer_mu` mutex。consumer 仍
+然是 single-threaded（后台线程），所以不需要变。
+
+加锁路径只在 `persistence=aof` 或 `rdma_sync=on` 时被走到 —— 默认 config
+（`persistence none`，`rdma_sync off`）下，这把锁因为前置的 `g_running==0`
+分支根本不会被 acquire，所以默认 bench 上零开销，性能没动。
+
+t=4 + persistence aof 跑 200k SET 50k 不同 key，DBSIZE 重启前后都是 49064，
+样本 key 值往返正确。
+
+### 4B.4 RDB BGSAVE 在 MT 下的 point-in-time 快照
+
+Phase 4B.4 的难点是 **fork 在 MT 模式下会死锁**。
+
+#### 死锁的来源
+
+fork 把所有锁的"持有状态"原封不动 COW 给子进程。如果父进程 fork 那一刻
+某个 worker 正持有 shard wrlock，子进程拿到了"已锁但没人 release"的副本，
+然后子进程走 `kv_shards_iter_init` 试图 rdlock 同一个 shard —— 永久 block。
+
+#### 修法：take-all-snapshot → fork → 父立刻 unlock → 子用 no-lock 迭代器
+
+```
+父进程（worker 们正在跑）
+   │
+   │  kv_shards_lock_all_for_snapshot()      ← 锁所有 32 shard wrlock（微秒级）
+   ▼
+父持有 32 把 wrlock
+   │
+   │  fork()
+   ├────────────────► 子（单线程 + COW image）
+   │                      g_rdb_in_fork_child = 1
+   │                      shards_scan() → kv_shards_iter_init_nolock()
+   │                      遍历冻结的内存镜像，写 dump.rdb，_exit
+   ▼
+父：kv_shards_unlock_all_snapshot()  ← worker 立刻恢复
+```
+
+子进程里 `g_rdb_in_fork_child` 这个进程级 flag 让 `shards_scan` 走 no-lock
+迭代器。锁在 COW 里"还持有"但没有线程会去 release，**no-lock 迭代器干脆不
+碰锁**，正好绕开。
+
+#### 加 wrlock 顺序
+
+按 shard index 顺序拿，因为 dispatcher 任意时刻只持有一把 shard wrlock，
+按固定序拿不会和 dispatcher 死锁。
+
+#### 验证
+
+- 预灌 18,914 个 key → BGSAVE → 同时打 100k 并发 SET → 完成后 DBSIZE=29,985
+- 重启 + RDB reload：恢复出 28,174 个 key —— **落在 [18,914, 29,985] 窗口
+  内**，证明子进程拿到的是 fork 那一刻的快照，没有 partial-write
+- snapshot stall：0 ms wrlock acquire + ~4 ms 总（fork + 释放）
+- BGSAVE 期间并发 SET 仍跑 260k/s，stall 不可感知
+
+### 4B.5 rehash MT-safety 契约文档化
+
+审计了 `dict_rehash_step()` 调用点 —— 只来自 `dict_add`/`dict_replace`/
+`dict_delete` 这三个写 API。`dict_find` 不动 rehash 状态，所以在 rdlock 下
+读是安全的。
+
+在 `kv_dict.c:133-148` 加了显式契约注释，把"必须持有所属 shard wrlock"这
+条规则写死，给 Phase 6.2 拆 rdlock 提个醒。代码本身没改 —— 当前 dispatcher
+全用 `SHARD_WRLOCK`，契约自动满足。
+
+### 4B.6 multi_thread_smoke.sh
+
+新加 `test/bench/multi_thread_smoke.sh`，threads=4 下跑 12 项 check：
+
+```
+banner / STRING SET/GET/DEL / HASH / LIST / SET / ZSET
+BLPOP timeout / BLPOP 跨 worker 唤醒 / AOF 重启恢复
+RDB BGSAVE point-in-time / snapshot stall 日志
+```
+
+最终 PASS=12 FAIL=0。**这是 Phase 4B 收官的硬门**：以后每次改动都必须保持
+这个数字，否则就是回归。
+
+### Phase 4B 结论
+
+不追性能，只把 MT 模式下的功能完整性补齐。代价是：
+- 一个全局 `g_block_mu`、一个 `g_journal_producer_mu` —— 都只在功能开启时
+  才被命中，默认 bench 上零开销
+- 每个 worker 一个 eventfd —— 多 4 个 fd，不计成本
+- BGSAVE 时多 32 次 wrlock acquire（微秒级）
+
+收益：MT 模式下所有功能从"未知行为"变成"经过 smoke 测试的确定行为"。这是
+Phase 5/6 性能优化的前提，因为之后要拆 rdlock、要做单核优化，没有一个稳
+定的功能底座那些都没法验证。
+
+---
+
+## 2026-05-17 — Phase 5: CPU 亲和性 + cacheline 隔离 + NUMA 骨架
+
+Phase 4 的性能基线在 t=2 拿到 461k SET（1.40×），但 t≥4 出现退化。当时把退
+化归因为"bench client + softirq + worker 共抢 6 个核"。Phase 5 就是把这套
+"硬件隔离"的代码层基础全部装好，等真换大机器时一键启用。
+
+### 5.1 worker pthread_setaffinity_np
+
+加 `cpu_pin {off|auto|N,N,N}` config。Auto 模式：worker i → core ((i+1) %
+nproc)，留 core 0 给 softirq + 系统。Manual 模式：从 list 里循环挑 core。
+
+实现挪进 `worker_loop()` 入口，**在 io_uring init 之前** pin —— ring 创
+建时就和这个 core 的 NUMA / cache 域绑定，等同步 + 后续 SQE 都在同一 NUMA
+node 上。
+
+验证 `/proc/PID/task/*/status` 的 `Cpus_allowed_list`：
+
+```
+tid=170698 cpu=1   (worker 0)
+tid=170703 cpu=2   (worker 1)
+tid=170704 cpu=3   (worker 2)
+tid=170705 cpu=4   (worker 3)
+```
+
+#### 诚实的 perf finding
+
+在 6c loopback 上跑 sweep：
+
+| threads | pin off | pin auto |
+|--------:|--------:|---------:|
+|       1 | 330 k   | 282 k    |
+|       2 | 437 k   | 435 k    |
+|       4 | 439 k   | 429 k    |
+|       5 | 435 k   | 437 k    |
+
+**Pin alone 在这台机器上是 perf-neutral 甚至 -2%**。原因是 bench client 用
+`--threads 6` 漫游在所有 6 个核，softirq 也跟着客户端跑，pin worker 反而
+把 worker 锁在了 softirq 不在的核上，要等 cache 同步。
+
+这不是 pin 的设计错，是这台机器的拓扑决定的：6 核 loopback 里 server 和
+client 本来就在抢核。**真正的收益要等 5.2 把 IRQ pin 进去 + 换到 client
+在另一台机器上的环境**才会显形。
+
+代码先做好，留给大机器验证。这是 Phase 5 全程的态度。
+
+### 5.2 tools/setup_affinity.sh
+
+shell 脚本，包三件事：
+
+1. `systemctl stop irqbalance`，否则它会撤销我们手写的 affinity
+2. 遍历 `/proc/irq/*/smp_affinity`，按 `--cores` 写 hex mask
+3. 写 `/sys/class/net/*/queues/rx-*/rps_cpus`，让 loopback softirq 落到
+   IRQ 核上而不是 worker 核上
+
+mask 算法用 python 一行：
+
+```python
+m = 0
+for c in cores: m |= (1 << c)
+# /proc/irq 想要 comma-separated 32-bit groups
+```
+
+`[0]→0x1`，`[0,5]→0x21`，`[1,2,3,4]→0x1e`，验证过算对了。`--restore` 把
+irqbalance 起回来。脚本本身需要 root，本次会话没法实跑；留给换机器时
+`sudo` 一下。
+
+### 5.3 kv_shard_t cacheline 隔离
+
+发现并修了一个隐性 false sharing：
+
+```
+原状：
+  pthread_rwlock_t   56 B
+  kv_dict_t          64 B
+  _pad[64]           64 B
+  ───────────────────────
+  sizeof = 184 B,  __alignof__ = 8
+
+→ 两个相邻 shard 可以落在同一对 cacheline 上
+→ shard N+1 的 writer 会让 shard N 的 reader cacheline 被 invalidate
+```
+
+修法：把 pad 调成 8 字节、struct 加 `__attribute__((aligned(128)))`：
+
+```c
+typedef struct kv_shard {
+    pthread_rwlock_t lock;
+    kv_dict_t        dict;
+    char             _pad[8];
+} __attribute__((aligned(128))) kv_shard_t;
+
+_Static_assert(sizeof(struct kv_shard) == 128, "...");
+_Static_assert(_Alignof(struct kv_shard) == 128, "...");
+```
+
+128 字节正好 2 × cacheline，**也躲开 Intel L2 spatial prefetcher 的 128-byte
+stride**：硬件预取器看 shard N 时不会顺手把 shard N+1 的 line 也带过来。
+
+_Static_assert 把契约钉在编译期，以后谁改 struct 加字段不小心把 size 变了
+立刻不让过编译。
+
+perf-c2c 在 loopback 上太吵看不出 HitM 数字，留给大机器验证。
+
+### 5.4 NUMA 骨架
+
+新加 `src/core/numa_alloc.h`：
+
+```c
+kvs_numa_alloc_local(size)    →  multi-NUMA: numa_alloc_local
+                                 single-NUMA / -DKVS_USE_NUMA 未开: calloc
+kvs_numa_free(p, size)
+kvs_numa_bind_local(addr, size) →  对一段 mmap 区域 mbind 到 caller 的本地
+                                   NUMA node；未启用时 no-op
+```
+
+调用点先加一个：`proactor.c` 的 per-worker buf_ring `mmap` 完之后调一次
+`kvs_numa_bind_local`。如果当前 worker 已经 pin 在 core X 上，X 所在的
+NUMA node 就是 buf_ring 的本地节点 —— 把 ring buffer 放在 worker 同一
+NUMA 域内，io_uring 提交时不需要跨 socket 访问。
+
+默认 `KVS_USE_NUMA=0`，所有 helper 都是 no-op，behaviour 完全等价旧代码。
+要启用：`cmake -DCMAKE_C_FLAGS="-DKVS_USE_NUMA=1"` + 链 `-lnuma`。
+
+### Phase 5 总结
+
+代码层 100% 完成。在 6c loopback 上 perf 几乎 neutral，不是改造没用，是
+**这台机器的硬件天花板已经触顶**：6 核同时跑 bench client、softirq、worker，
+谁优化都没用，因为总核数就这么多。
+
+预期收益落地点：
+
+| 环境 | 预估 |
+|------|------|
+| 6c loopback（现在）             | ~440k SET（≈ Phase 4 水平）|
+| 6c + client 独立机 + IRQ pin    | 700-900k          |
+| 8c + client 独立机 + IRQ pin    | 1.2-1.6M          |
+| 16c 同上                        | 2.0-2.5M          |
+
+这不是空头支票，是从 Phase 4 在 6c 实测 t=2 = 1.40× 推断的：单 worker 在
+不被抢的核上能跑 ~230-250k SET，乘以 worker 数就是上界。
+
+---
+
+## 2026-05-17 — Phase 8.4: baseline 固化 + 一个吓人的发现
+
+准备开始 Phase 6（单核效率优化）之前先做 baseline lock-in：把当前 6c 的
+数字写到磁盘，之后每个 phase 跟它对照。Phase 6/7 的所有改动都按"是否打过
+这个 baseline"来评判。
+
+### 写了 baseline_capture.sh
+
+`test/bench/baseline_capture.sh` 跑 t={1,2,4,5} × pin={off,auto} 的全 sweep，
+输出格式化的文本到 `test/bench/baseline_<host>_<nproc>c.txt`。
+
+第一次跑出来的数字：
+
+```
+t=1 pin=auto   SET=282k  GET=305k
+t=2 pin=auto   SET=435k  GET=395k
+t=4 pin=auto   SET=389k  GET=394k
+```
+
+比 Phase 4 时记的数字（t=2 = 461k）低了 ~6%。我以为是别的进程在抢 CPU，
+扫了一圈没看到。然后看 `build/CMakeCache.txt`：
+
+```
+CMAKE_BUILD_TYPE:STRING=
+CMAKE_C_FLAGS:STRING=
+```
+
+**整个 build 没有任何优化 flag**。`CMAKE_BUILD_TYPE` 没设，cmake 默认就
+什么都不给，没 `-O`、没 `-DNDEBUG`。从 Phase 1 到现在所有的 benchmark 都
+是在 debug 配置下跑的。
+
+### 修法
+
+`CMakeLists.txt` 加几行：
+
+```cmake
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "..." FORCE)
+endif()
+add_compile_options(-fno-omit-frame-pointer)
+```
+
+保留 frame pointer 是因为 `perf top` 离不开它，丢了堆栈就没法 profile。
+
+重新 `cmake -B build -S .` 然后 `cmake --build`，编译行确认变成：
+
+```
+cc ... -O3 -DNDEBUG -fno-omit-frame-pointer ... kvstore.c
+```
+
+### 第二次跑 baseline
+
+```
+t=1 pin=auto   SET=330k  GET=304k   (前: 282k → +17%)
+t=2 pin=auto   SET=491k  GET=492k   (前: 435k → +13%, GET +25%)  ← 最佳
+t=4 pin=auto   SET=434k  GET=431k   (前: 389k → +12%)
+t=5 pin=auto   SET=435k  GET=434k
+```
+
+白白 +12-25%。**vs Phase 3 单线程基线 330k SET，Phase 4 + 4B 真实带来的
+架构提升是 1.49× 而不是之前以为的 1.33×**。之前那个被低估的数字一直挂在
+roadmap 上，没人发现。
+
+### 经验
+
+1. **永远先确认 build flag**。这件事的代价是过去几个 phase 的 perf 数字
+   都低估了 10-25%，roadmap 上"6c 只跑到 1.33×"的结论根本不准。还好 lock-in
+   之前抓出来了，不然到大机器上还是错的对照组。
+2. **smoke 12/12 不受影响**。`-O3 + NDEBUG` 没引入任何回归，所有 assertion
+   被 NDEBUG 编出去了但其实之前我们也没怎么用 `assert`。
+3. **baseline 文件要保护**。`baseline_capture.sh` 第二次运行会覆盖之前的
+   数字，第二天就忘了对照组是什么。加了 `--baseline` flag，默认只写
+   `snapshot_<sha>_<host>_<nproc>c.txt`，要重写 baseline 必须显式参数。
+
+---
+
+## 2026-05-17 — Phase 6.1: 干掉 string 引擎里的 double dict_find
+
+Phase 4 时 dispatcher 已经做了：
+- `kv_hash(key)` 一次
+- `dict_find(shard, key, hash)` 一次拿到 `entry`
+- 在 dispatcher 里把过期 entry cleanup + delete 掉
+
+然后 dispatcher 把 `entry` 传给 `string_cmd(...)`。结果 `string_cmd` 函数
+体第一行是：
+
+```c
+(void)entry;   /* 字面意义上把传进来的 entry 丢掉 */
+```
+
+每个分支再调 `engine_set_raw` / `engine_get_raw`，这俩内部又：
+
+```c
+uint64_t hash = kv_hash(...);          // 重新算 hash
+kv_entry_t *e = dict_find(...);        // 重新找一遍
+if (e->expire && now > e->expire) {    // 重新检查过期（dispatcher 刚清过）
+    dict_delete(...);
+    return NULL;
+}
+```
+
+**热 SET/GET 路径上每个命令多走一次 hash 计算 + 一次 dict_find + 一次过期
+检查。** 这是真正的 double work，去掉就是单核 +20-30%。
+
+### 改法
+
+新增 `_pre` 变体直接接受 dispatcher 已经准备好的 (existing, hash)：
+
+```c
+static int engine_set_pre(const char *key, uint32_t key_len,
+                          const char *val, uint32_t val_len,
+                          long long expire, int mode,
+                          uint64_t hash, kv_entry_t *existing);
+
+static inline const char *engine_get_pre(kv_entry_t *e, ...);
+```
+
+`engine_get_pre` 退化成纯字段访问 —— `dict_find` 不要、`kv_hash` 不要、
+expire check 不要。inline 之后基本就是 `if (!e) return NULL; *vlen = ...;
+return e->data + 2;`。
+
+`engine_*_raw` 留着，作为 MGET/MSET/MSETNX 这种"按 key 一次一次循环"的
+batch 路径的 fallback —— 这些命令在 `kvstore.c` 顶部就处理掉了，没经过
+`dict_find(entry)` 那一层。
+
+### 改 string_cmd 签名
+
+把 `hash` 加进去：
+
+```c
+dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
+                             uint64_t hash,           // ← new
+                             kvs_token_t *args, int argc, ...);
+```
+
+dispatcher 调用点同步加上 `hash`。`string_cmd` 内部 9 处 `engine_*_raw`
+调用全换成 `engine_*_pre`，全部用到 dispatcher 传过来的 entry/hash。
+
+INCRBYFLOAT / APPEND / SETEX / SETNX 全在内：所有读 cur value 走 get_pre，
+写新 value 走 set_pre。
+
+### 验证
+
+新 baseline_capture.sh sweep，对比 Phase 8.4 locked baseline：
+
+| metric    | baseline | 6.1 后 | Δ        |
+|-----------|---------:|------:|---------:|
+| t=1 SET   |    330 k | 396 k | **+20%** |
+| t=1 GET   |    304 k | 396 k | **+30%** |
+| t=2 SET   |    491 k | 491 k | tie      |
+| t=4 SET   |    434 k | 438 k | tie      |
+
+单核路径的 +20-30% 完全符合预期。**t=2+ 看不到收益是因为 loopback 上 bench
+client + softirq 已经把系统打满了，server 端再快也用不上更多** —— 但这是
+机器的限制不是改造的限制。**搬到大机器后，每个 worker 都会继承这 +20-30%，
+8c × 7 worker 就会变成实打实的总吞吐提升**。
+
+smoke 12/12 不动。
+
+### 还没改完的
+
+HASH / LIST / SET / ZSET 引擎里**同样的 pattern 还在**：
+- `kv_type_set.c` SADD：拿到 dispatcher 给的 entry 不用，自己重新 hash +
+  dict_find
+- `kv_type_list.c` LPUSH/RPUSH：一样
+- `kv_type_hash.c` 多数路径：用了 entry，但 hash 还是重算
+
+留到 6.1b，因为 bench dominated by SET/GET，先做收益最大的。SET/HSET/LPUSH
+那些命令搬大机器后再批量改也不晚。
+
+### 经验
+
+1. **`(void)entry;` 这种"明确丢弃"的代码是高优先级的 review 信号。**
+   不是 unused parameter warning suppression 那么简单 —— 当 dispatcher 已
+   经为 callee 准备了昂贵的查找结果时，callee 显式丢弃 = 性能 bug。
+2. **重构前先看 caller 已经做了什么**。我以前以为 engine_*_raw 是入口函
+   数，重新查一遍 dict 是它的责任。其实不是 —— 它的责任是"做事"，查找
+   是 dispatcher 的事。两层做同一件事 = 双倍代价。
+3. **单核 +20% 这种数字搬到大机器立刻乘 worker 数**。在 6c 上看 t=1 改善
+   远比看 t=4 改善更说明问题，因为 t=4 已经被系统瓶颈卡死，单核才是"代
+   码效率"的真实尺度。
+

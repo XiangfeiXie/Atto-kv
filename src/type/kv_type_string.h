@@ -13,8 +13,14 @@
  * This is the default type.  All keys created via SET are STRING type.
  */
 
-/* Command dispatch for STRING-type keys (or new keys that become STRING). */
+/* Command dispatch for STRING-type keys (or new keys that become STRING).
+ *
+ * Phase 6.1: `hash` is the pre-computed key hash from kvs_dispatch.  `entry`
+ * is the pre-found dict entry (or NULL).  Passing both lets us skip the
+ * redundant `kv_hash + dict_find` that engine_*_raw used to perform on the
+ * hot SET/GET path — one fewer hashtable walk per command. */
 dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
+                             uint64_t hash,
                              kvs_token_t *args, int argc, DynBuf *wb,
                              const char *msg_raw, int msg_len);
 

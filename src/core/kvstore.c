@@ -674,7 +674,9 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     dispatch_result_t r = DISPATCH_OK;
     switch (cmd_type) {
     case KV_TYPE_STRING:
-        string_cmd(cmd, entry, tokens + 1, argc - 1, wb, msg_raw, msg_len);
+        /* Phase 6.1 — pass pre-computed hash so string_cmd's engine_*_pre
+         * paths skip the second kv_hash + dict_find on the hot SET/GET. */
+        string_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb, msg_raw, msg_len);
         r = DISPATCH_OK;
         break;
     case KV_TYPE_LIST:

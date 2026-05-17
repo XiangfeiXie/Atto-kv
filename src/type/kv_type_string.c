@@ -61,22 +61,21 @@ static int try_parse_int64(const char *p, int len, int64_t *out) {
  * Core engine ops (raw: no KVItem allocations)
  * ===================================================================== */
 
-/* SET semantics:
-   mode = 0: unconditional (Redis default — create or replace)
-   mode = 1: NX — only set if key absent
-   mode = 2: XX — only set if key present
-   Returns: 0 ok, 1 condition not met (NX/XX fail), -1 hard error. */
-static int engine_set_raw(const char *key, uint32_t key_len,
+/* Phase 6.1 — engine_set with pre-found entry + pre-computed hash.
+ *
+ * The dispatcher (kvs_dispatch) already takes the shard wrlock, computes
+ * the key hash, calls dict_find once, and clears expired entries.  When
+ * string_cmd calls this, `existing` is either NULL or a definitely-non-
+ * expired STRING entry (other types are rejected upstream by WRONGTYPE).
+ *
+ * Saves: 1 × kv_hash, 1 × dict_find, 1 × expire check per SET-family cmd.
+ *
+ * mode = 0 unconditional, 1 NX, 2 XX.  Returns 0 ok, 1 cond-fail, -1 err. */
+static int engine_set_pre(const char *key, uint32_t key_len,
                           const char *val, uint32_t val_len,
-                          long long expire, int mode)
+                          long long expire, int mode,
+                          uint64_t hash, kv_entry_t *existing)
 {
-    uint64_t hash = kv_hash((const uint8_t *)key, key_len);
-    kv_entry_t *existing = dict_find(kv_dict_for(hash), key, key_len, hash);
-    if (existing && existing->expire && get_time_now() > existing->expire) {
-        kvs_cleanup_entry(existing);  /* free nested structures for collection types */
-        dict_delete(kv_dict_for(hash), key, key_len, hash);
-        existing = NULL;
-    }
     if (mode == 1 && existing) return 1;   /* NX failed */
     if (mode == 2 && !existing) return 1;  /* XX failed */
 
@@ -113,6 +112,35 @@ static int engine_set_raw(const char *key, uint32_t key_len,
     return 0;
 }
 
+/* Backwards-compat wrapper for MGET/MSET/MSETNX batch paths in kvstore.c
+ * where the entry hasn't been pre-fetched (each key has its own loop). */
+static int engine_set_raw(const char *key, uint32_t key_len,
+                          const char *val, uint32_t val_len,
+                          long long expire, int mode)
+{
+    uint64_t hash = kv_hash((const uint8_t *)key, key_len);
+    kv_entry_t *existing = dict_find(kv_dict_for(hash), key, key_len, hash);
+    if (existing && existing->expire && get_time_now() > existing->expire) {
+        kvs_cleanup_entry(existing);
+        dict_delete(kv_dict_for(hash), key, key_len, hash);
+        existing = NULL;
+    }
+    return engine_set_pre(key, key_len, val, val_len, expire, mode, hash, existing);
+}
+
+/* Phase 6.1 — engine_get with pre-found entry.  Direct field access; no
+ * dict_find, no expire check (dispatcher already cleared expired keys). */
+static inline const char *engine_get_pre(kv_entry_t *e,
+                                         uint32_t *vlen_out, long long *expire_out,
+                                         uint8_t *enc_out)
+{
+    if (!e) return NULL;
+    if (vlen_out)   *vlen_out   = entry_payload_len(e);
+    if (expire_out) *expire_out = e->expire;
+    if (enc_out)    *enc_out    = entry_encoding(e);
+    return entry_payload(e);
+}
+
 static const char *engine_get_raw(const char *key, uint32_t key_len,
                                   uint32_t *vlen_out, long long *expire_out,
                                   uint8_t *enc_out)
@@ -125,10 +153,7 @@ static const char *engine_get_raw(const char *key, uint32_t key_len,
         dict_delete(kv_dict_for(hash), key, key_len, e->hash);
         return NULL;
     }
-    if (vlen_out)   *vlen_out   = entry_payload_len(e);
-    if (expire_out) *expire_out = e->expire;
-    if (enc_out)    *enc_out    = entry_encoding(e);
-    return entry_payload(e);
+    return engine_get_pre(e, vlen_out, expire_out, enc_out);
 }
 
 static int engine_mod_raw(const char *key, uint32_t key_len,
@@ -243,12 +268,15 @@ static long long slice_to_ll(kvs_token_t t) {
  * ===================================================================== */
 
 dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
+                             uint64_t hash,
                              kvs_token_t *args, int argc, DynBuf *wb,
                              const char *msg_raw, int msg_len)
 {
-    (void)entry;
     (void)msg_raw;
     (void)msg_len;
+    /* Phase 6.1 — `entry` and `hash` come pre-computed from kvs_dispatch.
+     * Every path below uses the engine_*_pre variants, eliminating the
+     * second kv_hash + dict_find that engine_*_raw used to perform. */
 
     char temp[64];
     int  ret;
@@ -295,9 +323,9 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
                     return DISPATCH_ERROR;
                 }
             }
-            ret = engine_set_raw(args[0].ptr, (uint32_t)args[0].len,
+            ret = engine_set_pre(args[0].ptr, (uint32_t)args[0].len,
                                  args[1].ptr, (uint32_t)args[1].len,
-                                 expire, mode);
+                                 expire, mode, hash, entry);
             if (ret < 0)       dynbuf_cat(wb, REP_ERROR, REP_ERROR_LEN);
             else if (ret == 0) dynbuf_cat(wb, REP_OK,    REP_OK_LEN);
             else               dynbuf_cat(wb, REP_NIL,   REP_NIL_LEN); /* NX/XX failed */
@@ -306,8 +334,8 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
         if (TOKEN_EQ(cmd, "SETNX")) {
             if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN);
                             return DISPATCH_ERROR; }
-            ret = engine_set_raw(args[0].ptr, (uint32_t)args[0].len,
-                                 args[1].ptr, (uint32_t)args[1].len, 0, 1);
+            ret = engine_set_pre(args[0].ptr, (uint32_t)args[0].len,
+                                 args[1].ptr, (uint32_t)args[1].len, 0, 1, hash, entry);
             char rb[8]; int rl = snprintf(rb, sizeof(rb), ":%d\r\n", ret == 0 ? 1 : 0);
             dynbuf_cat(wb, rb, rl);
             return DISPATCH_OK;
@@ -319,17 +347,16 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
             if (s <= 0) { dynbuf_cat(wb,
                 "-ERR invalid expire time in 'setex' command\r\n", 45);
                 return DISPATCH_ERROR; }
-            ret = engine_set_raw(args[0].ptr, (uint32_t)args[0].len,
+            ret = engine_set_pre(args[0].ptr, (uint32_t)args[0].len,
                                  args[2].ptr, (uint32_t)args[2].len,
-                                 get_time_now() + s * 1000, 0);
+                                 get_time_now() + s * 1000, 0, hash, entry);
             dynbuf_cat(wb, ret == 0 ? REP_OK : REP_ERROR,
                        ret == 0 ? REP_OK_LEN : REP_ERROR_LEN);
             return DISPATCH_OK;
         }
         if (TOKEN_EQ(cmd, "STRLEN")) {
             uint32_t vlen; uint8_t enc;
-            const char *val = engine_get_raw(args[0].ptr, (uint32_t)args[0].len,
-                                              &vlen, NULL, &enc);
+            const char *val = engine_get_pre(entry, &vlen, NULL, &enc);
             long long n = 0;
             if (val) {
                 if (enc == KV_ENCODING_INT) {
@@ -350,8 +377,7 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
         {
             uint32_t vlen;
             uint8_t  enc;
-            const char *val = engine_get_raw(args[0].ptr, (uint32_t)args[0].len,
-                                              &vlen, NULL, &enc);
+            const char *val = engine_get_pre(entry, &vlen, NULL, &enc);
             if (!val) {
                 dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
             } else if (enc == KV_ENCODING_INT) {
@@ -384,8 +410,9 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 long long s = slice_to_ll(args[2]);
                 if (s > 0) expire = get_time_now() + s * 1000;
             }
-            ret = engine_set_raw(args[0].ptr, (uint32_t)args[0].len,
-                                 args[1].ptr, (uint32_t)args[1].len, expire, 0);
+            ret = engine_set_pre(args[0].ptr, (uint32_t)args[0].len,
+                                 args[1].ptr, (uint32_t)args[1].len, expire, 0,
+                                 hash, entry);
             dynbuf_cat(wb, ret == 0 ? REP_OK : REP_ERROR,
                        ret == 0 ? REP_OK_LEN : REP_ERROR_LEN);
         }
@@ -397,8 +424,7 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
                         return DISPATCH_ERROR; }
         {
             uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
-            const char *val = engine_get_raw(args[0].ptr, (uint32_t)args[0].len,
-                                              &vlen, NULL, &enc);
+            const char *val = engine_get_pre(entry, &vlen, NULL, &enc);
             char ibuf[24];
             const char *cur_p = val; uint32_t cur_l = vlen;
             if (val && enc == KV_ENCODING_INT) {
@@ -412,8 +438,8 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
                              return DISPATCH_ERROR; }
             if (cur_l) memcpy(combined, cur_p, cur_l);
             memcpy(combined + cur_l, args[1].ptr, (size_t)args[1].len);
-            ret = engine_set_raw(args[0].ptr, (uint32_t)args[0].len,
-                                 combined, new_len, 0, 0);
+            ret = engine_set_pre(args[0].ptr, (uint32_t)args[0].len,
+                                 combined, new_len, 0, 0, hash, entry);
             free(combined);
             if (ret < 0) { dynbuf_cat(wb, REP_ERROR, REP_ERROR_LEN);
                            return DISPATCH_ERROR; }
@@ -448,8 +474,7 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
             }
 
             uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
-            const char *val = engine_get_raw(args[0].ptr, (uint32_t)args[0].len,
-                                              &vlen, NULL, &enc);
+            const char *val = engine_get_pre(entry, &vlen, NULL, &enc);
             long long cur = 0;
             if (val) {
                 if (enc == KV_ENCODING_INT) {
@@ -472,8 +497,8 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
             }
             cur += delta;
             char nb[24]; int nl = snprintf(nb, sizeof(nb), "%lld", cur);
-            ret = engine_set_raw(args[0].ptr, (uint32_t)args[0].len,
-                                 nb, (uint32_t)nl, 0, 0);
+            ret = engine_set_pre(args[0].ptr, (uint32_t)args[0].len,
+                                 nb, (uint32_t)nl, 0, 0, hash, entry);
             if (ret < 0) { dynbuf_cat(wb, REP_ERROR, REP_ERROR_LEN);
                            return DISPATCH_ERROR; }
             char rb[32]; int rl = snprintf(rb, sizeof(rb), ":%lld\r\n", cur);
@@ -495,8 +520,7 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
             }
             /* Load current value; parse as double (int encoding OK too). */
             uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
-            const char *val = engine_get_raw(args[0].ptr, (uint32_t)args[0].len,
-                                              &vlen, NULL, &enc);
+            const char *val = engine_get_pre(entry, &vlen, NULL, &enc);
             double cur = 0.0;
             if (val) {
                 if (enc == KV_ENCODING_INT) {
@@ -523,8 +547,8 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 if (nl > 0 && nb[nl-1] == '.') nl--;
                 nb[nl] = '\0';
             }
-            ret = engine_set_raw(args[0].ptr, (uint32_t)args[0].len,
-                                 nb, (uint32_t)nl, 0, 0);
+            ret = engine_set_pre(args[0].ptr, (uint32_t)args[0].len,
+                                 nb, (uint32_t)nl, 0, 0, hash, entry);
             if (ret < 0) { dynbuf_cat(wb, REP_ERROR, REP_ERROR_LEN);
                            return DISPATCH_ERROR; }
             char rb[96];

@@ -8,7 +8,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>      /* strcasecmp / strncasecmp */
+#include <errno.h>        /* CONFIG SET maxclients value parsing */
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <signal.h>
 #include <fcntl.h>
 
@@ -95,8 +98,16 @@ int g_in_reload = 0;    /* set by persistence layer during AOF/RDB reload */
 void *kvs_malloc(size_t size) { return malloc(size); }
 void kvs_free(void *ptr)       { free(ptr); }
 
-/* ── Cached time: updated once per event-loop iteration ── */
-static long long g_cached_ms;
+/* ── Cached time ──
+ *
+ * Updated by worker 0 once per event-loop iteration (see proactor.c
+ * worker_loop tick handler), read by every worker on every TTL/expire
+ * check.  Phase 8.2: declared _Atomic so the writer/reader contract is
+ * explicit (relaxed ordering is sufficient — we don't need any
+ * happens-before from this value, just a torn-read-free 64-bit load).
+ * On x86_64 this compiles to a plain mov; the only practical effect is
+ * giving TSAN visibility into the unsynchronised cross-thread access. */
+static _Atomic long long g_cached_ms;
 
 long long get_time_now_real(void) {
     struct timeval tv;
@@ -105,11 +116,13 @@ long long get_time_now_real(void) {
 }
 
 long long get_time_now(void) {
-    return g_cached_ms;
+    return atomic_load_explicit(&g_cached_ms, memory_order_relaxed);
 }
 
 void update_cached_time(void) {
-    g_cached_ms = get_time_now_real();
+    atomic_store_explicit(&g_cached_ms,
+                          get_time_now_real(),
+                          memory_order_relaxed);
 }
 
 KVItem* create_kvitem_len(const char *value, int vlen) {
@@ -186,7 +199,236 @@ static inline void reply_bulk(DynBuf *wb, const char *s, int len) {
     int hl = snprintf(hdr, sizeof(hdr), "$%d\r\n", len);
     dynbuf_cat(wb, hdr, hl);
     if (len > 0) dynbuf_cat(wb, s, len);
-    dynbuf_cat(wb, "\r\n", 2);
+    dynbuf_lit(wb, "\r\n");
+}
+
+/* =====================================================================
+ * Phase 7.2 — CONFIG GET / SET / RESETSTAT / REWRITE
+ *
+ * Online runtime tuning.  Two classes of params:
+ *   1. Read-only at runtime — port, persistence, network, threads,
+ *      cpu_pin, xdp, rdma_*.  CONFIG GET returns them; CONFIG SET
+ *      refuses with an explanatory error (would require socket
+ *      rebind / thread pool restart / module reinit — out of scope
+ *      for an online command).
+ *   2. Online-settable — loglevel, maxclients.  CONFIG SET writes
+ *      via __atomic_store_n(_, _, __ATOMIC_RELAXED) so concurrent
+ *      worker reads stay TSAN-clean and benefit from the new value
+ *      on their next iteration without any synchronisation cost.
+ *
+ * Lookup is via a small static table keyed on lowercase name.
+ * Values are formatted on demand into a per-call buffer; the table
+ * itself stays read-only across the process lifetime.
+ *
+ * Format follows Redis: CONFIG GET param → flat array [name,value,...]
+ * (one pair per matched param; we don't currently support glob, just
+ * exact name match, which is what every driver and redis-cli uses).
+ * ===================================================================== */
+
+/* Format helpers — return number of bytes written into out. */
+static int fmt_loglevel(char *out, int cap) {
+    int v = __atomic_load_n(&kvs_config.loglevel, __ATOMIC_RELAXED);
+    const char *s = (v == LOG_DEBUG) ? "debug" :
+                    (v == LOG_INFO)  ? "info"  :
+                    (v == LOG_WARN)  ? "warn"  : "error";
+    int n = (int)strlen(s);
+    if (n > cap) n = cap;
+    memcpy(out, s, n);
+    return n;
+}
+static int fmt_maxclients(char *out, int cap) {
+    int v = __atomic_load_n(&kvs_config.maxclients, __ATOMIC_RELAXED);
+    return snprintf(out, cap, "%d", v);
+}
+static int fmt_persistence(char *out, int cap) {
+    const char *s = (kvs_config.persist_mode == PERSIST_NONE) ? "none" :
+                    (kvs_config.persist_mode == PERSIST_RDB)  ? "rdb"  : "aof";
+    int n = (int)strlen(s);
+    if (n > cap) n = cap;
+    memcpy(out, s, n);
+    return n;
+}
+static int fmt_threads(char *out, int cap) {
+    return snprintf(out, cap, "%d", kvs_config.threads);
+}
+static int fmt_port(char *out, int cap) {
+    return snprintf(out, cap, "%d", kvs_config.port);
+}
+static int fmt_xdp(char *out, int cap) {
+    const char *s = kvs_config.xdp_enabled ? "yes" : "no";
+    int n = (int)strlen(s);
+    if (n > cap) n = cap;
+    memcpy(out, s, n);
+    return n;
+}
+static int fmt_cpu_pin(char *out, int cap) {
+    if (kvs_config.cpu_pin_mode == 0) {
+        const char *s = "off"; int n = 3;
+        if (n > cap) n = cap; memcpy(out, s, n); return n;
+    }
+    if (kvs_config.cpu_pin_mode == 1) {
+        const char *s = "auto"; int n = 4;
+        if (n > cap) n = cap; memcpy(out, s, n); return n;
+    }
+    /* manual list */
+    int off = 0;
+    for (int i = 0; i < kvs_config.cpu_pin_count && off + 8 < cap; i++) {
+        off += snprintf(out + off, cap - off, "%s%d",
+                        i ? "," : "", kvs_config.cpu_pin_list[i]);
+    }
+    return off;
+}
+
+/* SET handlers — return 0 on success, -1 with error string written via wb. */
+static int set_loglevel(const char *val, DynBuf *wb) {
+    int v = -1;
+    if      (strcasecmp(val, "debug") == 0) v = LOG_DEBUG;
+    else if (strcasecmp(val, "info")  == 0) v = LOG_INFO;
+    else if (strcasecmp(val, "warn")  == 0) v = LOG_WARN;
+    else if (strcasecmp(val, "error") == 0) v = LOG_ERROR;
+    else {
+        dynbuf_lit(wb, "-ERR loglevel must be one of: debug info warn error\r\n");
+        return -1;
+    }
+    __atomic_store_n(&kvs_config.loglevel, v, __ATOMIC_RELAXED);
+    return 0;
+}
+static int set_maxclients(const char *val, DynBuf *wb) {
+    char *end; errno = 0;
+    long v = strtol(val, &end, 10);
+    if (*end != '\0' || errno != 0 || v < 64 || v > 65536) {
+        dynbuf_lit(wb, "-ERR maxclients must be an integer in [64, 65536]\r\n");
+        return -1;
+    }
+    __atomic_store_n(&kvs_config.maxclients, (int)v, __ATOMIC_RELAXED);
+    return 0;
+}
+
+/* Param table.  fmt() prints current value; set() applies change (NULL
+ * means read-only at runtime).  Names match the .conf file syntax. */
+typedef int (*cfg_fmt_fn)(char *out, int cap);
+typedef int (*cfg_set_fn)(const char *val, DynBuf *wb);
+struct cfg_entry {
+    const char *name;
+    cfg_fmt_fn  fmt;
+    cfg_set_fn  set;       /* NULL → read-only */
+};
+static const struct cfg_entry g_cfg_table[] = {
+    /* online-settable */
+    { "loglevel",     fmt_loglevel,    set_loglevel    },
+    { "maxclients",   fmt_maxclients,  set_maxclients  },
+    /* read-only at runtime (boot-time only) */
+    { "persistence",  fmt_persistence, NULL },
+    { "threads",      fmt_threads,     NULL },
+    { "port",         fmt_port,        NULL },
+    { "xdp",          fmt_xdp,         NULL },
+    { "cpu_pin",      fmt_cpu_pin,     NULL },
+};
+static const int g_cfg_table_n =
+    (int)(sizeof(g_cfg_table) / sizeof(g_cfg_table[0]));
+
+static const struct cfg_entry *cfg_lookup(const kvs_token_t *t) {
+    for (int i = 0; i < g_cfg_table_n; i++) {
+        const char *n = g_cfg_table[i].name;
+        int nl = (int)strlen(n);
+        if (nl == t->len && strncasecmp(n, t->ptr, (size_t)nl) == 0)
+            return &g_cfg_table[i];
+    }
+    return NULL;
+}
+
+static dispatch_result_t handle_config(kvs_token_t *tokens, int argc, DynBuf *wb) {
+    if (argc < 2) {
+        dynbuf_cat(wb,
+            "-ERR wrong number of arguments for 'config' command\r\n",
+            sizeof("-ERR wrong number of arguments for 'config' command\r\n") - 1);
+        return DISPATCH_ERROR;
+    }
+
+    /* CONFIG subcommand names are also case-insensitive in Redis. */
+    kvs_token_t sub = tokens[1];
+
+    if (sub.len == 3 && strncasecmp(sub.ptr, "GET", 3) == 0) {
+        if (argc != 3) {
+            dynbuf_cat(wb,
+                "-ERR wrong number of arguments for 'config|get' command\r\n",
+                sizeof("-ERR wrong number of arguments for 'config|get' command\r\n") - 1);
+            return DISPATCH_ERROR;
+        }
+        const struct cfg_entry *e = cfg_lookup(&tokens[2]);
+        if (!e) {
+            /* Unknown name → empty array, like Redis. */
+            dynbuf_lit(wb, "*0\r\n");
+            return DISPATCH_OK;
+        }
+        char vbuf[256];
+        int  vlen = e->fmt(vbuf, (int)sizeof(vbuf));
+        if (vlen < 0) vlen = 0;
+        if (vlen > (int)sizeof(vbuf)) vlen = (int)sizeof(vbuf);
+        dynbuf_lit(wb, "*2\r\n");
+        reply_bulk(wb, e->name, (int)strlen(e->name));
+        reply_bulk(wb, vbuf, vlen);
+        return DISPATCH_OK;
+    }
+
+    if (sub.len == 3 && strncasecmp(sub.ptr, "SET", 3) == 0) {
+        if (argc != 4) {
+            dynbuf_cat(wb,
+                "-ERR wrong number of arguments for 'config|set' command\r\n",
+                sizeof("-ERR wrong number of arguments for 'config|set' command\r\n") - 1);
+            return DISPATCH_ERROR;
+        }
+        const struct cfg_entry *e = cfg_lookup(&tokens[2]);
+        if (!e) {
+            dynbuf_cat(wb,
+                "-ERR Unknown CONFIG parameter\r\n",
+                sizeof("-ERR Unknown CONFIG parameter\r\n") - 1);
+            return DISPATCH_ERROR;
+        }
+        if (!e->set) {
+            dynbuf_cat(wb,
+                "-ERR parameter is read-only at runtime "
+                "(boot-time only — restart with updated .conf)\r\n",
+                sizeof("-ERR parameter is read-only at runtime "
+                       "(boot-time only — restart with updated .conf)\r\n") - 1);
+            return DISPATCH_ERROR;
+        }
+        /* Materialise value into a NUL-terminated buffer for parsing. */
+        char vbuf[192];
+        int vlen = tokens[3].len;
+        if (vlen >= (int)sizeof(vbuf)) vlen = (int)sizeof(vbuf) - 1;
+        memcpy(vbuf, tokens[3].ptr, (size_t)vlen);
+        vbuf[vlen] = '\0';
+        if (e->set(vbuf, wb) < 0)
+            return DISPATCH_ERROR;          /* set() already wrote -ERR */
+        dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        return DISPATCH_OK;
+    }
+
+    if (sub.len == 9 && strncasecmp(sub.ptr, "RESETSTAT", 9) == 0) {
+        /* No internal stats counter yet — accept, like a no-op. */
+        dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        return DISPATCH_OK;
+    }
+
+    if (sub.len == 7 && strncasecmp(sub.ptr, "REWRITE", 7) == 0) {
+        /* Rewriting the .conf file in-place needs careful merge logic
+         * (preserve comments, only update changed keys).  Out of scope
+         * for Phase 7.2; report unsupported so callers fall back. */
+        dynbuf_cat(wb,
+            "-ERR CONFIG REWRITE not implemented "
+            "(use external config management)\r\n",
+            sizeof("-ERR CONFIG REWRITE not implemented "
+                   "(use external config management)\r\n") - 1);
+        return DISPATCH_ERROR;
+    }
+
+    dynbuf_cat(wb,
+        "-ERR Unknown CONFIG subcommand "
+        "(supported: GET, SET, RESETSTAT, REWRITE)\r\n",
+        sizeof("-ERR Unknown CONFIG subcommand "
+               "(supported: GET, SET, RESETSTAT, REWRITE)\r\n") - 1);
+    return DISPATCH_ERROR;
 }
 
 /* ── Retry a blocked client's saved command ── */
@@ -217,12 +459,45 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
 
     kvs_token_t cmd = tokens[0];
 
-    /* ── Lazy client allocation ── */
-    if (c && !c->client) {
-        c->client = (client_t *)calloc(1, sizeof(client_t));
-        if (c->client)
-            c->client->conn = c;
+    /* Phase 6.2b — case-insensitive command name.
+     *
+     * Redis protocol mandates command names are case-insensitive;
+     * `SET k v`, `set k v`, `Set k v` are all valid and equivalent.
+     * Our previous dispatcher matched raw bytes (TOKEN_EQ memcmp +
+     * CMD4 first-4-byte switch), so lowercase commands returned
+     * "ERR unknown command".
+     *
+     * Fix: uppercase the command token into a 32-byte stack buffer
+     * once on entry, then both the keyless TOKEN_EQ chain and the
+     * CMD4 jump-table see the canonical form.  We also overwrite
+     * tokens[0] so the per-type dispatchers (string_cmd / hash_cmd
+     * / list_cmd / set_cmd / zset_cmd) — which all run their own
+     * TOKEN_EQ on cmd.ptr — see the same canonicalised cmd.
+     *
+     * ASCII A-Z conversion: bit 5 (0x20) distinguishes uppercase
+     * from lowercase ASCII letters.  Bytes outside [a-z] are left
+     * unchanged, so digits / hyphens (nonexistent in Redis command
+     * names anyway) stay byte-identical.  Cost: ≤16 byte mask per
+     * dispatch ≈ 5 ns.  Pre-existing bug found in Phase 6.2; safe
+     * to fix here because no existing call site relies on case-
+     * sensitive command rejection. */
+    char ucmd_buf[32];
+    int  ulen = cmd.len;
+    if (ulen > (int)sizeof(ucmd_buf)) ulen = (int)sizeof(ucmd_buf);
+    for (int i = 0; i < ulen; i++) {
+        unsigned char ch = (unsigned char)cmd.ptr[i];
+        ucmd_buf[i] = (ch >= 'a' && ch <= 'z') ? (char)(ch & 0xDF)
+                                                : (char)ch;
     }
+    cmd.ptr   = ucmd_buf;
+    cmd.len   = ulen;
+    tokens[0] = cmd;
+
+    /* Phase 8.2 — client_t is now eagerly allocated in proactor.c on
+     * EVENT_ACCEPT, so c->client is non-NULL by the time any command
+     * dispatches.  See proactor.c "Phase 8.2 — eager client_t" block.
+     * Reload paths and BLPOP wake replays may pass c==NULL; handle
+     * that defensively. */
 
     /* ── Global / connection commands (no key needed) ── */
 
@@ -233,8 +508,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             /* Redis: PING <msg> echoes msg as bulk reply */
             reply_bulk(wb, tokens[1].ptr, tokens[1].len);
         } else {
-            dynbuf_cat(wb,
-                "-ERR wrong number of arguments for 'ping' command\r\n", 51);
+            dynbuf_lit(wb, "-ERR wrong number of arguments for 'ping' command\r\n");
         }
         return DISPATCH_OK;
     }
@@ -248,8 +522,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (argc >= 2) {
             reply_bulk(wb, tokens[1].ptr, tokens[1].len);
         } else {
-            dynbuf_cat(wb,
-                "-ERR wrong number of arguments for 'echo' command\r\n", 51);
+            dynbuf_lit(wb, "-ERR wrong number of arguments for 'echo' command\r\n");
         }
         return DISPATCH_OK;
     }
@@ -257,8 +530,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     /* HELLO — clients use this to negotiate RESP3. Decline gracefully so
        clients fall back to RESP2 without erroring out. */
     if (TOKEN_EQ(cmd, "HELLO")) {
-        dynbuf_cat(wb,
-            "-NOPROTO sorry, this protocol version is not supported\r\n", 56);
+        dynbuf_lit(wb, "-NOPROTO sorry, this protocol version is not supported\r\n");
         return DISPATCH_OK;
     }
 
@@ -285,7 +557,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (argc >= 2 && TOKEN_EQ(tokens[1], "COUNT")) {
             reply_integer(wb, 0);
         } else {
-            dynbuf_cat(wb, "*0\r\n", 4);
+            dynbuf_lit(wb, "*0\r\n");
         }
         return DISPATCH_OK;
     }
@@ -294,7 +566,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     if (TOKEN_EQ(cmd, "SELECT")) {
         long long db = 0;
         if (argc != 2 || token_to_ll(tokens[1], &db) < 0 || db != 0) {
-            dynbuf_cat(wb, "-ERR DB index out of range\r\n", 28);
+            dynbuf_lit(wb, "-ERR DB index out of range\r\n");
         } else {
             dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         }
@@ -311,6 +583,25 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         rdb_save_async_uring();
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         return DISPATCH_OK;
+    }
+
+    /* Phase 7.1.0 — BGREWRITEAOF stub.  See persistence.c Part 2b for
+     * the V2 design plan.  Currently aof_rewrite_bg() always returns
+     * -1 (NOT IMPLEMENTED); on this dev box AOF never grows large
+     * enough for rewrite to matter, so the stub is intentional. */
+    if (TOKEN_EQ(cmd, "BGREWRITEAOF")) {
+        if (aof_rewrite_bg() == 0) {
+            dynbuf_lit(wb, "+Background append only file rewriting started\r\n");
+        } else {
+            dynbuf_lit(wb, "-ERR BGREWRITEAOF not implemented yet "
+                "(see persistence.c Part 2b for design plan)\r\n");
+        }
+        return DISPATCH_OK;
+    }
+
+    /* Phase 7.2 — online runtime config tuning. */
+    if (TOKEN_EQ(cmd, "CONFIG")) {
+        return handle_config(tokens, argc, wb);
     }
 
     if (TOKEN_EQ(cmd, "FLUSHALL") || TOKEN_EQ(cmd, "FLUSHDB")) {
@@ -363,12 +654,12 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                 int bh = snprintf(hdr, sizeof(hdr), "$%d\r\n", il);
                 dynbuf_cat(wb, hdr, bh);
                 dynbuf_cat(wb, ibuf, il);
-                dynbuf_cat(wb, "\r\n", 2);
+                dynbuf_lit(wb, "\r\n");
             } else {
                 int bh = snprintf(hdr, sizeof(hdr), "$%u\r\n", vlen);
                 dynbuf_cat(wb, hdr, bh);
                 dynbuf_cat(wb, val, (int)vlen);
-                dynbuf_cat(wb, "\r\n", 2);
+                dynbuf_lit(wb, "\r\n");
             }
         }
         return DISPATCH_OK;
@@ -377,8 +668,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     /* MSET key val [key val ...] → always +OK (overwrites any existing type). */
     if (TOKEN_EQ(cmd, "MSET")) {
         if (argc < 3 || ((argc - 1) % 2) != 0) {
-            dynbuf_cat(wb,
-                "-ERR wrong number of arguments for 'mset' command\r\n", 51);
+            dynbuf_lit(wb, "-ERR wrong number of arguments for 'mset' command\r\n");
             return DISPATCH_ERROR;
         }
         for (int i = 1; i + 1 < argc; i += 2) {
@@ -424,8 +714,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     /* MSETNX key val [key val ...] → :1 if all keys absent and set, else :0 */
     if (TOKEN_EQ(cmd, "MSETNX")) {
         if (argc < 3 || ((argc - 1) % 2) != 0) {
-            dynbuf_cat(wb,
-                "-ERR wrong number of arguments for 'msetnx' command\r\n", 53);
+            dynbuf_lit(wb, "-ERR wrong number of arguments for 'msetnx' command\r\n");
             return DISPATCH_ERROR;
         }
         /* First pass: any existing (non-expired) key aborts the whole op.
@@ -670,14 +959,12 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     /* ── EXPIRE — integer reply :1 (set) / :0 (no key). ── */
     if (TOKEN_EQ(cmd, "EXPIRE")) {
         if (argc < 3) {
-            dynbuf_cat(wb,
-                "-ERR wrong number of arguments for 'expire' command\r\n", 53);
+            dynbuf_lit(wb, "-ERR wrong number of arguments for 'expire' command\r\n");
             return DISPATCH_ERROR;
         }
         long long secs;
         if (token_to_ll(tokens[2], &secs) < 0) {
-            dynbuf_cat(wb,
-                "-ERR value is not an integer or out of range\r\n", 46);
+            dynbuf_lit(wb, "-ERR value is not an integer or out of range\r\n");
             return DISPATCH_ERROR;
         }
         if (!entry) {
@@ -739,19 +1026,21 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         r = DISPATCH_OK;
         break;
     case KV_TYPE_LIST:
-        r = list_cmd(cmd, entry, tokens + 1, argc - 1, wb,
+        /* Phase 6.1b — pass pre-computed hash so list_cmd skips redundant
+         * kv_hash recomputes on every command branch. */
+        r = list_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb,
                      msg_raw, msg_len, c ? c->client : NULL);
         break;
     case KV_TYPE_SET:
-        r = set_cmd(cmd, entry, tokens + 1, argc - 1, wb,
+        r = set_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb,
                     msg_raw, msg_len, c ? c->client : NULL);
         break;
     case KV_TYPE_HASH:
-        r = hash_cmd(cmd, entry, tokens + 1, argc - 1, wb,
+        r = hash_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb,
                      msg_raw, msg_len, c ? c->client : NULL);
         break;
     case KV_TYPE_ZSET:
-        r = zset_cmd(cmd, entry, tokens + 1, argc - 1, wb,
+        r = zset_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb,
                      msg_raw, msg_len, c ? c->client : NULL);
         break;
     }

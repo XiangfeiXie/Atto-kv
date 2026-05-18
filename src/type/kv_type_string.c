@@ -296,20 +296,16 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 kvs_token_t opt = args[i];
                 if ((opt.len == 2 && (opt.ptr[0]=='E'||opt.ptr[0]=='e') &&
                                       (opt.ptr[1]=='X'||opt.ptr[1]=='x'))) {
-                    if (i + 1 >= argc) { dynbuf_cat(wb,
-                        "-ERR syntax error\r\n", 19); return DISPATCH_ERROR; }
+                    if (i + 1 >= argc) { dynbuf_lit(wb, "-ERR syntax error\r\n"); return DISPATCH_ERROR; }
                     long long s = slice_to_ll(args[++i]);
-                    if (s <= 0) { dynbuf_cat(wb,
-                        "-ERR invalid expire time in 'set' command\r\n", 43);
+                    if (s <= 0) { dynbuf_lit(wb, "-ERR invalid expire time in 'set' command\r\n");
                         return DISPATCH_ERROR; }
                     expire = get_time_now() + s * 1000;
                 } else if (opt.len == 2 && (opt.ptr[0]=='P'||opt.ptr[0]=='p') &&
                                             (opt.ptr[1]=='X'||opt.ptr[1]=='x')) {
-                    if (i + 1 >= argc) { dynbuf_cat(wb,
-                        "-ERR syntax error\r\n", 19); return DISPATCH_ERROR; }
+                    if (i + 1 >= argc) { dynbuf_lit(wb, "-ERR syntax error\r\n"); return DISPATCH_ERROR; }
                     long long ms = slice_to_ll(args[++i]);
-                    if (ms <= 0) { dynbuf_cat(wb,
-                        "-ERR invalid expire time in 'set' command\r\n", 43);
+                    if (ms <= 0) { dynbuf_lit(wb, "-ERR invalid expire time in 'set' command\r\n");
                         return DISPATCH_ERROR; }
                     expire = get_time_now() + ms;
                 } else if (opt.len == 2 && (opt.ptr[0]=='N'||opt.ptr[0]=='n') &&
@@ -319,7 +315,7 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
                                             (opt.ptr[1]=='X'||opt.ptr[1]=='x')) {
                     mode = 2;
                 } else {
-                    dynbuf_cat(wb, "-ERR syntax error\r\n", 19);
+                    dynbuf_lit(wb, "-ERR syntax error\r\n");
                     return DISPATCH_ERROR;
                 }
             }
@@ -344,8 +340,7 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
             if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN);
                             return DISPATCH_ERROR; }
             long long s = slice_to_ll(args[1]);
-            if (s <= 0) { dynbuf_cat(wb,
-                "-ERR invalid expire time in 'setex' command\r\n", 45);
+            if (s <= 0) { dynbuf_lit(wb, "-ERR invalid expire time in 'setex' command\r\n");
                 return DISPATCH_ERROR; }
             ret = engine_set_pre(args[0].ptr, (uint32_t)args[0].len,
                                  args[2].ptr, (uint32_t)args[2].len,
@@ -388,12 +383,12 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 int hl = snprintf(temp, sizeof(temp), "$%d\r\n", il);
                 dynbuf_cat(wb, temp, hl);
                 dynbuf_cat(wb, istr, il);
-                dynbuf_cat(wb, "\r\n", 2);
+                dynbuf_lit(wb, "\r\n");
             } else {
                 int hl = snprintf(temp, sizeof(temp), "$%u\r\n", vlen);
                 dynbuf_cat(wb, temp, hl);
                 dynbuf_cat(wb, val, (int)vlen);
-                dynbuf_cat(wb, "\r\n", 2);
+                dynbuf_lit(wb, "\r\n");
             }
         }
         return DISPATCH_OK;
@@ -465,8 +460,7 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
                     if (args[1].len == 0 ||
                         (args[1].ptr[0] != '-' && args[1].ptr[0] != '+' &&
                          (args[1].ptr[0] < '0' || args[1].ptr[0] > '9'))) {
-                        dynbuf_cat(wb,
-                            "-ERR value is not an integer or out of range\r\n", 46);
+                        dynbuf_lit(wb, "-ERR value is not an integer or out of range\r\n");
                         return DISPATCH_ERROR;
                     }
                 }
@@ -482,8 +476,7 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 } else {
                     int64_t iv;
                     if (!try_parse_int64(val, (int)vlen, &iv)) {
-                        dynbuf_cat(wb,
-                            "-ERR value is not an integer or out of range\r\n", 46);
+                        dynbuf_lit(wb, "-ERR value is not an integer or out of range\r\n");
                         return DISPATCH_ERROR;
                     }
                     cur = iv;
@@ -492,7 +485,7 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
             /* Overflow check */
             if ((delta > 0 && cur > 9223372036854775807LL - delta) ||
                 (delta < 0 && cur < -9223372036854775807LL - 1 - delta)) {
-                dynbuf_cat(wb, "-ERR increment or decrement would overflow\r\n", 44);
+                dynbuf_lit(wb, "-ERR increment or decrement would overflow\r\n");
                 return DISPATCH_ERROR;
             }
             cur += delta;
@@ -515,7 +508,7 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
             char *iend = NULL;
             double incr = strtod(ibuf, &iend);
             if (iend == ibuf || (*iend != '\0' && *iend != '\r' && *iend != '\n')) {
-                dynbuf_cat(wb, "-ERR value is not a valid float\r\n", 34);
+                dynbuf_lit(wb, "-ERR value is not a valid float\r\n");
                 return DISPATCH_ERROR;
             }
             /* Load current value; parse as double (int encoding OK too). */
@@ -532,7 +525,7 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
                     char *vend = NULL;
                     cur = strtod(vbuf, &vend);
                     if (vend == vbuf || (*vend != '\0' && *vend != '\r' && *vend != '\n')) {
-                        dynbuf_cat(wb, "-ERR value is not a valid float\r\n", 34);
+                        dynbuf_lit(wb, "-ERR value is not a valid float\r\n");
                         return DISPATCH_ERROR;
                     }
                 }

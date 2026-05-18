@@ -490,7 +490,7 @@ static void set_send_all_elements(kv_entry_t *e, DynBuf *wb) {
             int bhl = snprintf(bhdr, sizeof(bhdr), "$%u\r\n", elen);
             dynbuf_cat(wb, bhdr, bhl);
             dynbuf_cat(wb, p, elen);
-            dynbuf_cat(wb, "\r\n", 2);
+            dynbuf_lit(wb, "\r\n");
             p += elen;
         }
         return;
@@ -506,7 +506,7 @@ static void set_send_all_elements(kv_entry_t *e, DynBuf *wb) {
         int hl = snprintf(temp, sizeof(temp), "$%u\r\n", de->key_len);
         dynbuf_cat(wb, temp, hl);
         dynbuf_cat(wb, k, (int)de->key_len);
-        dynbuf_cat(wb, "\r\n", 2);
+        dynbuf_lit(wb, "\r\n");
     }
     dict_iter_free(it);
 }
@@ -529,7 +529,7 @@ static void set_send_random_one(kv_entry_t *e, DynBuf *wb) {
         int hl = snprintf(hdr, sizeof(hdr), "$%u\r\n", elen);
         dynbuf_cat(wb, hdr, hl);
         dynbuf_cat(wb, p + 4, elen);
-        dynbuf_cat(wb, "\r\n", 2);
+        dynbuf_lit(wb, "\r\n");
     } else {
         kv_dict_t *d = (kv_dict_t *)(e->data + 2);
         kv_iter_t *it = dict_iter_new(d, 1);
@@ -542,7 +542,7 @@ static void set_send_random_one(kv_entry_t *e, DynBuf *wb) {
         int hl = snprintf(hdr, sizeof(hdr), "$%u\r\n", de->key_len);
         dynbuf_cat(wb, hdr, hl);
         dynbuf_cat(wb, entry_key(de), (int)de->key_len);
-        dynbuf_cat(wb, "\r\n", 2);
+        dynbuf_lit(wb, "\r\n");
         dict_iter_free(it);
     }
 }
@@ -712,7 +712,7 @@ static inline void resp_write_bulk(DynBuf *wb, const char *s, uint32_t l) {
     int hl = snprintf(hdr, sizeof(hdr), "$%u\r\n", l);
     dynbuf_cat(wb, hdr, hl);
     dynbuf_cat(wb, s, (int)l);
-    dynbuf_cat(wb, "\r\n", 2);
+    dynbuf_lit(wb, "\r\n");
 }
 
 /* Replace the set at `key` atomically with the given member list.
@@ -748,6 +748,7 @@ static int set_store_overwrite(const char *key, int klen,
  * ===================================================================== */
 
 dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
+                          uint64_t hash,
                           kvs_token_t *args, int argc, DynBuf *wb,
                           const char *msg_raw, int msg_len,
                           client_t *client)
@@ -770,7 +771,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
         if (TOKEN_EQ(cmd, "SADD")) {
             if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
 
-            uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
             kv_entry_t *e = dict_find(kv_dict_for(hash), key, (uint32_t)strlen(key), hash);
             int existed = 0;
 
@@ -778,7 +779,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 char data[16];
                 set_build_empty(data);
                 e = dict_add(kv_dict_for(hash), key, (uint32_t)strlen(key), data, SET_EMPTY_SIZE, hash);
-                if (!e) { dynbuf_cat(wb, "-ERR create set failed\r\n", 23); return DISPATCH_ERROR; }
+                if (!e) { dynbuf_lit(wb, "-ERR create set failed\r\n"); return DISPATCH_ERROR; }
             } else {
                 if (entry_type(e) != KV_TYPE_SET) {
                     dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
@@ -791,14 +792,14 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 char data[16];
                 set_build_empty(data);
                 e = dict_add(kv_dict_for(hash), key, (uint32_t)strlen(key), data, SET_EMPTY_SIZE, hash);
-                if (!e) { dynbuf_cat(wb, "-ERR create set failed\r\n", 23); return DISPATCH_ERROR; }
+                if (!e) { dynbuf_lit(wb, "-ERR create set failed\r\n"); return DISPATCH_ERROR; }
             }
 
             int total_added = 0;
             for (int i = 1; i < argc; i++) {
                 int added = 0;
                 if (set_add(&e, key, args[i].ptr, args[i].len, &added) < 0) {
-                    dynbuf_cat(wb, "-ERR sadd failed\r\n", 17);
+                    dynbuf_lit(wb, "-ERR sadd failed\r\n");
                     return DISPATCH_ERROR;
                 }
                 total_added += added;
@@ -817,7 +818,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 return DISPATCH_ERROR;
             }
 
-            uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
             if (check_expiry(entry, key, hash)) {
                 dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN);
                 return DISPATCH_OK;
@@ -827,7 +828,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
             for (int i = 1; i < argc; i++) {
                 int removed = 0;
                 if (set_remove(&entry, key, args[i].ptr, args[i].len, &removed) < 0) {
-                    dynbuf_cat(wb, "-ERR srem failed\r\n", 17);
+                    dynbuf_lit(wb, "-ERR srem failed\r\n");
                     return DISPATCH_ERROR;
                 }
                 total_removed += removed;
@@ -839,14 +840,14 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
         }
 
         if (TOKEN_EQ(cmd, "SMEMBERS")) {
-            if (!entry) { dynbuf_cat(wb, "*0\r\n", 4); return DISPATCH_OK; }
+            if (!entry) { dynbuf_lit(wb, "*0\r\n"); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_SET) {
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
-            uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
             if (check_expiry(entry, key, hash)) {
-                dynbuf_cat(wb, "*0\r\n", 4);
+                dynbuf_lit(wb, "*0\r\n");
                 return DISPATCH_OK;
             }
             set_send_all_elements(entry, wb);
@@ -859,7 +860,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
-            uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
             if (check_expiry(entry, key, hash)) {
                 dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN);
                 return DISPATCH_OK;
@@ -876,7 +877,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
-            uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
             if (check_expiry(entry, key, hash)) {
                 dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN);
                 return DISPATCH_OK;
@@ -893,7 +894,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
-            uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
             if (check_expiry(entry, key, hash)) {
                 dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
                 return DISPATCH_OK;
@@ -911,7 +912,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 memcpy(nbuf, args[1].ptr, nl); nbuf[nl] = '\0';
                 count = atoll(nbuf);
                 if (count < 0) {
-                    dynbuf_cat(wb, "-ERR value is out of range\r\n", 28);
+                    dynbuf_lit(wb, "-ERR value is out of range\r\n");
                     return DISPATCH_ERROR;
                 }
             }
@@ -921,7 +922,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 return DISPATCH_OK;
             }
             if (has_count && count == 0) {
-                dynbuf_cat(wb, "*0\r\n", 4);
+                dynbuf_lit(wb, "*0\r\n");
                 return DISPATCH_OK;
             }
             if ((uint64_t)count > card) count = card;
@@ -930,7 +931,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
              * Fisher–Yates, then remove and emit them. */
             char **ptrs; uint32_t *lens; uint32_t n;
             if (set_members_dup(entry, &ptrs, &lens, &n) < 0) {
-                dynbuf_cat(wb, "-ERR oom\r\n", 10);
+                dynbuf_lit(wb, "-ERR oom\r\n");
                 return DISPATCH_ERROR;
             }
 
@@ -958,7 +959,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
-            uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
             if (check_expiry(entry, key, hash)) {
                 dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
                 return DISPATCH_OK;
@@ -978,13 +979,13 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
 
             uint32_t card = set_card(entry);
             if (cnt == 0 || card == 0) {
-                dynbuf_cat(wb, "*0\r\n", 4);
+                dynbuf_lit(wb, "*0\r\n");
                 return DISPATCH_OK;
             }
 
             char **ptrs; uint32_t *lens; uint32_t n;
             if (set_members_dup(entry, &ptrs, &lens, &n) < 0) {
-                dynbuf_cat(wb, "-ERR out of memory\r\n", 20);
+                dynbuf_lit(wb, "-ERR out of memory\r\n");
                 return DISPATCH_ERROR;
             }
 
@@ -1062,7 +1063,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 set_build_empty(init);
                 uint64_t dh = kv_hash((const uint8_t *)dkey, (uint32_t)strlen(dkey));
                 de = dict_add(kv_dict_for(dh), dkey, (uint32_t)strlen(dkey), init, SET_EMPTY_SIZE, dh);
-                if (!de) { dynbuf_cat(wb, "-ERR smove failed\r\n", 18); return DISPATCH_ERROR; }
+                if (!de) { dynbuf_lit(wb, "-ERR smove failed\r\n"); return DISPATCH_ERROR; }
             }
             int added = 0;
             set_add(&de, dkey, args[2].ptr, args[2].len, &added);
@@ -1095,7 +1096,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
 
                 /* Resolve all source set entries upfront. */
                 kv_entry_t **srcs = (kv_entry_t **)calloc((size_t)src_n, sizeof(*srcs));
-                if (!srcs) { dynbuf_cat(wb, "-ERR oom\r\n", 10); return DISPATCH_ERROR; }
+                if (!srcs) { dynbuf_lit(wb, "-ERR oom\r\n"); return DISPATCH_ERROR; }
                 for (int i = 0; i < src_n; i++) {
                     /* For STORE the dispatch path didn't pre-resolve src args[i]. */
                     if (i == 0 && !store) {
@@ -1133,7 +1134,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                             if (set_card(srcs[i]) < set_card(srcs[base])) base = i;
                         char **bp; uint32_t *bl; uint32_t bn;
                         if (set_members_dup(srcs[base], &bp, &bl, &bn) < 0) {
-                            free(srcs); dynbuf_cat(wb, "-ERR oom\r\n", 10);
+                            free(srcs); dynbuf_lit(wb, "-ERR oom\r\n");
                             return DISPATCH_ERROR;
                         }
                         rp = (char **)malloc((size_t)bn * sizeof(char *));
@@ -1141,7 +1142,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                         if (!rp || !rl) {
                             free(rp); free(rl);
                             set_members_free(bp, bl, bn); free(srcs);
-                            dynbuf_cat(wb, "-ERR oom\r\n", 10); return DISPATCH_ERROR;
+                            dynbuf_lit(wb, "-ERR oom\r\n"); return DISPATCH_ERROR;
                         }
                         for (uint32_t i = 0; i < bn; i++) {
                             int ok = 1;
@@ -1169,7 +1170,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                         rl = (uint32_t *)malloc((size_t)total * sizeof(uint32_t));
                         if (!rp || !rl) {
                             free(rp); free(rl); free(srcs);
-                            dynbuf_cat(wb, "-ERR oom\r\n", 10); return DISPATCH_ERROR;
+                            dynbuf_lit(wb, "-ERR oom\r\n"); return DISPATCH_ERROR;
                         }
                         for (int i = 0; i < src_n; i++) {
                             if (!srcs[i]) continue;
@@ -1193,7 +1194,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                     if (srcs[0] && set_card(srcs[0]) > 0) {
                         char **bp; uint32_t *bl; uint32_t bn;
                         if (set_members_dup(srcs[0], &bp, &bl, &bn) < 0) {
-                            free(srcs); dynbuf_cat(wb, "-ERR oom\r\n", 10);
+                            free(srcs); dynbuf_lit(wb, "-ERR oom\r\n");
                             return DISPATCH_ERROR;
                         }
                         rp = (char **)malloc((size_t)bn * sizeof(char *));
@@ -1201,7 +1202,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                         if (!rp || !rl) {
                             free(rp); free(rl);
                             set_members_free(bp, bl, bn); free(srcs);
-                            dynbuf_cat(wb, "-ERR oom\r\n", 10); return DISPATCH_ERROR;
+                            dynbuf_lit(wb, "-ERR oom\r\n"); return DISPATCH_ERROR;
                         }
                         for (uint32_t i = 0; i < bn; i++) {
                             int in_other = 0;
@@ -1225,7 +1226,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                     const char *dk = key_from_token(args[0], dkb, sizeof(dkb));
                     if (set_store_overwrite(dk, (int)strlen(dk), rp, rl, rc) < 0) {
                         set_members_free(rp, rl, rc);
-                        dynbuf_cat(wb, "-ERR store failed\r\n", 18);
+                        dynbuf_lit(wb, "-ERR store failed\r\n");
                         return DISPATCH_ERROR;
                     }
                     int hl2 = snprintf(temp, sizeof(temp), ":%u\r\n", rc);
@@ -1252,7 +1253,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 return DISPATCH_ERROR;
             }
             {
-                uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+                /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
                 set_cleanup_entry(entry);
                 int ret = dict_delete(kv_dict_for(hash), key, (uint32_t)strlen(key), hash);
                 dynbuf_cat(wb, ret == 0 ? REP_OK : REP_NIL,
@@ -1271,7 +1272,7 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 return DISPATCH_ERROR;
             }
             {
-                uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+                /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
                 if (check_expiry(entry, key, hash))
                     dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
                 else

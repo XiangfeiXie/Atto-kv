@@ -231,23 +231,134 @@ TSAN bugs is cheaper than chasing perf regressions across machines.
             +50% at the t=2 sweet spot purely from architecture
             +12% extra from finally building with -O3
         - smoke regression after -O3 rebuild: PASS=12 FAIL=0
-  [ ] 8.2  ASAN + TSAN scan
-        - rebuild with -fsanitize=address run multi_thread_smoke.sh,
-          expect PASS=12 FAIL=0 + no leak report
-        - rebuild with -fsanitize=thread, same smoke; expect zero
-          TSAN warnings (any warning = real bug, fix before moving on)
-  [ ] 8.1  make smoke / CI hook
-        - add Makefile target `make smoke` that runs the smoke test;
-          fail the build on smoke FAIL>0
-  [ ] 8.3  30-min soak
-        - redis-benchmark looped 30 min + BGSAVE × 5 + FLUSHDB ×1
-        - sample VmRSS, fd count, slowlog every 60s; check monotonic
+  [x] 8.2  ASAN + TSAN scan  (DONE 2026-05-17)
+        - ASAN build (build-asan/): full multi_thread_smoke 12/12 PASS,
+          zero ASAN findings (no leak, no UAF, no buffer overflow).
+          Phase 6.2 cleanup-attribute lock guards prove memory-safe.
+        - TSAN found three real issues + a class of kernel-mediated
+          false positives:
+          * REAL FIX 1 — conn_release ordering.  Used to be
+              dynbuf_free → close(fd) → memset(c, 0, sizeof(*c))
+            After close() the kernel may immediately hand fd to another
+            worker via SO_REUSEPORT; the memset then stomps the new
+            owner's slot init.  Fixed by reordering to
+              dynbuf_free → memset → close
+            so every slot mutation is done BEFORE releasing fd.
+          * REAL FIX 2 — g_cached_ms torn-read potential.  Worker 0
+            wrote, all workers read, no atomic.  Now _Atomic long long
+            with relaxed memory_order; on x86_64 compiles to plain mov.
+          * REFACTOR — client_t lazy alloc.  Used to be in
+            kvs_dispatch (`if (!c->client) c->client = calloc(...)`),
+            which TSAN flagged as racing with the previous owner's
+            conn_release.  Moved to proactor.c EVENT_ACCEPT block so
+            every conn_pool[fd] write is inside the kernel-mediated
+            close→accept ownership window.  Bonus: removes a per-
+            dispatch branch — dev_quick LRANGE 56k→65k (+16%).
+          * SUPPRESSION — test/bench/tsan.suppressions.  conn_pool[]
+            is shared across workers, indexed by fd.  fd reuse is
+            mediated by kernel close()/accept() ordering which TSAN
+            cannot observe.  Suppress race:dynbuf_init, race:dynbuf_free,
+            race:worker_loop, race:block_check_timeouts.  Suppression
+            scope explicitly avoids kvs_dispatch so Phase 6.2 lock
+            changes remain TSAN-visible.
+        - test/bench/tsan_lock_smoke.sh — focused smoke (banner +
+          concurrent rdlock readers + rd/wr interleave + lazy-expire
+          upgrade + MGET/MSET cross-shard + BLPOP cross-worker), runs
+          in 30-60s under TSAN (vs 3-5min for full smoke).  Result:
+          PASS=6  FAIL=0  TSAN_warnings=0
+        - Release smoke regression: 12/12 PASS unchanged
+        - dev_quick steady: SET=388k GET=385k MSET=157k LRANGE=65k
+        - tsan_lock_smoke must pass before any future locking change
+          merges; full multi_thread_smoke + ASAN/TSAN sanitizer matrix
+          recommended once per phase landing
+  [x] 8.1  make smoke / CI hook  (DONE 2026-05-17)
+        - 4 cmake custom targets in CMakeLists.txt:
+            cmake --build build --target smoke       (Release 12-check)
+            cmake --build build --target asan-smoke  (ASAN, build-asan/)
+            cmake --build build --target tsan-smoke  (TSAN focused, build-tsan/)
+            cmake --build build --target smoke-all   (the merge gate)
+        - smoke depends on kvstore so it auto-rebuilds; asan/tsan
+          targets exec the script directly (script self-checks for
+          missing sanitizer binary and prints a build hint).
+        - smoke-all chains Release → ASAN → TSAN; first FAIL stops
+          the chain.  Verified end-to-end: 12 + 12 + 6 PASS = 30
+        - sh subshell-parens gotcha: cmake escapes commands for
+          /bin/sh, so any "(text)" in COMMAND echo strings becomes a
+          subshell.  Use brackets instead: "[Release]" not "(Release)"
+  [~] 8.3  Soak script + 10-min smoke PASS  (DONE 2026-05-17, full 30-min pending)
+        - test/bench/soak.sh — long-running soak harness
+            * boots kvstore (configurable conf), runs redis-benchmark
+              loop (set/get/incr/lpush/lrange) + BGSAVE+FLUSHDB on a 5-min
+              cycle, samples VmRSS / fd count / DBSIZE every 60s
+            * verdict criteria: RSS_final < 1.5× post-warmup baseline,
+              fd drift < 50, no PID disappearance
+            * usage: SOAK_MINUTES=N test/bench/soak.sh
+        - 10-min smoke result on Ubuntu-24 6c:
+            * RSS 30MB → 37MB (ratio 1.25, under threshold)
+            * fd count: stable at 66 (drift 0)
+            * DBSIZE cycled 1↔3 across BGSAVE+FLUSHDB cleanly
+            * VERDICT: PASS
+        - Full 30-min run deferred to overnight; harness ready.
+
+Phase 7 — Operability & online tuning
+======================================
+
+  [x] 7.2  Online CONFIG GET / SET + RESP truncation bug class fix
+           (DONE 2026-05-17)
+        - Added CONFIG GET / SET / RESETSTAT / REWRITE in kvstore.c.
+            * Online-settable: loglevel, maxclients
+              (__atomic_store_n(_, _, RELAXED) — workers pick up
+              new value on next dispatch, TSAN-clean)
+            * Read-only-at-runtime: port, persistence, threads,
+              xdp, cpu_pin (CONFIG GET works; CONFIG SET → -ERR
+              with explanation)
+            * RESETSTAT: no-op +OK (no stats infra yet)
+            * REWRITE: -ERR not implemented (would need conf-file
+              merge logic preserving comments)
+        - test/bench/config_smoke.sh — 24 checks, all PASS
+        - SYSTEMIC BUG FOUND DURING REVIEW:
+            * dynbuf_cat(wb, "lit", N) idiom required manual byte
+              counts.  Initial CONFIG handler had hardcoded 86 for
+              a literal containing UTF-8 em-dash (3 bytes each) —
+              RESP frame was truncated, missing `\r\n`, hung client.
+            * Codebase audit (Python byte-counter): 41/100 sites
+              had wrong N.  33 truncated `\r\n` → client hang;
+              8 over-read past literal → extra `\0` byte (UB).
+            * Fix: added dynbuf_lit(wb, s) macro in
+              @/home/xxf/9.1-kvstore/src/util/dynbuf.h:34 — uses
+              `"" s` to enforce literal-only and sizeof(s)-1 for
+              the byte count.  Compile-time safety.
+            * Sweep: converted 193 sites across 6 files to
+              dynbuf_lit.  Post-sweep audit: 0 mismatches, 0
+              hand-counted sites left.
+            * RESP parser itself (protocol.c) is fine — bug was
+              purely on the response-emit side.
+        - 3 build variants clean; smoke-all 30/30 PASS;
+          config_smoke 24/24 PASS.
 
 Phase 6 — Single-core dispatcher efficiency
 ============================================
 Each item is core-count independent.  Each worker on the future big box
 inherits the same speedup, so doing this on 6c first is correct.
 
+  [x] 6.1b Eliminate redundant kv_hash recomputes in LIST/HASH/SET/ZSET  (DONE 2026-05-17)
+        - Extended signatures of list_cmd / hash_cmd / set_cmd / zset_cmd
+          to accept `uint64_t hash` (matches Phase 6.1's string_cmd shape).
+        - Inside each handler, ~10-15 occurrences of
+          `kv_hash((const uint8_t *)key, ...)` per file were the same
+          primary-key recompute the dispatcher already did.  Replaced
+          with reuse of the param.  Variant patterns:
+            uint64_t h = kv_hash(...)     → uint64_t h = hash
+            uint64_t hash = kv_hash(...)  → DELETE (shadowed param)
+            uint64_t khash = kv_hash(...) → uint64_t khash = hash
+            uint64_t src_h = kv_hash(...) → uint64_t src_h = hash (LMOVE)
+        - Secondary keys (LMOVE/RPOPLPUSH dst, multi-key iter,
+          resolve_set_key on a different key) intentionally left alone.
+        - Saves ~5-10 ns per dispatched command on the LIST/HASH/SET/ZSET
+          paths; not visible on dev_quick SET/GET (already pre-optimized
+          by Phase 6.1) but lifts the ceiling on HSET/SADD/ZADD batches.
+        - All 3 build variants (Release / ASAN / TSAN) clean; smoke-all
+          30/30 PASS; dev_quick unchanged within noise.
   [x] 6.1  Eliminate double dict_find — STRING engine done  (DONE 2026-05-17)
         - root cause: string_cmd received `entry` from dispatcher but did
           `(void)entry;`, then engine_set_raw/engine_get_raw re-hashed
@@ -272,36 +383,136 @@ inherits the same speedup, so doing this on 6c first is correct.
           deferred to 6.1b (lower priority, those aren't the hot path
           on the SET/GET-dominated benchmark)
 
-  [ ] 6.2  Split read-only commands to rdlock
-        - strict-RO  (rdlock only):
-            STRLEN HLEN HEXISTS HKEYS HVALS LLEN LINDEX SCARD SMEMBERS
-            SISMEMBER ZCARD ZSCORE ZCOUNT TYPE EXISTS DBSIZE
-        - lazy-expire-RO (rdlock-then-upgrade):
-            GET HGET LRANGE SMEMBERS ZRANGE  — read under rdlock; if
-            entry found expired, drop rdlock, take wrlock, re-check,
-            then expire + return nil
-        - 6c can't fully show the gain (heavy shared-shard rdlock
-          contention needs many workers), but code is ready for
-          big-box scaling validation
+  [x] 6.2  Split read-only commands to rdlock  (DONE 2026-05-17)
+        - root cause: kvs_dispatch unconditionally took shard wrlock
+          on every keyed command.  Read-heavy workloads (GET/HGET/
+          LRANGE/...) serialised on a per-shard wrlock with the same
+          futex/atomic cost as writers, so adding more workers past the
+          shard count contributed contention but no throughput.
+        - new SHARD_LOCK(h, write_mode) macro replaces SHARD_WRLOCK;
+          dispatcher classifies cmd_type + is_write BEFORE locking, so
+          rdlock is taken for reads and wrlock only for writers
+        - SHARD_UPGRADE_TO_WR() macro for lazy-expire path: if a reader
+          finds an expired entry under rdlock, drop rdlock + take
+          wrlock + re-find (another writer may have deleted it during
+          the upgrade), then delete
+        - multi-key paths converted: MGET (pure read), MSETNX pre-check
+          (read-only abort decision), MSET / MSETNX XDP-cache read-back
+          (reads value just written) — all rdlock; DEL / MSET write
+          phase / MSETNX write phase remain wrlock as required
+        - back-compat: SHARD_WRLOCK kept as `SHARD_LOCK((h),1)` alias
+          so any future call site that needs explicit wrlock reads
+          unchanged
+        - 4B.6 smoke regression: PASS=12 FAIL=0
+        - Phase 6.2 baseline_capture sweep on 6c (snapshot_7e046c1):
+            t=1 pin=off    SET=395k  GET=360k  (vs baseline GET=282k → +27%)
+            t=1 pin=auto   SET=396k  GET=359k
+            t=2 pin=off    SET=490k  GET=488k  (vs baseline GET=436k → +12%)
+            t=2 pin=auto   SET=492k  GET=494k  ← still best
+            t=4 pin=off    SET=488k  GET=485k  (vs baseline 437/437 → +12/+11)
+            t=4 pin=auto   SET=464k  GET=489k  (vs baseline 434/431 → +7/+13)
+            t=5 pin=off    SET=492k  GET=477k
+            t=5 pin=auto   SET=438k  GET=489k  (GET +13% vs baseline 433k)
+            t=6 pin=off    SET=478k  GET=430k  (new — basleine had no t=6)
+            t=6 pin=auto   SET=434k  GET=493k
+        - Notable: GET ≥ SET at t=2 (494k > 492k) for the first time;
+          rdlock differentiation gives readers true concurrency
+        - On 6c the gain caps because 2 workers + bench client's 6
+          threads already fill the cores; full benefit lands on a
+          machine with >shard-count workers, which is where Phase 7
+          / Phase 5-validate live
+        - Snapshot saved at test/bench/snapshot_7e046c1_ubuntu-24_6c.txt;
+          locked baseline (e6a1ff8) untouched
+
+  [x] 6.2b  Case-insensitive command dispatch  (DONE 2026-05-17)
+        - root cause: kvs_dispatch did memcmp-on-raw-bytes (TOKEN_EQ
+          + CMD4 jump-table) so `set k v` / `Set k v` returned
+          "ERR unknown command", breaking redis client compat
+        - fix: at top of kvs_dispatch, copy cmd.ptr into a 32-byte
+          stack buffer with a branchless ASCII A-Z conversion
+          (mask 0xDF for [a-z] only); rewrite cmd.ptr and tokens[0]
+          to the canonical form so all keyless TOKEN_EQ chains, the
+          CMD4 switch, AND the per-type engine TOKEN_EQ all see the
+          same uppercase form
+        - non-letter bytes pass through unchanged; commands longer
+          than 32 bytes are truncated for matching (longest real
+          Redis command is ZREMRANGEBYSCORE = 16 bytes)
+        - cost: ~5 ns / dispatch (≤16 byte mask loop); dev_quick
+          unchanged (SET 393k / GET 390k vs 388k / 385k baseline)
+        - Verified: lowercase set/get/rpush/lrange all work, mixed
+          case Set/Get works, unknown commands still rejected
+        - smoke-all: 12 + 12 + 6 = 30 PASS
 
   [ ] 6.3  perfect-hash command dispatch (gperf) — gated by perf top
         - only do if `perf top` of running kvstore shows command-name
           comparison in top 10; otherwise skip
 
-  [ ] 6.4  per-shard incremental rehash batching
-        - currently dict_add/del runs `dict_rehash_step(d, 1)`;
-          change to `dict_rehash_step(d, REHASH_BATCH)` where
-          REHASH_BATCH = 8.  Amortises rehash cost when many writes
-          arrive at the same shard
+  [x] 6.4  per-shard incremental rehash batching  (DONE 2026-05-17)
+        - REHASH_BATCH = 8 in kv_dict.c, applied to all four
+          dict_rehash_step call sites: dict_add (during rehash),
+          dict_add_raw (same), dict_delete (after found), dict_delete
+          (after not-found)
+        - rationale: each write op now migrates 8 buckets instead of
+          1, shrinking the rehash window 8× and getting dict_find
+          back onto the single-table fast path sooner.  GET on the
+          rdlock path benefits directly.
+        - cost: per-write rehash cost rises ~8x in steady state, but
+          each entry still migrates exactly once total, so amortised
+          O(1) is preserved.  Tail latency stayed flat at SET p50
+          ≈ 2.5 ms in dev_quick.
+        - REHASH_BATCH constant has comment explaining the
+          1/4/8/16+ trade-off and why 8 was chosen.
+        - smoke-all: 12 + 12 + 6 = 30 PASS, dev_quick steady
 
 Phase 7 — Software-stall elimination
 =====================================
-  [ ] 7.1  AOF rewrite background-thread (mirror 4B.4 BGSAVE pattern)
-        - fork + COW snapshot, child rewrites, parent renames
-        - acquires all shard wrlocks briefly, like BGSAVE does
+  [/] 7.1  AOF rewrite background-thread  (Phase 7.1.0 STUB DONE 2026-05-17)
+        - V2 implementation deferred until AOF actually grows large
+          enough for rewrite to matter on this dev box (currently
+          ≤ 10 MB across smoke + dev_quick).  Stubbed cleanly so the
+          command surface is in place and the implementation slot is
+          unambiguous.
+        - aof_rewrite_bg() in persistence.c returns -1; BGREWRITEAOF
+          dispatch in kvstore.c maps that to a -ERR reply.  Both
+          paths log a pointer to the design notes.
+        - persistence.c "Part 2b" header has the full V2 plan: trigger
+          guard, kv_shards_lock_all_for_snapshot snapshot reuse, child
+          RESP-emit via io_uring, rewrite buffer hooked into
+          aof_async_append, finalize via worker-0-tick polling of a
+          SIGCHLD-set flag.  Roughly 200 LOC mirroring rdb_save_async_uring.
+        - To activate: replace the stub body with the V2 implementation
+          described in Part 2b; no API change required.
+  [ ] 7.1  AOF rewrite background-thread (V2 — full implementation)
+        - prereq: workload that actually grows AOF past ~100 MB;
+          schedule once on a bigger box or with a soak that includes
+          repeated SET/EXPIRE churn
+  [/] 7.2  Deployment modes / threads -N semantics  (PARTIAL DONE 2026-05-17)
+        Three-tier deployment configs landed; runtime CONFIG SET still pending.
+        - threads value semantics extended in src/core/config.c:
+            threads = 0   → auto: nproc - 1 (existing default)
+            threads > 0   → explicit worker count (existing)
+            threads < 0   → "auto-leave |N|": shared-server / laptop-friendly
+              e.g. threads -2 on 6c box → 4 workers; on 16c → 14
+              e.g. threads -10 on 6c box → clamped to 1 worker
+        - cgroup v2 cpu.max already-read function (read_cgroup_cpu_quota)
+          now also caps the auto + auto-leave paths at quota - reserve.
+          Container with --cpus=4 + threads -2 → 2 workers automatically.
+        - Three deployment configs:
+            conf/kvstore-server.conf    专用服务器, threads 0 (auto), AOF+RDB
+            conf/kvstore-shared.conf    共享/容器, threads -2 (auto-leave 2)
+            conf/kvstore-dev.conf       开发笔记本, threads -2, persistence none
+        - README "部署模式" section documents threads -N semantics, when
+          to use which config, the "绑核 ≠ 100% 占用" io_uring sleep
+          property, and systemd Nice/CPUWeight knobs for further yield.
+        - parse_int range extended to [-32, 64] for threads key.
+        - Verified all three configs boot correctly on 6c box; smoke-all
+          12 + 12 + 6 = 30 PASS unchanged.
   [ ] 7.2  Online CONFIG SET for selected runtime params
         - safe: loglevel, maxclients (grow only), persistence switch
         - rejected: threads, cpu_pin, port, network (need restart)
+        - cpu_pin can in principle be done at runtime via
+          pthread_setaffinity_np against each g_workers[i].thread,
+          but ROI low on a single-machine project — defer.
   [ ] 7.3  Replication backlog MT-safe audit
         - currently the WAL/repl backlog push is in the dispatcher's
           write path; audit whether the producer mu from 4B.3 covers

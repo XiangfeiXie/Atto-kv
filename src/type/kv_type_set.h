@@ -20,7 +20,10 @@
  */
 
 /* Command dispatch for SET-type keys. */
+/* Phase 6.1b: pre-computed hash for args[0] passed in from dispatcher
+ * to skip redundant kv_hash recomputes inside the handler. */
 dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
+                          uint64_t hash,
                           kvs_token_t *args, int argc, DynBuf *wb,
                           const char *msg_raw, int msg_len,
                           client_t *client);

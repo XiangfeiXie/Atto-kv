@@ -16,7 +16,8 @@
 
 set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-KVS="$ROOT/build/kvstore"
+# Allow overriding for sanitizer builds: KVS=$(pwd)/build-asan/kvstore ./smoke.sh
+KVS="${KVS:-$ROOT/build/kvstore}"
 
 PASS=0
 FAIL=0

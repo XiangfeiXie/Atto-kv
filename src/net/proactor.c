@@ -14,6 +14,7 @@
 #include "config.h"
 #include "protocol.h"
 #include "block.h"
+#include "client.h"        /* Phase 8.2 — eager client_t alloc on accept */
 #include "kvstore.h"
 #include "numa_alloc.h"     /* Phase 5.4 — NUMA-aware allocation skeleton */
 
@@ -238,7 +239,26 @@ static void set_event_wake_read(struct io_uring *ring, int evfd) {
     memcpy(&sqe->user_data, &ci, sizeof(ci));
 }
 
-/* ── Release a connection slot ── */
+/* ── Release a connection slot ──
+ *
+ * conn_pool[] is a SHARED global array indexed by fd.  Different workers
+ * (SO_REUSEPORT) accept() different connections, but the kernel may hand
+ * the same fd back to a different worker immediately after close().
+ *
+ * Concretely the cross-worker fd-reuse race used to be:
+ *   1. Worker A: dynbuf_free(c->...)
+ *   2. Worker A: close(fd)              ← kernel can reuse fd from now on
+ *   3. (race) Worker B: accept() returns same fd
+ *   3. (race) Worker B: dynbuf_init(c)  ← writes the slot
+ *   4. Worker A: memset(c, 0, ...)      ← stomps Worker B's init
+ *
+ * Fix: do EVERY slot mutation before close().  After close() the slot
+ * is owned by whichever worker accepts the fd next; we must not touch
+ * it again.  TSAN will still flag the dynbuf_free here as racing with
+ * the other worker's dynbuf_init on the same address — that race is
+ * mediated by the kernel close/accept ordering which TSAN cannot see;
+ * see test/bench/tsan.suppressions for the suppression entry.
+ */
 static void conn_release(int fd) {
     if (fd < 0 || fd >= conn_pool_size) return;
     struct conn *c = &conn_pool[fd];
@@ -249,8 +269,8 @@ static void conn_release(int fd) {
     }
     dynbuf_free(&c->read_buf);
     dynbuf_free(&c->write_buf);
-    close(fd);
-    memset(c, 0, sizeof(*c));
+    memset(c, 0, sizeof(*c));   /* clear slot BEFORE releasing fd */
+    close(fd);                  /* kernel may now hand fd to another worker */
 }
 
 /* Listen socket is opened in the main thread (so we surface bind errors
@@ -463,13 +483,21 @@ static void *worker_loop(void *arg) {
                     close(connfd);
                     continue;
                 }
-                dynbuf_init(&conn_pool[connfd].read_buf,  KVS_NET_BUF_INIT);
-                dynbuf_init(&conn_pool[connfd].write_buf, KVS_NET_BUF_INIT);
-                conn_pool[connfd].fd = connfd;
-                conn_pool[connfd].active = 1;
-                conn_pool[connfd].r_off = 0;
-                conn_pool[connfd].w_off = 0;
-                conn_pool[connfd].owner_worker_id = w->id;   /* Phase 4B.2 */
+                struct conn *nc = &conn_pool[connfd];
+                dynbuf_init(&nc->read_buf,  KVS_NET_BUF_INIT);
+                dynbuf_init(&nc->write_buf, KVS_NET_BUF_INIT);
+                nc->fd = connfd;
+                nc->active = 1;
+                nc->r_off = 0;
+                nc->w_off = 0;
+                nc->owner_worker_id = w->id;   /* Phase 4B.2 */
+                /* Phase 8.2 — eager client_t allocation.  Used to be lazy
+                 * inside kvs_dispatch, which TSAN flagged as racing with
+                 * the previous owner's conn_release on the same slot.
+                 * Allocating here keeps every conn_pool[fd] write inside
+                 * the kernel-mediated accept→close ownership window. */
+                nc->client = (client_t *)calloc(1, sizeof(client_t));
+                if (nc->client) nc->client->conn = nc;
                 set_event_recv_multishot(ring, connfd);
             }
             else if (result.event == EVENT_READ) {

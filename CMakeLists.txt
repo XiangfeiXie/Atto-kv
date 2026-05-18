@@ -221,3 +221,60 @@ set_target_properties(kvs_top PROPERTIES OUTPUT_NAME "kvs-top")
 
 # ── testcase target ───────────────────────────────────────────────────
 add_executable(testcase test/testcase.c)
+
+# ── Phase 8.1 — smoke / sanitizer-smoke targets ──────────────────────
+# Run as:
+#   cmake --build build --target smoke        (Release smoke 12 checks)
+#   cmake --build build --target asan-smoke   (rebuilds ASAN if needed)
+#   cmake --build build --target tsan-smoke   (TSAN focused lock smoke)
+#   cmake --build build --target smoke-all    (the matrix, gates merges)
+#
+# Each target depends on the right binary so cmake rebuilds before
+# running.  Exit non-zero on any FAIL; CI / hooks can simply run
+# `cmake --build build --target smoke-all`.
+add_custom_target(smoke
+    COMMAND ${CMAKE_COMMAND} -E echo "-- Phase 4B smoke [Release] --"
+    COMMAND ${CMAKE_SOURCE_DIR}/test/bench/multi_thread_smoke.sh
+    DEPENDS kvstore
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    USES_TERMINAL
+    COMMENT "Running Release multi_thread_smoke.sh"
+)
+
+# ASAN/TSAN builds live in separate build dirs so the targets here
+# only invoke the smoke scripts; the sanitizer build is the user's
+# responsibility (see test/bench/tsan.suppressions header for the
+# canonical configure flags).  Both targets fail loudly if the
+# expected binary is missing.
+add_custom_target(asan-smoke
+    COMMAND ${CMAKE_COMMAND} -E echo "-- Phase 4B smoke [ASAN] --"
+    COMMAND ${CMAKE_COMMAND} -E env
+            KVS=${CMAKE_SOURCE_DIR}/build-asan/kvstore
+            ASAN_OPTIONS=halt_on_error=0:detect_leaks=1:abort_on_error=0
+            ${CMAKE_SOURCE_DIR}/test/bench/multi_thread_smoke.sh
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    USES_TERMINAL
+    COMMENT "Running ASAN multi_thread_smoke.sh"
+)
+
+add_custom_target(tsan-smoke
+    COMMAND ${CMAKE_COMMAND} -E echo "-- Phase 8.2 TSAN focused lock smoke --"
+    COMMAND ${CMAKE_COMMAND} -E env
+            KVS=${CMAKE_SOURCE_DIR}/build-tsan/kvstore
+            ${CMAKE_SOURCE_DIR}/test/bench/tsan_lock_smoke.sh
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    USES_TERMINAL
+    COMMENT "Running TSAN lock smoke"
+)
+
+# Roll-up target — the merge gate.  Runs Release first (fastest, most
+# coverage), then ASAN, then TSAN.  Each script exits non-zero on FAIL
+# so cmake will halt the chain at the first failure.
+add_custom_target(smoke-all
+    DEPENDS smoke
+    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target asan-smoke
+    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target tsan-smoke
+    COMMAND ${CMAKE_COMMAND} -E echo "OK smoke + asan-smoke + tsan-smoke all green"
+    USES_TERMINAL
+    COMMENT "Phase 8.1 — full sanitizer matrix smoke (gate for any locking change)"
+)

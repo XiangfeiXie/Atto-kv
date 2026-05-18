@@ -20,7 +20,10 @@
  * Shrink threshold: 64 fields (hysteresis to prevent boundary jitter).
  */
 
+/* Phase 6.1b: pre-computed hash for args[0] passed in from dispatcher
+ * to skip redundant kv_hash recomputes inside the handler. */
 dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
+                           uint64_t hash,
                            kvs_token_t *args, int argc, DynBuf *wb,
                            const char *msg_raw, int msg_len,
                            client_t *client);

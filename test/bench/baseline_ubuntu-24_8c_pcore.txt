@@ -1,0 +1,25 @@
+============================================================
+kvstore 8c P-core baseline — captured 2026-05-18T02:45:34+00:00
+  host       : ubuntu-24
+  CPU        : i7-13620H (6P + 2E exposed in VM)
+  taskset    : 0x3f (cores 0-5 = 6 P-cores)
+  kernel     : 6.8.0-111-generic
+  bench      : redis-benchmark -c 400 -n 1000000 -P 10
+  build hash : 7e046c1
+  mode       : CO-LOCATED (client + server share same 6 P-cores)
+============================================================
+
+  Build type  : Release
+
+Sweep — varying server worker count and bench_threads to expose the
+        co-location tradeoff (more server threads = fewer client threads):
+
+  t=1 pin=auto bench_threads=5  SET= 359453.62  GET= 328083.97
+  t=2 pin=auto bench_threads=4  SET= 487567.00  GET= 491642.09
+  t=3 pin=auto bench_threads=3  SET= 438020.16  GET= 329055.59
+  t=4 pin=auto bench_threads=2  SET= 261369.58  GET= 242189.38
+  t=5 pin=auto bench_threads=1  SET= 134970.98  GET= 165645.19
+
+Note: optimal split tends to be t≈2-3 with bench_threads≈3-4 because
+      the server is more CPU-bound than the bench client.  Real
+      scaling requires 2-VM separation; see test/bench/vs_redis.sh.

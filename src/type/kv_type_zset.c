@@ -900,14 +900,14 @@ static void resp_write_score(DynBuf *wb, double s) {
     char hdr[24];  int hl   = snprintf(hdr,  sizeof(hdr),  "$%d\r\n", slen);
     dynbuf_cat(wb, hdr, hl);
     dynbuf_cat(wb, sbuf, slen);
-    dynbuf_cat(wb, "\r\n", 2);
+    dynbuf_lit(wb, "\r\n");
 }
 
 static void resp_write_bulk_z(DynBuf *wb, const char *s, uint32_t l) {
     char hdr[24]; int hl = snprintf(hdr, sizeof(hdr), "$%u\r\n", l);
     dynbuf_cat(wb, hdr, hl);
     dynbuf_cat(wb, s, (int)l);
-    dynbuf_cat(wb, "\r\n", 2);
+    dynbuf_lit(wb, "\r\n");
 }
 
 /* =====================================================================
@@ -973,6 +973,7 @@ void zset_rebuild_encoding(kv_entry_t *e) {
  * ===================================================================== */
 
 dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
+                           uint64_t hash,
                            kvs_token_t *args, int argc, DynBuf *wb,
                            const char *msg_raw, int msg_len,
                            client_t *client)
@@ -1010,28 +1011,28 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 idx++;
             }
             if (flag_nx && flag_xx) {
-                dynbuf_cat(wb, "-ERR XX and NX options at the same time are not compatible\r\n", 60);
+                dynbuf_lit(wb, "-ERR XX and NX options at the same time are not compatible\r\n");
                 return DISPATCH_ERROR;
             }
             if (flag_nx && (flag_gt || flag_lt)) {
-                dynbuf_cat(wb, "-ERR GT, LT, and/or NX options at the same time are not compatible\r\n", 68);
+                dynbuf_lit(wb, "-ERR GT, LT, and/or NX options at the same time are not compatible\r\n");
                 return DISPATCH_ERROR;
             }
             if (flag_gt && flag_lt) {
-                dynbuf_cat(wb, "-ERR GT, LT options at the same time are not compatible\r\n", 57);
+                dynbuf_lit(wb, "-ERR GT, LT options at the same time are not compatible\r\n");
                 return DISPATCH_ERROR;
             }
             if ((argc - idx) < 2 || ((argc - idx) % 2) != 0) {
-                dynbuf_cat(wb, "-ERR syntax error\r\n", 19);
+                dynbuf_lit(wb, "-ERR syntax error\r\n");
                 return DISPATCH_ERROR;
             }
             if (flag_incr && (argc - idx) != 2) {
-                dynbuf_cat(wb, "-ERR INCR option supports a single increment-element pair\r\n", 60);
+                dynbuf_lit(wb, "-ERR INCR option supports a single increment-element pair\r\n");
                 return DISPATCH_ERROR;
             }
 
             /* Ensure entry exists (unless XX prevents creation). */
-            uint64_t khash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            uint64_t khash = hash;  /* Phase 6.1b: reuse dispatcher hash */
             kv_entry_t *e = entry;
             if (!e || check_expiry(e, key, khash)) {
                 if (flag_xx) {
@@ -1042,7 +1043,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 char data[16]; zset_build_empty(data);
                 e = dict_add(kv_dict_for(khash), key, (uint32_t)strlen(key), data, ZSET_EMPTY_SIZE, khash);
                 if (!e) {
-                    dynbuf_cat(wb, "-ERR create zset failed\r\n", 24);
+                    dynbuf_lit(wb, "-ERR create zset failed\r\n");
                     return DISPATCH_ERROR;
                 }
             }
@@ -1054,7 +1055,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
             for (int i = idx; i + 1 < argc; i += 2) {
                 double score;
                 if (parse_score(args[i], &score) < 0) {
-                    dynbuf_cat(wb, "-ERR value is not a valid float\r\n", 34);
+                    dynbuf_lit(wb, "-ERR value is not a valid float\r\n");
                     return DISPATCH_ERROR;
                 }
                 double cur = 0;
@@ -1079,7 +1080,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 if (zset_set_member(&e, key, (uint32_t)strlen(key),
                                     target, args[i+1].ptr,
                                     (uint32_t)args[i+1].len, &added) < 0) {
-                    dynbuf_cat(wb, "-ERR zadd failed\r\n", 17);
+                    dynbuf_lit(wb, "-ERR zadd failed\r\n");
                     return DISPATCH_ERROR;
                 }
                 if (added) total_added++;
@@ -1104,7 +1105,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
-            uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
             if (check_expiry(entry, key, hash)) {
                 dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN);
                 return DISPATCH_OK;
@@ -1158,7 +1159,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
-            uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
             if (check_expiry(entry, key, hash)) {
                 dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
                 return DISPATCH_OK;
@@ -1192,7 +1193,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 int hl = snprintf(temp, sizeof(temp), "$%d\r\n", slen);
                 dynbuf_cat(wb, temp, hl);
                 dynbuf_cat(wb, sbuf, slen);
-                dynbuf_cat(wb, "\r\n", 2);
+                dynbuf_lit(wb, "\r\n");
             }
             return DISPATCH_OK;
         }
@@ -1203,7 +1204,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
-            uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
             if (check_expiry(entry, key, hash)) {
                 dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN);
                 return DISPATCH_OK;
@@ -1220,7 +1221,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
-            uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
             if (check_expiry(entry, key, hash)) {
                 dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
                 return DISPATCH_OK;
@@ -1265,14 +1266,14 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
 
         if (TOKEN_EQ(cmd, "ZRANGE")) {
             if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
-            if (!entry) { dynbuf_cat(wb, "*0\r\n", 4); return DISPATCH_OK; }
+            if (!entry) { dynbuf_lit(wb, "*0\r\n"); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_ZSET) {
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
-            uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
             if (check_expiry(entry, key, hash)) {
-                dynbuf_cat(wb, "*0\r\n", 4);
+                dynbuf_lit(wb, "*0\r\n");
                 return DISPATCH_OK;
             }
 
@@ -1297,7 +1298,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
             if (start < 0) start = 0;
             if (stop >= (int)len) stop = (int)len - 1;
             if (start > stop || len == 0) {
-                dynbuf_cat(wb, "*0\r\n", 4);
+                dynbuf_lit(wb, "*0\r\n");
                 return DISPATCH_OK;
             }
 
@@ -1316,7 +1317,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                         int bhl = snprintf(bhdr, sizeof(bhdr), "$%u\r\n", mlen);
                         dynbuf_cat(wb, bhdr, bhl);
                         dynbuf_cat(wb, p + 4, mlen);
-                        dynbuf_cat(wb, "\r\n", 2);
+                        dynbuf_lit(wb, "\r\n");
                         if (withscores) {
                             double sc = pk_read_score(p + 4 + mlen);
                             char sbuf[64];
@@ -1324,7 +1325,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                             bhl = snprintf(bhdr, sizeof(bhdr), "$%d\r\n", slen);
                             dynbuf_cat(wb, bhdr, bhl);
                             dynbuf_cat(wb, sbuf, slen);
-                            dynbuf_cat(wb, "\r\n", 2);
+                            dynbuf_lit(wb, "\r\n");
                         }
                     }
                     p += 4 + mlen + 8;
@@ -1337,14 +1338,14 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                     int bhl = snprintf(bhdr, sizeof(bhdr), "$%u\r\n", node->member_len);
                     dynbuf_cat(wb, bhdr, bhl);
                     dynbuf_cat(wb, node->member, node->member_len);
-                    dynbuf_cat(wb, "\r\n", 2);
+                    dynbuf_lit(wb, "\r\n");
                     if (withscores) {
                         char sbuf[64];
                         int slen = snprintf(sbuf, sizeof(sbuf), "%.17g", node->score);
                         bhl = snprintf(bhdr, sizeof(bhdr), "$%d\r\n", slen);
                         dynbuf_cat(wb, bhdr, bhl);
                         dynbuf_cat(wb, sbuf, slen);
-                        dynbuf_cat(wb, "\r\n", 2);
+                        dynbuf_lit(wb, "\r\n");
                     }
                     node = node->level[0].forward;
                 }
@@ -1359,7 +1360,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
-            uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
             if (check_expiry(entry, key, hash)) {
                 dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN);
                 return DISPATCH_OK;
@@ -1368,7 +1369,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
             double min_score, max_score; int min_excl=0, max_excl=0;
             if (parse_score_range(args[1], &min_score, &min_excl) < 0 ||
                 parse_score_range(args[2], &max_score, &max_excl) < 0) {
-                dynbuf_cat(wb, "-ERR value is not a valid float\r\n", 34);
+                dynbuf_lit(wb, "-ERR value is not a valid float\r\n");
                 return DISPATCH_ERROR;
             }
 
@@ -1400,21 +1401,21 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
 
         if (TOKEN_EQ(cmd, "ZRANGEBYSCORE")) {
             if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
-            if (!entry) { dynbuf_cat(wb, "*0\r\n", 4); return DISPATCH_OK; }
+            if (!entry) { dynbuf_lit(wb, "*0\r\n"); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_ZSET) {
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
-            uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
             if (check_expiry(entry, key, hash)) {
-                dynbuf_cat(wb, "*0\r\n", 4);
+                dynbuf_lit(wb, "*0\r\n");
                 return DISPATCH_OK;
             }
 
             double min_score, max_score; int min_excl=0, max_excl=0;
             if (parse_score_range(args[1], &min_score, &min_excl) < 0 ||
                 parse_score_range(args[2], &max_score, &max_excl) < 0) {
-                dynbuf_cat(wb, "-ERR value is not a valid float\r\n", 34);
+                dynbuf_lit(wb, "-ERR value is not a valid float\r\n");
                 return DISPATCH_ERROR;
             }
 
@@ -1497,14 +1498,14 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 int bhl = snprintf(bhdr, sizeof(bhdr), "$%u\r\n", matches[i].ml);
                 dynbuf_cat(wb, bhdr, bhl);
                 dynbuf_cat(wb, matches[i].m, (int)matches[i].ml);
-                dynbuf_cat(wb, "\r\n", 2);
+                dynbuf_lit(wb, "\r\n");
                 if (withscores) {
                     char sbuf[64];
                     int slen = snprintf(sbuf, sizeof(sbuf), "%.17g", matches[i].s);
                     bhl = snprintf(bhdr, sizeof(bhdr), "$%d\r\n", slen);
                     dynbuf_cat(wb, bhdr, bhl);
                     dynbuf_cat(wb, sbuf, slen);
-                    dynbuf_cat(wb, "\r\n", 2);
+                    dynbuf_lit(wb, "\r\n");
                 }
             }
             return DISPATCH_OK;
@@ -1514,23 +1515,23 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
             if (argc != 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
             double incr;
             if (parse_score(args[1], &incr) < 0) {
-                dynbuf_cat(wb, "-ERR value is not a valid float\r\n", 34);
+                dynbuf_lit(wb, "-ERR value is not a valid float\r\n");
                 return DISPATCH_ERROR;
             }
             /* Create on the fly if missing */
-            uint64_t khash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+            uint64_t khash = hash;  /* Phase 6.1b: reuse dispatcher hash */
             kv_entry_t *e = entry;
             if (!e || check_expiry(e, key, khash)) {
                 char init[16]; zset_build_empty(init);
                 e = dict_add(kv_dict_for(khash), key, (uint32_t)strlen(key), init, ZSET_EMPTY_SIZE, khash);
-                if (!e) { dynbuf_cat(wb, "-ERR zincrby failed\r\n", 21); return DISPATCH_ERROR; }
+                if (!e) { dynbuf_lit(wb, "-ERR zincrby failed\r\n"); return DISPATCH_ERROR; }
             }
             double cur = 0;
             zset_get_score(e, args[2].ptr, (uint32_t)args[2].len, &cur);
             double new_score = cur + incr;
             if (zset_set_member(&e, key, (uint32_t)strlen(key),
                                 new_score, args[2].ptr, (uint32_t)args[2].len, NULL) < 0) {
-                dynbuf_cat(wb, "-ERR zincrby failed\r\n", 21);
+                dynbuf_lit(wb, "-ERR zincrby failed\r\n");
                 return DISPATCH_ERROR;
             }
             resp_write_score(wb, new_score);
@@ -1587,7 +1588,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
         /* ── ZREVRANGE key start stop [WITHSCORES] ── */
         if (TOKEN_EQ(cmd, "ZREVRANGE")) {
             if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
-            if (!entry) { dynbuf_cat(wb, "*0\r\n", 4); return DISPATCH_OK; }
+            if (!entry) { dynbuf_lit(wb, "*0\r\n"); return DISPATCH_OK; }
             int start, stop;
             { char tbuf[32]; int nl;
               nl = args[1].len < 31 ? args[1].len : 31;
@@ -1602,7 +1603,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
             if (stop  < 0) stop  = (int)card + stop;
             if (start < 0) start = 0;
             if (stop >= (int)card) stop = (int)card - 1;
-            if (start > stop || card == 0) { dynbuf_cat(wb, "*0\r\n", 4); return DISPATCH_OK; }
+            if (start > stop || card == 0) { dynbuf_lit(wb, "*0\r\n"); return DISPATCH_OK; }
 
             int rng = stop - start + 1;
             int hl2 = snprintf(temp, sizeof(temp), "*%d\r\n",
@@ -1624,11 +1625,11 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
         /* ── ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT off count] ── */
         if (TOKEN_EQ(cmd, "ZREVRANGEBYSCORE")) {
             if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
-            if (!entry) { dynbuf_cat(wb, "*0\r\n", 4); return DISPATCH_OK; }
+            if (!entry) { dynbuf_lit(wb, "*0\r\n"); return DISPATCH_OK; }
             double max_s, min_s; int max_excl=0, min_excl=0;
             if (parse_score_range(args[1], &max_s, &max_excl) < 0 ||
                 parse_score_range(args[2], &min_s, &min_excl) < 0) {
-                dynbuf_cat(wb, "-ERR value is not a valid float\r\n", 34);
+                dynbuf_lit(wb, "-ERR value is not a valid float\r\n");
                 return DISPATCH_ERROR;
             }
             int withscores = 0; long long lim_off = 0, lim_cnt = -1;
@@ -1685,7 +1686,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 if (cnt < 0) cnt = 0;
             }
             if (!entry || zset_card(entry) == 0 || cnt == 0) {
-                dynbuf_cat(wb, "*0\r\n", 4);
+                dynbuf_lit(wb, "*0\r\n");
                 return DISPATCH_OK;
             }
             uint32_t card = zset_card(entry);
@@ -1743,7 +1744,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
             double mn, mx; int mn_excl=0, mx_excl=0;
             if (parse_score_range(args[1], &mn, &mn_excl) < 0 ||
                 parse_score_range(args[2], &mx, &mx_excl) < 0) {
-                dynbuf_cat(wb, "-ERR value is not a valid float\r\n", 34);
+                dynbuf_lit(wb, "-ERR value is not a valid float\r\n");
                 return DISPATCH_ERROR;
             }
             zset_pair_t *arr; uint32_t n;
@@ -1764,7 +1765,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
         if (TOKEN_EQ(cmd, "ZRANDMEMBER")) {
             if (!entry || zset_card(entry) == 0) {
                 if (argc < 2) dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
-                else          dynbuf_cat(wb, "*0\r\n", 4);
+                else          dynbuf_lit(wb, "*0\r\n");
                 return DISPATCH_OK;
             }
             if (argc < 2) {
@@ -1781,7 +1782,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
             long long cnt = atoll(b);
             int withscores = (argc >= 3 && args[2].len == 10 &&
                               memcmp(args[2].ptr, "WITHSCORES", 10) == 0);
-            if (cnt == 0) { dynbuf_cat(wb, "*0\r\n", 4); return DISPATCH_OK; }
+            if (cnt == 0) { dynbuf_lit(wb, "*0\r\n"); return DISPATCH_OK; }
 
             zset_pair_t *arr; uint32_t n;
             if (zset_enum_dup(entry, &arr, &n) < 0) return DISPATCH_ERROR;
@@ -1821,7 +1822,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 return DISPATCH_ERROR;
             }
             {
-                uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+                /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
                 zset_cleanup_entry(entry);
                 int ret = dict_delete(kv_dict_for(hash), key, (uint32_t)strlen(key), hash);
                 dynbuf_cat(wb, ret == 0 ? REP_OK : REP_NIL,
@@ -1840,7 +1841,7 @@ dispatch_result_t zset_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 return DISPATCH_ERROR;
             }
             {
-                uint64_t hash = kv_hash((const uint8_t *)key, (uint32_t)strlen(key));
+                /* Phase 6.1b: param `hash` is the dispatcher's primary-key hash */
                 if (check_expiry(entry, key, hash))
                     dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
                 else

@@ -41,6 +41,19 @@ void rdb_save_sync(void);
 /* RDB：fork + io_uring 批量写，主线程不阻塞 */
 void rdb_save_async_uring(void);
 
+/* Phase 7.1.0 — BGREWRITEAOF stub.
+ *
+ * Trigger an AOF rewrite (compact the AOF by emitting one canonical
+ * SET/HSET/ZADD/RPUSH/SADD per live entry instead of replaying every
+ * historical mutation).  Returns:
+ *   0  rewrite scheduled (or already running)
+ *  -1  not implemented in this build (current state — see persistence.c)
+ *
+ * Design notes for the future implementation are at the top of the
+ * stub body in persistence.c.  Until then this returns -1 and the
+ * BGREWRITEAOF command replies with -ERR. */
+int aof_rewrite_bg(void);
+
 /* mmap 加载：避免逐条 fread 的系统调用开销 */
 void rdb_load_mmap(void);
 void aof_reload_mmap(void);

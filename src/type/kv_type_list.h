@@ -21,7 +21,11 @@
 
 /* Command dispatch for LIST-type keys (or new keys created via LPUSH/RPUSH).
    Returns DISPATCH_BLOCKED for BLPOP/BRPOP when all keys are empty. */
+/* Phase 6.1b: `hash` is the dispatcher's pre-computed hash for the
+ * primary key (args[0]).  Pass it so the handler can skip the
+ * redundant kv_hash recompute on every read command. */
 dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
+                           uint64_t hash,
                            kvs_token_t *args, int argc, DynBuf *wb,
                            const char *msg_raw, int msg_len,
                            client_t *client);

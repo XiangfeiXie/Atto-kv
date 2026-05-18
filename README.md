@@ -11,6 +11,7 @@
 - [快速开始](#快速开始)
 - [编译](#编译)
 - [配置](#配置)
+- [部署模式](#部署模式三档预设配置)
 - [支持的命令](#支持的命令)
 - [网络模型](#网络模型)
 - [持久化](#持久化)
@@ -237,18 +238,74 @@ xdp_iface   lo            # XDP 挂载网卡：本地测试用 lo，远端用实
 sockmap     no            # sockmap 流层观测：yes | no（需 cgroup v2）
 
 # ── Phase 4：多线程 proactor ─────────────────────────────
-threads     0             # 0 = auto (nproc-1); 1 = 单线程；N = 显式 N worker
-                          # 启动时按 nproc / KV_NR_SHARDS / cgroup cpu.max 做 sanity warn
+threads     0             # 0  = auto: nproc - 1（留 1 核给 IRQ/系统）
+                          # >0 = 显式 worker 数
+                          # <0 = "auto-leave |N|"：留 N 核给系统/邻居
+                          # cgroup cpu.max 自动 cap
                           # >1 时启用 SO_REUSEPORT + 32 shard 锁
+cpu_pin     auto          # off | auto | 1,3,5,7
+                          # io_uring DEFER_TASKRUN 闲时 sleep，绑核 ≠ 100% 占用
 ```
 
 > **注意**：`xdp_iface` 必须与流量实际经过的网卡一致。  
 > 本机客户端（连 127.0.0.1 或本机 IP）流量走 `lo`；远端客户端流量走物理网卡（如 `ens33`）。
 
-配置文件示例：
-- `conf/kvstore.conf` — 完整注释参考配置
-- `conf/kvstore-master.conf` — 主机部署配置
-- `conf/kvstore-slave.conf` — 从机部署配置
+---
+
+## 部署模式（三档预设配置）
+
+不同环境对"礼貌让步"的要求不一样。下面三个开箱即用的 `.conf`，对应三种典型场景：
+
+| 配置 | 场景 | `threads` | 行为 |
+|---|---|---|---|
+| `conf/kvstore-server.conf` | **专用服务器**（独占整机） | `0` (auto: `nproc-1`) | 吃满核，QPS 优先，AOF + RDB 双轨 |
+| `conf/kvstore-shared.conf` | **共享服务器 / 容器**（多租户） | `-2` (auto-leave 2) | 留 2 核给邻居，cgroup quota 自动 cap |
+| `conf/kvstore-dev.conf` | **开发笔记本**（IDE + 浏览器并跑） | `-2` | 留核给 IDE，关持久化排除 IO 干扰 |
+
+### 何时用哪个
+
+```bash
+# 专用服务器（16c box → 15 worker）
+./build/kvstore conf/kvstore-server.conf
+
+# 容器 / 共享 server（cpu.max=4 → 自动 cap 在 2 worker）
+./build/kvstore conf/kvstore-shared.conf
+
+# 开发笔记本（6c → 4 worker，IDE 用 2 核不被挤）
+./build/kvstore conf/kvstore-dev.conf
+```
+
+### `threads` 三种语义速查
+
+| 写法 | 含义 | 6c 例子 | 16c 例子 | 容器 cpu.max=4 |
+|---|---|---|---|---|
+| `threads 0` | auto: `nproc - 1` | 5 | 15 | 3 |
+| `threads 4` | 显式 4 worker | 4 | 4 | 4（会 WARN） |
+| `threads -2` | auto-leave 2: `nproc - 2` | 4 | 14 | 2 |
+
+### 为什么"绑核"不会卡住别的程序
+
+`io_uring` 加上 `IORING_SETUP_DEFER_TASKRUN` flag，让 worker 在 SQ 空时主动进入内核 sleep。
+**绑核只决定"我醒着的时候用哪个核"**，闲时该核照常给其他进程用。可用 `pidstat -p $(pidof kvstore) 1` 验证：闲时 `%CPU` 接近 0，不是 100。
+
+如果还想进一步让步（QPS 满载时也不挤别人），用 systemd 配合：
+
+```ini
+[Service]
+ExecStart=/path/to/kvstore /etc/kvstore/kvstore-shared.conf
+Nice=10                          # 优先级低 10 级
+CPUWeight=50                     # cgroup v2 权重减半
+IOSchedulingClass=best-effort
+```
+
+### 配置文件全集
+
+- `conf/kvstore.conf` — 完整注释参考（每个配置项都列出）
+- `conf/kvstore-server.conf` — 专用服务器
+- `conf/kvstore-shared.conf` — 共享 server / 容器
+- `conf/kvstore-dev.conf` — 开发笔记本
+- `conf/kvstore-master.conf` — 主从复制 · 主机
+- `conf/kvstore-slave.conf` — 主从复制 · 从机
 
 ---
 

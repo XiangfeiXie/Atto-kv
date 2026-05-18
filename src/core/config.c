@@ -68,15 +68,43 @@ static int read_cgroup_cpu_quota(void) {
 }
 
 /* Resolve sentinel values and emit sanity warnings.  Called once after
- * the .conf file has been parsed. */
+ * the .conf file has been parsed.
+ *
+ * threads value semantics (Phase 7.2-deploy):
+ *    threads = 0   → auto: nproc - 1 (leave 1 core for IRQ / system)
+ *    threads > 0   → explicit worker count
+ *    threads < 0   → "auto-leave |N|": max(1, nproc - |N|)
+ *                    e.g. threads = -2 on a 6c box → 4 workers
+ *                    e.g. threads = -4 on a 6c box → 2 workers (laptop-friendly)
+ * Cgroup quota: if present and tighter than nproc, the auto and
+ * auto-leave paths cap at quota.  Explicit (positive) values are
+ * honoured as written but a WARN fires if they exceed the quota. */
 static void config_postprocess(void) {
     long nproc = sysconf(_SC_NPROCESSORS_ONLN);
     if (nproc < 1) nproc = 1;
 
-    if (kvs_config.threads <= 0) {
+    /* Cgroup-aware capacity: if /sys/fs/cgroup/cpu.max says we have
+     * 4 cores but the host has 32, the effective ceiling is 4.
+     * Container deployments need this to size workers correctly. */
+    int cgroup_cpus = read_cgroup_cpu_quota();
+    long effective = (cgroup_cpus > 0 && cgroup_cpus < nproc)
+                       ? (long)cgroup_cpus : nproc;
+
+    if (kvs_config.threads == 0) {
+        /* Auto: leave 1 core for OS / IRQ / softirq. */
         kvs_config.threads_auto = 1;
-        kvs_config.threads = (int)((nproc > 1) ? (nproc - 1) : 1);
+        kvs_config.threads = (int)((effective > 1) ? (effective - 1) : 1);
+    } else if (kvs_config.threads < 0) {
+        /* Auto-leave: "reserve |N| cores for everything else".
+         * Used for shared servers and dev laptops where you want the
+         * KV process to be a polite tenant rather than greedy. */
+        int reserve = -kvs_config.threads;
+        kvs_config.threads_auto = 1;
+        long target = effective - reserve;
+        if (target < 1) target = 1;
+        kvs_config.threads = (int)target;
     }
+    /* else: explicit positive value, honoured as-is */
 
     if (kvs_config.threads > nproc) {
         printf("[CONFIG] WARN: threads=%d > online cpus=%ld; "
@@ -88,7 +116,6 @@ static void config_postprocess(void) {
                "(rule-of-thumb: shards >= 8 * threads)\n",
                kvs_config.threads, KV_NR_SHARDS);
     }
-    int cgroup_cpus = read_cgroup_cpu_quota();
     if (cgroup_cpus > 0 && kvs_config.threads > cgroup_cpus) {
         printf("[CONFIG] WARN: threads=%d exceeds cgroup cpu.max=%d\n",
                kvs_config.threads, cgroup_cpus);
@@ -253,8 +280,11 @@ int config_load(const char *path) {
 
         /* ---- Phase 4: multi-worker proactor ---- */
         } else if (strcasecmp(key, "threads") == 0) {
-            /* 0 = auto (nproc-1), resolved in config_postprocess() */
-            parse_int(val, lineno, "threads", 0, 64, &kvs_config.threads);
+            /* 0    = auto (nproc - 1)
+             * > 0  = explicit worker count
+             * < 0  = "auto-leave |N|": shared-server / laptop-friendly
+             * Resolved in config_postprocess(). */
+            parse_int(val, lineno, "threads", -32, 64, &kvs_config.threads);
 
         /* ---- Phase 5.1: CPU pinning ----
          *   cpu_pin off            -> mode=0

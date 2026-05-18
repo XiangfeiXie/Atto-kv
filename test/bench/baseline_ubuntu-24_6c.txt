@@ -1,10 +1,10 @@
 ============================================================
-kvstore baseline — locked 2026-05-17 (Phase 8.4)
+kvstore baseline — captured 2026-05-18T02:44:00+00:00
   host       : ubuntu-24
   nproc      : 6
-  kernel     : 6.8.0-110-generic
+  kernel     : 6.8.0-111-generic
   bench      : redis-benchmark -c 400 -n 1000000 -P 10 --threads 6
-  build hash : e6a1ff8  (first build with CMAKE_BUILD_TYPE=Release)
+  build hash : 7e046c1
 ============================================================
 
   Build type  : Release
@@ -12,18 +12,6 @@ kvstore baseline — locked 2026-05-17 (Phase 8.4)
 
 Sweep (SET / GET QPS, requests-per-second):
 
-  t=1 pin=off   SET=  330141.97  GET=  282406.09
-  t=1 pin=auto  SET=  329815.28  GET=  303490.12
-  t=2 pin=off   SET=  489715.94  GET=  436872.00
-  t=2 pin=auto  SET=  491400.47  GET=  492368.31  ← best
-  t=4 pin=off   SET=  437254.06  GET=  437636.75
-  t=4 pin=auto  SET=  434216.25  GET=  431034.50
-  t=5 pin=off   SET=  421052.62  GET=  437062.91
-  t=5 pin=auto  SET=  434593.62  GET=  433651.34
-
-How to reproduce on a different machine:
-  ./test/bench/baseline_capture.sh
-Then diff baseline_<host>_<nproc>c.txt against this file.
-
-NOTE: this file is the locked Phase 8.4 reference.  Do NOT overwrite.
-Successive phase snapshots live as snapshot_phase<N>_<host>_<nproc>c.txt.
+  t=1 pin=off   SET= 567536.88  GET= 663129.94
+  t=1 pin=auto  SET= 566893.38  GET= 567536.88
+  t=2 pin=off   SET= 990099.00  GET= 991080.31

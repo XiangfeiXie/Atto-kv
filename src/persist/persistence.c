@@ -666,6 +666,82 @@ void rdb_save_async_uring(void) {
 }
 
 /* =============================================================================
+ * Part 2b. AOF rewrite — Phase 7.1.0 stub.
+ *
+ * Status: NOT YET IMPLEMENTED.  The BGREWRITEAOF command currently
+ * returns -ERR, and aof_rewrite_bg() returns -1.  AOF on this dev
+ * box never grows beyond ~10 MB during normal smoke / dev_quick
+ * runs, so rewrite is a no-op feature for current workloads.  When
+ * a real workload pushes AOF past ~100 MB the implementation
+ * outlined below should be slotted in — every piece of infrastructure
+ * already exists in this file, so the wiring is mostly mechanical.
+ *
+ * ─── Design when we DO implement it (V2 plan) ───
+ *
+ * 1. Trigger:
+ *    aof_rewrite_bg() is called by BGREWRITEAOF or by an
+ *    auto-trigger (e.g. AOF doubled in size since last rewrite).
+ *    Reject if g_aof_rewrite_pid != 0 (already running, like the
+ *    existing g_rdb_child_pid guard does for BGSAVE).
+ *
+ * 2. Snapshot:
+ *    Mirror rdb_save_async_uring exactly:
+ *      kv_shards_lock_all_for_snapshot();   (Phase 4B.4)
+ *      pid_t pid = fork();                  (parent unlocks immediately)
+ *    Child gets a frozen COW image just like RDB; safe to walk
+ *    via kv_shards_iter_init_nolock + g_rdb_in_fork_child=1.  We
+ *    can reuse the same fork-child flag because BGSAVE and
+ *    BGREWRITEAOF will refuse to overlap (one child slot).
+ *
+ * 3. Child output:
+ *    For each entry, emit ONE canonical RESP command that recreates
+ *    it (SET / HSET / RPUSH / SADD / ZADD plus EXPIREAT if TTL set).
+ *    Use io_uring just like rdb_save_async_uring does:
+ *    chunk-write to build/appendonly.aof.tmp, then fsync, then exit.
+ *
+ * 4. The rewrite buffer (the actually hard part):
+ *    Between the fork and the child's exit, the parent keeps
+ *    serving writes that mutate the live dict.  Those writes
+ *    are NOT in the child's snapshot.  We tee them into an
+ *    in-memory "rewrite buffer" (DynBuf protected by an existing
+ *    producer mu, cf. wal_repl.c's g_journal_producer_mu).  Hook:
+ *    aof_async_append() checks g_aof_rewrite_in_progress and, if
+ *    set, also pushes a copy into the rewrite buffer.
+ *
+ * 5. Finalize (on SIGCHLD for the rewrite child):
+ *    SIGCHLD handler is NOT a safe place for fsync/rename.  Set a
+ *    flag g_aof_rewrite_done, polled by the proactor worker 0 tick:
+ *      a) open appendonly.aof.tmp O_APPEND
+ *      b) write out the rewrite buffer (under producer mu)
+ *      c) fsync, close
+ *      d) atomic rename appendonly.aof.tmp → appendonly.aof
+ *      e) clear g_aof_rewrite_in_progress, free rewrite buffer
+ *
+ * 6. Failure modes:
+ *    - fork fails: free buffer, fall through, return -1.
+ *    - child crashes: SIGCHLD reaper sees nonzero exit, drops
+ *      buffer, leaves old AOF in place.
+ *    - rename fails (disk full): same — old AOF preserved.
+ *
+ * The whole thing is ~200 lines mirroring rdb_save_async_uring's
+ * shape.  Do NOT inline the rewrite buffer copy on the dispatcher
+ * hot path; aof_async_append already holds the producer mu, so the
+ * extra dynbuf_cat is essentially free there.
+ * ============================================================================= */
+
+int aof_rewrite_bg(void) {
+    /* Phase 7.1.0 stub.  Return -1 so the BGREWRITEAOF command in
+     * kvs_dispatch can map this to -ERR not yet implemented.  The
+     * design notes above document the entire V2 plan; when ready
+     * to land, the implementation goes here. */
+    fprintf(stderr,
+            "[AOF] BGREWRITEAOF requested but rewrite is not implemented "
+            "yet (Phase 7.1.0 stub).  See persistence.c Part 2b for the "
+            "design plan.\n");
+    return -1;
+}
+
+/* =============================================================================
  * Part 3. mmap 加载：RDB / AOF
  * ============================================================================= */
 

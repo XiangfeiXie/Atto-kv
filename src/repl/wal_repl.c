@@ -81,8 +81,25 @@ static pthread_mutex_t   g_journal_producer_mu = PTHREAD_MUTEX_INITIALIZER;
 /* ── WAL file state ── */
 static int              g_wal_fd       = -1;
 
-/* ── Slave state (io_uring dispatch, no per-slave threads) ── */
-typedef struct { int fd; int active; } slave_state_t;
+/* ── Slave state (io_uring dispatch, no per-slave threads) ──
+ *
+ * Phase 7.3 audit (2026-05-17): both fields are written by the
+ * listener thread (slave_start) and the consumer thread (slave_close),
+ * read by the consumer dispatch loop and the listener's free-slot
+ * scan in ebpf_incr_add_slave.  The activate / deactivate transitions
+ * are race-free on x86 TSO but were a theoretical visibility race on
+ * weakly-ordered ISAs (ARM / RISC-V) and a clean TSAN finding.
+ *
+ * Fix: make `active` carry the publication fence.  Writers store
+ * memory_order_release (so prior `fd` write is visible); readers
+ * load memory_order_acquire (paired with the release).  The `fd`
+ * itself stays relaxed since it's only read after `active` is
+ * observed = 1, and only written before `active` is observed = 1 or
+ * after = 0. */
+typedef struct {
+    _Atomic int fd;          /* -1 = no fd (relaxed) */
+    _Atomic int active;      /* 0 = inactive (release on store, acquire on load) */
+} slave_state_t;
 static slave_state_t  g_slaves[INCR_MAX_SLAVES];
 
 /* ── Dispatch io_uring ring (single ring for all slave sends) ── */
@@ -123,9 +140,18 @@ static _Atomic int g_n_active_slaves = 0;
 
 static void slave_close(int i)
 {
-    if (!g_slaves[i].active) return;
-    g_slaves[i].active = 0;
-    if (g_slaves[i].fd >= 0) { close(g_slaves[i].fd); g_slaves[i].fd = -1; }
+    /* Acquire pair: see comment on slave_state_t.
+     * After observing active=1 we are safe to read fd. */
+    if (atomic_load_explicit(&g_slaves[i].active,
+                              memory_order_acquire) == 0) return;
+    /* Release pair: any later `fd` mutation must be visible to
+     * threads that observe active=0 + later =1 again. */
+    atomic_store_explicit(&g_slaves[i].active, 0, memory_order_release);
+    int fd = atomic_load_explicit(&g_slaves[i].fd, memory_order_relaxed);
+    if (fd >= 0) {
+        close(fd);
+        atomic_store_explicit(&g_slaves[i].fd, -1, memory_order_relaxed);
+    }
     atomic_fetch_sub_explicit(&g_n_active_slaves, 1, memory_order_relaxed);
 }
 
@@ -167,8 +193,10 @@ static void dispatch_reap_cqes(int n_wait)
  * the slot active so the consumer dispatch loop will include it. */
 static int slave_start(int i, int fd, uint64_t start_seq)
 {
-    g_slaves[i].fd     = fd;
-    g_slaves[i].active = 0;
+    /* Both stores are relaxed; the publishing release happens on
+     * `active = 1` after the catchup completes. */
+    atomic_store_explicit(&g_slaves[i].fd, fd, memory_order_relaxed);
+    atomic_store_explicit(&g_slaves[i].active, 0, memory_order_relaxed);
 
     pthread_mutex_lock(&g_backlog_mu);
     for (uint64_t j = 0; j < g_backlog_count; j++) {
@@ -177,19 +205,23 @@ static int slave_start(int i, int fd, uint64_t start_seq)
         if (bs->seq < start_seq) continue;
         uint64_t plen = (uint64_t)bs->length;
         struct iovec iov[2] = {
-            { .iov_base = &plen,    .iov_len = sizeof(plen) },
-            { .iov_base = bs->msg,  .iov_len = bs->length   },
+            { .iov_base = &plen, .iov_len = 8 },
+            { .iov_base = bs->msg, .iov_len = plen },
         };
         struct msghdr mh = { .msg_iov = iov, .msg_iovlen = 2 };
         if (sendmsg(fd, &mh, MSG_NOSIGNAL) < 0) {
             pthread_mutex_unlock(&g_backlog_mu);
-            close(fd); g_slaves[i].fd = -1;
+            close(fd);
+            atomic_store_explicit(&g_slaves[i].fd, -1, memory_order_relaxed);
             return -1;
         }
     }
     pthread_mutex_unlock(&g_backlog_mu);
 
-    g_slaves[i].active = 1;
+    /* Release: publish .fd to any thread observing .active=1.
+     * Paired with the acquire load in the consumer dispatch loop
+     * and in slave_close. */
+    atomic_store_explicit(&g_slaves[i].active, 1, memory_order_release);
     atomic_fetch_add_explicit(&g_n_active_slaves, 1, memory_order_relaxed);
     return 0;
 }
@@ -502,7 +534,11 @@ static void *consumer_thread(void *arg)
                 if (g_fullsync_status == FULLSYNC_IDLE && g_dispatch_uring_ok) {
                     int nsq = 0;
                     for (int i = 0; i < INCR_MAX_SLAVES; i++) {
-                        if (!g_slaves[i].active) continue;
+                        /* Acquire-load: pairs with slave_start's release
+                         * store on active=1, so a subsequent relaxed
+                         * load of .fd sees the correct fd. */
+                        if (atomic_load_explicit(&g_slaves[i].active,
+                                memory_order_acquire) == 0) continue;
                         struct io_uring_sqe *sqe =
                             io_uring_get_sqe(&g_dispatch_ring);
                         if (!sqe) {
@@ -511,7 +547,9 @@ static void *consumer_thread(void *arg)
                             sqe = io_uring_get_sqe(&g_dispatch_ring);
                         }
                         if (sqe) {
-                            io_uring_prep_send(sqe, g_slaves[i].fd,
+                            int sfd = atomic_load_explicit(&g_slaves[i].fd,
+                                                            memory_order_relaxed);
+                            io_uring_prep_send(sqe, sfd,
                                                s->buf, s->wire_len,
                                                MSG_NOSIGNAL);
                             io_uring_sqe_set_data64(sqe, (uint64_t)i);
@@ -702,8 +740,8 @@ int ebpf_incr_master_start(void)
              getpid(), (unsigned long)time(NULL));
 
     for (int i = 0; i < INCR_MAX_SLAVES; i++) {
-        g_slaves[i].fd     = -1;
-        g_slaves[i].active = 0;
+        atomic_store_explicit(&g_slaves[i].fd,     -1, memory_order_relaxed);
+        atomic_store_explicit(&g_slaves[i].active,  0, memory_order_relaxed);
     }
 
     /* Start consumer thread */
@@ -805,7 +843,14 @@ void ebpf_incr_stop(void)
 int ebpf_incr_add_slave(int tcp_fd, uint64_t start_seq)
 {
     for (int i = 0; i < INCR_MAX_SLAVES; i++) {
-        if (g_slaves[i].active) continue;
+        /* Acquire load: if we see active=0, we're safe to overwrite
+         * the slot.  A concurrent slave_close may race here, but in
+         * practice both this function and slave_close run on the
+         * listener-handshake / consumer-dispatch threads only, never
+         * both simultaneously on the same slot index (slot is freed
+         * by close → re-used by next add). */
+        if (atomic_load_explicit(&g_slaves[i].active,
+                                  memory_order_acquire) != 0) continue;
         return slave_start(i, tcp_fd, start_seq);
     }
     fprintf(stderr, "[WAL-REPL] no free slave slot\n");

@@ -52,6 +52,7 @@ set(CORE_SRCS
     src/core/config.c
     src/core/protocol.c
     src/core/block.c
+    src/core/fastpath_cache.c
 )
 
 set(ENGINE_SRCS
@@ -221,6 +222,38 @@ set_target_properties(kvs_top PROPERTIES OUTPUT_NAME "kvs-top")
 
 # ── testcase target ───────────────────────────────────────────────────
 add_executable(testcase test/testcase.c)
+
+# ── Phase 10.1 — fp_cache standalone test ────────────────────────────
+# Lock-free seqlock fast-path cache unit + stress test.  Builds against
+# fastpath_cache.c only (no engine / dispatcher dependencies) so the
+# test exercises the data structure in isolation.
+add_executable(fp_cache_test
+    test/fp_cache_test.c
+    src/core/fastpath_cache.c
+)
+target_include_directories(fp_cache_test PRIVATE
+    src/core
+)
+target_link_libraries(fp_cache_test PRIVATE Threads::Threads)
+
+# ── Phase 10.5 — fp_cache in-process CPU microbenchmark ──────────────
+# Network-free comparison of (rdlock + dict_find) vs (fp_get).  This is
+# the apples-to-apples lookup-path measurement that redis-benchmark
+# numbers cannot show, because their TCP/io_uring overhead dominates.
+add_executable(bench_fp_inproc
+    test/bench_fp_inproc.c
+    src/core/fastpath_cache.c
+    src/engine/kv_dict.c
+    src/type/kv_type_string.c
+    src/util/dynbuf.c
+)
+target_include_directories(bench_fp_inproc PRIVATE
+    src/core
+    src/engine
+    src/type
+    src/util
+)
+target_link_libraries(bench_fp_inproc PRIVATE Threads::Threads m)
 
 # ── Phase 8.1 — smoke / sanitizer-smoke targets ──────────────────────
 # Run as:

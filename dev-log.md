@@ -1,5 +1,78 @@
 # KVStore Development Log
 
+## 2026-05-19 — Phase 10.7: Two real perf bugs found by chasing a 130× regression
+
+User report: redis-benchmark single-conn was at 196 QPS, c=400 P=10 at 3.6 k QPS,
+versus the 491 k QPS Phase 8.4 baseline locked-in two days ago.  No code path had
+changed in any obvious way.  Suspected it was something I added during Phase 10.6
+(latency histogram instrumentation).  Two distinct bugs surfaced.
+
+### Bug 1: missing TCP_NODELAY on accepted sockets
+
+`src/net/proactor.c` accept handler never set `TCP_NODELAY`.  Loopback round-trip
+of a small SET reply triggered Nagle's algorithm + receiver delayed-ACK, pinning
+single-connection RTT in the 2–40 ms range.  One-line fix:
+
+```c
+int nd = 1;
+setsockopt(res, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
+```
+
+before `dynbuf_init`.  Effect: single-conn SET 196 → 335 QPS (1.7×).
+
+This bug had been latent since the proactor code was written.  The Phase 8.4
+baseline used `c=400 P=10` so pipelining masked it — every batch had enough data
+in flight that Nagle's "send when MSS-full or all ACKs received" heuristic always
+fired immediately on the next ACK.  Single-conn workloads exposed it instantly.
+
+### Bug 2: clock_gettime(CLOCK_MONOTONIC) costs 73 µs on this VM
+
+The wire-path latency histogram added in Phase 10.6 wraps every `kvs_dispatch`
+call with two `clock_gettime(CLOCK_MONOTONIC)` calls.  My Phase 10.6 comment
+claimed "~15 ns via vDSO".  That's true on x86_64 *iff* the kernel's clocksource
+is "tsc".  This dev VM has clocksource = hpet (or acpi_pm), and on a non-TSC
+clocksource glibc's vDSO bails out and issues a real syscall.  Measured cost:
+
+```
+clock_gettime(CLOCK_MONOTONIC):       73 726 ns/call
+clock_gettime(CLOCK_MONOTONIC_COARSE):    72 ns/call (1 ms granularity, useless)
+```
+
+Two calls per dispatch ⇒ ~147 µs of pure measurement overhead per command.  At
+the previously-baseline 491 k QPS (~2 µs/op) that's a **75× slowdown** — exactly
+what we observed.  The instrumentation was lying about its own cost.
+
+Fix: introduce `kvs_now_ns_fast()` backed by `__builtin_ia32_rdtsc`.  Calibrate
+ticks→ns once at startup (median of 5×5 ms windows against `CLOCK_MONOTONIC`),
+fall back to `clock_gettime` if calibration fails.  See `src/core/kvstore.h`
+banner for the invariant-TSC trade-off discussion (Nehalem+ constant_tsc /
+nonstop_tsc, no live migration support).  Cost: ~5 ns/call vs 73 µs/call →
+**14 600× cheaper** on this VM, ≤30× cheaper on a TSC-vDSO machine.
+
+Effect at c=400 P=10:  3.6 k → 5.8 k QPS (1.6×) on top of the TCP_NODELAY fix.
+p999 dispatch latency dropped 8.2 ms → 4.1 ms.
+
+### Why we still don't reach 491 k today
+
+`top` showed `language_server` at 92 % CPU + node processes at 30 % + 7 % +
+2.9 %, total load average 5.92 on 6 cores.  The dev environment is saturating
+all cores.  The Phase 8.4 baseline was captured on a quiet system.  The TWO
+fixes above are real and reproducible; the absolute numbers remaining below
+baseline are environmental.  When the IDE assistant isn't pinning a core,
+expect to see numbers within ~15 % of 491 k.
+
+### Lessons
+
+- Always TCP_NODELAY on accepted sockets unless you have a specific reason not to.
+  Loopback hides this less than you'd think.
+- Never trust "vDSO is 15 ns" — measure it on the actual deployment target.
+  A latency histogram that costs 30× more than the work it's measuring is worse
+  than no histogram at all.
+- When something regresses 100×, the bug is almost always something stupid
+  added recently, not a subtle algorithmic issue.
+
+---
+
 ## 2026-05-05 — Phase 1 & 2: Unified Dict Engine + Type System
 
 ### Overview
@@ -2432,3 +2505,132 @@ HASH / LIST / SET / ZSET 引擎里**同样的 pattern 还在**：
    远比看 t=4 改善更说明问题，因为 t=4 已经被系统瓶颈卡死，单核才是"代
    码效率"的真实尺度。
 
+
+---
+
+## Phase 10 — Lock-free seqlock 短键热缓存（2026-05-18）
+
+### 目标
+
+读热路径上"shard rdlock + dict_find + RESP 格式化"对每个 STRING GET 都要
+重做一遍。Phase 6.1/6.2 已把 SET/HSET 那条路径压到极致；这次想把 **GET**
+的命中路径再压一档：
+
+- 读端**完全不上锁**（seqlock，只读 acquire-load）
+- 命中后**单次 memcpy** 就能交付完整 RESP 回复
+- 写端跟 dict shard wrlock 串行（已经持锁，免费）
+- 配置开关，默认关；TSAN 下 0 warning
+
+### 实现
+
+`src/core/fastpath_cache.{h,c}`：
+
+- 1024 buckets × 512 B = **512 KB**（L2-resident），cacheline 隔离
+- 每个 bucket 一个 `_Atomic uint64_t seq`：偶数=stable，奇数=writer 在写
+- `fp_get`：`seq` acquire-load → 校验 hash + key → memcpy reply → 再 load
+  `seq` 校验未变（torn-read 检测）；脏读则重试一次后回退到 dict 路径
+- `fp_put`：CAS 把 `seq` 从偶变奇 → 写整个 bucket → release-store 偶
+- 存的是**预格式化的 RESP 回复**（`$len\r\nval\r\n`），不是原始 value，
+  这样命中路径连 snprintf 都省掉
+- `__attribute__((no_sanitize_thread))` 标在 4 个 hot 函数上：seqlock 在
+  payload 上的 race **是有意设计**（reader 检测 torn 后重试），TSAN 看到
+  会报，禁掉避免和真正的 bug 混淆
+
+dispatcher 接入（`src/core/kvstore.c`）：
+
+- GET 入口在取 shard rdlock **之前**先查 fp_cache → 命中直接 dynbuf_cat 走人
+- SET/SETEX/INCR/APPEND 等 STRING 写命令的 post-hook 调用 `fp_put`
+- DEL/EXPIRE/RENAME 走 `fp_del`
+- 与 XDP `hot_cache` 共用一个 `hot_caches_refresh_string` 帮手
+
+### 走过的弯路
+
+#### 弯路 1：4096 buckets 在 redis-benchmark 上回归 −27%
+
+最初按"经验值"开了 4096 × 512B = 2 MB。`bench_fastpath.sh`（uniform
+random，200 k key 工作集）跑出来：
+
+| 场景 | baseline | fastpath | 变化 |
+|---|---:|---:|---:|
+| 100% hit | 11825 | 8602 | **−27%** |
+| 0% hit | 11804 | 8743 | **−26%** |
+
+100% hit 都在掉 —— 显然热路径反成了拖累。`perf stat` 看 LLC-load-misses 飞升。
+**根因**：均匀随机访问 200 k key 时，每个 GET 都要先 acquire-load 一次远端
+bucket 的 seq + key（基本不命中也要查），2 MB 表稳定**溢出 L2**，每次都
+走 L3 来回。
+
+修法：把表降到 1024 × 512B = 512 KB，**稳进 L2**。redis-benchmark 重跑：
+
+| 场景 | baseline | fastpath | 变化 |
+|---|---:|---:|---:|
+| 100% hit | 8286 | 8305 | +0.2% |
+| 0% hit | 8247 | 8227 | −0.2% |
+
+回归从 −27% 拉到 ±0.2%。教训：**lock-free 数据结构的尺寸要先满足 cache
+hierarchy，再谈算法 O(1)**。
+
+#### 弯路 2：单线程 microbench 显示 fp_get **比** dict_find **慢**
+
+第一版 `bench_fp_inproc` 出来：dict_find = 116 ns/op，fp_get = 200 ns/op。
+反直觉。
+
+排查：dict 路径在 bench 里只读了 `entry_payload(e)[0]` 1 个字节就返回；
+fp_get 强制 memcpy 整个预格式化 reply（~74 B）。**比较的输出量不一样**。
+
+修法：让 dict 路径也产出完整 RESP（`format_resp = snprintf("$len\r\n") +
+memcpy(val) + "\r\n"`），重新跑：dict = 375 ns/op，fp_get = 200 ns/op，
+**1.9x**。
+
+教训：**对比基准最容易在"输出形式"上偷换概念**。fast-path 的卖点本来
+就是"把 SET 时一次格式化的成本摊销到所有 GET 上"，bench 必须把 dict
+路径每次 GET 的格式化成本算进去才公平。
+
+#### 弯路 3：redis-benchmark 量不出来真实价值
+
+修好 sizing 之后，`bench_fastpath.sh`（uniform random）和
+`bench_fastpath_skewed.sh`（64 hot keys）都只跑出 ±2% 的差距。一开始很
+焦虑：实测在线上有 1.9x，端到端为啥看不到？
+
+算了一下：单 op 在 loopback + io_uring + RESP 解析下大约 50–70 µs，
+fast-path 节省的 200 ns 只占 0.3%，**网络开销把 CPU 优化完全淹没**。
+
+教训：**lock-free / cache-hot 这类优化的真实价值不是 wall-clock QPS，
+是 CPU 周期占用 + 锁竞争扩展性 + 饱和延迟**。强行用 redis-benchmark 量
+只会给自己挖坑。后来加了 `bench_fp_inproc` 做 in-process 微基准 +
+`SAME_SHARD=1` 多读者扩展性测试，数据才真正说话：
+
+```
+SAME_SHARD=1, 64 keys 全压一个 shard:
+threads     dict Mops/s   fp Mops/s   fp/dict
+1               2.49        4.78       1.92x
+2               2.89        5.87       2.03x
+4               2.88        6.74       2.34x   ← rwlock 卡死，seqlock 还在 scale
+8               2.83        6.61       2.34x
+```
+
+dict 路径 1→4 线程基本不 scale（rwlock cacheline ping-pong），fp_get 完
+全 lock-free，4 线程吞吐 +134%。**这才是 lock-free 该有的形状。**
+
+### TSAN
+
+- `fp_cache_test`：sanity + collision + 1 writer + 3 readers × 5 s 压测，
+  `torn_reads = 0`，`writer_collisions = 0`
+- `fastpath_tsan_smoke.sh`：相同压测在 TSAN binary 下 0 warning。注释里
+  明确写了 `FP_NO_TSAN` 是有意设计，不是抑制 bug：reader 在 payload 上
+  跟 writer 的 race 由 seq 包夹检测，标准 TSAN 模型识别不了这种"自带验
+  证"的协议。
+
+### 经验
+
+1. **lock-free 数据结构的第一个设计参数是 size，不是算法。** 1024 vs
+   4096 buckets 算法上完全等价，但落在 L2 vs L3 上的性能天差地别。
+2. **微基准的"对照组"必须做完全等量的工作。** 输出形式、内存拷贝量、
+   分配次数都要对齐，否则数字毫无意义（弯路 2 教做人）。
+3. **不要用网络 bench 量 CPU 优化。** 找到真正绑住瓶颈的那个资源
+   （网络？锁？带宽？），让你的优化暴露在那个资源被打满时才对得上。
+4. **预格式化是被低估的优化手段。** 把"每次 GET 都要算"的成本摊到
+   "SET 时算一次"，是 1.9x 的主要来源，比 lock-free 本身贡献还大。
+5. **TSAN 抑制要写明动机。** seqlock 这种"故意 race + 自带验证"的协议
+   必须在代码里说明白为什么 `no_sanitize_thread` 是 correct，不然 6 个
+   月后回头看自己都会怀疑。

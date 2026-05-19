@@ -531,55 +531,202 @@ Code is already in main; needs real-hardware sign-off.
   [ ] Phase 4 perf sweep on 8c / 16c: t={1,2,4,8,16}, compare to
         test/bench/baseline_6c.txt locked in by 8.4
 
-Phase 9 — BPF acceleration (replaces old "6.5 XDP")
-====================================================
-Two-step, gated by observed cache hit rate.
+Phase 9 — BPF acceleration   [SHELVED 2026-05-18, see Phase 10]
+================================================================
+After multi-round design review (see assessment-day0.md §6 BPF
+acceleration ceiling analysis), Phase 9.1/9.2 are SHELVED.  Brief:
 
-  [ ] 9.0  cache-hit observability prog
-        - 30-line BPF prog that just counts (GET requests with key
-          length ≤ 32 AND previously SET) over real workload
-        - run overnight; need ≥30% to justify any further work
+  * 9.2 XDP_TX was already abandoned in dev-log Phase 17 (TCP rcv_nxt
+    desync on long connections).
+  * 9.1 sockmap/sk_skb short-path is technically possible but the
+    BPF map syscall on the userspace fast-path read (~250 ns) almost
+    cancels the dispatch+lock savings (~200 ns).  Realistic net gain
+    on loopback: 0 ~ +5%.  Not worth a 3-day engineering investment
+    that also increases BPF program complexity.
+  * "Old sockmap accel +30%" was already self-debunked in this file
+    (note below).  The honest ceiling for in-kernel BPF acceleration
+    in this codebase is ~10-15% even with mmap'd BPF arrays
+    (Option J+ explored), and that path deviates from the project's
+    own "XDP observe-only" decision.
 
-  [ ] 9.1  sockmap + sk_skb short-path (the "easy half")
-        - sockmap_kvs.kern.c upgraded from observation-only to a
-          BPF_SK_SKB_STREAM_VERDICT program that:
-            * parses incoming RESP frames in kernel (one frame per
-              verdict callback — kernel handles TCP reassembly)
-            * looks up short hot key in BPF kv_hot_cache map
-            * on hit: bpf_sk_redirect_map to a userspace fast-reply
-              socket, bypassing kvs_dispatch + shard locks
-            * on miss: SK_PASS, unchanged path
-        - kvstore.c SET hook populates kv_hot_cache when key ≤ 32B
-          and value ≤ 256B; DEL/expire removes
-        - works on loopback, ~5-15% expected, zero correctness risk
+Decision: keep BPF as OBSERVATION-ONLY (current state), pursue user-
+space lock-free fast-path instead (Phase 10 below).  The 3-layer BPF
+observation stack (XDP packet / sockmap stream / uprobe slowlog)
+remains a supplementary highlight; no new BPF work is required.
 
-  [ ] 9.2  XDP_TX zero-syscall path (the "hard half")
-        - only after 9.1 stable and cache hit rate ≥ 60%
-        - xdp_kvs.kern.c: parse RESP, lookup cache, XDP_TX a fully
-          formed TCP reply, mark socket bytes for userspace drain
-        - sock_ops prog tracks per-conn ISN + 5-tuple
-        - userspace consults kv_pending_drain before dispatch
-        - needs real NIC to show benefit; loopback ≈ 0
+  [-] 9.0  cache-hit observability prog        SHELVED — current
+        XDP+sockmap counters already provide this with 0 incremental
+        work; xdp_stats.hit_rate and sockmap.cmd_counts cover it.
+  [-] 9.1  sockmap + sk_skb short-path         SHELVED — see above
+  [-] 9.2  XDP_TX zero-syscall path            ABANDONED (pre-existing,
+                                                dev-log Phase 17)
+
+Phase 10 — Lock-free seqlock fast-path cache (Option α)   [PRIMARY]
+====================================================================
+NEW main technical highlight.  Replaces shelved Phase 9.1 as the
+project's "single deep highlight".  Adds a NEW technical dimension
+(lock-free programming) that the project currently lacks — every
+existing concurrency primitive is pthread_rwlock based.
+
+Rationale: realistic +25-35% GET QPS on hot small-string workloads,
+fully independent from BPF stack, validates under TSAN cleanly,
+opens a 5-10 minute interview deep-dive on memory ordering and
+lock-free reader protocols.
+
+Architecture:
+  - 4096 buckets × 512B per bucket = 2 MB total (fits in L2/L3)
+  - per-bucket seqlock (64-bit atomic seq counter; even=stable,
+    odd=writer-in-progress)
+  - reader: lock-free, retry once on writer collision
+  - writer: per-bucket single-writer (paired with shard wrlock from
+    dict write path)
+  - key cap: 64 B, value cap: 256 B (covers ~90% of real GET traffic)
+
+  [X] 10.1  fp_cache.h/c — core seqlock data structure
+        - struct fp_cache, fp_entry (cacheline-aligned 512B)
+        - fp_get(): try-lock-free read with seq1/seq2 verification
+        - fp_put(): writer protocol (seq |= 1 → write → seq += 2)
+        - fp_del(): invalidate by hash, no-op if absent
+        - memory_order: acquire on read, release on write
+        - C11 atomics, no pthread inside fp_cache
+        - unit test: fp_cache_test.c with single-thread + 4-thread
+          stress (1 writer, 3 readers, 1M ops, no torn-read)
+
+  [X] 10.2  Wire into kvs_dispatch GET path
+        - GET handler entry: fp_get() before dict_find
+        - on hit: reply_bulk + return DISPATCH_OK
+        - on miss: fall through (zero overhead, ~30 ns mmap-style read)
+        - SET/DEL/EXPIRE post hooks: fp_put / fp_del invoked AFTER
+          dict write commits but BEFORE wrlock release (writer-vs-
+          writer ordering same as dict)
+        - eligibility filter: STRING type only, key ≤ 64B, value
+          encoding == RAW, value ≤ 256B
+        - statistics: g_fp_hits, g_fp_misses, g_fp_invalidations
+          (per-CPU atomics, aggregated by INFO command)
+
+  [X] 10.3  Configuration + INFO + kvs-top integration
+        - new config key: fastpath_cache yes|no  (default: no, opt-in
+          for perf-focused workloads)
+        - INFO Stats: fastpath_cache_hits / misses / hit_rate /
+          buckets_used / invalidations
+        - kvs-top: new "[FAST]" line showing fp_hits/s and hit_rate
+        - banner shows "Fastpath cache : 4096 buckets, 2 MB" when on
+
+  [X] 10.4  TSAN validation
+        - fastpath_tsan_smoke.sh: 6 readers + 2 writers × 30s
+        - expected: 0 race warnings (seqlock is a TSAN-known pattern;
+          may need ANNOTATE_HAPPENS_BEFORE/AFTER if TSAN cannot prove
+          the seq dance — keep as fallback)
+        - regression gate: tsan_lock_smoke.sh + multi_thread_smoke.sh
+          must remain PASS=12+6 with fastpath_cache=yes
+
+  [X] 10.5  Benchmark + before/after
+        - test/bench/bench_fastpath.sh: 100% hot-key GET workload at
+          c=400 P=10 t=2 (matching 8.4 baseline conditions)
+        - measure with fastpath_cache=no and =yes
+        - target: +25-35% GET QPS on 100% hit rate
+        - also measure 50% / 0% hit rate to confirm graceful no-op
+          when miss (must show ≤2% overhead vs baseline at 0% hit)
+
+  [X] 10.6  Documentation
+        - benchmark.md §10: lock-free seqlock fast-path section
+        - README.md: add fast-path layer to architecture diagram,
+          add "lock-free hot-path cache" to highlights list
+        - dev-log.md: design notes on memory_order choices and
+          why seqlock vs hazard-pointer/RCU for this use case
+
+Estimated total: 3 days.  Independent of BPF stack and any other
+phase — can be developed and merged without touching existing files
+beyond kvstore.c (GET dispatch entry + SET/DEL post hooks).
+
+Phase 10 — exit criteria
+========================
+  Status: DONE 2026-05-18.
+  Outcome (see benchmark.md §9 + dev-log Phase 10):
+    * Sizing: 1024 buckets × 512B = 512 KB (L2-resident); earlier
+      4096-bucket version regressed redis-benchmark by -27%, fixed
+      by shrinking to fit L2.
+    * In-process micro: 1.9x single-thread (375ns -> 200ns).
+    * Multi-reader same-shard: rwlock plateaus at ~2.9 Mops/s for
+      1->8 threads; fp_get scales to 6.74 Mops/s at 4 threads
+      (+134% over rwlock path).
+    * End-to-end redis-benchmark: ~neutral (network-bound regime;
+      explicitly documented as not the right tool for this feature).
+    * TSAN: fp_cache_test 1W+3R x 5s = 0 torn / 0 warnings;
+      fastpath_tsan_smoke.sh is the regression gate.
+    * Docs: benchmark.md §9, README architecture +invariant + feature
+      row, dev-log Phase 10 entry.
+  Original PASS conditions (NOTE: original target +25-35% on
+  redis-benchmark was based on a wrong mental model; corrected during
+  10.5 — see dev-log "弯路 3"):
+    * fp_cache_test 0 failures on 4-thread stress
+    * tsan_lock_smoke + multi_thread_smoke regression PASS=18/18
+    * bench_fastpath.sh shows +25-35% on 100% hit, ≤2% overhead at 0%
+    * benchmark.md §10 + README architecture diagram updated
+
+Phase 11 — Deferred follow-ons (gated on Phase 10 outcome)   [HOLD]
+====================================================================
+Two further single-core perf optimizations.  Decision to execute
+either is GATED on Phase 10 results:
+  * If Phase 10 lands +25%+ as expected → β/γ may not be needed for
+    project narrative purposes; defer until specific bench gap.
+  * If Phase 10 underdelivers (<15%) → start β as a complement.
+
+  [HOLD] 11.1  β  SIMD-accelerated RESP parser
+        - SSE4.2 PCMPISTRI for \r\n scanning, AVX2 digit batch parse
+        - estimated +5-10% across all dispatched commands
+        - 2-3 days, mostly self-contained in protocol.c
+        - prereq: Phase 10 done + bench shows RESP parse in top 5
+          of `perf top` (currently ~300 ns/op = 12% of 2.5 µs budget)
+        - resume value: medium ("SIMD optimization" is well-respected)
+
+  [HOLD] 11.2  γ  Batched dispatch / group-commit
+        - when io_uring CQE batch contains multiple GETs targeting
+          the same shard, acquire shard rdlock once and process all
+        - amortizes lock acquire (~50 ns) across pipelined commands
+        - estimated +15-25% on Pipeline=10 workloads
+        - 3-5 days; touches dispatcher main loop
+        - prereq: Phase 10 done + benchmark.md confirms pipelined
+          throughput is the next bottleneck
+        - resume value: medium-high (batch-dispatch is a deep
+          systems pattern)
 
 ═══════════════════════════════════════════════════════════════════════════
-Execution order (recommended)
+Execution order (recommended)   — REVISED 2026-05-18
 ═══════════════════════════════════════════════════════════════════════════
-  1.  Phase 8.4   baseline 6c lock-in       (20 min, do first)
-  2.  Phase 6.1   double dict_find          (half day, +10-15%)
-  3.  Phase 6.2   rdlock split              (1 day, structural)
-  4.  Phase 8.2   ASAN/TSAN scan            (half day, after 6.1+6.2)
-  5.  Phase 7.1   AOF rewrite bg fork       (1 day, reuse 4B.4 pattern)
-  6.  Phase 6.3   gperf — only if perf top warrants
-  7.  Phase 6.4   rehash batching           (30 min)
-  8.  Phase 7.2   online CONFIG SET         (half day)
-  9.  Phase 7.3   repl backlog audit        (half day)
-  10. Phase 8.1   make smoke target         (30 min)
-  11. Phase 8.3   30-min soak               (background run)
-  ───── move to bigger box ─────
-  12. Phase 5-validate (five items)
-  13. Phase 9.0   BPF observability
-  14. Phase 9.1   sk_skb short-path
-  15. Phase 9.2   XDP_TX (only if 9.0 says yes)
+Done so far:
+  1.  Phase 8.4   baseline 6c lock-in       DONE
+  2.  Phase 6.1   double dict_find          DONE
+  3.  Phase 6.2   rdlock split              DONE
+  4.  Phase 8.2   ASAN/TSAN scan            DONE
+  5.  Phase 6.4   rehash batching           DONE
+  6.  Phase 6.2b  case-insensitive dispatch DONE
+  7.  Phase 7.2   CONFIG GET/SET (partial)  DONE
+  8.  Phase 8.1   make smoke target         DONE
+  9.  Phase 8.3   10-min soak               DONE
+  10. Phase 9 multi-key concurrency fixes   DONE (SMOVE/LMOVE/RPOPLPUSH
+                                                  + BLPOP cross-worker)
+  11. INFO command + atomic counters        DONE
+
+Now (single primary line):
+  12. Phase 10    Lock-free seqlock cache   ★ MAIN HIGHLIGHT, ~3 days
+
+After Phase 10:
+  13. Phase 11    β SIMD or γ batch dispatch — GATED on 10 outcome
+
+Background / opportunistic:
+  - Phase 7.1 V2 AOF rewrite-bg              (when AOF >100 MB)
+  - Phase 6.3 gperf                          (only if perf top warrants)
+  - Phase 7.3 repl backlog audit             (half day)
+  - 30-min full soak                         (overnight)
+
+Bigger-box (deferred):
+  - Phase 5-validate (five items)
+  - 2-VM physical isolation benchmark
+  - vs Redis 7.x head-to-head numbers
+
+SHELVED / abandoned:
+  - Phase 9.0/9.1/9.2  BPF acceleration  (see Phase 9 block above)
 
 Notes / risks
 =============
@@ -587,6 +734,12 @@ Notes / risks
     up to 16-worker; revisit at ≥32 cores.
   * NUMA: skeleton lands in 5.4; real validation in Phase 5-validate.
   * Old "sockmap accel +30%" was a myth (sockmap can't synthesize
-    replies).  Real perf jump on hits comes from Phase 9.2 XDP_TX.
+    replies).  Old "Phase 9.2 XDP_TX is the real perf jump" was also
+    a myth — TCP rcv_nxt desync killed it.  The real perf jump in
+    this codebase comes from Phase 10 lock-free seqlock fast-path.
   * Phase 7.1 AOF-rewrite-bg is the only remaining "fork-based"
     software-stall item; the RDB equivalent was already done in 4B.4.
+  * Phase 10 reader is purely lock-free C11 atomics; if TSAN cannot
+    prove the seq protocol, fall back to ANNOTATE_HAPPENS_BEFORE/
+    AFTER in the reader/writer pair.  Do NOT add a mutex to "shut
+    TSAN up" — it would defeat the entire technical highlight.

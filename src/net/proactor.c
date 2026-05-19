@@ -3,6 +3,8 @@
 #include <sched.h>
 #include <liburing.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>     /* TCP_NODELAY — disables Nagle on accepted conns */
+#include <sys/socket.h>
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -147,10 +149,45 @@ void set_event_accept(struct io_uring *ring, int sockfd) {
 
 /* ── Local notify: drain pipelined input, post send SQE on **this** worker's
  *    ring.  Only safe when invoked on the conn's owner worker.  Caller in
- *    cross-worker scenarios must route through proactor_block_notify(). ── */
+ *    cross-worker scenarios must route through proactor_block_notify().
+ *
+ *    Phase 9 (multi-key fix): this is now also the SOLE place where a
+ *    BLPOP/BRPOP wake reply (either retried saved command or pending
+ *    timeout) gets emitted.  The wake-side worker (LPUSH dispatcher /
+ *    block_check_timeouts on worker 0) only marks the client and calls
+ *    g_notify_cb; the actual write into conn->write_buf and the send SQE
+ *    submission happen here, on the owner worker, so write_buf access
+ *    stays single-worker. ── */
 static void proactor_block_notify_local(client_t *cl) {
     if (!cl || !cl->conn || !tls_worker) return;
     struct conn *conn = cl->conn;
+
+    /* (a) Timed-out BLPOP: emit the nil reply locally. */
+    if (cl->block_pending_timeout) {
+        dynbuf_cat(&conn->write_buf, "$-1\r\n", 5);
+        cl->block_pending_timeout = 0;
+    }
+
+    /* (b) Awakened BLPOP via LPUSH/RPUSH: re-dispatch the saved BLPOP
+     *     command so the standard list_cmd path emits the reply.  We do
+     *     this here, NOT in the LPUSH worker, because writing to
+     *     conn->write_buf and calling kvs_dispatch (which can take other
+     *     shard locks) must be done on a thread that owns this conn. */
+    if (cl->block_cmd_len > 0) {
+        kvs_token_t tokens2[KVS_MAX_TOKENS];
+        int argc2 = 0;
+        int consumed = resp_parse_slices(cl->block_cmd_buf,
+                                          cl->block_cmd_len,
+                                          tokens2, KVS_MAX_TOKENS, &argc2);
+        if (consumed > 0) {
+            kvs_dispatch(tokens2, argc2,
+                         cl->block_cmd_buf, consumed,
+                         &conn->write_buf, conn);
+        }
+        cl->block_cmd_len = 0;
+    }
+
+    /* (c) Drain any pipelined RX bytes that arrived while blocked. */
     if (conn->read_buf.len > 0) {
         conn->w_off = 0;
         kvs_drain_resp_commands_off(&conn->read_buf, &conn->r_off,
@@ -266,6 +303,13 @@ static void conn_release(int fd) {
         block_remove_client(c->client);
         free(c->client);
         c->client = NULL;
+    }
+    /* Phase 9 — INFO connected_clients gauge.  Decrement only if the slot
+     * was actually active (defensive in case conn_release is called twice
+     * on the same slot via overlapping CQEs). */
+    if (c->active) {
+        atomic_fetch_sub_explicit(&g_kvs_connected_clients, 1,
+                                   memory_order_relaxed);
     }
     dynbuf_free(&c->read_buf);
     dynbuf_free(&c->write_buf);
@@ -483,6 +527,17 @@ static void *worker_loop(void *arg) {
                     close(connfd);
                     continue;
                 }
+                /* TCP_NODELAY: disable Nagle on the accepted socket.  Without
+                 * this, the kernel buffers small replies (e.g. "+OK\r\n",
+                 * "$5\r\nworld\r\n") waiting for either ~40 ms or piggybacking
+                 * on the next ACK.  Combined with the client's delayed-ACK
+                 * timer, single-RTT loopback latency degrades from ~50 µs to
+                 * 3-40 ms, collapsing single-connection QPS by ~100x.
+                 * One setsockopt per accept is cheap (~150 ns) and only paid
+                 * once per connection. */
+                int nd = 1;
+                setsockopt(res, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
+
                 struct conn *nc = &conn_pool[connfd];
                 dynbuf_init(&nc->read_buf,  KVS_NET_BUF_INIT);
                 dynbuf_init(&nc->write_buf, KVS_NET_BUF_INIT);
@@ -491,6 +546,11 @@ static void *worker_loop(void *arg) {
                 nc->r_off = 0;
                 nc->w_off = 0;
                 nc->owner_worker_id = w->id;   /* Phase 4B.2 */
+                /* Phase 9 — INFO total/live counters. */
+                atomic_fetch_add_explicit(&g_kvs_total_connections, 1,
+                                          memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_kvs_connected_clients, 1,
+                                          memory_order_relaxed);
                 /* Phase 8.2 — eager client_t allocation.  Used to be lazy
                  * inside kvs_dispatch, which TSAN flagged as racing with
                  * the previous owner's conn_release on the same slot.

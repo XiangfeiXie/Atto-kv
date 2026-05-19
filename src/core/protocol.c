@@ -1,9 +1,11 @@
 #include "protocol.h"
 #include "server.h"
 #include "client.h"
+#include "kvstore.h"           /* kvs_lat_record_ns, KVS_LAT_BUCKETS */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 /* ==================== RESP static fragments ==================== */
 
@@ -173,8 +175,19 @@ int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn 
         int cmd_len = resp_parse_slices(rb->buf + off, remaining,
                                         tokens, KVS_MAX_TOKENS, &argc);
         if (cmd_len > 0) {
+            /* Phase 10.7 — wire-path latency sample using rdtsc-backed
+             * fast clock.  An earlier version used clock_gettime which is
+             * ~15 ns via vDSO on a TSC clocksource, but ~73 µs as a real
+             * syscall on this VM (hpet/acpi_pm clocksource).  The latter
+             * inflated the overhead from <1 % to >99 % and collapsed
+             * benchmark QPS by 130×.  Replay paths (AOF/WAL reload) call
+             * kvs_dispatch directly and intentionally bypass this. */
+            uint64_t _t0 = kvs_now_ns_fast();
             dispatch_result_t r = kvs_dispatch(tokens, argc,
                                                rb->buf + off, cmd_len, wb, c);
+            uint64_t _t1 = kvs_now_ns_fast();
+            kvs_lat_record_ns(_t1 - _t0);
+
             off += cmd_len;
             remaining -= cmd_len;
             ncmd++;

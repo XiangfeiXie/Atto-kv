@@ -40,6 +40,8 @@ static void config_default(void) {
 
     kvs_config.sockmap_enabled = 0;
 
+    kvs_config.fastpath_cache_enabled = 0;  /* Phase 10 — opt-in */
+
     /* 0 = auto: max(1, nproc - 1).  Resolved in config_postprocess(). */
     kvs_config.threads = 0;
     kvs_config.threads_auto = 0;
@@ -273,6 +275,11 @@ int config_load(const char *path) {
             strncpy(kvs_config.xdp_iface, val,
                     sizeof(kvs_config.xdp_iface) - 1);
 
+        /* ---- Phase 10: lock-free seqlock fast-path cache ---- */
+        } else if (strcasecmp(key, "fastpath_cache") == 0) {
+            int v = parse_bool(val, lineno, "fastpath_cache");
+            if (v >= 0) kvs_config.fastpath_cache_enabled = v;
+
         /* ---- sockmap (Phase 2) ---- */
         } else if (strcasecmp(key, "sockmap") == 0) {
             int v = parse_bool(val, lineno, "sockmap");
@@ -377,6 +384,8 @@ void config_print(void) {
         printf("  XDP fast-path : iface=%s\n", kvs_config.xdp_iface);
     if (kvs_config.sockmap_enabled)
         printf("  sockmap       : enabled (stream-layer observability)\n");
+    if (kvs_config.fastpath_cache_enabled)
+        printf("  Fastpath cache: lock-free seqlock, 1024 buckets, 512 KB (L2-resident)\n");
     if (kvs_config.threads > 1) {
         long nproc = sysconf(_SC_NPROCESSORS_ONLN);
         printf("  Workers       : %d %s (nproc=%ld, %d shards, SO_REUSEPORT)\n",

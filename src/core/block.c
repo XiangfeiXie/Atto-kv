@@ -224,11 +224,18 @@ void block_check_timeouts(void) {
     pthread_mutex_unlock(&g_block_mu);
 
     /* Phase 2 — outside the lock: scrub remaining waiter entries (uses
-     * its own lock acquisition) and dispatch notify_cb. */
+     * its own lock acquisition) and dispatch notify_cb.
+     *
+     * MT-safety: do NOT write conn->write_buf here.  block_check_timeouts
+     * runs on worker 0, but the conn may be owned by another worker that
+     * is concurrently running EVENT_READ/EVENT_WRITE on the same write_buf.
+     * Instead, set block_pending_timeout and let proactor_block_notify_local
+     * (which always runs on the owner worker) emit the "$-1\r\n" reply
+     * when it processes the wake. */
     for (int i = 0; i < n_expired; i++) {
         client_t *c = expired[i];
         block_remove_client(c);
-        if (c->conn) dynbuf_cat(&c->conn->write_buf, "$-1\r\n", 5);
+        c->block_pending_timeout = 1;
         if (g_notify_cb) g_notify_cb(c);
     }
 }

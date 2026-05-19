@@ -57,6 +57,12 @@ typedef struct {
     /* sockmap stream-layer observability (Phase 2) */
     int  sockmap_enabled;
 
+    /* Phase 10 — Lock-free seqlock fast-path cache for short-key GETs.
+     * 4096 buckets × 512B = 2 MB, layered above 32-shard rwlock dict.
+     * Reader-only on the GET hot path; SET/DEL/EXPIRE post-hooks
+     * keep it in sync.  Default off; flip on for read-heavy workloads. */
+    int  fastpath_cache_enabled;
+
     /* Phase 4 — multi-worker proactor (0 = auto: nproc-1, 1 = single,
      * N = manual).  Auto/manual flag set after config_load. */
     int  threads;

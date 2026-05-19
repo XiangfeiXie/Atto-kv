@@ -1031,26 +1031,57 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
             return DISPATCH_OK;
         }
 
-        /* SMOVE source destination member → 1 if moved, 0 otherwise */
+        /* SMOVE source destination member → 1 if moved, 0 otherwise.
+         *
+         * MT-safety: dispatcher holds wrlock on `hash` (source).  Destination
+         * lives on a possibly-different shard; we additionally acquire its
+         * wrlock here (in canonical ascending-shard order to avoid deadlock
+         * with another worker doing SMOVE in the reverse direction). */
         if (TOKEN_EQ(cmd, "SMOVE")) {
             if (argc != 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
 
             char dkey_buf[256] = {0};
             const char *dkey = key_from_token(args[1], dkey_buf, sizeof(dkey_buf));
+            uint32_t dklen = (uint32_t)strlen(dkey);
+            uint64_t dh = kv_hash((const uint8_t *)dkey, dklen);
 
-            /* Source already in `entry` (per-dispatch resolved on args[0]); validate. */
-            if (!entry) { dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN); return DISPATCH_OK; }
+            /* Acquire destination shard wrlock alongside the primary. */
+            int dst_locked = 0;
+            int reacquired = kv_shard_acquire_dst_wr(hash, dh, &dst_locked);
+
+            /* If primary was released to honour ascending order, the cached
+             * `entry` may now be stale (another writer could have deleted or
+             * mutated it).  Re-find under the freshly-held primary wrlock. */
+            if (reacquired) {
+                entry = dict_find(kv_dict_for(hash), key, (uint32_t)strlen(key), hash);
+                if (entry && entry->expire && get_time_now() > entry->expire) {
+                    set_cleanup_entry(entry);
+                    dict_delete(kv_dict_for(hash), key, (uint32_t)strlen(key), hash);
+                    entry = NULL;
+                }
+            }
+
+            if (!entry) {
+                kv_shard_release_dst_wr(dh, dst_locked);
+                dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN);
+                return DISPATCH_OK;
+            }
             if (entry_type(entry) != KV_TYPE_SET) {
+                kv_shard_release_dst_wr(dh, dst_locked);
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
+
+            /* resolve_set_key now runs with dst's wrlock held → safe. */
             kv_entry_t *de = NULL;
-            if (resolve_set_key(dkey, (int)strlen(dkey), &de) < 0) {
+            if (resolve_set_key(dkey, (int)dklen, &de) < 0) {
+                kv_shard_release_dst_wr(dh, dst_locked);
                 dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
 
             if (!set_ismember(entry, args[2].ptr, args[2].len)) {
+                kv_shard_release_dst_wr(dh, dst_locked);
                 dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN);
                 return DISPATCH_OK;
             }
@@ -1061,13 +1092,17 @@ dispatch_result_t set_cmd(kvs_token_t cmd, kv_entry_t *entry,
             if (!de) {
                 char init[16];
                 set_build_empty(init);
-                uint64_t dh = kv_hash((const uint8_t *)dkey, (uint32_t)strlen(dkey));
-                de = dict_add(kv_dict_for(dh), dkey, (uint32_t)strlen(dkey), init, SET_EMPTY_SIZE, dh);
-                if (!de) { dynbuf_lit(wb, "-ERR smove failed\r\n"); return DISPATCH_ERROR; }
+                de = dict_add(kv_dict_for(dh), dkey, dklen, init, SET_EMPTY_SIZE, dh);
+                if (!de) {
+                    kv_shard_release_dst_wr(dh, dst_locked);
+                    dynbuf_lit(wb, "-ERR smove failed\r\n");
+                    return DISPATCH_ERROR;
+                }
             }
             int added = 0;
             set_add(&de, dkey, args[2].ptr, args[2].len, &added);
 
+            kv_shard_release_dst_wr(dh, dst_locked);
             dynbuf_cat(wb, REP_ONE, REP_ONE_LEN);
             return DISPATCH_OK;
         }

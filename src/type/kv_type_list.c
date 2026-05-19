@@ -1366,7 +1366,12 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
             return DISPATCH_OK;
         }
 
-        /* ── LMOVE src dst LEFT|RIGHT LEFT|RIGHT ── */
+        /* ── LMOVE src dst LEFT|RIGHT LEFT|RIGHT ──
+         *
+         * MT-safety: dispatcher holds wrlock on src.  Acquire dst wrlock
+         * additionally (canonical ascending order to avoid deadlock with a
+         * concurrent LMOVE/RPOPLPUSH in the reverse direction).  If primary
+         * was released to honour ordering, re-find src entry. */
         if (TOKEN_EQ(cmd, "LMOVE")) {
             if (argc < 4) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
             if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
@@ -1380,35 +1385,75 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
             else if (dd.len == 5 && (memcmp(dd.ptr, "RIGHT", 5) == 0 || memcmp(dd.ptr, "right", 5) == 0)) dst_left = 0;
             else { dynbuf_lit(wb, "-ERR syntax error\r\n"); return DISPATCH_ERROR; }
 
-            char dst_kb[256];
-            kv_entry_t *dst_e = NULL;
-            uint64_t dst_h = 0;
-            if (list_lookup(args[1], &dst_e, &dst_h, dst_kb, (int)sizeof(dst_kb), wb) < 0)
-                return DISPATCH_ERROR;
-            const char *dst_k = dst_kb;
-
-            /* Phase 6.1b: src hash is the dispatcher's primary-key hash */
+            char dst_kb[256] = {0};
+            const char *dst_k = key_from_token(args[1], dst_kb, (int)sizeof(dst_kb));
+            uint32_t dst_klen = (uint32_t)strlen(dst_k);
+            uint64_t dst_h = kv_hash((const uint8_t *)dst_k, dst_klen);
             uint64_t src_h = hash;
+
+            /* Acquire dst wrlock alongside primary (might re-acquire primary). */
+            int dst_locked = 0;
+            int reacquired = kv_shard_acquire_dst_wr(src_h, dst_h, &dst_locked);
+
+            if (reacquired) {
+                /* Re-find src entry under freshly-held primary wrlock. */
+                entry = dict_find(kv_dict_for(src_h), key, (uint32_t)strlen(key), src_h);
+                if (entry && entry->expire && get_time_now() > entry->expire) {
+                    list_cleanup_entry(entry);
+                    dict_delete(kv_dict_for(src_h), key, (uint32_t)strlen(key), src_h);
+                    entry = NULL;
+                }
+                if (!entry) {
+                    kv_shard_release_dst_wr(dst_h, dst_locked);
+                    dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
+                    return DISPATCH_OK;
+                }
+                if (entry_type(entry) != KV_TYPE_LIST) {
+                    kv_shard_release_dst_wr(dst_h, dst_locked);
+                    dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                    return DISPATCH_ERROR;
+                }
+            }
+
+            /* Resolve dst now that we hold its wrlock. */
+            kv_entry_t *dst_e = dict_find(kv_dict_for(dst_h), dst_k, dst_klen, dst_h);
+            if (dst_e && dst_e->expire && get_time_now() > dst_e->expire) {
+                list_cleanup_entry(dst_e);
+                dict_delete(kv_dict_for(dst_h), dst_k, dst_klen, dst_h);
+                dst_e = NULL;
+            }
+            if (dst_e && entry_type(dst_e) != KV_TYPE_LIST) {
+                kv_shard_release_dst_wr(dst_h, dst_locked);
+                dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                return DISPATCH_ERROR;
+            }
 
             char out_buf[65536];
             int olen = 0;
             if (list_pop(&entry, key, out_buf, &olen, src_left) < 0) {
+                kv_shard_release_dst_wr(dst_h, dst_locked);
                 dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
                 return DISPATCH_OK;
             }
 
             if (!dst_e) {
                 char data[16]; list_build_empty(data);
-                dst_e = dict_add(kv_dict_for(dst_h), dst_k, (uint32_t)strlen(dst_k), data, LIST_EMPTY_SIZE, dst_h);
-                if (!dst_e) { dynbuf_lit(wb, "-ERR create list failed\r\n");
-                              return DISPATCH_ERROR; }
+                dst_e = dict_add(kv_dict_for(dst_h), dst_k, dst_klen, data, LIST_EMPTY_SIZE, dst_h);
+                if (!dst_e) {
+                    kv_shard_release_dst_wr(dst_h, dst_locked);
+                    dynbuf_lit(wb, "-ERR create list failed\r\n");
+                    return DISPATCH_ERROR;
+                }
             }
             if (list_push(&dst_e, dst_k, out_buf, olen, dst_left) < 0) {
+                kv_shard_release_dst_wr(dst_h, dst_locked);
                 dynbuf_lit(wb, "-ERR push failed\r\n");
                 return DISPATCH_ERROR;
             }
 
             list_maybe_delete_empty(entry, key, src_h);
+
+            kv_shard_release_dst_wr(dst_h, dst_locked);
 
             int bh = snprintf(temp, sizeof(temp), "$%d\r\n", olen);
             dynbuf_cat(wb, temp, bh);
@@ -1513,42 +1558,82 @@ dispatch_result_t list_cmd(kvs_token_t cmd, kv_entry_t *entry,
             return DISPATCH_OK;
         }
 
-        /* ── RPOPLPUSH src dst ── */
+        /* ── RPOPLPUSH src dst ──
+         *
+         * MT-safety: same pattern as LMOVE.  Acquire dst wrlock alongside
+         * primary; if dst's shard idx < primary's, primary is released and
+         * re-acquired in canonical order, requiring an entry re-find. */
         if (TOKEN_EQ(cmd, "RPOPLPUSH")) {
             if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
             if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
 
-            char dst_kb[256];
-            kv_entry_t *dst_e = NULL;
-            uint64_t dst_h = 0;
-            if (list_lookup(args[1], &dst_e, &dst_h, dst_kb, (int)sizeof(dst_kb), wb) < 0)
-                return DISPATCH_ERROR;
-            const char *dst_k = dst_kb;
-
-            /* Phase 6.1b: src hash is the dispatcher's primary-key hash */
+            char dst_kb[256] = {0};
+            const char *dst_k = key_from_token(args[1], dst_kb, (int)sizeof(dst_kb));
+            uint32_t dst_klen = (uint32_t)strlen(dst_k);
+            uint64_t dst_h = kv_hash((const uint8_t *)dst_k, dst_klen);
             uint64_t src_h = hash;
+
+            int dst_locked = 0;
+            int reacquired = kv_shard_acquire_dst_wr(src_h, dst_h, &dst_locked);
+
+            if (reacquired) {
+                entry = dict_find(kv_dict_for(src_h), key, (uint32_t)strlen(key), src_h);
+                if (entry && entry->expire && get_time_now() > entry->expire) {
+                    list_cleanup_entry(entry);
+                    dict_delete(kv_dict_for(src_h), key, (uint32_t)strlen(key), src_h);
+                    entry = NULL;
+                }
+                if (!entry) {
+                    kv_shard_release_dst_wr(dst_h, dst_locked);
+                    dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
+                    return DISPATCH_OK;
+                }
+                if (entry_type(entry) != KV_TYPE_LIST) {
+                    kv_shard_release_dst_wr(dst_h, dst_locked);
+                    dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                    return DISPATCH_ERROR;
+                }
+            }
+
+            kv_entry_t *dst_e = dict_find(kv_dict_for(dst_h), dst_k, dst_klen, dst_h);
+            if (dst_e && dst_e->expire && get_time_now() > dst_e->expire) {
+                list_cleanup_entry(dst_e);
+                dict_delete(kv_dict_for(dst_h), dst_k, dst_klen, dst_h);
+                dst_e = NULL;
+            }
+            if (dst_e && entry_type(dst_e) != KV_TYPE_LIST) {
+                kv_shard_release_dst_wr(dst_h, dst_locked);
+                dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                return DISPATCH_ERROR;
+            }
 
             char out_buf[65536];
             int olen = 0;
             if (list_pop(&entry, key, out_buf, &olen, /*left=*/0) < 0) {
+                kv_shard_release_dst_wr(dst_h, dst_locked);
                 dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
                 return DISPATCH_OK;
             }
 
-            /* Create dst if absent */
             if (!dst_e) {
                 char data[16]; list_build_empty(data);
-                dst_e = dict_add(kv_dict_for(dst_h), dst_k, (uint32_t)strlen(dst_k), data, LIST_EMPTY_SIZE, dst_h);
-                if (!dst_e) { dynbuf_lit(wb, "-ERR create list failed\r\n");
-                              return DISPATCH_ERROR; }
+                dst_e = dict_add(kv_dict_for(dst_h), dst_k, dst_klen, data, LIST_EMPTY_SIZE, dst_h);
+                if (!dst_e) {
+                    kv_shard_release_dst_wr(dst_h, dst_locked);
+                    dynbuf_lit(wb, "-ERR create list failed\r\n");
+                    return DISPATCH_ERROR;
+                }
             }
             if (list_push(&dst_e, dst_k, out_buf, olen, /*left=*/1) < 0) {
+                kv_shard_release_dst_wr(dst_h, dst_locked);
                 dynbuf_lit(wb, "-ERR push failed\r\n");
                 return DISPATCH_ERROR;
             }
 
             /* If src == dst, src wasn't deleted (push refilled it). */
             list_maybe_delete_empty(entry, key, src_h);
+
+            kv_shard_release_dst_wr(dst_h, dst_locked);
 
             int bh = snprintf(temp, sizeof(temp), "$%d\r\n", olen);
             dynbuf_cat(wb, temp, bh);

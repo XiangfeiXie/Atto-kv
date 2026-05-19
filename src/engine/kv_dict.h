@@ -185,6 +185,66 @@ static inline void kv_shard_unlock_h(uint64_t hash) {
     pthread_rwlock_unlock(&kv_shard_for(hash)->lock);
 }
 
+static inline uint32_t kv_shard_idx(uint64_t hash) {
+    return (uint32_t)((hash >> 32) & KV_SHARD_MASK);
+}
+
+/* =====================================================================
+ * Multi-shard locking helper for dual-key commands
+ *  (SMOVE / LMOVE / RPOPLPUSH and similar src+dst patterns).
+ *
+ * Pre-condition:
+ *   The caller's dispatcher already holds wrlock on `primary_hash` (via the
+ *   SHARD_LOCK macro in kvstore.c) and only this lock is held by us.
+ *
+ * Post-condition:
+ *   `primary_hash`'s shard wrlock is held (re-acquired if needed) AND
+ *   `secondary_hash`'s shard wrlock is held (only when it's a different
+ *   shard than primary; otherwise the primary lock already covers it).
+ *
+ * Strategy:
+ *   - same shard: no extra work; *out_dst_locked = 0
+ *   - secondary_idx > primary_idx: just take secondary; cannot deadlock
+ *     because all callers add secondaries in ascending order vs primary
+ *   - secondary_idx < primary_idx: must release primary first to honour
+ *     the canonical (ascending) global lock order; then take secondary
+ *     then primary. Returns 1 in this case so the caller knows to
+ *     re-find the primary entry (another writer may have mutated during
+ *     the release window).
+ *
+ * Cleanup:
+ *   The dispatcher's __cleanup__ on _sg releases primary at scope exit.
+ *   The caller MUST call kv_shard_release_dst_wr() before returning to
+ *   release the secondary if *out_dst_locked was set.
+ *
+ * Returns 1 if primary was released and re-acquired (caller MUST re-find
+ * any entry it had cached on primary), 0 otherwise.
+ * ===================================================================== */
+static inline int kv_shard_acquire_dst_wr(uint64_t primary_hash,
+                                          uint64_t secondary_hash,
+                                          int *out_dst_locked) {
+    *out_dst_locked = 0;
+    uint32_t pi = kv_shard_idx(primary_hash);
+    uint32_t si = kv_shard_idx(secondary_hash);
+    if (pi == si) return 0;
+    if (si > pi) {
+        kv_shard_wrlock_h(secondary_hash);
+        *out_dst_locked = 1;
+        return 0;
+    }
+    /* si < pi — release primary, take in canonical order */
+    kv_shard_unlock_h(primary_hash);
+    kv_shard_wrlock_h(secondary_hash);
+    kv_shard_wrlock_h(primary_hash);
+    *out_dst_locked = 1;
+    return 1;
+}
+
+static inline void kv_shard_release_dst_wr(uint64_t secondary_hash,
+                                           int dst_locked) {
+    if (dst_locked) kv_shard_unlock_h(secondary_hash);
+}
+
 void     kv_shards_init(void);
 void     kv_shards_destroy(void);
 uint32_t kv_shards_count(void);     /* sum dict_count across all shards   */

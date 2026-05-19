@@ -14,6 +14,7 @@
 #include <stdatomic.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <pthread.h>      /* kvs_lat_slot_idx tid hash */
 
 #include "rdma_repl.h"
 #include "wal_repl.h"
@@ -21,6 +22,7 @@
 #include "block.h"
 #include "xdp_manager.h"
 #include "sockmap_manager.h"
+#include "fastpath_cache.h"
 
 /* Pack first 4 bytes of a command name into a uint32_t for jump-table dispatch */
 #define CMD4(a,b,c,d) ((uint32_t)(uint8_t)(a) | ((uint32_t)(uint8_t)(b) << 8) | \
@@ -92,6 +94,142 @@ static inline void kvs_shard_guard_release(kvs_shard_guard_t *g) {
 /* ==================== Global dict (single storage engine) ==================== */
 /* g_dict has been replaced by sharded g_shards (see kv_dict.h). */
 int g_in_reload = 0;    /* set by persistence layer during AOF/RDB reload */
+
+/* ==================== INFO counters (declared in kvstore.h) ============= */
+_Atomic uint64_t g_kvs_total_commands     = 0;
+_Atomic uint64_t g_kvs_total_connections  = 0;
+_Atomic int      g_kvs_connected_clients  = 0;
+long long        g_kvs_start_time_ms      = 0;
+
+/* Phase 10.7 — TSC fast clock (see kvstore.h banner). */
+double g_kvs_tsc_ns_per_tick = 0.0;
+int    g_kvs_tsc_usable      = 0;
+
+void kvs_tsc_calibrate(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    /* Median of 5 short calibration windows; rejects outliers caused by
+     * a single host scheduler stall during the sleep. */
+    double samples[5];
+    for (int i = 0; i < 5; i++) {
+        struct timespec a, b, sl = {0, 5 * 1000 * 1000};   /* 5 ms */
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        uint64_t ta = __builtin_ia32_rdtsc();
+        nanosleep(&sl, NULL);
+        uint64_t tb = __builtin_ia32_rdtsc();
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        uint64_t ns = (uint64_t)(b.tv_sec  - a.tv_sec) * 1000000000ull
+                    + (uint64_t)(b.tv_nsec - a.tv_nsec);
+        uint64_t ticks = tb - ta;
+        samples[i] = (ticks > 0 && ns > 0) ? (double)ns / (double)ticks : 0.0;
+    }
+    /* simple insertion sort */
+    for (int i = 1; i < 5; i++) {
+        double v = samples[i]; int j = i - 1;
+        while (j >= 0 && samples[j] > v) { samples[j+1] = samples[j]; j--; }
+        samples[j+1] = v;
+    }
+    double median = samples[2];
+    if (median > 0.05 && median < 5.0) {   /* 0.2 GHz – 20 GHz sanity */
+        g_kvs_tsc_ns_per_tick = median;
+        g_kvs_tsc_usable      = 1;
+        printf("[tsc] calibrated %.4f ns/tick (~%.2f GHz)\n",
+               median, 1.0 / median);
+        return;
+    }
+    fprintf(stderr, "[tsc] calibration failed (median=%.4g ns/tick), "
+                    "falling back to clock_gettime\n", median);
+#endif
+    g_kvs_tsc_usable = 0;
+}
+
+/* Latency histogram (Phase 10.6).  See kvstore.h for bucket layout +
+ * sharding rationale.  Sharded across KVS_LAT_SLOTS cacheline-aligned
+ * slots to avoid false-sharing contention from the wire-path workers. */
+struct kvs_lat_slot g_kvs_lat_slots[KVS_LAT_SLOTS] = { { {0}, 0, 0, {0} } };
+
+/* Map ns to bucket index 0..15.
+ *   <1024 ns  → 0
+ *   else      → min(15, position-of-highest-bit(ns/1024))
+ * Compiles to a single LZCNT on x86_64 with -mbmi. */
+static inline int kvs_lat_bucket(uint64_t ns) {
+    if (ns < 1024u) return 0;
+    uint64_t scaled = ns >> 10;                       /* ns / 1024 */
+    int idx = 64 - __builtin_clzll(scaled);           /* 1..64 */
+    if (idx > KVS_LAT_BUCKETS - 1) idx = KVS_LAT_BUCKETS - 1;
+    return idx;
+}
+
+/* Pick a slot using the calling thread's id.  pthread_self() is a
+ * pointer-sized opaque value; mixing the high bits with a multiplicative
+ * hash gives reasonable distribution across slots even if libc gives us
+ * sequential thread IDs.  Cached in TLS so the hash is paid once per
+ * worker thread, not per command. */
+static inline int kvs_lat_slot_idx(void) {
+    static __thread int s_cached_slot = -1;
+    if (__builtin_expect(s_cached_slot < 0, 0)) {
+        uintptr_t tid = (uintptr_t)pthread_self();
+        uint64_t  h   = (uint64_t)tid * 0x9E3779B97F4A7C15ull;
+        s_cached_slot = (int)((h >> 56) & (KVS_LAT_SLOTS - 1));
+    }
+    return s_cached_slot;
+}
+
+void kvs_lat_record_ns(uint64_t ns) {
+    int b = kvs_lat_bucket(ns);
+    struct kvs_lat_slot *s = &g_kvs_lat_slots[kvs_lat_slot_idx()];
+    atomic_fetch_add_explicit(&s->hist[b], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s->count,   1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s->sum_ns, ns, memory_order_relaxed);
+}
+
+/* ==================== Phase 10 — fast-path cache ====================
+ * Allocated when kvs_config.fastpath_cache_enabled.  Reader-path
+ * lookups happen at the top of kvs_dispatch (before shard lock);
+ * writer-path puts/dels happen in the same post-hook that maintains
+ * the XDP hot_cache (see hot_caches_refresh_string / hot_caches_evict).
+ * Lifetime is process-long: never freed after init except at shutdown
+ * to keep the read path branch-free. */
+struct fp_cache *g_fp_cache = NULL;
+
+/* Helper: refresh both XDP hot_cache and fp_cache for a STRING write.
+ * MUST be called with the shard lock held (rdlock is fine — we just
+ * read back the value we already wrote).  Eligibility filters are
+ * applied per backend separately. */
+static inline void hot_caches_refresh_string(const char *key, int klen,
+                                              uint64_t khash) {
+    uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
+    const char *v = string_engine_get(key, (uint32_t)klen, &vlen, &enc);
+    int eligible = (v != NULL && enc == KV_ENCODING_RAW && vlen > 0);
+
+    if (kvs_config.xdp_enabled) {
+        if (eligible && vlen <= XDP_VAL_MAX)
+            xdp_cache_put(key, klen, v, (int)vlen);
+        else
+            xdp_cache_del(key, klen);
+    }
+    if (g_fp_cache) {
+        /* Skip very small values: shard-locked dict path already serves
+         * them in tens of cycles; pulling them through the seqlock would
+         * just pollute the 512KB table without measurable upside. */
+        if (eligible
+            && klen <= (int)FP_KEY_MAX
+            && vlen >= FP_VAL_MIN
+            && vlen <= FP_VAL_MAX)
+            fp_put(g_fp_cache, key, (uint32_t)klen, khash, v, vlen);
+        else
+            fp_del(g_fp_cache, key, (uint32_t)klen, khash);
+    }
+}
+
+/* Helper: evict from both hot caches.  Called from DEL / EXPIRE /
+ * non-STRING write paths.  No lock requirement. */
+static inline void hot_caches_evict(const char *key, int klen,
+                                     uint64_t khash) {
+    if (kvs_config.xdp_enabled)
+        xdp_cache_del(key, klen);
+    if (g_fp_cache)
+        fp_del(g_fp_cache, key, (uint32_t)klen, khash);
+}
 
 /* ==================== Utility ==================== */
 
@@ -261,6 +399,20 @@ static int fmt_xdp(char *out, int cap) {
     memcpy(out, s, n);
     return n;
 }
+static int fmt_appendonly(char *out, int cap) {
+    const char *s = ENABLE_AOF ? "yes" : "no";
+    int n = (int)strlen(s);
+    if (n > cap) n = cap;
+    memcpy(out, s, n);
+    return n;
+}
+static int fmt_save(char *out, int cap) {
+    const char *s = ENABLE_RDB ? "900 1 300 10 60 10000" : "";
+    int n = (int)strlen(s);
+    if (n > cap) n = cap;
+    memcpy(out, s, n);
+    return n;
+}
 static int fmt_cpu_pin(char *out, int cap) {
     if (kvs_config.cpu_pin_mode == 0) {
         const char *s = "off"; int n = 3;
@@ -322,6 +474,8 @@ static const struct cfg_entry g_cfg_table[] = {
     { "threads",      fmt_threads,     NULL },
     { "port",         fmt_port,        NULL },
     { "xdp",          fmt_xdp,         NULL },
+    { "appendonly",   fmt_appendonly,  NULL },
+    { "save",         fmt_save,        NULL },
     { "cpu_pin",      fmt_cpu_pin,     NULL },
 };
 static const int g_cfg_table_n =
@@ -431,21 +585,299 @@ static dispatch_result_t handle_config(kvs_token_t *tokens, int argc, DynBuf *wb
     return DISPATCH_ERROR;
 }
 
-/* ── Retry a blocked client's saved command ── */
-static void block_retry_client(client_t *wc) {
-    if (!wc || !wc->block_cmd_len) return;
+/* Note: the saved-command replay (formerly block_retry_client) now lives
+ * in proactor.c proactor_block_notify_local so that it runs strictly on
+ * the conn's owner worker.  See client.h block_cmd_buf comment. */
 
-    int argc2 = 0;
-    kvs_token_t tokens2[KVS_MAX_TOKENS];
-    int consumed = resp_parse_slices(wc->block_cmd_buf, wc->block_cmd_len,
-                                     tokens2, KVS_MAX_TOKENS, &argc2);
-    if (consumed <= 0) return;
+/* =====================================================================
+ * Phase 9 — INFO command
+ *
+ * Emits a Redis-compatible INFO dump as a single bulk string.  The body
+ * is built into a stack buffer (capped at 4 KB which fits all sections
+ * we currently populate), then framed as `$<len>\r\n<body>\r\n`.
+ *
+ * Sections:
+ *   server       — version, process id, port, uptime, network model, threads
+ *   clients      — connected_clients, maxclients
+ *   memory       — used_memory (jemalloc stats.allocated when available)
+ *   persistence  — aof_enabled, rdb_enabled, in_reload state
+ *   stats        — total_connections_received, total_commands_processed
+ *   replication  — role, rdma_sync_enabled, provider, master/listen address
+ *   cpu          — used_cpu_sys, used_cpu_user (rusage)
+ *   keyspace     — db0:keys=N
+ *
+ * `INFO` (no arg)        → all sections
+ * `INFO <section>`        → just that section (case-insensitive prefix match)
+ * `INFO everything|all`   → same as INFO (Redis-compat alias)
+ *
+ * Cost: a few formatted snprintfs + one mallctl + one getrusage.  Called
+ * by clients on connect and occasionally; not on the hot path. */
+#include <sys/resource.h>
+#include <sys/utsname.h>
 
-    /* Re-dispatch into the woken client's write buffer */
-    dispatch_result_t rr = kvs_dispatch(tokens2, argc2,
-                                        wc->block_cmd_buf, consumed,
-                                        &wc->conn->write_buf, wc->conn);
-    (void)rr;
+static int section_match(kvs_token_t t, const char *name) {
+    size_t n = strlen(name);
+    if ((size_t)t.len != n) return 0;
+    return strncasecmp(t.ptr, name, n) == 0;
+}
+
+static dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) {
+    /* Argument parsing: zero/one arg supported.  Unknown section → empty body. */
+    int want_server      = 1;
+    int want_clients     = 1;
+    int want_memory      = 1;
+    int want_persistence = 1;
+    int want_stats       = 1;
+    int want_replication = 1;
+    int want_cpu         = 1;
+    int want_keyspace    = 1;
+
+    if (argc >= 2) {
+        kvs_token_t s = tokens[1];
+        if (!section_match(s, "all") && !section_match(s, "everything") &&
+            !section_match(s, "default")) {
+            want_server = section_match(s, "server");
+            want_clients = section_match(s, "clients");
+            want_memory = section_match(s, "memory");
+            want_persistence = section_match(s, "persistence");
+            want_stats = section_match(s, "stats");
+            want_replication = section_match(s, "replication");
+            want_cpu = section_match(s, "cpu");
+            want_keyspace = section_match(s, "keyspace");
+        }
+    }
+
+    /* Build body into a stack buffer.  4 KB is comfortably above the sum of
+     * fixed strings + ~16 numeric fields × 32 bytes. */
+    char body[4096];
+    int  off = 0;
+    #define APPEND(...) do {                                                 \
+        int _n = snprintf(body + off, sizeof(body) - off, __VA_ARGS__);      \
+        if (_n < 0 || _n >= (int)(sizeof(body) - off)) goto truncated;       \
+        off += _n;                                                            \
+    } while (0)
+
+    long long now_ms = get_time_now_real();
+    long long uptime_s = (now_ms - g_kvs_start_time_ms) / 1000;
+
+    if (want_server) {
+        struct utsname un = {0};
+        uname(&un);
+        APPEND("# Server\r\n");
+        APPEND("redis_version:9.1.0-kvstore\r\n");
+        APPEND("kvstore_version:10.0\r\n");
+        APPEND("redis_mode:standalone\r\n");
+        APPEND("os:%s %s %s\r\n", un.sysname, un.release, un.machine);
+        APPEND("arch_bits:64\r\n");
+        APPEND("process_id:%d\r\n", (int)getpid());
+        APPEND("tcp_port:%d\r\n", kvs_config.port);
+        APPEND("uptime_in_seconds:%lld\r\n", uptime_s);
+        APPEND("uptime_in_days:%lld\r\n", uptime_s / 86400);
+        const char *netname =
+            (kvs_config.network_model == NET_PROACTOR) ? "proactor (io_uring)" :
+            (kvs_config.network_model == NET_REACTOR)  ? "reactor (epoll)"     :
+                                                         "ntyco (coroutine)";
+        APPEND("network_model:%s\r\n", netname);
+        APPEND("workers:%d\r\n", kvs_config.threads > 0 ? kvs_config.threads : 1);
+        APPEND("shards:%u\r\n", KV_NR_SHARDS);
+        APPEND("\r\n");
+    }
+
+    if (want_clients) {
+        APPEND("# Clients\r\n");
+        APPEND("connected_clients:%d\r\n",
+               atomic_load_explicit(&g_kvs_connected_clients,
+                                    memory_order_relaxed));
+        APPEND("maxclients:%d\r\n",
+               __atomic_load_n(&kvs_config.maxclients, __ATOMIC_RELAXED));
+        APPEND("\r\n");
+    }
+
+    if (want_memory) {
+        size_t allocated = 0;
+        const char *allocator = "libc";
+#ifdef USE_JEMALLOC
+        size_t sz = sizeof(allocated);
+        /* je_mallctl epoch refresh required for stats to be current. */
+        uint64_t epoch = 1;
+        size_t esz = sizeof(epoch);
+        mallctl("epoch", &epoch, &esz, &epoch, esz);
+        if (mallctl("stats.allocated", &allocated, &sz, NULL, 0) != 0)
+            allocated = 0;
+        allocator = "jemalloc";
+#else
+        /* getrusage ru_maxrss is in KB on Linux; convert to bytes. */
+        struct rusage ru;
+        if (getrusage(RUSAGE_SELF, &ru) == 0)
+            allocated = (size_t)ru.ru_maxrss * 1024;
+#endif
+        APPEND("# Memory\r\n");
+        APPEND("used_memory:%zu\r\n", allocated);
+        APPEND("used_memory_human:%.2fM\r\n", (double)allocated / (1024.0 * 1024.0));
+        APPEND("mem_allocator:%s\r\n", allocator);
+        APPEND("\r\n");
+    }
+
+    if (want_persistence) {
+        APPEND("# Persistence\r\n");
+        APPEND("aof_enabled:%d\r\n", ENABLE_AOF ? 1 : 0);
+        APPEND("rdb_enabled:%d\r\n", ENABLE_RDB ? 1 : 0);
+        APPEND("loading:%d\r\n", g_in_reload ? 1 : 0);
+        APPEND("\r\n");
+    }
+
+    if (want_stats) {
+        APPEND("# Stats\r\n");
+        APPEND("total_connections_received:%llu\r\n",
+               (unsigned long long)atomic_load_explicit(&g_kvs_total_connections,
+                                                         memory_order_relaxed));
+        APPEND("total_commands_processed:%llu\r\n",
+               (unsigned long long)atomic_load_explicit(&g_kvs_total_commands,
+                                                         memory_order_relaxed));
+        /* Phase 10 — lock-free seqlock fast-path cache stats.  Emitted
+         * unconditionally so INFO consumers can see "0" when disabled
+         * (matches Redis style for module / extension counters). */
+        uint64_t fp_h = 0, fp_m = 0, fp_inv = 0, fp_col = 0;
+        if (g_fp_cache) fp_stats(g_fp_cache, &fp_h, &fp_m, &fp_inv, &fp_col);
+        APPEND("fastpath_cache_enabled:%d\r\n",
+               kvs_config.fastpath_cache_enabled ? 1 : 0);
+        APPEND("fastpath_cache_hits:%llu\r\n",     (unsigned long long)fp_h);
+        APPEND("fastpath_cache_misses:%llu\r\n",   (unsigned long long)fp_m);
+        APPEND("fastpath_cache_invalidations:%llu\r\n",
+               (unsigned long long)fp_inv);
+        APPEND("fastpath_cache_writer_collisions:%llu\r\n",
+               (unsigned long long)fp_col);
+        if (fp_h + fp_m > 0) {
+            double rate = 100.0 * (double)fp_h / (double)(fp_h + fp_m);
+            APPEND("fastpath_cache_hit_rate:%.2f\r\n", rate);
+        } else {
+            APPEND("fastpath_cache_hit_rate:0.00\r\n");
+        }
+
+        /* Phase 10.6 — dispatch latency histogram (16 log2-spaced buckets,
+         * 1 µs .. ≥16 ms).  Emit per-bucket counts for raw consumption
+         * (Prometheus, plotting, etc.) plus derived p50/p99/p999/mean for
+         * humans reading INFO directly.  Counters are sharded across
+         * KVS_LAT_SLOTS cachelines to avoid writer contention; INFO sums
+         * them on read.  Tearing across slots/buckets is acceptable for
+         * percentile estimation at this granularity. */
+        uint64_t lat_buckets[KVS_LAT_BUCKETS] = {0};
+        uint64_t lat_total = 0;
+        uint64_t lat_sum   = 0;
+        for (int s = 0; s < KVS_LAT_SLOTS; s++) {
+            for (int i = 0; i < KVS_LAT_BUCKETS; i++) {
+                lat_buckets[i] += atomic_load_explicit(
+                        &g_kvs_lat_slots[s].hist[i], memory_order_relaxed);
+            }
+            lat_total += atomic_load_explicit(&g_kvs_lat_slots[s].count,
+                                               memory_order_relaxed);
+            lat_sum   += atomic_load_explicit(&g_kvs_lat_slots[s].sum_ns,
+                                               memory_order_relaxed);
+        }
+        APPEND("latency_total_samples:%llu\r\n", (unsigned long long)lat_total);
+        if (lat_total > 0) {
+            APPEND("latency_mean_us:%.2f\r\n",
+                   (double)lat_sum / (double)lat_total / 1000.0);
+        } else {
+            APPEND("latency_mean_us:0.00\r\n");
+        }
+        /* Bucket upper bounds in microseconds. B0 covers <1 µs; subsequent
+         * boundaries double.  Bucket counts emitted as latency_us_le_<N>. */
+        static const uint64_t bucket_upper_us[KVS_LAT_BUCKETS] = {
+            1, 2, 4, 8, 16, 32, 64, 128, 256, 512,
+            1024, 2048, 4096, 8192, 16384, 0 /* +Inf */
+        };
+        for (int i = 0; i < KVS_LAT_BUCKETS; i++) {
+            if (bucket_upper_us[i] == 0) {
+                APPEND("latency_us_le_inf:%llu\r\n",
+                       (unsigned long long)lat_buckets[i]);
+            } else {
+                APPEND("latency_us_le_%llu:%llu\r\n",
+                       (unsigned long long)bucket_upper_us[i],
+                       (unsigned long long)lat_buckets[i]);
+            }
+        }
+        /* Percentile estimation: walk the cumulative distribution and pick
+         * the bucket whose CDF crosses each target.  Reported as the bucket's
+         * upper bound — a conservative (i.e. never-underestimating) estimate. */
+        if (lat_total > 0) {
+            const double pcts[3] = { 0.50, 0.99, 0.999 };
+            const char  *names[3] = { "p50", "p99", "p999" };
+            for (int p = 0; p < 3; p++) {
+                uint64_t target = (uint64_t)((double)lat_total * pcts[p]);
+                if (target == 0) target = 1;
+                uint64_t cum = 0;
+                int picked = KVS_LAT_BUCKETS - 1;
+                for (int i = 0; i < KVS_LAT_BUCKETS; i++) {
+                    cum += lat_buckets[i];
+                    if (cum >= target) { picked = i; break; }
+                }
+                if (bucket_upper_us[picked] == 0) {
+                    APPEND("latency_%s_us:+inf\r\n", names[p]);
+                } else {
+                    APPEND("latency_%s_us:%llu\r\n",
+                           names[p],
+                           (unsigned long long)bucket_upper_us[picked]);
+                }
+            }
+        } else {
+            APPEND("latency_p50_us:0\r\n");
+            APPEND("latency_p99_us:0\r\n");
+            APPEND("latency_p999_us:0\r\n");
+        }
+
+        APPEND("\r\n");
+    }
+
+    if (want_replication) {
+        APPEND("# Replication\r\n");
+        APPEND("role:%s\r\n", kvs_config.rdma_role == ROLE_MASTER ? "master" : "slave");
+        APPEND("rdma_sync_enabled:%d\r\n", kvs_config.rdma_sync_enabled ? 1 : 0);
+        if (kvs_config.rdma_sync_enabled) {
+            APPEND("rdma_provider:%s\r\n", kvs_config.rdma_provider);
+            if (kvs_config.rdma_role == ROLE_MASTER) {
+                APPEND("rdma_listen:%s:%d\r\n",
+                       kvs_config.rdma_listen_ip, kvs_config.rdma_listen_port);
+            } else {
+                APPEND("master_host:%s\r\n", kvs_config.rdma_master_ip);
+                APPEND("master_port:%d\r\n", kvs_config.rdma_master_port);
+            }
+        }
+        APPEND("connected_slaves:0\r\n");
+        APPEND("\r\n");
+    }
+
+    if (want_cpu) {
+        struct rusage ru;
+        if (getrusage(RUSAGE_SELF, &ru) == 0) {
+            double sys_s = ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+            double usr_s = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6;
+            APPEND("# CPU\r\n");
+            APPEND("used_cpu_sys:%.6f\r\n", sys_s);
+            APPEND("used_cpu_user:%.6f\r\n", usr_s);
+            APPEND("\r\n");
+        }
+    }
+
+    if (want_keyspace) {
+        uint32_t nkeys = kv_shards_count();
+        APPEND("# Keyspace\r\n");
+        if (nkeys > 0)
+            APPEND("db0:keys=%u,expires=0,avg_ttl=0\r\n", nkeys);
+        APPEND("\r\n");
+    }
+
+truncated:
+    /* Frame as RESP bulk string. */
+    {
+        char hdr[32];
+        int hl = snprintf(hdr, sizeof(hdr), "$%d\r\n", off);
+        dynbuf_cat(wb, hdr, hl);
+        dynbuf_cat(wb, body, off);
+        dynbuf_lit(wb, "\r\n");
+    }
+    #undef APPEND
+    return DISPATCH_OK;
 }
 
 /* ==================== Command dispatch ==================== */
@@ -456,6 +888,11 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
 {
     if (tokens == NULL || argc <= 0 || wb == NULL)
         return DISPATCH_ERROR;
+
+    /* Phase 9 — INFO total_commands_processed.  Bump before dispatch even
+     * for unknown / malformed commands; INFO reports the wire activity rate
+     * regardless of correctness, matching Redis semantics. */
+    atomic_fetch_add_explicit(&g_kvs_total_commands, 1, memory_order_relaxed);
 
     kvs_token_t cmd = tokens[0];
 
@@ -604,6 +1041,11 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return handle_config(tokens, argc, wb);
     }
 
+    /* Phase 9 — INFO server/clients/memory/etc. */
+    if (TOKEN_EQ(cmd, "INFO")) {
+        return handle_info(tokens, argc, wb);
+    }
+
     if (TOKEN_EQ(cmd, "FLUSHALL") || TOKEN_EQ(cmd, "FLUSHDB")) {
         /* Walk every shard under its own rdlock, then wrlock-clear all. */
         kv_shards_iter_t it; kv_shards_iter_init(&it);
@@ -690,21 +1132,15 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (!g_in_reload) {
             if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
             kvs_rdma_incr_probe(msg_raw, msg_len);
-            if (kvs_config.xdp_enabled) {
+            if (kvs_config.xdp_enabled || g_fp_cache) {
                 for (int i = 1; i + 1 < argc; i += 2) {
                     uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                           (uint32_t)tokens[i].len);
-                    /* XDP cache update is read-only (just reads back the
-                     * value we just wrote); rdlock allows other readers
-                     * to continue concurrently. */
+                    /* Hot-cache refresh is read-only (rdlock just reads
+                     * back the value we already wrote); other readers
+                     * continue concurrently. */
                     SHARD_LOCK(kh, 0);
-                    uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
-                    const char *v = string_engine_get(
-                        tokens[i].ptr, (uint32_t)tokens[i].len, &vlen, &enc);
-                    if (v && enc == KV_ENCODING_RAW && vlen > 0 && vlen <= XDP_VAL_MAX)
-                        xdp_cache_put(tokens[i].ptr, tokens[i].len, v, (int)vlen);
-                    else
-                        xdp_cache_del(tokens[i].ptr, tokens[i].len);
+                    hot_caches_refresh_string(tokens[i].ptr, tokens[i].len, kh);
                 }
             }
         }
@@ -745,19 +1181,13 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (!g_in_reload) {
             if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
             kvs_rdma_incr_probe(msg_raw, msg_len);
-            if (kvs_config.xdp_enabled) {
+            if (kvs_config.xdp_enabled || g_fp_cache) {
                 for (int i = 1; i + 1 < argc; i += 2) {
                     uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                           (uint32_t)tokens[i].len);
-                    /* MSETNX XDP-cache read-back: rdlock (read-only). */
+                    /* Hot-cache read-back: rdlock (read-only). */
                     SHARD_LOCK(kh, 0);
-                    uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
-                    const char *v = string_engine_get(
-                        tokens[i].ptr, (uint32_t)tokens[i].len, &vlen, &enc);
-                    if (v && enc == KV_ENCODING_RAW && vlen > 0 && vlen <= XDP_VAL_MAX)
-                        xdp_cache_put(tokens[i].ptr, tokens[i].len, v, (int)vlen);
-                    else
-                        xdp_cache_del(tokens[i].ptr, tokens[i].len);
+                    hot_caches_refresh_string(tokens[i].ptr, tokens[i].len, kh);
                 }
             }
         }
@@ -786,9 +1216,12 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (ndel > 0 && !g_in_reload) {
             if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
             kvs_rdma_incr_probe(msg_raw, msg_len);
-            if (kvs_config.xdp_enabled) {
-                for (int i = 1; i < argc; i++)
-                    xdp_cache_del(tokens[i].ptr, tokens[i].len);
+            if (kvs_config.xdp_enabled || g_fp_cache) {
+                for (int i = 1; i < argc; i++) {
+                    uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
+                                          (uint32_t)tokens[i].len);
+                    hot_caches_evict(tokens[i].ptr, tokens[i].len, kh);
+                }
             }
         }
         return DISPATCH_OK;
@@ -825,6 +1258,38 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
 
     kvs_token_t key_tok = tokens[1];
     uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
+
+    /* ── Phase 10 — Lock-free seqlock fast-path for GET ──
+     *
+     *  Probe BEFORE we classify or take any shard lock.  On hit we
+     *  emit a complete RESP bulk reply directly from the seqlock
+     *  cache, completely skipping shard rdlock + dict_find +
+     *  reply formatting.  On miss we fall through to the normal
+     *  dispatcher path with at most ~30 ns of memory-load overhead.
+     *
+     *  Eligibility:
+     *    - cache enabled
+     *    - cmd is exactly "GET" (3 bytes; case already normalised
+     *      by Phase 6.2b dispatcher prelude)
+     *    - argc == 2 (single key, no options)
+     *    - key length within cache bound
+     *  AOF / WAL / observability are not affected: a GET is read-only
+     *  so there is nothing to log or replicate.  The XDP/sockmap
+     *  observation programs still see the wire bytes regardless. */
+    if (g_fp_cache
+        && argc == 2
+        && cmd.len == 3
+        && cmd.ptr[0] == 'G' && cmd.ptr[1] == 'E' && cmd.ptr[2] == 'T'
+        && key_tok.len > 0
+        && (uint32_t)key_tok.len <= FP_KEY_MAX) {
+        uint8_t fpbuf[FP_REPLY_MAX];
+        uint32_t fpvlen = 0;
+        if (fp_get(g_fp_cache, key_tok.ptr, (uint32_t)key_tok.len, hash,
+                   fpbuf, &fpvlen, sizeof(fpbuf)) == 0) {
+            dynbuf_cat(wb, (char *)fpbuf, (int)fpvlen);
+            return DISPATCH_OK;
+        }
+    }
 
     /* Phase 6.2 — classify command BEFORE locking, so we can choose rdlock
      * (for reads) vs wrlock (for writes).  cmd_type < 0 means unknown,
@@ -976,9 +1441,10 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (!g_in_reload) {
             if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
             kvs_rdma_incr_probe(msg_raw, msg_len);
-            /* XDP cannot check expiry — evict from hot cache */
-            if (kvs_config.xdp_enabled)
-                xdp_cache_del(key_tok.ptr, key_tok.len);
+            /* Hot caches cannot represent expiry — evict on EXPIRE.
+             * (fp_cache also has no TTL knowledge by design.) */
+            if (kvs_config.xdp_enabled || g_fp_cache)
+                hot_caches_evict(key_tok.ptr, key_tok.len, hash);
         }
         return DISPATCH_OK;
     }
@@ -1057,32 +1523,34 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (ok && !g_in_reload) {
             if (ENABLE_AOF) aof_async_append(msg_raw, msg_len);
             kvs_rdma_incr_probe(msg_raw, msg_len);
-            /* XDP hot-cache: update for string writes, evict for other types */
-            if (kvs_config.xdp_enabled) {
-                if (cmd_type == KV_TYPE_STRING) {
-                    uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
-                    const char *v = string_engine_get(
-                        key_tok.ptr, (uint32_t)key_tok.len, &vlen, &enc);
-                    if (v && enc == KV_ENCODING_RAW &&
-                        vlen > 0 && vlen <= XDP_VAL_MAX)
-                        xdp_cache_put(key_tok.ptr, key_tok.len, v, (int)vlen);
-                    else
-                        xdp_cache_del(key_tok.ptr, key_tok.len);
-                } else {
-                    xdp_cache_del(key_tok.ptr, key_tok.len);
-                }
+            /* Hot caches: update on STRING writes, evict on other types.
+             * Lock is still held here (single-key SHARD_LOCK macro), so
+             * the engine read inside hot_caches_refresh_string is safe. */
+            if (kvs_config.xdp_enabled || g_fp_cache) {
+                if (cmd_type == KV_TYPE_STRING)
+                    hot_caches_refresh_string(key_tok.ptr, key_tok.len, hash);
+                else
+                    hot_caches_evict(key_tok.ptr, key_tok.len, hash);
             }
         }
     }
 
     /* ── After LPUSH/RPUSH, wake any client blocked on this key ──
-     *  Drop the shard lock first: the woken client's saved command may target
-     *  a different shard, and block_retry_client recurses into kvs_dispatch. */
+     *
+     *  Drop the shard lock first: the wake notify path may dispatch into
+     *  block subsystem APIs and (on the same-worker fast path) into the
+     *  woken client's saved command, which can target any shard.
+     *
+     *  Phase 9 multi-key fix: do NOT call block_retry_client here.  The
+     *  retry must run on the woken client's owner worker so that
+     *  conn->write_buf is touched by exactly one worker.  block_notify_woken
+     *  routes via proactor_block_notify(): same-worker → runs locally,
+     *  cross-worker → enqueues to owner's wake_evfd and the owner's
+     *  proactor_block_notify_local will retry block_cmd_buf. */
     SHARD_RELEASE();
     if (r == DISPATCH_OK && (TOKEN_EQ(cmd, "LPUSH") || TOKEN_EQ(cmd, "RPUSH"))) {
         client_t *wc = block_wake_one(key_tok.ptr, (uint32_t)key_tok.len);
         if (wc) {
-            block_retry_client(wc);
             block_notify_woken(wc);
         }
     }
@@ -1160,6 +1628,9 @@ int main(int argc, char *argv[]) {
      * buffered (4096+ bytes), hiding log messages from bench scripts. */
     setlinebuf(stdout);
     setlinebuf(stderr);
+    /* Phase 9 — record server start time for INFO uptime_in_seconds. */
+    g_kvs_start_time_ms = get_time_now_real();
+    kvs_tsc_calibrate();
     persist_set_basedir(argv[0]);
     const char *conf_path = (argc >= 2) ? argv[1] : "conf/kvstore.conf";
     config_load(conf_path);
@@ -1172,6 +1643,14 @@ int main(int argc, char *argv[]) {
         xdp_manager_init(kvs_config.xdp_iface, kvs_config.port);
     if (kvs_config.sockmap_enabled)
         sockmap_manager_init(kvs_config.port);
+    /* Phase 10 — lock-free seqlock fast-path cache */
+    if (kvs_config.fastpath_cache_enabled) {
+        g_fp_cache = fp_cache_new();
+        if (!g_fp_cache) {
+            KVS_LOG(LOG_WARN, "fp_cache_new() failed; fastpath disabled");
+            kvs_config.fastpath_cache_enabled = 0;
+        }
+    }
 
     if (kvs_config.rdma_sync_enabled) {
         if (kvs_config.rdma_role == ROLE_MASTER) {

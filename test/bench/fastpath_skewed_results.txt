@@ -1,0 +1,25 @@
+=== Phase 10 fastpath skewed-workload benchmark ===
+date: 2026-05-18 13:13:22
+params: hot_keys=64 value_size=64 total_ops=300000
+
+[0;32m[INFO][0m  13:13:31 kvstore 已启动 (conf=kvstore-fastpath-off.conf, pid=47276, port=2000)
+--- skewed baseline / kvstore-fastpath-off.conf ---
+GET_QPS=15206.04
+fastpath_cache_enabled:0
+fastpath_cache_hits:0
+fastpath_cache_misses:0
+fastpath_cache_writer_collisions:0
+fastpath_cache_hit_rate:0.00
+
+[0;32m[INFO][0m  13:14:06 kvstore 已启动 (conf=kvstore-fastpath.conf, pid=47387, port=2000)
+--- skewed fastpath / kvstore-fastpath.conf ---
+GET_QPS=14996.25
+fastpath_cache_enabled:1
+fastpath_cache_hits:333676
+fastpath_cache_misses:16324
+fastpath_cache_writer_collisions:0
+fastpath_cache_hit_rate:95.34
+
+=== summary ===
+scenario                   baseline     fastpath       gain
+skewed (64 hot keys)       15206.04     14996.25     -1.38%

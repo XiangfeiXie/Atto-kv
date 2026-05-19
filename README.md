@@ -34,6 +34,7 @@
 | **主从复制** | RDMA 零拷贝全量同步 + WAL journal 增量复制，consumer 线程 io_uring 分发 |
 | **三层 BPF 观测栈** | XDP (L2/L3 包层 hit/miss/bypass) + sockmap sk_skb (L4/L7 流层 per-cmd / per-conn) + uprobe (应用函数延迟)，全部 `XDP_PASS` / `SK_PASS` 被动监控，单边开销 < 8% |
 | **CMD4 跳表** | 命令分发 O(1)，4 字节整数 switch，无 strcmp 循环 |
+| **Lock-free 短键热缓存** | per-bucket seqlock 直映射表（1024×512B = 512 KB，L2-resident），STRING GET 命中跳过 shard rwlock；单线程 1.9x，4 线程同 shard 下 +134%，TSAN 0 warning |
 | **jemalloc** | 默认内存分配器，峰值内存比 glibc malloc 低 4%，支持 `arenas.purge` 手动归还 |
 | **阻塞命令** | BLPOP / BRPOP，key→waiter 哈希表 + 超时扫描，消息队列语义 |
 | **可观测工具** | `kvs-top` 实时仪表盘聚合三层数据；`kvs_slowlog` eBPF uprobe 抓慢命令 |
@@ -43,53 +44,100 @@
 ## 架构
 
 ```
-                           ┌──── NIC (ens33 / lo) ────┐
-                           │  XDP 程序（被动监控 L2/L3）│
-                           │  hits / misses / bypass    │
-                           │  hot_cache LRU 65536 槽    │
-                           │  → 始终 XDP_PASS           │
-                           └───────────────────────────┘
+                            ┌─── NIC (ens33 / lo) ───┐
+                            │  XDP 被动监控 L2/L3     │
+                            │  hits / misses / bypass │
+                            │  hot_cache LRU 65 536   │
+                            │  → 始终 XDP_PASS        │
+                            └─────────────────────────┘
+                                       │
+┌──────────────────────────────────────▼───────────────────────────────────────┐
+│                              kvstore 进程                                     │
+│                                                                               │
+│  ┌──────────────────────────── 网络层 (proactor) ───────────────────────────┐ │
+│  │  N × worker, 每核独立 io_uring + buf_ring + SO_REUSEPORT                 │ │
+│  │  conn_pool[fd] 共享，按 fd 单 worker 拥有；cross-worker wake 走 eventfd  │ │
+│  │                                                                           │ │
+│  │  worker 0 ──┐    worker 1 ──┐    worker 2 ──┐                             │ │
+│  │   eventfd   │     eventfd   │     eventfd   │  ← BLPOP 跨 worker 唤醒队列 │ │
+│  │     │       │       │       │       │       │                             │ │
+│  └─────┼───────┼───────┼───────┼───────┼───────┼─────────────────────────────┘ │
+│        │       │       │       │       │       │                               │
+│  ┌─────▼───────▼─────────────────────────────────────────────────────────────┐ │
+│  │                       命令分发层 (kvs_dispatch)                           │ │
+│  │                                                                           │ │
+│  │  ① 大写规整 + CMD4 跳表 → 类型分类 (string/list/set/hash/zset)           │ │
+│  │  ①.5 STRING GET fast-path（Phase 10）：lock-free seqlock 直映射表        │ │
+│  │      命中 → 单次 memcpy 预格式化 RESP 回复 → 跳过 ② 整段 shard 锁        │ │
+│  │  ② 主 key shard 锁：读用 rdlock 写用 wrlock (Phase 6.2)                  │ │
+│  │  ③ 多 key 命令 (SMOVE/LMOVE/RPOPLPUSH) 加 dst shard wrlock              │ │
+│  │     按 shard idx 升序加锁防死锁 (Phase 9)                               │ │
+│  │  ④ 类型 handler 走 entry/hash 直访 (Phase 6.1 没有 double dict_find)    │ │
+│  │  ⑤ 写命令后置：AOF append → WAL probe → XDP hot-cache 同步              │ │
+│  │                                                                           │ │
+│  │  INFO / CONFIG / CLIENT / DBSIZE / SAVE / BGSAVE / FLUSHALL /             │ │
+│  │  SELECT / HELLO / COMMAND / EXPIRE / TTL / PERSIST                        │ │
+│  └─────────────────────────┬─────────────────────────────────────────────────┘ │
+│                            │                                                   │
+│  ┌─────────────────────────▼──────────────┐  ┌───────────────────────────────┐ │
+│  │      存储引擎 (kv_dict, 32 sharded)     │  │     blocking 子系统            │ │
+│  │                                          │  │  block_table[256] (djb2)      │ │
+│  │  shards[0..31]：                         │  │  BLPOP/BRPOP 注册 + 跨 worker │ │
+│  │   pthread_rwlock_t  56 B                 │  │  唤醒 (LPUSH/RPUSH 仅 notify; │ │
+│  │   kv_dict_t         64 B                 │  │  retry & reply 都在 owner    │ │
+│  │   pad                8 B                 │  │  worker 内执行, 写 write_buf │ │
+│  │   ─────────────  128 B (cacheline-aligned)│  │  始终单 worker → 无 race)    │ │
+│  │                                          │  └───────────────────────────────┘ │
+│  │  渐进式 rehash (REHASH_BATCH=8)           │                                   │
+│  │  FNV-1a + Murmur3 → 高位选 shard, 低位定 bucket                              │
+│  │  单次 malloc: [hdr][type:1][enc:1][payload][key]                             │
+│  └─────────────────────────────────────────┘                                   │
+│                                                                               │
+│  ┌────────────── 5 种数据类型 (双编码自动转换) ──────────────────────────────┐ │
+│  │  STRING  raw / int        LIST  packed ↔ quicklist                         │ │
+│  │  SET     packed ↔ dict    HASH  listpack ↔ hashtable                       │ │
+│  │  ZSET    listpack ↔ (dict + skiplist)                                      │ │
+│  └────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                               │
+│  ┌──────────── 持久化 ────────────────┐  ┌───── 主从复制 (libfabric RDMA) ──┐ │
+│  │  RDB: 全分片 wrlock + fork()         │  │  Master: probe(uprobe) → ringbuf│ │
+│  │       父进程立即解锁；子进程 COW 内   │  │     → relay → libfabric send    │ │
+│  │       走 no-lock 迭代器 + io_uring   │  │  Slave : connect + recv → 解析  │ │
+│  │       异步落盘 (Phase 4B.4)          │  │     直接内存加载 (零拷贝)       │ │
+│  │                                      │  │  增量: WAL journal SPSC ring +  │ │
+│  │  AOF: 主线程 atomic_fetch_add 占 slot │  │       eventfd 条件唤醒 consumer │ │
+│  │       memcpy → consumer 线程 writev   │  │       → io_uring 批量分发 →     │ │
+│  │       eventfd 仅在 consumer 睡眠时   │  │       slave fi_send             │ │
+│  │       唤醒；热路径零 syscall         │  │  全程零 RESP 文本序列化         │ │
+│  └──────────────────────────────────────┘  └─────────────────────────────────┘ │
+│                                                                               │
+│  ┌──────────── 三层 BPF 可观测 (全部 PASS, 单边 < 8% 开销) ──────────────────┐ │
+│  │  L2/L3  XDP: hot_cache 命中率 + bypass + tx_drop                            │ │
+│  │  L4/L7  sockops: passive accept → sockhash 自动注册                         │ │
+│  │         sk_skb stream_verdict: per-cmd 计数 + per-conn LRU 画像             │ │
+│  │  L7+    uprobe (kvs_slowlog): 命令分发函数的延迟超阈值上报                  │ │
+│  │                                                                             │ │
+│  │  所有 map pin 到 /sys/fs/bpf/kvstore/, kvs-top 跨进程读取                   │ │
+│  └─────────────────────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────────────────────┘
                                          │
-┌────────────────────────────────────────▼──────────────────────────────────┐
-│                              kvstore 进程                                  │
-│                                                                            │
-│  ┌──────────────────────┐    ┌──────────────────────────────────────────┐ │
-│  │     网络层           │    │            命令分发层                     │ │
-│  │                      │    │  CMD4 jump-table → 5 种类型 handler      │ │
-│  │  Reactor  (epoll)    │───▶│  写命令后处理:                            │ │
-│  │  Proactor (io_uring) │    │   ① AOF ring push  (lock-free)           │ │
-│  │  NtyCo    (协程)     │    │   ② WAL journal push (atomic, 无锁)      │ │
-│  └──────────────────────┘    │   ③ XDP hot-cache flush                  │ │
-│                               └──────────────────────────────────────────┘ │
-│                                         │                                   │
-│  ┌──────────────────────┐    ┌──────────▼───────────────────────────────┐  │
-│  │     存储引擎          │    │           WAL consumer 线程               │  │
-│  │                      │    │  journal ring (4096 slots, SPSC)         │  │
-│  │  kv_dict (统一字典)   │    │  → writev WAL 文件 (group commit)        │  │
-│  │  FNV-1a + Murmur3    │    │  → in-memory backlog (16384 slots)       │  │
-│  │  渐进式 rehash        │    │  → io_uring 批量分发 → Slave TCP         │  │
-│  │  单次 malloc 布局     │    └──────────────────────────────────────────┘  │
-│  └──────────────────────┘                                                   │
-│                                                                              │
-│  ┌──────────────────────┐    ┌──────────────────────────────────────────┐   │
-│  │     持久化层          │    │           RDMA 全量同步                   │   │
-│  │                      │    │  fork() COW → RDB 序列化 → libfabric     │   │
-│  │  RDB: fork + io_uring│    │  Slave: RDMA read → 直接内存加载         │   │
-│  │  AOF: mmap ring buf  │    │  全程不落盘，无 RESP 文本解析             │   │
-│  └──────────────────────┘    └──────────────────────────────────────────┘   │
-│                                                                              │
-│  ┌──────────────────────┐    ┌──────────────────────────────────────────┐   │
-│  │   sockmap 流层观测    │    │       userspace 工具                      │   │
-│  │                      │    │                                          │   │
-│  │  cgroup sockops →    │◀───┤  kvs-top: 1Hz TUI                        │   │
-│  │   sockmap 自动注册   │    │   读 /sys/fs/bpf/kvstore/<map>           │   │
-│  │  sk_skb stream_      │    │   渲染三层聚合 + delta rate              │   │
-│  │   verdict 解析 RESP  │    │  kvs_slowlog: uprobe 慢命令              │   │
-│  │  per-cmd / per-conn  │    └──────────────────────────────────────────┘   │
-│  │  全程 SK_PASS         │                                                  │
-│  └──────────────────────┘                                                   │
-└──────────────────────────────────────────────────────────────────────────────┘
+                                ┌────────▼────────┐
+                                │  kvs-top (TUI)  │  ◀── 1 Hz 聚合 BPF 三层
+                                │  kvs_slowlog    │  ◀── 慢命令 uprobe
+                                │  redis-cli INFO │  ◀── 8 段 + 计数器
+                                └─────────────────┘
 ```
+
+### 关键并发不变量
+
+| 不变量 | 强制方式 |
+|---|---|
+| `dict` 写互斥 | 32 shards × pthread_rwlock，dispatcher 持锁；多 key 命令按 shard idx 升序加锁防死锁 |
+| `conn_pool[fd]` 单线程 | 每个 fd 仅 owner worker 触摸；fd 释放走 close 边界 |
+| `write_buf` 单线程 | 跨 worker BLPOP 唤醒只 notify，replay & reply 在 owner worker 完成 |
+| 复制热路径零 syscall | atomic seq + memcpy + 条件 eventfd（仅 consumer 睡眠时）|
+| BGSAVE 无 stall | 全分片 wrlock → fork → 父立即解锁，子进程 no-lock 迭代器 |
+| fast-path 无 reader 锁 | per-bucket 64-bit seqlock（even=stable / odd=writer），acquire-load 包夹整次 memcpy；写者 CAS-on-seq 保证单写者，与 dict shard wrlock 串行 |
 
 ### 源码结构
 
@@ -100,6 +148,7 @@ src/
 │   ├── protocol.c/h     零拷贝 RESP 解析（kvs_token_t 切片，零 malloc）
 │   ├── config.c/h       配置解析（strtol 范围校验，行截断检测）
 │   ├── block.c/h        BLPOP/BRPOP 阻塞子系统
+│   ├── fastpath_cache.c/h  Phase 10: lock-free seqlock 短键热缓存（512 KB, L2-resident）
 │   └── server.h         连接管理、DynBuf 读写缓冲
 ├── engine/        统一存储引擎
 │   └── kv_dict.c/h      FNV-1a + Murmur3，渐进式 rehash，单次 malloc 条目
@@ -256,11 +305,12 @@ cpu_pin     auto          # off | auto | 1,3,5,7
 
 不同环境对"礼貌让步"的要求不一样。下面三个开箱即用的 `.conf`，对应三种典型场景：
 
-| 配置 | 场景 | `threads` | 行为 |
-|---|---|---|---|
-| `conf/kvstore-server.conf` | **专用服务器**（独占整机） | `0` (auto: `nproc-1`) | 吃满核，QPS 优先，AOF + RDB 双轨 |
-| `conf/kvstore-shared.conf` | **共享服务器 / 容器**（多租户） | `-2` (auto-leave 2) | 留 2 核给邻居，cgroup quota 自动 cap |
-| `conf/kvstore-dev.conf` | **开发笔记本**（IDE + 浏览器并跑） | `-2` | 留核给 IDE，关持久化排除 IO 干扰 |
+| 配置 | 场景 | `threads` | `cpu_pin` | 行为 |
+|---|---|---|---|---|
+| `conf/kvstore-server.conf` | **专用服务器**（独占整机） | `0` (auto: `nproc-1`) | `auto` | 吃满核，QPS 优先，AOF + RDB 双轨 |
+| `conf/kvstore-shared.conf` | **共享服务器 / 容器**（多租户） | `-2` (auto-leave 2) | `auto` | 留 2 核给邻居，cgroup quota 自动 cap |
+| `conf/kvstore-dev.conf` | **开发笔记本**（IDE + 浏览器并跑） | `-2` | `auto` | 留核给 IDE，关持久化排除 IO 干扰 |
+| `conf/kvstore-local.conf` | **本机 6c 笔记本**（确定性绑核） | `3` | `3,4,5` | KV 占后 3 核，前 3 核 (0,1,2) 留给 IDE/softirq；多 worker 并发验证 |
 
 ### 何时用哪个
 
@@ -273,6 +323,9 @@ cpu_pin     auto          # off | auto | 1,3,5,7
 
 # 开发笔记本（6c → 4 worker，IDE 用 2 核不被挤）
 ./build/kvstore conf/kvstore-dev.conf
+
+# 本机 6c 笔记本（KV 钉到 cores 3/4/5，前 3 核留给 IDE）
+./build/kvstore conf/kvstore-local.conf
 ```
 
 ### `threads` 三种语义速查
@@ -304,6 +357,7 @@ IOSchedulingClass=best-effort
 - `conf/kvstore-server.conf` — 专用服务器
 - `conf/kvstore-shared.conf` — 共享 server / 容器
 - `conf/kvstore-dev.conf` — 开发笔记本
+- `conf/kvstore-local.conf` — 本机 6c：3 worker + cpu_pin 3,4,5（推荐本机调试用）
 - `conf/kvstore-master.conf` — 主从复制 · 主机
 - `conf/kvstore-slave.conf` — 主从复制 · 从机
 
@@ -311,10 +365,17 @@ IOSchedulingClass=best-effort
 
 ## 支持的命令
 
-### 全局
+### 全局 / 服务管理
 ```
-PING  ECHO  SAVE  FLUSHALL  DEL  EXISTS  EXPIRE  TTL  TYPE
+PING  ECHO  HELLO  QUIT  SELECT  CLIENT
+COMMAND  CONFIG (GET/SET/RESETSTAT)  INFO [section]
+DBSIZE  SAVE  BGSAVE  BGREWRITEAOF  FLUSHALL  FLUSHDB
+DEL  UNLINK  EXISTS  EXPIRE  TTL  PTTL  PERSIST  TYPE
 ```
+
+`INFO` 输出 8 段（server / clients / memory / persistence / stats /
+replication / cpu / keyspace），可作为 Prometheus 抓取入口。
+`INFO server` / `INFO stats` 等过滤单段。
 
 ### STRING
 ```

@@ -1,723 +1,404 @@
 # KVStore
 
-高性能、兼容 Redis 协议的键值存储系统，使用 C11 从零构建。覆盖网络 I/O、持久化、主从复制、eBPF/XDP 内核加速等底层系统编程技术。
+KVStore 是一个使用 **C11 从零实现的 Redis-like 高性能内存数据库**。项目重点展示网络 I/O、存储引擎、持久化、主从复制、RDMA/libfabric、BPF/XDP 可观测以及系统性能优化能力。
+
+这个项目不是简单的 Redis 命令练习，而是围绕“高吞吐、低侵入观测、可靠持久化、可恢复复制”构建的一套完整系统工程实践。
 
 ---
 
-## 目录
+## 项目亮点
 
-- [特性概览](#特性概览)
-- [架构](#架构)
-- [快速开始](#快速开始)
-- [编译](#编译)
-- [配置](#配置)
-- [部署模式](#部署模式三档预设配置)
-- [支持的命令](#支持的命令)
-- [网络模型](#网络模型)
-- [持久化](#持久化)
-- [主从复制](#主从复制)
-- [三层 BPF 可观测栈](#三层-bpf-可观测栈)
-- [可观测性工具](#可观测性工具)
-- [性能数据](#性能数据)
-- [测试](#测试)
-- [技术栈](#技术栈)
-
----
-
-## 特性概览
-
-| 特性 | 说明 |
-|------|------|
-| **5 种数据类型** | STRING、LIST、SET、HASH、ZSET，完整 Redis 命令兼容 |
-| **3 种网络模型** | Reactor (epoll)、Proactor (io_uring 进阶版：multishot accept/recv + 内核 buffer ring + DEFER_TASKRUN)、NtyCo (协程) |
-| **双持久化** | RDB 二进制快照 + AOF 命令日志，io_uring 异步写入，mmap 加速加载 |
-| **主从复制** | RDMA 零拷贝全量同步 + WAL journal 增量复制，consumer 线程 io_uring 分发 |
-| **三层 BPF 观测栈** | XDP (L2/L3 包层 hit/miss/bypass) + sockmap sk_skb (L4/L7 流层 per-cmd / per-conn) + uprobe (应用函数延迟)，全部 `XDP_PASS` / `SK_PASS` 被动监控，单边开销 < 8% |
-| **CMD4 跳表** | 命令分发 O(1)，4 字节整数 switch，无 strcmp 循环 |
-| **Lock-free 短键热缓存** | per-bucket seqlock 直映射表（1024×512B = 512 KB，L2-resident），STRING GET 命中跳过 shard rwlock；单线程 1.9x，4 线程同 shard 下 +134%，TSAN 0 warning |
-| **jemalloc** | 默认内存分配器，峰值内存比 glibc malloc 低 4%，支持 `arenas.purge` 手动归还 |
-| **阻塞命令** | BLPOP / BRPOP，key→waiter 哈希表 + 超时扫描，消息队列语义 |
-| **可观测工具** | `kvs-top` 实时仪表盘聚合三层数据；`kvs_slowlog` eBPF uprobe 抓慢命令 |
-
----
-
-## 架构
-
-```
-                            ┌─── NIC (ens33 / lo) ───┐
-                            │  XDP 被动监控 L2/L3     │
-                            │  hits / misses / bypass │
-                            │  hot_cache LRU 65 536   │
-                            │  → 始终 XDP_PASS        │
-                            └─────────────────────────┘
-                                       │
-┌──────────────────────────────────────▼───────────────────────────────────────┐
-│                              kvstore 进程                                     │
-│                                                                               │
-│  ┌──────────────────────────── 网络层 (proactor) ───────────────────────────┐ │
-│  │  N × worker, 每核独立 io_uring + buf_ring + SO_REUSEPORT                 │ │
-│  │  conn_pool[fd] 共享，按 fd 单 worker 拥有；cross-worker wake 走 eventfd  │ │
-│  │                                                                           │ │
-│  │  worker 0 ──┐    worker 1 ──┐    worker 2 ──┐                             │ │
-│  │   eventfd   │     eventfd   │     eventfd   │  ← BLPOP 跨 worker 唤醒队列 │ │
-│  │     │       │       │       │       │       │                             │ │
-│  └─────┼───────┼───────┼───────┼───────┼───────┼─────────────────────────────┘ │
-│        │       │       │       │       │       │                               │
-│  ┌─────▼───────▼─────────────────────────────────────────────────────────────┐ │
-│  │                       命令分发层 (kvs_dispatch)                           │ │
-│  │                                                                           │ │
-│  │  ① 大写规整 + CMD4 跳表 → 类型分类 (string/list/set/hash/zset)           │ │
-│  │  ①.5 STRING GET fast-path（Phase 10）：lock-free seqlock 直映射表        │ │
-│  │      命中 → 单次 memcpy 预格式化 RESP 回复 → 跳过 ② 整段 shard 锁        │ │
-│  │  ② 主 key shard 锁：读用 rdlock 写用 wrlock (Phase 6.2)                  │ │
-│  │  ③ 多 key 命令 (SMOVE/LMOVE/RPOPLPUSH) 加 dst shard wrlock              │ │
-│  │     按 shard idx 升序加锁防死锁 (Phase 9)                               │ │
-│  │  ④ 类型 handler 走 entry/hash 直访 (Phase 6.1 没有 double dict_find)    │ │
-│  │  ⑤ 写命令后置：AOF append → WAL probe → XDP hot-cache 同步              │ │
-│  │                                                                           │ │
-│  │  INFO / CONFIG / CLIENT / DBSIZE / SAVE / BGSAVE / FLUSHALL /             │ │
-│  │  SELECT / HELLO / COMMAND / EXPIRE / TTL / PERSIST                        │ │
-│  └─────────────────────────┬─────────────────────────────────────────────────┘ │
-│                            │                                                   │
-│  ┌─────────────────────────▼──────────────┐  ┌───────────────────────────────┐ │
-│  │      存储引擎 (kv_dict, 32 sharded)     │  │     blocking 子系统            │ │
-│  │                                          │  │  block_table[256] (djb2)      │ │
-│  │  shards[0..31]：                         │  │  BLPOP/BRPOP 注册 + 跨 worker │ │
-│  │   pthread_rwlock_t  56 B                 │  │  唤醒 (LPUSH/RPUSH 仅 notify; │ │
-│  │   kv_dict_t         64 B                 │  │  retry & reply 都在 owner    │ │
-│  │   pad                8 B                 │  │  worker 内执行, 写 write_buf │ │
-│  │   ─────────────  128 B (cacheline-aligned)│  │  始终单 worker → 无 race)    │ │
-│  │                                          │  └───────────────────────────────┘ │
-│  │  渐进式 rehash (REHASH_BATCH=8)           │                                   │
-│  │  FNV-1a + Murmur3 → 高位选 shard, 低位定 bucket                              │
-│  │  单次 malloc: [hdr][type:1][enc:1][payload][key]                             │
-│  └─────────────────────────────────────────┘                                   │
-│                                                                               │
-│  ┌────────────── 5 种数据类型 (双编码自动转换) ──────────────────────────────┐ │
-│  │  STRING  raw / int        LIST  packed ↔ quicklist                         │ │
-│  │  SET     packed ↔ dict    HASH  listpack ↔ hashtable                       │ │
-│  │  ZSET    listpack ↔ (dict + skiplist)                                      │ │
-│  └────────────────────────────────────────────────────────────────────────────┘ │
-│                                                                               │
-│  ┌──────────── 持久化 ────────────────┐  ┌───── 主从复制 (libfabric RDMA) ──┐ │
-│  │  RDB: 全分片 wrlock + fork()         │  │  Master: probe(uprobe) → ringbuf│ │
-│  │       父进程立即解锁；子进程 COW 内   │  │     → relay → libfabric send    │ │
-│  │       走 no-lock 迭代器 + io_uring   │  │  Slave : connect + recv → 解析  │ │
-│  │       异步落盘 (Phase 4B.4)          │  │     直接内存加载 (零拷贝)       │ │
-│  │                                      │  │  增量: WAL journal SPSC ring +  │ │
-│  │  AOF: 主线程 atomic_fetch_add 占 slot │  │       eventfd 条件唤醒 consumer │ │
-│  │       memcpy → consumer 线程 writev   │  │       → io_uring 批量分发 →     │ │
-│  │       eventfd 仅在 consumer 睡眠时   │  │       slave fi_send             │ │
-│  │       唤醒；热路径零 syscall         │  │  全程零 RESP 文本序列化         │ │
-│  └──────────────────────────────────────┘  └─────────────────────────────────┘ │
-│                                                                               │
-│  ┌──────────── 三层 BPF 可观测 (全部 PASS, 单边 < 8% 开销) ──────────────────┐ │
-│  │  L2/L3  XDP: hot_cache 命中率 + bypass + tx_drop                            │ │
-│  │  L4/L7  sockops: passive accept → sockhash 自动注册                         │ │
-│  │         sk_skb stream_verdict: per-cmd 计数 + per-conn LRU 画像             │ │
-│  │  L7+    uprobe (kvs_slowlog): 命令分发函数的延迟超阈值上报                  │ │
-│  │                                                                             │ │
-│  │  所有 map pin 到 /sys/fs/bpf/kvstore/, kvs-top 跨进程读取                   │ │
-│  └─────────────────────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────────────────────┘
-                                         │
-                                ┌────────▼────────┐
-                                │  kvs-top (TUI)  │  ◀── 1 Hz 聚合 BPF 三层
-                                │  kvs_slowlog    │  ◀── 慢命令 uprobe
-                                │  redis-cli INFO │  ◀── 8 段 + 计数器
-                                └─────────────────┘
-```
-
-### 关键并发不变量
-
-| 不变量 | 强制方式 |
+| 方向 | 实现内容 |
 |---|---|
-| `dict` 写互斥 | 32 shards × pthread_rwlock，dispatcher 持锁；多 key 命令按 shard idx 升序加锁防死锁 |
-| `conn_pool[fd]` 单线程 | 每个 fd 仅 owner worker 触摸；fd 释放走 close 边界 |
-| `write_buf` 单线程 | 跨 worker BLPOP 唤醒只 notify，replay & reply 在 owner worker 完成 |
-| 复制热路径零 syscall | atomic seq + memcpy + 条件 eventfd（仅 consumer 睡眠时）|
-| BGSAVE 无 stall | 全分片 wrlock → fork → 父立即解锁，子进程 no-lock 迭代器 |
-| fast-path 无 reader 锁 | per-bucket 64-bit seqlock（even=stable / odd=writer），acquire-load 包夹整次 memcpy；写者 CAS-on-seq 保证单写者，与 dict shard wrlock 串行 |
+| **Redis 协议兼容** | 实现 RESP 解析与回复，支持常用 Redis 命令和 STRING / LIST / HASH / SET / ZSET 五类核心数据结构 |
+| **高性能网络模型** | 支持 epoll reactor、io_uring proactor、NtyCo coroutine；proactor 使用 multishot accept/recv、provided buffer ring、`DEFER_TASKRUN` 等优化 |
+| **分片存储引擎** | 32-shard hash table，每个 shard 独立 `pthread_rwlock`，支持渐进式 rehash、TTL、lazy expire、多 key 命令有序加锁 |
+| **RDB / AOF / WAL** | RDB fork-COW 快照；AOF 与增量复制统一 WAL；consumer 线程批量 `writev`；启动时支持 mmap replay |
+| **主从复制** | 基于 libfabric / Soft-RoCE 的 RDMA fullsync；fullsync 后通过 TCP incremental replication + backlog catchup 追增量 |
+| **lock-free GET fastpath** | 1024 buckets × 512B 的 seqlock direct-mapped cache，热 key 小 value GET 可跳过 shard 锁和 dict lookup |
+| **BPF/XDP 可观测** | XDP packet-level passive stats、sockmap stream stats、uprobe slowlog；默认关闭，需通过 `kvs_top` 独立 attach，避免污染主 benchmark |
+| **系统化验证** | smoke、ASAN、TSAN、fastpath stress、AOF replay、RDMA fullsync/catchup、redis-benchmark 性能回归 |
 
-### 源码结构
+---
 
+## 适合展示的能力点
+
+- **网络系统编程**
+  - `epoll`
+  - `io_uring`
+  - `SO_REUSEPORT`
+  - 多 worker event loop
+  - eventfd cross-worker wakeup
+
+- **存储系统设计**
+  - sharded hash table
+  - 多数据类型编码
+  - TTL 与 lazy expire
+  - RDB snapshot
+  - AOF/WAL recovery
+
+- **复制与一致性**
+  - RDMA fullsync
+  - fork-COW snapshot
+  - incremental WAL stream
+  - replid / seq / backlog catchup
+  - fullsync 与增量切换
+
+- **性能优化**
+  - io_uring 进阶特性
+  - SET/GET 热路径拆解
+  - lock-free seqlock fastpath
+  - AOF/RDMA 统一 WAL 去重
+  - RDMA-only 避免磁盘写放大
+
+- **Linux kernel / eBPF**
+  - XDP
+  - sockmap
+  - uprobe
+  - pinned BPF maps
+  - 低侵入 observability
+
+---
+
+## 架构概览
+
+```text
+client / redis-benchmark / redis-cli
+        |
+        v
++---------------------------+
+| network layer             |
+| epoll / io_uring / NtyCo  |
+| multi-worker + SO_REUSEPORT
++-------------+-------------+
+              |
+              v
++---------------------------+
+| RESP parser + dispatcher  |
+| CMD4 dispatch             |
+| command type classification
++-------------+-------------+
+              |
+              +----------------------+
+              | STRING GET fastpath  |
+              | lock-free seqlock    |
+              +----------------------+
+              |
+              v
++---------------------------+
+| sharded KV engine         |
+| 32 shards + rwlock        |
+| string/list/hash/set/zset |
+| TTL / lazy expire         |
++-------------+-------------+
+              |
+        write command post-hook
+              |
+              v
++---------------------------+       +------------------------------+
+| unified WAL append        | ----> | WAL consumer thread          |
+| AOF + incremental repl    |       | batch writev / backlog       |
++-------------+-------------+       | io_uring dispatch to slaves  |
+              |                     +------------------------------+
+              |
+              v
++---------------------------+
+| persistence / replication |
+| RDB fork-COW snapshot     |
+| AOF mmap replay           |
+| RDMA fullsync + catchup   |
++---------------------------+
+
+observability:
+  XDP packet stats / sockmap stream stats / uprobe slowlog
 ```
-src/
-├── core/          命令分发、协议解析、配置、阻塞子系统
-│   ├── kvstore.c/h      main()，CMD4 跳表分发，写命令后处理
-│   ├── protocol.c/h     零拷贝 RESP 解析（kvs_token_t 切片，零 malloc）
-│   ├── config.c/h       配置解析（strtol 范围校验，行截断检测）
-│   ├── block.c/h        BLPOP/BRPOP 阻塞子系统
-│   ├── fastpath_cache.c/h  Phase 10: lock-free seqlock 短键热缓存（512 KB, L2-resident）
-│   └── server.h         连接管理、DynBuf 读写缓冲
-├── engine/        统一存储引擎
-│   └── kv_dict.c/h      FNV-1a + Murmur3，渐进式 rehash，单次 malloc 条目
-├── type/          数据类型
-│   ├── kv_type_string.c/h   STRING: raw + int 内联编码
-│   ├── kv_type_list.c/h     LIST: packed(≤128) → quicklist 自动转换
-│   ├── kv_type_set.c/h      SET: hashtable + intset 双编码
-│   ├── kv_type_hash.c/h     HASH: listpack + hashtable 双编码
-│   └── kv_type_zset.c/h     ZSET: listpack + skiplist 双编码
-├── net/           网络 I/O 模型
-│   ├── reactor.c            epoll 事件驱动
-│   ├── proactor.c           io_uring 异步 I/O
-│   └── ntyco.c              NtyCo 协程（有栈协程）
-├── persist/       持久化
-│   └── persistence.c/h      RDB/AOF，io_uring 写入，mmap 加速加载
-├── repl/          主从复制
-│   ├── rdma_repl.c/h        RDMA 全量同步（libfabric）
-│   └── wal_repl.c/h         WAL journal 增量复制，io_uring 批量分发
-├── bpf/           eBPF / XDP / sockmap
-│   ├── xdp_kvs.kern.c       XDP 内核程序（被动监控 hot_cache hit/miss）
-│   ├── xdp_kvs.h            XDP 共享常量
-│   ├── xdp_manager.c/h      XDP 用户态管理 API（加载/缓存操作）
-│   ├── sockmap_kvs.kern.c   sockmap 内核程序（sockops + sk_skb 流层观测）
-│   ├── sockmap_kvs.h        sockmap 共享结构（per-cmd / per-conn）
-│   ├── sockmap_manager.c/h  sockmap 用户态加载器 + 迭代 API
-│   └── bpf_pin.c/h          BPF map pin 助手 (/sys/fs/bpf/kvstore/)
-├── tools/         工具
-│   ├── kvs_slowlog.bpf.c    慢命令 eBPF uprobe 内核程序
-│   ├── kvs_slowlog.c        慢命令用户态采集
-│   └── kvs_top.c            实时三层 BPF 观测仪表盘 (kvs-top)
-└── util/
-    └── dynbuf.c/h            动态缓冲区（reserve 预分配）
-```
+
+---
+
+## 核心模块
+
+| 模块 | 文件/目录 | 说明 |
+|---|---|---|
+| 协议与调度 | `src/core/` | RESP 解析、命令分发、配置、INFO、网络入口 |
+| 存储引擎 | `src/engine/` | sharded dict、entry 管理、snapshot iterator |
+| 数据类型 | `src/type/` | string/list/hash/set/zset 类型实现 |
+| 持久化 | `src/persist/` | RDB、AOF/WAL replay、路径管理 |
+| 复制 | `src/repl/` | WAL incremental replication、RDMA/libfabric fullsync |
+| fastpath | `src/core/fastpath_cache.*` | seqlock 短键热缓存 |
+| BPF/XDP | `src/bpf/`, `src/xdp/` | XDP、sockmap、uprobe 观测程序 |
+| 测试 | `test/` | smoke、benchmark、ASAN/TSAN、fastpath tests |
+| 配置 | `conf/` | 默认配置、bench 配置、主从配置 |
+
+---
+
+## 已实现功能
+
+### Redis 协议与命令
+
+- **协议**
+  - RESP array / bulk string 解析
+  - redis-cli / redis-benchmark 可直接访问
+
+- **通用命令**
+  - `PING`
+  - `COMMAND`
+  - `HELLO`
+  - `SELECT`
+  - `INFO`
+  - `CONFIG`
+  - `CLIENT`
+  - `DBSIZE`
+  - `FLUSHALL`
+  - `SAVE`
+  - `BGSAVE`
+
+- **数据类型**
+  - STRING: `GET`, `SET`, `SETNX`, `SETEX`, `INCR`, `DECR`, `APPEND`, `MGET`, `MSET`
+  - LIST: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `BLPOP`, `BRPOP`
+  - HASH: `HSET`, `HGET`, `HDEL`, `HGETALL`, `HLEN`
+  - SET: `SADD`, `SREM`, `SMEMBERS`, `SCARD`, `SMOVE`
+  - ZSET: `ZADD`, `ZRANGE`, `ZREM`, `ZCARD`
+
+> 说明：项目目标是 Redis-like 核心能力实现，不宣称完整替代 Redis。Cluster、Lua、ACL、完整 SCAN 族和 Redis 全命令兼容仍属于后续扩展方向。
+
+---
+
+## 性能摘要
+
+更完整的数据见 [benchmark.md](./benchmark.md)。
+
+| 场景 | 结果摘要 |
+|---|---|
+| io_uring 进阶优化 | Phase 3 后多个 pipeline 场景平均提升约 **30%** |
+| 6c loopback 基准 | `threads=2` 时 SET/GET 约 **492k / 494k rps** |
+| 单核效率优化 | 去除 double dict lookup 后单 worker SET/GET 提升约 **20% / 30%** |
+| AOF 开销 | 历史对照中 kvstore AOF 损耗约 **11%**，Redis AOF everysec 损耗约 **35-40%** |
+| fastpath microbench | 单线程 `fp_get` 约 **1.9x**；4 readers 同 shard 场景约 **2.34x** |
+| AOF + RDMA WAL 合并 | `AOF+RDMA` 只写一份 WAL；100k SET WAL 大小与 AOF-only 一致，约 **12.7 MB** |
+| RDMA-only 优化 | `persistence none + rdma_sync on` 不再写磁盘 WAL，`wal_bytes=0` |
+| RDMA fullsync/catchup | Soft-RoCE verbs 下 fullsync 成功，catchup 后 master/slave DBSIZE 一致 |
 
 ---
 
 ## 快速开始
 
-### 依赖（Ubuntu 24.04）
+### 依赖
+
+常用依赖：
+
+- `gcc`
+- `cmake`
+- `make`
+- `pkg-config`
+- `liburing`
+- `jemalloc`
+- `redis-tools`
+
+可选依赖：
+
+- `libfabric`
+- `libbpf`
+- `clang`
+- `llvm`
+- `bpftool`
+
+### 编译
 
 ```bash
-sudo apt-get update && sudo apt-get install -y \
-    build-essential gcc clang make cmake pkg-config \
-    liburing-dev libfabric-dev libbpf-dev libelf-dev \
-    zlib1g-dev libjemalloc-dev \
-    rdma-core linux-tools-$(uname -r)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
 ```
 
-### 单节点启动
+### 启动
 
 ```bash
-# 编译
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-cd ..
-
-# 启动（默认端口 2000，AOF 持久化）
 ./build/kvstore conf/kvstore.conf
+```
 
-# 连接测试
+### 使用 redis-cli
+
+```bash
 redis-cli -p 2000 PING
 redis-cli -p 2000 SET hello world
 redis-cli -p 2000 GET hello
 ```
 
-### 主从复制启动
+### 使用 redis-benchmark
 
 ```bash
-# 主机（需要 CAP_NET_ADMIN 用于 XDP，或 root）
-sudo ./build/kvstore conf/kvstore-master.conf
-
-# 从机（另一台机器）
-sudo ./build/kvstore conf/kvstore-slave.conf
+redis-benchmark -h 127.0.0.1 -p 2000 -t set,get -n 100000 -c 50 -P 16
 ```
 
 ---
 
-## 编译
+## 常用配置
 
-```bash
-mkdir -p build && cd build
+配置文件示例见 `conf/kvstore.conf` 和 `conf/bench/`。
 
-# 默认（jemalloc + Release）
-cmake .. -DCMAKE_BUILD_TYPE=Release
+| 配置项 | 说明 |
+|---|---|
+| `port` | 服务端口 |
+| `network` | 网络模型：`reactor` / `proactor` / `ntyco` |
+| `threads` | worker 数量 |
+| `cpu_pin` | CPU 亲和性 |
+| `persistence` | `none` / `rdb` / `aof` |
+| `rdma_sync` | 是否启用 RDMA fullsync / 增量复制 |
+| `rdma_role` | `master` / `slave` |
+| `rdma_provider` | libfabric provider，如 `verbs` / `tcp` |
+| `fastpath_cache` | 是否启用 lock-free GET fastpath |
+| `latency_histogram` | 是否启用延迟直方图采样（默认关闭） |
 
-# 不使用 jemalloc（内存对比测试）
-cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_JEMALLOC=OFF
-
-# Debug 模式
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-
-make -j$(nproc)
-```
-
-编译产物：
-
-| 文件 | 说明 |
-|------|------|
-| `build/kvstore` | 主进程 |
-| `build/xdp_kvs.kern.o` | XDP BPF 内核程序（需与 kvstore 同目录） |
-| `build/sockmap_kvs.kern.o` | sockmap BPF 内核程序（需与 kvstore 同目录） |
-| `build/kvs-top` | 三层 BPF 观测仪表盘 |
-| `build/kvs_slowlog` | 慢命令监控工具 |
-
----
-
-## 配置
-
-配置文件格式：`key value  # 注释`，大小写不敏感。
-
-```conf
-# ── 服务 ─────────────────────────────────────────────────
-port        2000          # 客户端端口（1-65535）
-network     proactor      # reactor | proactor | ntyco
-maxclients  10000         # 最大连接数（64-65536）
-loglevel    info          # debug | info | warn | error
-
-# ── 持久化 ───────────────────────────────────────────────
-persistence aof           # none | rdb | aof
-
-# ── RDMA + WAL 主从同步 ──────────────────────────────────
-rdma_sync   off           # on | off
-rdma_role   master        # master | slave
-rdma_provider verbs       # tcp（调试）| verbs（Soft-RoCE / InfiniBand）
-
-rdma_listen_ip    0.0.0.0   # 主机监听地址
-rdma_listen_port  2100
-rdma_master_ip    127.0.0.1  # 从机填主机地址
-rdma_master_port  2100
-incr_port         6382       # WAL 增量同步端口
-
-# ── 三层 BPF 可观测栈 ────────────────────────────────────
-xdp         no            # XDP 包层观测：yes | no（需 CAP_NET_ADMIN）
-xdp_iface   lo            # XDP 挂载网卡：本地测试用 lo，远端用实际网卡
-sockmap     no            # sockmap 流层观测：yes | no（需 cgroup v2）
-
-# ── Phase 4：多线程 proactor ─────────────────────────────
-threads     0             # 0  = auto: nproc - 1（留 1 核给 IRQ/系统）
-                          # >0 = 显式 worker 数
-                          # <0 = "auto-leave |N|"：留 N 核给系统/邻居
-                          # cgroup cpu.max 自动 cap
-                          # >1 时启用 SO_REUSEPORT + 32 shard 锁
-cpu_pin     auto          # off | auto | 1,3,5,7
-                          # io_uring DEFER_TASKRUN 闲时 sleep，绑核 ≠ 100% 占用
-```
-
-> **注意**：`xdp_iface` 必须与流量实际经过的网卡一致。  
-> 本机客户端（连 127.0.0.1 或本机 IP）流量走 `lo`；远端客户端流量走物理网卡（如 `ens33`）。
-
----
-
-## 部署模式（三档预设配置）
-
-不同环境对"礼貌让步"的要求不一样。下面三个开箱即用的 `.conf`，对应三种典型场景：
-
-| 配置 | 场景 | `threads` | `cpu_pin` | 行为 |
-|---|---|---|---|---|
-| `conf/kvstore-server.conf` | **专用服务器**（独占整机） | `0` (auto: `nproc-1`) | `auto` | 吃满核，QPS 优先，AOF + RDB 双轨 |
-| `conf/kvstore-shared.conf` | **共享服务器 / 容器**（多租户） | `-2` (auto-leave 2) | `auto` | 留 2 核给邻居，cgroup quota 自动 cap |
-| `conf/kvstore-dev.conf` | **开发笔记本**（IDE + 浏览器并跑） | `-2` | `auto` | 留核给 IDE，关持久化排除 IO 干扰 |
-| `conf/kvstore-local.conf` | **本机 6c 笔记本**（确定性绑核） | `3` | `3,4,5` | KV 占后 3 核，前 3 核 (0,1,2) 留给 IDE/softirq；多 worker 并发验证 |
-
-### 何时用哪个
-
-```bash
-# 专用服务器（16c box → 15 worker）
-./build/kvstore conf/kvstore-server.conf
-
-# 容器 / 共享 server（cpu.max=4 → 自动 cap 在 2 worker）
-./build/kvstore conf/kvstore-shared.conf
-
-# 开发笔记本（6c → 4 worker，IDE 用 2 核不被挤）
-./build/kvstore conf/kvstore-dev.conf
-
-# 本机 6c 笔记本（KV 钉到 cores 3/4/5，前 3 核留给 IDE）
-./build/kvstore conf/kvstore-local.conf
-```
-
-### `threads` 三种语义速查
-
-| 写法 | 含义 | 6c 例子 | 16c 例子 | 容器 cpu.max=4 |
-|---|---|---|---|---|
-| `threads 0` | auto: `nproc - 1` | 5 | 15 | 3 |
-| `threads 4` | 显式 4 worker | 4 | 4 | 4（会 WARN） |
-| `threads -2` | auto-leave 2: `nproc - 2` | 4 | 14 | 2 |
-
-### 为什么"绑核"不会卡住别的程序
-
-`io_uring` 加上 `IORING_SETUP_DEFER_TASKRUN` flag，让 worker 在 SQ 空时主动进入内核 sleep。
-**绑核只决定"我醒着的时候用哪个核"**，闲时该核照常给其他进程用。可用 `pidstat -p $(pidof kvstore) 1` 验证：闲时 `%CPU` 接近 0，不是 100。
-
-如果还想进一步让步（QPS 满载时也不挤别人），用 systemd 配合：
-
-```ini
-[Service]
-ExecStart=/path/to/kvstore /etc/kvstore/kvstore-shared.conf
-Nice=10                          # 优先级低 10 级
-CPUWeight=50                     # cgroup v2 权重减半
-IOSchedulingClass=best-effort
-```
-
-### 配置文件全集
-
-- `conf/kvstore.conf` — 完整注释参考（每个配置项都列出）
-- `conf/kvstore-server.conf` — 专用服务器
-- `conf/kvstore-shared.conf` — 共享 server / 容器
-- `conf/kvstore-dev.conf` — 开发笔记本
-- `conf/kvstore-local.conf` — 本机 6c：3 worker + cpu_pin 3,4,5（推荐本机调试用）
-- `conf/kvstore-master.conf` — 主从复制 · 主机
-- `conf/kvstore-slave.conf` — 主从复制 · 从机
-
----
-
-## 支持的命令
-
-### 全局 / 服务管理
-```
-PING  ECHO  HELLO  QUIT  SELECT  CLIENT
-COMMAND  CONFIG (GET/SET/RESETSTAT)  INFO [section]
-DBSIZE  SAVE  BGSAVE  BGREWRITEAOF  FLUSHALL  FLUSHDB
-DEL  UNLINK  EXISTS  EXPIRE  TTL  PTTL  PERSIST  TYPE
-```
-
-`INFO` 输出 8 段（server / clients / memory / persistence / stats /
-replication / cpu / keyspace），可作为 Prometheus 抓取入口。
-`INFO server` / `INFO stats` 等过滤单段。
-
-### STRING
-```
-SET  SETNX  SETEX  GET  GETSET  APPEND
-INCR  INCRBY  INCRBYFLOAT  DECR  DECRBY
-STRLEN  MOD
-```
-
-### LIST
-```
-LPUSH  LPUSHX  RPUSH  RPUSHX  LPOP  RPOP  RPOPLPUSH
-LLEN  LRANGE  LINDEX  LSET  LREM  LTRIM  LINSERT  LPOS  LMOVE
-BLPOP  BRPOP
-```
-
-### SET
-```
-SADD  SREM  SPOP  SMOVE
-SMEMBERS  SCARD  SISMEMBER  SMISMEMBER  SRANDMEMBER
-SINTER  SINTERSTORE  SUNION  SUNIONSTORE  SDIFF  SDIFFSTORE
-```
-
-### HASH
-```
-HSET  HSETNX  HDEL  HMSET  HINCRBY  HINCRBYFLOAT
-HGET  HGETALL  HMGET  HKEYS  HVALS  HLEN  HEXISTS  HSTRLEN  HRANDFIELD
-```
-
-### ZSET
-```
-ZADD  ZREM  ZREMRANGEBYRANK  ZREMRANGEBYSCORE  ZINCRBY  ZPOPMIN  ZPOPMAX
-ZSCORE  ZMSCORE  ZCARD  ZCOUNT
-ZRANGE  ZRANK  ZRANGEBYSCORE  ZRANDMEMBER
-ZREVRANGE  ZREVRANK  ZREVRANGEBYSCORE
-```
-
----
-
-## 网络模型
-
-通过 `network` 配置项切换，无需重新编译：
-
-| 模型 | 实现 | 适用场景 |
-|------|------|---------|
-| `reactor` | epoll 事件循环 | 通用，兼容性最好 |
-| `proactor` | io_uring 异步 I/O | 高并发推荐，Pipeline 性能最强 |
-| `ntyco` | 有栈协程（NtyCo） | 同步编程风格调试 |
-
----
-
-## 持久化
-
-### RDB
-
-`SAVE` 命令或启动时自动加载。`fork()` 子进程 COW 快照，`io_uring` 异步写入文件，主进程不阻塞。
-
-```bash
-redis-cli -p 2000 SAVE
-```
-
-### AOF
-
-每条写命令追加到 AOF 文件，mmap ring buffer 实现零拷贝写入。重启时自动回放（`g_in_reload` 标志屏蔽重放期间的双写）。
-
-`persistence aof` 同时开启 AOF + RDB，AOF 用于崩溃恢复，RDB 用于快速全量加载。
+> **观察层默认不随配置启动**：XDP / sockmap 需要通过 `kvs_top` 的 `--attach-*` 参数按需挂载；`conf/bench/` 仍保留演示配置。
 
 ---
 
 ## 主从复制
 
-### 全量同步（RDMA）
+KVStore 的复制由两部分组成：
 
-```
-Master                              Slave
-  │  fork() COW                       │
-  │  → RDB 序列化到内存               │
-  │  → libfabric RDMA write ─────────▶│
-  │                                   │  直接从内存加载，不落盘
-  │  全量同步完成，切换增量复制        │
-```
+- **fullsync**
+  - master fork 子进程获取 COW snapshot
+  - child 使用 no-lock iterator 序列化数据
+  - 通过 libfabric / RDMA 发送给 slave
+  - slave streaming load
 
-- libfabric provider：`verbs`（Soft-RoCE / InfiniBand）或 `tcp`（开发调试）
-- 零拷贝传输，无 RESP 文本序列化
+- **incremental replication**
+  - 写命令进入统一 WAL journal
+  - consumer 线程维护 backlog
+  - slave fullsync 后通过 TCP incremental channel catchup
 
-### 增量复制（WAL journal）
+最近优化：
 
-```
-主线程                  consumer 线程（后台）           Slave
-  │                          │                           │
-  ├─ wal_repl_append()       │                           │
-  │  ① atomic seq            │                           │
-  │  ② memcpy → journal ring │                           │
-  │  ③ eventfd 唤醒（仅      │                           │
-  │    consumer 睡眠时）      │                           │
-  │                          ├─ writev → WAL 文件        │
-  │                          ├─ backlog 追加             │
-  │                          └─ io_uring_prep_send ─────▶│
-  │                             1次 submit = N个 slave   │
-```
-
-**主线程开销极低**：热路径仅有 `atomic_fetch_add + memcpy`，`eventfd write` 仅在 consumer 睡眠时触发（条件唤醒优化），不产生每命令一次 syscall 的开销。
+- AOF 与 RDMA 增量复制统一为单次 `wal_repl_append()`
+- `AOF+RDMA` 不再重复 WAL append
+- `RDMA-only` 不再写磁盘 WAL
+- fullsync 期间即使 slave 尚未 active，也保留 backlog，保证 catchup 不丢写
 
 ---
 
-## 三层 BPF 可观测栈
+## BPF/XDP 可观测
 
-kvstore 在三个不同的内核挂载点同时运行 eBPF 程序，构成端到端的零侵入可观测栈。所有
-程序均为 **被动监控**（`XDP_PASS` / `SK_PASS`），不改包不丢包，**单边总开销 < 8%**。
+项目包含三层低侵入观测能力：
 
-### 设计演进：为什么 XDP 现在是被动监控
+| 层级 | 技术 | 用途 |
+|---|---|---|
+| L2/L3 | XDP | packet-level stats、passive hit/miss/bypass |
+| L4/L7 | sockmap / sk_skb | stream-level command / connection stats |
+| L7 | uprobe | slowlog、函数级延迟诊断 |
 
-最初版本曾尝试 XDP_TX 在内核内构造 RESP 回包，绕过 TCP 协议栈以达到 ~2μs 延迟。
-该方案在 redis-benchmark 长连接场景下出现 **TCP "双轨" 状态不一致**：内核 TCP 的
-`rcv_nxt` 不会因 XDP 消费的包而前进，连接最终会因序号失配而停滞。
+设计原则：
 
-最终方案放弃 XDP_TX，采用 **三层并联观测**：每层只做不会破坏 TCP 语义的工作，
-聚合后的可观测能力反而比单点提速更有价值。
+- BPF/XDP 不是零成本，而是低侵入、可控开销。
+- 高频观测默认关闭，避免影响主性能 benchmark。
+- 需要排障时按需开启，并通过采样、per-CPU map、阈值过滤控制成本。
 
-### 各层职责
+### 独立观测工具 `kvs_top`
 
-| 层 | 挂载点 | 程序 | 职责 |
-|---|---|---|---|
-| **L2/L3 包层** | XDP (driver / SKB) | `xdp_kvs.kern.c` | 解析以太网/IP/TCP 头，按端口过滤 + 解析 RESP GET，查询 `hot_cache` 计 hit/miss/bypass，**始终 XDP_PASS** |
-| **L4/L7 流层** | sockops (cgroup) + sk_skb (sockmap) | `sockmap_kvs.kern.c` | 监听 `BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB`，将 accept 的 socket 自动注册进 `sockhash`；流到达时 `sk_skb/stream_verdict` 调用 `bpf_skb_pull_data` 拉直 64 字节，解析 RESP 命令名（大写归一），更新 per-cmd 哈希计数 + per-conn LRU 画像，**始终 SK_PASS** |
-| **应用函数层** | uprobe | `kvs_slowlog.bpf.c` | uprobe 挂在命令分发入口/出口函数，超阈值的命令上报延迟 + 入参（**只在超时触发**，零开销路径） |
-
-### BPF Maps
-
-| Map | 类型 | 内容 | 由谁写 |
-|---|---|---|---|
-| `hot_cache` | `LRU_HASH` | key→value 热缓存（≤65536 条） | 用户态 SET/DEL 后写入 |
-| `xdp_stats` | `ARRAY` | hits / misses / bypass / tx_drop 计数 | XDP |
-| `config_map` | `ARRAY` | 目标端口 | 用户态 |
-| `sockmap` | `SOCKHASH` | cookie→sock\_fd | sockops |
-| `sockmap_config` | `ARRAY` | 目标端口 | 用户态 |
-| `sockmap_stats` | `ARRAY` | added / verdict / parsed / parse\_skip 计数 | sk\_skb |
-| `cmd_counts` | `HASH` | RESP 命令名 → (count, bytes) | sk\_skb |
-| `conn_profiles` | `LRU_HASH` | cookie → (first_seen, last_seen, cmds, bytes_in) | sk\_skb |
-
-### Map Pinning
-
-`xdp_manager` / `sockmap_manager` 在加载完成后调用 `bpf_obj_pin(2)` 把所有
-观测 map 钉到 `/sys/fs/bpf/kvstore/<map_name>`，让 `kvs-top` 这类外部工具
-通过 `bpf_obj_get(2)` 只读打开即可读数据，不需要重新加载 BPF 对象。
-kvstore 关闭时自动 `unlink(2)` 清除 pin。
-
-### 使用条件
-
-- 需要 `CAP_BPF` / `CAP_NET_ADMIN`（或 root 运行）
-- XDP：仅支持标准 IPv4（`ihl=5`），lo / 虚拟机自动降级为 SKB-generic 模式
-- sockmap：需要 cgroup v2（统一层级），需要内核 ≥ 5.6（`bpf_skb_pull_data` 在 sk_skb 可用）
-- 配置项：`xdp yes` + `xdp_iface lo` 启用 XDP 层；`sockmap yes` 启用流层；
-  二者完全独立，可任意组合（见 `conf/bench/kvstore-observability.conf`）
-
-### 性能开销（实测，redis-benchmark `-t set,get`，C=50）
-
-| Pipeline | 无 BPF (req/s) | sockmap-on (req/s) | Δ |
-|---|---|---|---|
-| P=1 SET | 20088 | 17908 | -10.9% |
-| P=1 GET | 19956 | 19164 | -4.0% |
-| P=4 GET | 75301 | 68775 | -8.7% |
-| P=10 SET/GET | 187k / 173k | 183k / 180k | < 噪声 |
-
-每条 verdict 调用 ~200ns；P=1 时最显眼，pipelined 场景被摊薄到测量噪声水平。
-
----
-
-## 可观测性工具
-
-### kvs-top — 三层 BPF 实时仪表盘
+`kvs_top` 现在既是 dashboard，也负责 on-demand attach/detach：
 
 ```bash
-sudo ./build/kvs-top                # 1Hz 刷新，每段 top-10
-sudo ./build/kvs-top -d 0.5 -n 20   # 2Hz 刷新，每段 top-20
-sudo ./build/kvs-top --once         # 单帧快照（脚本友好）
+# 以 loopback 接口加载 XDP，并把 sockmap 挂到 kvstore 进程所在 cgroup
+sudo ./build/kvs-top \
+     --attach-xdp --xdp-iface lo \
+     --attach-sockmap --sockmap-pid $(pidof kvstore)
+
+# 仅挂载后立即退出（可用于脚本化部署 / 清理）
+sudo ./build/kvs-top --attach-xdp --xdp-iface lo \
+                     --attach-sockmap --sockmap-pid $(pidof kvstore) \
+                     --detach --once
 ```
 
-输出布局（聚合三层）：
-```
-[L2/L3] XDP hot-cache
-  hits=360000   misses=0   hit_rate=100.00%   bypass=1.95M   tx_drop=0
-
-[L4/L7] sockmap stream-verdict
-  socks_added=303   verdict=1.15M (17708/s)
-  parsed=1.15M (17708/s, 99.98%)   add_fail=0   parse_skip=253
-
-[L7] Top N commands (sorted by rate)
-  CMD     count    rate(/s)    bytes
-  SET     492236   17707.8     21.12MB
-  GET     360000        0.0    12.36MB
-
-[L4] Top N connections (sorted by recent activity)
-  cookie   cmds   bytes_in   age(s)   idle(ms)
-  16808    2655   116.67KB   7.1      0.6
-```
-
-工作原理：从 `/sys/fs/bpf/kvstore/` 打开 pinned maps，比较两次快照算 delta rate。
-未启用某层时该 section 显示 `(not loaded)`，不强制依赖三层全开。
-
-### kvs_slowlog — 慢命令 uprobe 抓取
-
-```bash
-sudo ./build/kvs_slowlog ./build/kvstore 1000   # 抓 >1ms 的命令
-```
-
-输出格式：
-```
-[SLOWLOG] latency=1234us  cmd=SET  args="bigkey longvalue..."
-```
+- XDP/sockmap 的 BPF map 会被 pin 到 `/sys/fs/bpf/kvstore/`，dashboard 读取同一路径。
+- 退出或 `Ctrl-C` 时会自动 detach，确保服务进程回到纯净性能口径。
+- 在单机 loopback 环境中挂载观测对 redis-benchmark 会造成约 10–15% 吞吐回退（额外包路径与 map 操作开销），正常性能评测请保持默认关闭。
 
 ---
 
-## 性能数据
-
-测试环境：Ubuntu 24.04，kernel 6.8，`redis-benchmark -c 50 -n 100000`，loopback。
-
-### Phase 3 io_uring 进阶优化（2026-05-16，最新）
-
-`network proactor`，无持久化，无 BPF。三步累积优化：multishot accept (3.1) →
-provided buffer ring + multishot recv (3.2) → SINGLE_ISSUER + DEFER_TASKRUN +
-COOP_TASKRUN setup flags (3.3)。
-
-| Pipeline | OP | baseline | Phase 3 | Δ |
-|---|---|---|---|---|
-| P=1 | SET | 18560 | 25654 | **+38.2%** |
-| P=1 | GET | 18471 | 22287 | +20.7% |
-| P=4 | SET | 69348 | 81169 | +17.0% |
-| P=4 | GET | 69881 | 100100 | **+43.2%** |
-| P=10 | SET | 164474 | 222222 | +35.1% |
-| P=10 | GET | 163399 | 198413 | +21.4% |
-| P=20 | SET | 432900 | 460830 | +6.5% (高方差区) |
-| P=20 | GET | 285714 | 442478 | **+54.9%** |
-
-平均 **+30%**。低 pipeline (P=1/4) 收益最大，符合"syscall 占比越高、io_uring 进阶越甜"的理论。
-原始数据：`test/bench/phase3-*.csv`。
-
-### Phase 4 多线程 proactor + dict 分片（2026-05-16）
-
-`threads N` 配合 `SO_REUSEPORT` 多 worker，dict 分成 32 shard 各自带
-`pthread_rwlock`，`SHARD_WRLOCK` 用 `__attribute__((cleanup))` 自动释放。
-压测：`redis-benchmark -c 400 -n 2000000 -P 10 --threads 6`（6 核机器，
-loopback）。
-
-| threads | SET rps | GET rps | scaling |
-|---:|---:|---:|---|
-| 1 | 360 k | 330 k | 1.00× |
-| 2 | **461 k** | **462 k** | 1.28× / 1.40× |
-| 4 | 439 k | 414 k | 1.22× / 1.25× |
-| 8 | 393 k | 377 k | 退化 |
-
-6 核机器最优 t=2；t≥4 时 server 线程与 client/softirq 在同一组 core 上互
-相争抢，退化明显。Phase 5 计划 CPU pinning 解决这个退化（在更高核数机器上
-也会重测，32 shard 留了足够余量）。原始数据：`test/bench/phase4-mt.csv`。
-
-### 历史数据（Phase 2 head 之前）
-
-### Pipeline 吞吐量（proactor 模型，无持久化）
-
-| Pipeline | kvstore SET | Redis SET | 比值 |
-|----------|-------------|-----------|------|
-| P=1  | 18,452  | 19,094  | 0.96x |
-| P=10 | 165,755 | 201,491 | 0.82x |
-| P=20 | 307,031 | 267,094 | **1.14x** |
-| P=40 | 513,347 | 342,583 | **1.49x** |
-| P=80 | 777,605 | 396,825 | **1.95x** |
-| P=160 | **1,092,896** | 454,133 | **2.40x** |
-
-### AOF 持久化损耗
-
-| 场景 | QPS | 损耗 |
-|------|-----|------|
-| kvstore 无持久化 | 341,064 | — |
-| kvstore AOF+RDB 双开 | 303,582 | 11% |
-| Redis 无持久化 | 311,915 | — |
-| Redis AOF everysec | 188,644 | 40% |
-
-### 主从同步（开启 vs 关闭）
-
-| 场景 | QPS |
-|------|-----|
-| 无主从同步 | 289,184 ~ 321,337 |
-| WAL 增量复制开启 | 293,427 ~ 295,683 |
-
-> 条件唤醒优化后，高负载下 WAL 路径热路径零 syscall，影响在测试误差范围内。
-
-### 三层 BPF 观测栈开销
-
-> 见 [#三层 BPF 可观测栈 → 性能开销](#三层-bpf-可观测栈) 章节。摘要：sockmap 流层
-> 单边开销 P=1 < 11%，P≥4 进入 redis-benchmark 测量噪声范围；XDP 被动监控开销
-> 在测量噪声内（约每包 60ns 的 helper 开销）。
-
----
-
-## 测试
-
-### Smoke 测试（全量功能验证）
+## 测试与验证
 
 ```bash
-# 先启动 kvstore
-./build/kvstore conf/kvstore.conf &
+# 构建
+cmake --build build -j"$(nproc)"
 
-# 运行所有 smoke 测试（5 种数据类型）
+# 功能回归
+bash test/run_regression.sh quick
+
+# 单独运行已启动服务上的数据类型 smoke
 bash test/smoke/run_all.sh
+
+# fastpath 单元与并发压测
+cmake --build build --target fp_cache_test
+./build/fp_cache_test
+
+# fastpath CPU microbenchmark
+cmake --build build --target bench_fp_inproc
+./build/bench_fp_inproc
 ```
 
-测试覆盖：`smoke_string.sh` / `smoke_list.sh` / `smoke_set.sh` / `smoke_hash.sh` / `smoke_zset.sh`
+已验证内容包括：
 
-### WAL + AOF 集成测试
-
-```bash
-bash test/test_wal_aof.sh
-```
-
-### 基准测试
-
-```bash
-# P=20，50 并发，30万请求
-redis-benchmark -p 2000 -t set,get -c 50 -P 20 -n 300000
-
-# 启动三层 BPF 观测栈 + 实时仪表盘
-sudo build/kvstore conf/bench/kvstore-observability.conf &
-sudo build/kvs-top                                  # 实时观察
-```
+- string/list/hash/set/zset smoke 全通过
+- fastpath torn-read stress 通过
+- AOF WAL replay 通过
+- RDMA fullsync / catchup 通过
+- ASAN / TSAN focused 测试通过
 
 ---
 
-## 技术栈
+## Benchmark
 
-| 组件 | 选型 |
-|------|------|
-| 语言 | C11 |
-| 异步 I/O | liburing (io_uring) |
-| RDMA 传输 | libfabric (verbs provider) |
-| eBPF/XDP | libbpf，clang BPF target |
-| 协程 | NtyCo（有栈协程，内嵌源码） |
-| 内存分配 | jemalloc（默认）/ glibc malloc（可选） |
-| 压缩/校验 | zlib（WAL CRC32，RDB 压缩） |
-| 协议 | RESP 2，兼容 redis-cli / redis-benchmark / 各语言 Redis SDK |
-| 构建 | CMake 3.16+，gcc / clang |
+详细性能数据、测试环境、复现命令和测试脚本说明见：
+
+- [benchmark.md](./benchmark.md)
+- [test/test.md](./test/test.md)
 
 ---
 
-## 开发日志
+## 项目边界与后续方向
 
-详细的设计决策、迭代过程和 Bug 修复记录：[dev-log.md](dev-log.md)
+### 已完成
+
+- Redis-like 核心协议与常用命令
+- 多线程 io_uring 网络模型
+- 五类核心数据结构
+- RDB / AOF / WAL
+- RDMA fullsync + TCP incremental replication
+- lock-free GET fastpath
+- BPF/XDP 可观测
+- 系统化 benchmark 与 correctness 验证
+
+### 待完善
+
+- 更完整 Redis command coverage
+- `SCAN` / `AUTH` / ACL / Lua / Cluster
+- `BGREWRITEAOF`
+- 多 slave 长时间稳定性压测
+- 2-VM 或物理机隔离 benchmark
+- 更完整的故障注入与恢复测试
+
+---
+
+## 面试讲解建议
+
+推荐重点讲这 5 个故事：
+
+- **io_uring proactor 优化**
+  - 从普通收发到 multishot accept/recv、buf ring、`DEFER_TASKRUN`，解释为什么低 pipeline 收益明显。
+
+- **fastpath cache**
+  - 为什么 direct-mapped seqlock cache 能绕过 shard lock，为什么只适合短 key 小 value 热点读。
+
+- **统一 WAL**
+  - AOF 和增量复制如何共享一条 WAL 路径，如何避免重复 append 和 RDMA-only 磁盘写放大。
+
+- **RDMA fullsync + catchup**
+  - fork-COW snapshot、no-lock iterator、libfabric 传输、fullsync 后 backlog catchup。
+
+- **BPF/XDP 观测取舍**
+  - BPF 低侵入但不是零成本，因此默认关闭高频观测，按需开启诊断。
+
+---
+
+## License
+
+本项目用于系统编程、数据库内核与性能优化学习展示。

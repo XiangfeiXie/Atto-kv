@@ -56,6 +56,11 @@
   #define FP_NO_TSAN
 #endif
 
+static inline uint32_t fp_index(uint64_t khash)
+{
+    return (uint32_t)(khash ^ (khash >> 32)) & FP_BUCKETS_MASK;
+}
+
 /* ---------------- Lifecycle ---------------- */
 
 struct fp_cache *fp_cache_new(void)
@@ -94,7 +99,8 @@ FP_NO_TSAN int fp_get(struct fp_cache *c,
         if (c) atomic_fetch_add_explicit(&c->misses, 1, memory_order_relaxed);
         return -1;
     }
-    struct fp_entry *e = &c->buckets[khash & FP_BUCKETS_MASK];
+    uint32_t idx = fp_index(khash);
+    struct fp_entry *e = &c->buckets[idx];
 
     for (int retry = 0; retry < 2; retry++) {
         /* (1) Acquire-load seq.  Pairs with the writer's release-store
@@ -148,6 +154,10 @@ FP_NO_TSAN int fp_get(struct fp_cache *c,
     }
 
 miss:
+    /* Phase 10.9 — set demand bit so the next fp_put on this bucket
+     * actually populates instead of being short-circuited. */
+    atomic_store_explicit(&c->demand[idx],
+                           FP_DEMAND_HOT, memory_order_relaxed);
     atomic_fetch_add_explicit(&c->misses, 1, memory_order_relaxed);
     return -1;
 }
@@ -195,6 +205,35 @@ FP_NO_TSAN static inline void fp_writer_release(struct fp_entry *e,
     atomic_store_explicit(&e->seq, s_taken + 2, memory_order_release);
 }
 
+FP_NO_TSAN static inline int fp_bucket_holds_key(struct fp_entry *e,
+                                                 const void *key,
+                                                 uint32_t klen,
+                                                 uint64_t khash)
+{
+    for (int retry = 0; retry < 2; retry++) {
+        uint64_t s1 = atomic_load_explicit(&e->seq, memory_order_acquire);
+        if (s1 == 0 || (s1 & 1u)) {
+            if (retry == 0) { FP_CPU_RELAX(); continue; }
+            return 0;
+        }
+        if (e->key_hash != khash || e->key_len != klen || e->reply_len == 0) {
+            uint64_t s2 = atomic_load_explicit(&e->seq, memory_order_acquire);
+            if (s2 == s1) return 0;
+            FP_CPU_RELAX();
+            continue;
+        }
+        uint8_t kbuf[FP_KEY_MAX];
+        memcpy(kbuf, e->key, klen);
+        uint64_t s2 = atomic_load_explicit(&e->seq, memory_order_acquire);
+        if (s2 != s1) {
+            FP_CPU_RELAX();
+            continue;
+        }
+        return memcmp(kbuf, key, klen) == 0;
+    }
+    return 0;
+}
+
 FP_NO_TSAN void fp_put(struct fp_cache *c,
                        const void *key, uint32_t klen, uint64_t khash,
                        const void *val, uint32_t vlen)
@@ -203,7 +242,27 @@ FP_NO_TSAN void fp_put(struct fp_cache *c,
            || vlen == 0 || vlen > FP_VAL_MAX) {
         return;
     }
-    struct fp_entry *e = &c->buckets[khash & FP_BUCKETS_MASK];
+    uint32_t idx = fp_index(khash);
+
+    struct fp_entry *e = &c->buckets[idx];
+
+    /* Phase 10.9 — demand-driven lazy fill.  If no recent reader has
+     * missed on this bucket, skip population only when the bucket does
+     * not already hold this exact key; cached keys must be refreshed on
+     * overwrite or GET would be able to serve stale data. */
+    if (atomic_load_explicit(&c->demand[idx],
+                              memory_order_relaxed) == FP_DEMAND_COLD
+        && !fp_bucket_holds_key(e, key, klen, khash)) {
+        atomic_fetch_add_explicit(&c->puts_skipped_cold, 1,
+                                   memory_order_relaxed);
+        return;
+    }
+    /* Clear the demand bit; if a concurrent reader misses again before
+     * the next fp_put, they'll re-arm it.  Relaxed is fine — racing
+     * reads/writes to this byte at worst lose one demand vote, which
+     * just means the next write may also skip; eventually fills. */
+    atomic_store_explicit(&c->demand[idx], FP_DEMAND_COLD,
+                           memory_order_relaxed);
 
     uint64_t s_taken = fp_writer_acquire(e, &c->writer_collisions);
 
@@ -224,6 +283,9 @@ FP_NO_TSAN void fp_put(struct fp_cache *c,
     e->reply[hlen + vlen]     = '\r';
     e->reply[hlen + vlen + 1] = '\n';
 
+    atomic_store_explicit(&c->cached_hash[idx], khash, memory_order_relaxed);
+    atomic_store_explicit(&c->cached_valid[idx], 1, memory_order_release);
+
     fp_writer_release(e, s_taken);
 }
 
@@ -232,7 +294,8 @@ FP_NO_TSAN void fp_del(struct fp_cache *c,
 {
     if (!c || klen == 0 || klen > FP_KEY_MAX) return;
 
-    struct fp_entry *e = &c->buckets[khash & FP_BUCKETS_MASK];
+    uint32_t idx = fp_index(khash);
+    struct fp_entry *e = &c->buckets[idx];
 
     /* Pre-check (lock-free peek): if this bucket clearly doesn't hold
      * our key, skip the write entirely.  Avoids cache-line ping-pong
@@ -262,11 +325,51 @@ FP_NO_TSAN void fp_del(struct fp_cache *c,
               && (memcmp(e->key, key, klen) == 0);
     if (hit) {
         e->reply_len = 0;
+        atomic_store_explicit(&c->cached_valid[idx], 0,
+                              memory_order_release);
         atomic_fetch_add_explicit(&c->invalidations, 1,
                                    memory_order_relaxed);
     }
 
     fp_writer_release(e, s_taken);
+}
+
+FP_NO_TSAN int fp_should_refresh(struct fp_cache *c,
+                                 const void *key, uint32_t klen,
+                                 uint64_t khash)
+{
+    if (!c || klen == 0 || klen > FP_KEY_MAX) return 0;
+    uint32_t idx = fp_index(khash);
+    if (atomic_load_explicit(&c->demand[idx],
+                             memory_order_relaxed) != FP_DEMAND_COLD) {
+        return 1;
+    }
+    if (atomic_load_explicit(&c->cached_valid[idx],
+                             memory_order_acquire) == 0) {
+        return 0;
+    }
+    if (atomic_load_explicit(&c->cached_hash[idx],
+                             memory_order_relaxed) != khash) {
+        return 0;
+    }
+    return fp_bucket_holds_key(&c->buckets[idx], key, klen, khash);
+}
+
+FP_NO_TSAN int fp_may_hold_key(struct fp_cache *c,
+                               const void *key, uint32_t klen,
+                               uint64_t khash)
+{
+    if (!c || klen == 0 || klen > FP_KEY_MAX) return 0;
+    uint32_t idx = fp_index(khash);
+    if (atomic_load_explicit(&c->cached_valid[idx],
+                             memory_order_acquire) == 0) {
+        return 0;
+    }
+    if (atomic_load_explicit(&c->cached_hash[idx],
+                             memory_order_relaxed) != khash) {
+        return 0;
+    }
+    return fp_bucket_holds_key(&c->buckets[idx], key, klen, khash);
 }
 
 /* ---------------- Stats ---------------- */
@@ -298,6 +401,13 @@ void fp_stats(const struct fp_cache *c,
         *writer_collisions = atomic_load_explicit(&c->writer_collisions,
                                                   memory_order_relaxed);
     }
+}
+
+uint64_t fp_puts_skipped_cold(const struct fp_cache *c)
+{
+    if (!c) return 0;
+    return atomic_load_explicit(&c->puts_skipped_cold,
+                                 memory_order_relaxed);
 }
 
 uint32_t fp_occupancy(const struct fp_cache *c)

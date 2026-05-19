@@ -1,7 +1,7 @@
 /*
  * fastpath_cache.h — Phase 10: Lock-free seqlock short-key hot cache
  *
- * A 2 MB direct-mapped cache (4096 buckets × 512B) layered ABOVE the
+ * A 512 KB direct-mapped cache (1024 buckets × 512B) layered ABOVE the
  * 32-shard rwlock dict.  Hot keys with payload ≤ 256B serve their
  * GET reply from here, completely skipping shard rdlock + dict_find +
  * reply_bulk formatting.  Reader path is lock-free; writer path uses
@@ -80,12 +80,38 @@ struct fp_entry {
 _Static_assert(sizeof(struct fp_entry) == FP_ENTRY_BYTES,
                "fp_entry must be exactly 512 bytes for cacheline isolation");
 
+/* Phase 10.9 — demand-driven lazy fill.
+ *
+ * Each STRING SET previously did a forced fp_put: a CAS spin + 512B
+ * memcpy + reply preformat, EVEN IF the key was never going to be GET'd
+ * again.  In benchmark patterns where each key is set exactly once
+ * (uniform random write loops) every fp_put was pure waste — the entry
+ * gets evicted before any reader looks at the bucket.  Costs ~12% on
+ * t=2 SET as measured against a build that skipped fp_put entirely.
+ *
+ * Fix: track a 1-bit "demand" per bucket.  Reader sets it on miss
+ * (the bucket is hot enough that someone *wanted* a hit), writer
+ * checks-and-clears it before doing the expensive seqlock dance.  A
+ * SET to a key nobody has GET'd skips fp_put after a single relaxed
+ * load.  Recently-read keys still get populated lazily on the *next*
+ * write to that bucket.
+ *
+ * Demand + cached-hash metadata is ~10 KB total, stays L1-resident on
+ * every worker.  Stored separately (not packed into fp_entry) so the
+ * 512B cacheline-aligned writer payload stays untouched. */
+#define FP_DEMAND_HOT  1u
+#define FP_DEMAND_COLD 0u
+
 struct fp_cache {
-    struct fp_entry  buckets[FP_BUCKETS];      /* 2 MB */
+    struct fp_entry  buckets[FP_BUCKETS];      /* 512 KB */
+    _Atomic uint8_t  demand[FP_BUCKETS];       /* 1 KB, L1-resident */
+    _Atomic uint64_t cached_hash[FP_BUCKETS];  /* 8 KB metadata prefilter */
+    _Atomic uint8_t  cached_valid[FP_BUCKETS]; /* 1 KB metadata prefilter */
     _Atomic uint64_t hits;
     _Atomic uint64_t misses;
     _Atomic uint64_t invalidations;
     _Atomic uint64_t writer_collisions;        /* per-bucket CAS retry count */
+    _Atomic uint64_t puts_skipped_cold;        /* fp_put short-circuited, no demand */
 } __attribute__((aligned(64)));
 
 /* Lifecycle */
@@ -112,6 +138,15 @@ void fp_put(struct fp_cache *c,
 void fp_del(struct fp_cache *c,
             const void *key, uint32_t klen, uint64_t khash);
 
+/* Cheap prefilter for writer post-hooks.  Returns non-zero if fp_put/fp_del
+ * may need to touch the seqlock bucket because either a reader recently
+ * missed there (demand hot) or the bucket already holds this exact key. */
+int fp_should_refresh(struct fp_cache *c,
+                      const void *key, uint32_t klen, uint64_t khash);
+
+int fp_may_hold_key(struct fp_cache *c,
+                    const void *key, uint32_t klen, uint64_t khash);
+
 /* Stats snapshot — relaxed loads, slightly skewed under heavy traffic
  * but adequate for INFO / kvs-top display. */
 void fp_stats(const struct fp_cache *c,
@@ -119,6 +154,12 @@ void fp_stats(const struct fp_cache *c,
               uint64_t *misses,
               uint64_t *invalidations,
               uint64_t *writer_collisions);
+
+/* Phase 10.9 — count of fp_put calls short-circuited by the demand
+ * filter.  Useful for tuning: a high ratio relative to misses means
+ * the workload is write-heavy with low read reuse (good — SET path
+ * paid the optimization). */
+uint64_t fp_puts_skipped_cold(const struct fp_cache *c);
 
 /* Approximate occupancy (count of buckets with even seq > 0 AND
  * val_len > 0).  O(FP_BUCKETS) — use only for INFO / diagnostics. */

@@ -205,6 +205,8 @@ add_dependencies(kvs_slowlog kvs_slowlog_bpf)
 add_executable(kvs_top
     src/tools/kvs_top.c
     src/bpf/bpf_pin.c
+    src/bpf/xdp_manager.c
+    src/bpf/sockmap_manager.c
 )
 
 target_include_directories(kvs_top PRIVATE

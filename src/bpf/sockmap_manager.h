@@ -2,8 +2,16 @@
 #define SOCKMAP_MANAGER_H
 
 #include <stdint.h>
+#include <sys/types.h>
 
-int  sockmap_manager_init(int port);
+/* Attach sockmap observability programs to the provided cgroup path.
+ * Pass NULL to use the current process cgroup (legacy behaviour). */
+int  sockmap_manager_init(int port, const char *cgroup_path);
+
+/* Convenience helper that resolves the cgroup of `pid` then delegates to
+ * sockmap_manager_init(). */
+int  sockmap_manager_init_for_pid(int port, pid_t pid);
+
 void sockmap_manager_stop(void);
 
 /* Aggregate stats counters (any pointer may be NULL). */

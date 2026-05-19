@@ -95,6 +95,13 @@ static int engine_set_pre(const char *key, uint32_t key_len,
 
     if (existing) {
         uint32_t nd = (uint32_t)(2 + plen);
+        if (existing->val_len == nd) {
+            existing->data[0] = (char)KV_TYPE_STRING;
+            existing->data[1] = (char)enc;
+            memcpy(existing->data + 2, pload, plen);
+            existing->expire = expire;
+            return 0;
+        }
         kv_entry_t *e = dict_resize_entry(kv_dict_for(hash), existing, nd);
         if (!e) return -1;
         e->data[0] = (char)KV_TYPE_STRING;

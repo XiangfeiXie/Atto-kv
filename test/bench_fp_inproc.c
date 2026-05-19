@@ -149,6 +149,10 @@ static void populate(struct fp_cache *fp, char *value)
         pthread_rwlock_unlock(lock);
 
         /* Mirror into the fast-path cache. */
+        uint8_t tmp[FP_REPLY_MAX];
+        uint32_t tmp_len = 0;
+        fp_get(fp, h->key, (uint32_t)h->klen, h->hash,
+               tmp, &tmp_len, sizeof(tmp));
         fp_put(fp, h->key, (uint32_t)h->klen, h->hash,
                value, (uint32_t)g_value_bytes);
     }

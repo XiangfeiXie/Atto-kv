@@ -40,7 +40,9 @@ static void config_default(void) {
 
     kvs_config.sockmap_enabled = 0;
 
-    kvs_config.fastpath_cache_enabled = 0;  /* Phase 10 — opt-in */
+    kvs_config.fastpath_cache_enabled = 1;
+    kvs_config.fastpath_cache_explicit = 0;
+    kvs_config.latency_histogram_enabled = 0;
 
     /* 0 = auto: max(1, nproc - 1).  Resolved in config_postprocess(). */
     kvs_config.threads = 0;
@@ -121,6 +123,11 @@ static void config_postprocess(void) {
     if (cgroup_cpus > 0 && kvs_config.threads > cgroup_cpus) {
         printf("[CONFIG] WARN: threads=%d exceeds cgroup cpu.max=%d\n",
                kvs_config.threads, cgroup_cpus);
+    }
+    if (kvs_config.rdma_sync_enabled
+        && kvs_config.rdma_role == ROLE_SLAVE
+        && !kvs_config.fastpath_cache_explicit) {
+        kvs_config.fastpath_cache_enabled = 0;
     }
 }
 
@@ -278,7 +285,14 @@ int config_load(const char *path) {
         /* ---- Phase 10: lock-free seqlock fast-path cache ---- */
         } else if (strcasecmp(key, "fastpath_cache") == 0) {
             int v = parse_bool(val, lineno, "fastpath_cache");
-            if (v >= 0) kvs_config.fastpath_cache_enabled = v;
+            if (v >= 0) {
+                kvs_config.fastpath_cache_enabled = v;
+                kvs_config.fastpath_cache_explicit = 1;
+            }
+
+        } else if (strcasecmp(key, "latency_histogram") == 0) {
+            int v = parse_bool(val, lineno, "latency_histogram");
+            if (v >= 0) kvs_config.latency_histogram_enabled = v;
 
         /* ---- sockmap (Phase 2) ---- */
         } else if (strcasecmp(key, "sockmap") == 0) {
@@ -384,6 +398,8 @@ void config_print(void) {
         printf("  XDP fast-path : iface=%s\n", kvs_config.xdp_iface);
     if (kvs_config.sockmap_enabled)
         printf("  sockmap       : enabled (stream-layer observability)\n");
+    if (kvs_config.latency_histogram_enabled)
+        printf("  Latency hist  : sampled dispatch histogram enabled\n");
     if (kvs_config.fastpath_cache_enabled)
         printf("  Fastpath cache: lock-free seqlock, 1024 buckets, 512 KB (L2-resident)\n");
     if (kvs_config.threads > 1) {

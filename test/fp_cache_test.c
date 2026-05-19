@@ -69,14 +69,21 @@ static void test_sanity(void)
     struct fp_cache *c = fp_cache_new();
     ASSERT(c != NULL);
 
-    /* miss on empty */
+    /* Phase 10.9 — fp_put is demand-gated: it only populates the bucket
+     * if a prior fp_get on the same bucket missed (arming demand).  The
+     * production call pattern is exactly this: client GETs, misses, then
+     * a subsequent write to the same bucket fills it.  Tests below mirror
+     * that pattern by calling fp_get first wherever they expect fp_put
+     * to take effect. */
+
+    /* miss on empty (also arms demand for k1's bucket) */
     uint8_t buf[FP_REPLY_MAX];
     uint32_t outlen = 0;
     int r = fp_get(c, "k1", 2, test_hash((const uint8_t*)"k1", 2),
                    buf, &outlen, sizeof(buf));
     ASSERT(r == -1);
 
-    /* put + get */
+    /* put + get (demand armed by the prior miss → populates) */
     fp_put(c, "k1", 2, test_hash((const uint8_t*)"k1", 2),
            "hello", 5);
     r = fp_get(c, "k1", 2, test_hash((const uint8_t*)"k1", 2),
@@ -85,7 +92,31 @@ static void test_sanity(void)
     ASSERT(outlen == 11);
     ASSERT(memcmp(buf, "$5\r\nhello\r\n", 11) == 0);
 
-    /* overwrite */
+    /* Overwrite of an already-cached key must refresh even without
+     * demand re-armed; otherwise GET could serve stale bytes. */
+    fp_put(c, "k1", 2, test_hash((const uint8_t*)"k1", 2),
+           "HELLO", 5);
+    r = fp_get(c, "k1", 2, test_hash((const uint8_t*)"k1", 2),
+               buf, &outlen, sizeof(buf));
+    ASSERT(r == 0);
+    ASSERT(outlen == 11);
+    ASSERT(memcmp(buf, "$5\r\nHELLO\r\n", 11) == 0);
+
+    /* Re-arm demand by performing a stale-content miss simulation:
+     * a GET against a *different* key in the same bucket would do, but
+     * the simplest reliable way is to fp_del + fp_get the same key.
+     * Here we just GET with a mismatching key length to force a miss
+     * without disturbing the populated entry. */
+    {
+        uint64_t kh = test_hash((const uint8_t*)"k1", 2);
+        uint32_t ol2 = 0;
+        uint8_t  bb[FP_REPLY_MAX];
+        /* Same hash, longer key bytes → fp_get sees key_len mismatch
+         * and misses, arming demand. */
+        (void)fp_get(c, "k1XX", 4, kh, bb, &ol2, sizeof(bb));
+    }
+
+    /* overwrite (demand re-armed above) */
     fp_put(c, "k1", 2, test_hash((const uint8_t*)"k1", 2),
            "world!!!", 8);
     r = fp_get(c, "k1", 2, test_hash((const uint8_t*)"k1", 2),
@@ -106,6 +137,11 @@ static void test_sanity(void)
     for (uint32_t i = 0; i < FP_KEY_MAX; i++) big_k[i] = (uint8_t)('a' + (i % 26));
     for (uint32_t i = 0; i < FP_VAL_MAX; i++) big_v[i] = (uint8_t)(i & 0xff);
     uint64_t bh = test_hash(big_k, FP_KEY_MAX);
+    /* Arm demand for this bucket via a get-miss. */
+    {
+        uint32_t ol3 = 0; uint8_t bb[FP_REPLY_MAX];
+        (void)fp_get(c, big_k, FP_KEY_MAX, bh, bb, &ol3, sizeof(bb));
+    }
     fp_put(c, big_k, FP_KEY_MAX, bh, big_v, FP_VAL_MAX);
 
     r = fp_get(c, big_k, FP_KEY_MAX, bh, buf, &outlen, sizeof(buf));
@@ -147,8 +183,12 @@ static void test_collision(void)
     struct fp_cache *c = fp_cache_new();
     ASSERT(c != NULL);
 
-    /* Use a contrived "hash" of 0 for both keys to force same bucket */
+    /* Use a contrived "hash" of 0xDEADBEEF for both keys to force same
+     * bucket.  Phase 10.9: arm demand via fp_get miss before each put. */
+    uint8_t bb[FP_REPLY_MAX]; uint32_t ol_arm = 0;
+    (void)fp_get(c, "alpha", 5, 0xDEADBEEFULL, bb, &ol_arm, sizeof(bb));
     fp_put(c, "alpha", 5, 0xDEADBEEFULL, "AAA", 3);
+    (void)fp_get(c, "bravo", 5, 0xDEADBEEFULL, bb, &ol_arm, sizeof(bb));
     fp_put(c, "bravo", 5, 0xDEADBEEFULL, "BBB", 3);
 
     uint8_t buf[FP_REPLY_MAX]; uint32_t ol = 0;

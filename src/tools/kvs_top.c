@@ -29,12 +29,15 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <limits.h>
 
 #include <bpf/bpf.h>
 
 #include "../bpf/bpf_pin.h"
 #include "../bpf/xdp_kvs.h"
 #include "../bpf/sockmap_kvs.h"
+#include "../bpf/xdp_manager.h"
+#include "../bpf/sockmap_manager.h"
 
 /* ── Configuration ─────────────────────────────────────────────────────── */
 
@@ -43,6 +46,12 @@ static int      g_topn        = 10;
 static double   g_interval_s  = 1.0;
 static int      g_once        = 0;
 static int      g_port        = 2000;     /* kvstore RESP port for INFO query */
+static int      g_attach_xdp  = 0;
+static int      g_attach_sockmap = 0;
+static const char *g_xdp_iface = NULL;
+static const char *g_sockmap_cgroup = NULL;
+static pid_t    g_sockmap_pid = -1;
+static int      g_detach_after_render = 0;
 
 static void on_sigint(int sig) { (void)sig; g_stop = 1; }
 
@@ -436,17 +445,38 @@ static void usage(const char *argv0) {
         "  -n, --topn N         number of top rows per section (default 10)\n"
         "  -p, --port PORT      kvstore RESP port for [FAST] INFO query (default 2000)\n"
         "  -1, --once           render one frame and exit\n"
+        "      --attach-xdp     load/attach XDP program before rendering (detach on exit)\n"
+        "      --xdp-iface IF   interface for --attach-xdp (default: keep config default)\n"
+        "      --attach-sockmap attach sockmap observability (detach on exit)\n"
+        "      --sockmap-cgroup PATH attach sockmap to explicit cgroup path\n"
+        "      --sockmap-pid PID attach sockmap to the cgroup of PID\n"
+        "      --detach          detach requested layers then exit (no dashboard)\n"
         "  -h, --help           this help\n",
         argv0);
 }
 
 int main(int argc, char **argv)
 {
+    enum {
+        OPT_ATTACH_XDP = 1000,
+        OPT_XDP_IFACE,
+        OPT_ATTACH_SOCKMAP,
+        OPT_SOCKMAP_CGROUP,
+        OPT_SOCKMAP_PID,
+        OPT_DETACH_ONLY
+    };
+
     static const struct option longopts[] = {
         {"interval", required_argument, 0, 'd'},
         {"topn",     required_argument, 0, 'n'},
         {"port",     required_argument, 0, 'p'},
         {"once",     no_argument,       0, '1'},
+        {"attach-xdp", no_argument,     0, OPT_ATTACH_XDP},
+        {"xdp-iface", required_argument,0, OPT_XDP_IFACE},
+        {"attach-sockmap", no_argument,0, OPT_ATTACH_SOCKMAP},
+        {"sockmap-cgroup", required_argument, 0, OPT_SOCKMAP_CGROUP},
+        {"sockmap-pid", required_argument, 0, OPT_SOCKMAP_PID},
+        {"detach",    no_argument,       0, OPT_DETACH_ONLY},
         {"help",     no_argument,       0, 'h'},
         {0,0,0,0}
     };
@@ -457,6 +487,20 @@ int main(int argc, char **argv)
         case 'n': g_topn       = atoi(optarg);         break;
         case 'p': g_port       = atoi(optarg);         break;
         case '1': g_once       = 1;                    break;
+        case OPT_ATTACH_XDP:      g_attach_xdp = 1; break;
+        case OPT_XDP_IFACE:       g_xdp_iface = optarg; break;
+        case OPT_ATTACH_SOCKMAP:  g_attach_sockmap = 1; break;
+        case OPT_SOCKMAP_CGROUP:  g_sockmap_cgroup = optarg; break;
+        case OPT_SOCKMAP_PID: {
+            long pid = strtol(optarg, NULL, 10);
+            if (pid <= 0 || pid > INT_MAX) {
+                fprintf(stderr, "kvs-top: invalid --sockmap-pid '%s'\n", optarg);
+                return 1;
+            }
+            g_sockmap_pid = (pid_t)pid;
+            break;
+        }
+        case OPT_DETACH_ONLY:     g_detach_after_render = 1; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
@@ -467,6 +511,41 @@ int main(int argc, char **argv)
 
     signal(SIGINT,  on_sigint);
     signal(SIGTERM, on_sigint);
+
+    int attached_xdp = 0;
+    int attached_sockmap = 0;
+
+    if (g_attach_xdp) {
+        const char *iface = g_xdp_iface && *g_xdp_iface ? g_xdp_iface : NULL;
+        if (!iface) {
+            /* Fallback to "lo" to keep behaviour predictable if not specified */
+            iface = "lo";
+        }
+        if (xdp_manager_init(iface, g_port) != 0) {
+            fprintf(stderr, "kvs-top: failed to attach XDP on iface %s\n", iface);
+            return 1;
+        }
+        attached_xdp = 1;
+    }
+
+    if (g_attach_sockmap) {
+        int rc = -1;
+        if (g_sockmap_cgroup && *g_sockmap_cgroup) {
+            rc = sockmap_manager_init(g_port, g_sockmap_cgroup);
+        } else if (g_sockmap_pid > 0) {
+            rc = sockmap_manager_init_for_pid(g_port, g_sockmap_pid);
+        } else {
+            fprintf(stderr,
+                    "kvs-top: --attach-sockmap requires --sockmap-pid or --sockmap-cgroup\n");
+            if (attached_xdp) xdp_manager_stop();
+            return 1;
+        }
+        if (rc != 0) {
+            if (attached_xdp) xdp_manager_stop();
+            return 1;
+        }
+        attached_sockmap = 1;
+    }
 
     /* Open all pinned maps; missing maps are tolerated (layer marked unavailable). */
     int xdp_stats_fd = kvs_bpf_open_pinned("xdp_stats");
@@ -501,6 +580,10 @@ int main(int argc, char **argv)
     n_cmds_prev = read_cmd_counts(cmd_fd, cmds_prev, MAX_CMD_ROWS, NULL, 0);
 
     do {
+        if (g_detach_after_render && !attached_xdp && !attached_sockmap) {
+            /* Nothing to show, exit early */
+            break;
+        }
         if (!g_once) {
             struct timespec sl = {
                 .tv_sec  = (time_t)g_interval_s,
@@ -534,11 +617,21 @@ int main(int argc, char **argv)
         memcpy(cmds_prev, cmds_cur, sizeof(cmds_cur));
         n_cmds_prev = n_cmds;
         ts_prev = ts_cur;
+        if (g_detach_after_render)
+            break;
     } while (!g_once && !g_stop);
 
     if (xdp_stats_fd >= 0) close(xdp_stats_fd);
     if (sm_stats_fd  >= 0) close(sm_stats_fd);
     if (cmd_fd       >= 0) close(cmd_fd);
     if (conn_fd      >= 0) close(conn_fd);
+
+    if (attached_sockmap)
+        sockmap_manager_stop();
+    if (attached_xdp)
+        xdp_manager_stop();
+
+    if (g_detach_after_render)
+        return 0;
     return 0;
 }

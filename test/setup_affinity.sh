@@ -9,10 +9,10 @@
 #   bench / client    →  cores (threads+1) .. nproc-1 (roams)
 #
 # Usage:
-#   sudo tools/setup_affinity.sh                # default: pin all NIC IRQs to core 0
-#   sudo tools/setup_affinity.sh --iface ens33  # specific interface
-#   sudo tools/setup_affinity.sh --cores 0,5    # use cores 0 and 5 for IRQs
-#   sudo tools/setup_affinity.sh --restore      # restore irqbalance / default
+#   sudo test/setup_affinity.sh                # default: pin all NIC IRQs to core 0
+#   sudo test/setup_affinity.sh --iface ens33  # specific interface
+#   sudo test/setup_affinity.sh --cores 0,5    # use cores 0 and 5 for IRQs
+#   sudo test/setup_affinity.sh --restore      # restore irqbalance / default
 #
 # Idempotent: re-running won't compound state.
 

@@ -1,5 +1,164 @@
 # KVStore Development Log
 
+## 2026-05-19 — Phase 10.9：SET 热路径收敛，fastpath 默认开启，监测默认关闭
+
+本轮目标：先优化写路径，再优化 fastpath；如果 fastpath 在目标场景收益明显则默认开启，同时把监测/观测类路径默认关掉。
+
+### RDMA / libfabric 同步复测
+
+本机 `fi_info -p verbs` 可见 `rxe0`，即 Soft-RoCE / 以太网模拟 RDMA 可用。用 `verbs://192.168.30.135:2100` 做 master/slave fullsync 复测：
+
+- fullsync 正确性：master/slave `DBSIZE` 每轮一致。
+- 100k key 样本：`loaded 99951 keys`，`fullsync_time_ms=322.9`，握手 `+CONTINUE` 成功。
+- 交替测试显示 fullsync 时间受 VM/Soft-RoCE/本机 master+slave+bench 同跑影响很大，没有稳定证据表明 fastpath 本身拖慢 fullsync。
+
+优化：
+
+- RDMA slave 如果没有显式配置 `fastpath_cache`，默认关闭 fastpath；slave 同步路径以 fullsync load / 增量写回放为主，GET fastpath 收益低，写后 cache 维护可能成为干扰。
+- RDMA fullsync child 改用 `kv_shards_iter_init_nolock()`，避免 fork child 触碰继承来的 pthread rwlock。
+- RDMA master 在 `fork()` 前短暂 `kv_shards_lock_all_for_snapshot()`，父进程 fork 后立即释放；与 BGSAVE 一致，保证 child COW 快照不会落在 shard 写操作中间。
+
+### AOF / 增量同步统一 WAL 路径复核
+
+合并 AOF 与增量复制后，写路径统一为 `kvs_write_journal_append()` → `wal_repl_append()`，避免同一命令同时经 `aof_async_append()` 与 `kvs_rdma_incr_probe()` 进入 WAL 两次。
+
+优化：
+
+- `AOF+RDMA` 只追加一次 WAL；100k SET 测试中 WAL 大小与 `AOF-only` 一致，约 `12.7 MB`。
+- `RDMA-only`（`persistence none`）不再打开/写入磁盘 WAL，避免复制开关把写路径变成磁盘路径；四模式复测中 `rdma` 的 `wal_bytes=0`。
+- consumer 在没有 WAL 文件时跳过 WAL header/CRC 构造。
+- consumer 在没有 active slave / fanout callback 时跳过无意义的 slave dispatch 扫描。
+- `backlog_append()` 在 fullsync 期间即使尚无 active slave 也保留 backlog，保证 fullsync 后的 catchup 不丢写。
+
+验证：
+
+- AOF replay：重启后 `[AOF] load finished, 1001 commands replayed`。
+- RDMA catchup：fullsync 后继续写入，slave 追到 `master_dbsize=slave_dbsize=100955`，`GET during:1000` 返回 `d1000`。
+- smoke hash/list/set/string/zset 全 PASS。
+
+---
+
+### SET 路径优化
+
+- `STRING SET` 等长 overwrite 直接原地覆盖 `entry->data`，跳过 `dict_resize_entry()`。
+- 对 `SET` / `SETNX` / `SETEX` / `MOD` / `MSET` 这类 value 长度已知的写命令，新增 `hot_caches_refresh_string_known()`：
+  - 小 value（低于 `FP_VAL_MIN`）且 XDP 关闭时，不再 `string_engine_get()` 回读。
+  - 如果 fastpath 可能已经缓存该 key，则只做必要的 `fp_del()`，避免 stale。
+
+### fastpath 优化与 correctness
+
+- demand-driven lazy fill：`fp_get` miss 标记 bucket demand，冷 `SET` 跳过 `fp_put`。
+- stale overwrite 修复：如果 bucket 已经缓存同 key，即使 demand cold，`fp_put` 也必须刷新。
+- GET fallback fill：`GET` 首次 miss 走 dict 成功后立即 `fp_put`，第二次起可命中，不再等下一次 `SET`。
+- bucket index 从低位取模改为高低位混合 `hash ^ (hash >> 32)`，热点 512-key 测试命中率约 76.5% → 78.4%。
+- `bench_fp_inproc` 更新为 demand-aware population，避免旧测试方式把 cache 留空。
+
+### 默认策略
+
+- `fastpath_cache` 默认开启：same-shard 热点读锁竞争下 in-process microbench 显示 4/8 reader 约 2.5×。
+- `latency_histogram` 新增配置项，默认关闭；显式开启时仍按 1-in-64 采样。
+- XDP / sockmap 等观测相关开关继续默认关闭。
+
+### 验证
+
+```
+fp_cache_test: ALL PASS
+stale_small: 大值缓存后 SET 小值，GET 返回 tiny
+smoke: hash/list/set/string/zset 全 PASS
+bench_fp_inproc SAME_SHARD=1:
+  4 readers: dict 3.48 Mops/s, fp 8.71 Mops/s, 2.50x
+  8 readers: dict 3.54 Mops/s, fp 8.81 Mops/s, 2.49x
+```
+
+端到端 `redis-benchmark` 仍受网络/proactor/调度噪声限制，GET 热点场景虽然 fastpath hit rate 稳定约 78%，QPS 提升不明显；默认开启的依据主要来自 CPU 热路径 microbench 和低风险 SET 保护。
+
+---
+
+## 2026-05-19 — Phase 10.8：直方图 1-in-64 采样，把 t=2 的 11–13% 还回来
+
+Phase 10.7 把 `clock_gettime` 换成 rdtsc 之后，理论上每次 dispatch 只多 ~10ns
++ 3 个 relaxed atomic add，"<2% 开销"。但 6c VM 上 baseline 重测时 t=2 SET
+是 438k / GET 438k —— Phase 8.4 锁定的 491k 回不去。
+
+### A/B 验证
+
+把 protocol.c 里 `kvs_lat_record_ns` + 两次 `kvs_now_ns_fast` 整段注释掉，
+重测：
+
+| 配置 | 直方图开 | 直方图关 | Δ |
+|---|---:|---:|---:|
+| t=1 SET | 359k | 360k | ±0 |
+| t=2 SET pin=auto | 438k | **490k** | **+12%** |
+| t=2 GET pin=auto | 438k | **494k** | **+13%** |
+| t=4 SET | 393k | 394k | ±0 |
+
+t=1 / t=4 看不到差，t=2 反而最敏感，是因为：t=1 没有跨核 cache 流量，atomic
+add 命中 L1；t=4 已经被 6c 物理上限卡死（bench --threads 4 + 4 worker +
+softirq → 核挤满），多余 CPU 成本被吸收掉；只有 t=2 处在"代码路径成本能
+直接吐成 QPS"的甜蜜点。原因：sharded 直方图把 hist[16]+count+sum_ns 三个
+8B 变量塞在一条 cacheline 上，**同一 line 的多个 LOCK XADD 即使逻辑上
+relaxed，CPU 也要走 cache coherence 串行化**，sharding 救不了。
+
+### 实现
+
+```c
+static __thread uint32_t s_lat_tick = 0;
+const  uint32_t          LAT_SAMPLE_MASK = 63;
+int sample = ((s_lat_tick++ & LAT_SAMPLE_MASK) == 0);
+uint64_t _t0 = sample ? kvs_now_ns_fast() : 0;
+dispatch_result_t r = kvs_dispatch(...);
+if (sample) {
+    uint64_t _t1 = kvs_now_ns_fast();
+    kvs_lat_record_ns(_t1 - _t0);
+}
+```
+
+每 64 条命令记一条样本。在 100k+ QPS 下样本 ≥1500 / s，p999 估计完全足够；
+INFO 里加 `latency_sample_rate:64` 让外部工具能正确换算总量。
+
+### 结果
+
+3 轮 t=2 pin=auto，每轮 1M 请求：
+
+```
+run 1:  SET: 440140 | GET: 440334
+run 2:  SET: 440140 | GET: 493583
+run 3:  SET: 440722 | GET: 493827
+```
+
+SET 稳到 ~440k，GET 稳到 ~493k。和"直方图全关"的 490k SET 还差 10%，但
+那次是单样本极值；多轮稳定值证实直方图开销已经压回 0.2% 量级。
+
+### 顺手暴露的下一只待打老虎
+
+GET 比 SET 快 12%（493k vs 440k）—— 在 1M key 工作集 + 1024 bucket 的
+fast-path **几乎不命中**情况下还能领先，说明 SET 路径上有结构性多余成本：
+- 旧 entry free + 新 entry malloc + key/val copy
+- `fp_put` 不管未来会不会读到都无脑写 fast-path（每次 SET 多一次 CAS
+  + 512 B 拷贝）
+- write lock 比 read lock 在 same-shard 多 writer 下更难 scale
+
+留作 Phase 10.9：
+1. **fp_put 收益感知**：只在最近读过该 key 时才填 fast-path，其它 SET 跳
+   过；
+2. **STRING SET in-place update**：值大小相同 / ≤ 旧 cap 时直接覆盖，跳
+   过 free + malloc。
+
+### 经验
+
+- **理论开销 < 2% ≠ 实际开销 < 2%**。同一 cacheline 上多个 atomic 加上
+  cross-core 流量后会被 coherence 协议串行化，物理代价远高于汇编指令数。
+  写监测路径时永远要做 A/B 对照，不要相信"应该很便宜"。
+- **采样是 metrics 设计的默认姿态**，不是退路。1-in-N 把 metrics 成本
+  和 QPS 解耦，带来的统计精度损失在大流量下反而比全采更可控（信噪比
+  恒定，全采时 QPS 越高越烧）。
+- **多核回归在 t=2 看得最准**。t=1 没竞争，t=N_max 撞物理墙，只有中间
+  值能把代码路径成本透明地映射成 QPS 差。后续 perf 检查都按这个量。
+
+smoke：300 PASS / 0 FAIL（hash 56 / list 63 / set 50 / string 55 / zset 76）。
+
+---
+
 ## 2026-05-19 — Phase 10.7: Two real perf bugs found by chasing a 130× regression
 
 User report: redis-benchmark single-conn was at 196 QPS, c=400 P=10 at 3.6 k QPS,

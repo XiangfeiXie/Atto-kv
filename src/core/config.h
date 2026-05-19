@@ -58,10 +58,13 @@ typedef struct {
     int  sockmap_enabled;
 
     /* Phase 10 — Lock-free seqlock fast-path cache for short-key GETs.
-     * 4096 buckets × 512B = 2 MB, layered above 32-shard rwlock dict.
+     * 1024 buckets × 512B = 512 KB, layered above 32-shard rwlock dict.
      * Reader-only on the GET hot path; SET/DEL/EXPIRE post-hooks
-     * keep it in sync.  Default off; flip on for read-heavy workloads. */
+     * keep it in sync. */
     int  fastpath_cache_enabled;
+    int  fastpath_cache_explicit;
+
+    int  latency_histogram_enabled;
 
     /* Phase 4 — multi-worker proactor (0 = auto: nproc-1, 1 = single,
      * N = manual).  Auto/manual flag set after config_load. */

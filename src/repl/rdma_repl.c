@@ -319,7 +319,7 @@ static void child_serialize_loop(shm_ring_t *shm,
     /* Write pointer: entries start after the 24-byte header */
     char *wp = s->data + 24;
 
-    kv_shards_iter_t it_s; kv_shards_iter_init(&it_s);
+    kv_shards_iter_t it_s; kv_shards_iter_init_nolock(&it_s);
 
     kv_entry_t *e;
     while ((e = kv_shards_iter_next(&it_s)) != NULL) {
@@ -630,10 +630,12 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
 
     /* 7) fork() */
     fullsync_sigchld_install();
+    kv_shards_lock_all_for_snapshot();
     child_pid = fork();
 
     if (child_pid < 0) {
         fprintf(stderr, "[RDMA-REPL] fork() failed: %s\n", strerror(errno));
+        kv_shards_unlock_all_snapshot();
         close(child_evt_fd);
         close(parent_evt_fd);
         ebpf_incr_fullsync_finish();
@@ -655,6 +657,7 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
         close(parent_evt_fd);
         _exit(0);
     }
+    kv_shards_unlock_all_snapshot();
 
     /* ============================================================
      * PARENT: spawn worker thread to handle RDMA send pipeline

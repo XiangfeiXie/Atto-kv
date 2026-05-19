@@ -246,7 +246,8 @@ static void backlog_append(uint64_t seq, const char *msg, uint32_t len)
 {
     /* Fast path: no slaves connected → backlog serves no purpose.
      * Skips mutex + memcpy, which at 300K QPS is a meaningful saving. */
-    if (atomic_load_explicit(&g_n_active_slaves, memory_order_relaxed) == 0)
+    if (atomic_load_explicit(&g_n_active_slaves, memory_order_relaxed) == 0
+        && g_fullsync_status == FULLSYNC_IDLE)
         return;
 
     pthread_mutex_lock(&g_backlog_mu);
@@ -297,6 +298,10 @@ void wal_repl_append(const char *msg, int length)
      * function is a single-load + branch and adds zero contention to
      * multi-worker SET/GET.  No mutex needed for the fast-path check. */
     if (!g_running || !g_stream_healthy || length <= 0) return;
+    if (kvs_config.persist_mode != PERSIST_AOF
+        && atomic_load_explicit(&g_n_active_slaves, memory_order_relaxed) == 0
+        && g_fullsync_status == FULLSYNC_IDLE)
+        return;
 
     /* Phase 4B.3: producer mutex — see comment at g_journal_producer_mu.
      * Only contended when WAL/repl is actually enabled, which is the
@@ -500,26 +505,31 @@ static void *consumer_thread(void *arg)
              * Slots [g_jtail, scan) are owned by consumer — producer
              * cannot overwrite them until we advance g_jtail. */
             int nbatch = 0;
+            int wal_enabled = (g_wal_fd >= 0);
             uint32_t scan = g_jtail;
             while (scan != h && nbatch < WAL_BATCH_MAX) {
                 journal_slot_t *s = &g_jslots[scan & JOURNAL_RING_MASK];
-                wal_record_hdr_t *hdr = &g_wal_hdrs[nbatch];
-                hdr->magic  = WAL_MAGIC;
-                hdr->seq    = s->seq;
-                hdr->length = s->length;
-                hdr->crc32  = (uint32_t)crc32(0,
-                                  (const Bytef *)(s->buf + 8), (uInt)s->length);
-                g_wal_iov[nbatch * 2 + 0] = (struct iovec){
-                    .iov_base = hdr,         .iov_len = WAL_HDR_SIZE };
-                g_wal_iov[nbatch * 2 + 1] = (struct iovec){
-                    .iov_base = s->buf + 8,  .iov_len = s->length    };
+                if (wal_enabled) {
+                    wal_record_hdr_t *hdr = &g_wal_hdrs[nbatch];
+                    hdr->magic  = WAL_MAGIC;
+                    hdr->seq    = s->seq;
+                    hdr->length = s->length;
+                    hdr->crc32  = (uint32_t)crc32(0,
+                                      (const Bytef *)(s->buf + 8), (uInt)s->length);
+                    g_wal_iov[nbatch * 2 + 0] = (struct iovec){
+                        .iov_base = hdr,         .iov_len = WAL_HDR_SIZE };
+                    g_wal_iov[nbatch * 2 + 1] = (struct iovec){
+                        .iov_base = s->buf + 8,  .iov_len = s->length    };
+                }
                 scan++;
                 nbatch++;
             }
 
             /* Single writev for all nbatch record headers + payloads */
-            if (g_wal_fd >= 0 && nbatch > 0)
-                writev(g_wal_fd, g_wal_iov, nbatch * 2);
+            if (wal_enabled && nbatch > 0) {
+                ssize_t wr = writev(g_wal_fd, g_wal_iov, nbatch * 2);
+                (void)wr;
+            }
 
             /* ── Pass 2: backlog + slave dispatch; advance g_jtail ── */
             for (int bi = 0; bi < nbatch; bi++) {
@@ -531,7 +541,10 @@ static void *consumer_thread(void *arg)
                 backlog_append(s->seq, s->buf + 8, s->length);
 
                 /* 4. Batch-dispatch to all slaves via io_uring */
-                if (g_fullsync_status == FULLSYNC_IDLE && g_dispatch_uring_ok) {
+                if (g_fullsync_status == FULLSYNC_IDLE
+                    && g_dispatch_uring_ok
+                    && (atomic_load_explicit(&g_n_active_slaves,
+                            memory_order_relaxed) > 0 || g_fanout_fn)) {
                     int nsq = 0;
                     for (int i = 0; i < INCR_MAX_SLAVES; i++) {
                         /* Acquire-load: pairs with slave_start's release
@@ -718,8 +731,8 @@ int ebpf_incr_master_start(void)
         return -1;
     }
 
-    /* Open WAL file */
-    wal_open();   /* non-fatal — replication works without WAL file */
+    if (kvs_config.persist_mode == PERSIST_AOF)
+        wal_open();
     if (io_uring_queue_init(DISPATCH_URING_DEPTH, &g_dispatch_ring, 0) == 0) {
         g_dispatch_uring_ok = 1;
     } else {

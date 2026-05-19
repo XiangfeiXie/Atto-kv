@@ -58,12 +58,29 @@ static void build_obj_path(void) {
     snprintf(g_obj_path, sizeof(g_obj_path), "%s/sockmap_kvs.kern.o", self);
 }
 
-/* Find the cgroup v2 path containing the current process.
- * Reads /proc/self/cgroup and looks for the unified-hierarchy entry
- * (the line starting with "0::").  Sets g_cgroup_path to the absolute
- * path under /sys/fs/cgroup.  Returns 0 on success, -1 otherwise. */
-static int resolve_cgroup_path(void) {
-    FILE *f = fopen("/proc/self/cgroup", "r");
+static int set_cgroup_path(const char *path)
+{
+    if (!path || !*path) return -1;
+    if (strlen(path) >= sizeof(g_cgroup_path))
+        return -1;
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode))
+        return -1;
+    strcpy(g_cgroup_path, path);
+    return 0;
+}
+
+/* Find the cgroup v2 path containing the current process (pid < 0) or the
+ * provided pid.  On success writes the absolute path into out (len bytes). */
+static int resolve_cgroup_path_generic(pid_t pid, char *out, size_t len)
+{
+    char proc_path[64];
+    if (pid < 0)
+        snprintf(proc_path, sizeof(proc_path), "/proc/self/cgroup");
+    else
+        snprintf(proc_path, sizeof(proc_path), "/proc/%d/cgroup", pid);
+
+    FILE *f = fopen(proc_path, "r");
     if (!f) return -1;
 
     char line[512];
@@ -82,15 +99,15 @@ static int resolve_cgroup_path(void) {
 
     if (rel[0] == '\0') return -1;
 
-    snprintf(g_cgroup_path, sizeof(g_cgroup_path), "/sys/fs/cgroup%s",
+    snprintf(out, len, "/sys/fs/cgroup%s",
              rel[0] == '/' && rel[1] == '\0' ? "" : rel);
 
     /* Verify the path exists and is a directory. */
     struct stat st;
-    if (stat(g_cgroup_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    if (stat(out, &st) != 0 || !S_ISDIR(st.st_mode)) {
         /* Fall back to the unified root */
-        strcpy(g_cgroup_path, "/sys/fs/cgroup");
-        if (stat(g_cgroup_path, &st) != 0 || !S_ISDIR(st.st_mode))
+        strcpy(out, "/sys/fs/cgroup");
+        if (stat(out, &st) != 0 || !S_ISDIR(st.st_mode))
             return -1;
     }
     return 0;
@@ -104,7 +121,7 @@ static int libbpf_print_fn(enum libbpf_print_level level,
 
 /* ── Public API ────────────────────────────────────────────────────────── */
 
-int sockmap_manager_init(int port) {
+int sockmap_manager_init(int port, const char *cgroup_path) {
     if (port <= 0 || port > 65535) {
         fprintf(stderr, "[SOCKMAP] invalid port %d, sockmap disabled\n", port);
         return -1;
@@ -117,10 +134,18 @@ int sockmap_manager_init(int port) {
         return -1;
     }
 
-    if (resolve_cgroup_path() != 0) {
-        fprintf(stderr, "[SOCKMAP] could not resolve cgroup v2 path "
-                "(system may be cgroup v1 only); sockmap disabled\n");
-        return -1;
+    if (cgroup_path) {
+        if (set_cgroup_path(cgroup_path) != 0) {
+            fprintf(stderr, "[SOCKMAP] target cgroup '%s' invalid; sockmap disabled\n",
+                    cgroup_path);
+            return -1;
+        }
+    } else {
+        if (resolve_cgroup_path_generic(-1, g_cgroup_path, sizeof(g_cgroup_path)) != 0) {
+            fprintf(stderr, "[SOCKMAP] could not resolve cgroup v2 path "
+                    "(system may be cgroup v1 only); sockmap disabled\n");
+            return -1;
+        }
     }
 
     libbpf_set_print(libbpf_print_fn);
@@ -225,6 +250,20 @@ int sockmap_manager_init(int port) {
            "(port=%d, capacity=%d)\n",
            g_cgroup_path, port, SOCKMAP_MAX_ENTRIES);
     return 0;
+}
+
+int sockmap_manager_init_for_pid(int port, pid_t pid)
+{
+    char path[sizeof(g_cgroup_path)] = "";
+    if (pid <= 0) {
+        fprintf(stderr, "[SOCKMAP] invalid pid %d\n", (int)pid);
+        return -1;
+    }
+    if (resolve_cgroup_path_generic(pid, path, sizeof(path)) != 0) {
+        fprintf(stderr, "[SOCKMAP] could not resolve cgroup for pid %d\n", (int)pid);
+        return -1;
+    }
+    return sockmap_manager_init(port, path);
 }
 
 void sockmap_manager_stop(void) {

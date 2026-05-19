@@ -1,0 +1,24 @@
+============================================================
+kvstore baseline — captured 2026-05-19T02:55:49+00:00
+  host       : ubuntu-24
+  nproc      : 6
+  kernel     : 6.8.0-110-generic
+  bench      : redis-benchmark -c 400 -n 1000000 -P 10 --threads 4
+  build hash : be067e9
+============================================================
+
+  Build type  : Release
+  Build flags : -O3 -DNDEBUG -fno-omit-frame-pointer
+
+Sweep (SET / GET QPS, requests-per-second):
+
+  t=1 pin=off   SET= 360100.84  GET= 302755.06
+  t=1 pin=auto  SET= 361271.69  GET= 330906.69
+  t=2 pin=off   SET= 438788.94  GET= 494315.38
+  t=2 pin=auto  SET= 440528.62  GET= 435919.81
+  t=4 pin=off   SET= 434216.25  GET= 488281.22
+  t=4 pin=auto  SET= 394166.34  GET= 435540.06
+
+How to reproduce on a different machine:
+  ./test/bench/baseline_capture.sh
+Then diff baseline_<host>_<nproc>c.txt against this file.

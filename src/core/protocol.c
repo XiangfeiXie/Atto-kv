@@ -1,6 +1,7 @@
 #include "protocol.h"
 #include "server.h"
 #include "client.h"
+#include "config.h"
 #include "kvstore.h"           /* kvs_lat_record_ns, KVS_LAT_BUCKETS */
 #include <string.h>
 #include <stdio.h>
@@ -175,18 +176,26 @@ int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn 
         int cmd_len = resp_parse_slices(rb->buf + off, remaining,
                                         tokens, KVS_MAX_TOKENS, &argc);
         if (cmd_len > 0) {
-            /* Phase 10.7 — wire-path latency sample using rdtsc-backed
-             * fast clock.  An earlier version used clock_gettime which is
-             * ~15 ns via vDSO on a TSC clocksource, but ~73 µs as a real
-             * syscall on this VM (hpet/acpi_pm clocksource).  The latter
-             * inflated the overhead from <1 % to >99 % and collapsed
-             * benchmark QPS by 130×.  Replay paths (AOF/WAL reload) call
-             * kvs_dispatch directly and intentionally bypass this. */
-            uint64_t _t0 = kvs_now_ns_fast();
+            /* Phase 10.8 — wire-path latency sample using rdtsc-backed
+             * fast clock (Phase 10.7).  Sampled 1-in-(LAT_SAMPLE_MASK+1)=64 to keep
+             * hot-path overhead at ~0.2% even at 500k+ QPS: an A/B with
+             * unconditional sampling showed an 11–13% regression at t=2
+             * caused by per-dispatch rdtsc×2 + 3 atomic adds on the same
+             * cacheline.  At 100k+ QPS 64x undersampling still leaves
+             * >1500 samples/s — plenty for stable p999.  Replay paths
+             * (AOF/WAL reload) call kvs_dispatch directly and bypass
+             * this entirely. */
+            static __thread uint32_t s_lat_tick = 0;
+            const  uint32_t          LAT_SAMPLE_MASK = 63;
+            int sample = kvs_config.latency_histogram_enabled
+                         && ((s_lat_tick++ & LAT_SAMPLE_MASK) == 0);
+            uint64_t _t0 = sample ? kvs_now_ns_fast() : 0;
             dispatch_result_t r = kvs_dispatch(tokens, argc,
                                                rb->buf + off, cmd_len, wb, c);
-            uint64_t _t1 = kvs_now_ns_fast();
-            kvs_lat_record_ns(_t1 - _t0);
+            if (sample) {
+                uint64_t _t1 = kvs_now_ns_fast();
+                kvs_lat_record_ns(_t1 - _t0);
+            }
 
             off += cmd_len;
             remaining -= cmd_len;

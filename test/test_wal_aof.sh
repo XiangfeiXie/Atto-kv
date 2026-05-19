@@ -2,7 +2,8 @@
 # =============================================================================
 # test_wal_aof.sh  —  WAL/AOF unification + incremental sync TCP test
 # =============================================================================
-BINARY="./build-glibc/kvstore"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BINARY="${KVS:-$ROOT/build/kvstore}"
 PORT=2099
 INCR_PORT=6399
 LOG="/tmp/kvstore-test.log"
@@ -33,8 +34,10 @@ incr_port $INCR_PORT
 EOF
 
 cleanup() {
-    kill $MASTER_PID 2>/dev/null || true
-    wait $MASTER_PID 2>/dev/null || true
+    if [ -n "${MASTER_PID:-}" ]; then
+        kill $MASTER_PID 2>/dev/null || true
+        wait $MASTER_PID 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 

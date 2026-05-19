@@ -1,7 +1,6 @@
 # KVStore Benchmark Report
 
-> **TODO**：项目完工后做全面测试，重新覆盖以下 TBD 表格。本文档先沉淀
-> 当前已验证的硬数据，作为每次回归的基准对照组。
+本文档整理 KVStore 当前已经验证过的性能数据、正确性验证和复现命令。数据主要来自本机 VMware VM / loopback / Soft-RoCE 环境，适合作为项目展示和回归基线；绝对 QPS 会受 VM 调度、CPU 亲和性、redis-benchmark 与服务端同机竞争影响。
 
 ---
 
@@ -9,188 +8,258 @@
 
 | 项 | 值 |
 |---|---|
-| 机器 | 8 vCPU (6 P-core + 2 E-core) Intel i7-13620H, VMware VM |
+| 机器 | 8 vCPU VMware VM，宿主机 Intel i7-13620H |
 | 内核 | Linux 6.8.0-110-generic |
-| 内存 | 8 GB, single NUMA node |
-| 编译 | `gcc 13.2`, `-O3 -DNDEBUG -fno-omit-frame-pointer` (Release) |
-| 分配器 | jemalloc 5.3.0 (默认启用) |
-| io_uring | liburing 2.5 (multishot accept/recv + buf_ring + DEFER_TASKRUN) |
-| RDMA | libfabric 1.17.0 (verbs / tcp provider) |
-| BPF | libbpf 1.3.0 |
+| 内存 | 8 GB，single NUMA node |
+| 编译 | `gcc 13.2`，Release，`-O3 -DNDEBUG` |
+| 分配器 | jemalloc 5.3.0 |
+| 网络压测 | `redis-benchmark` / `redis-cli` |
+| io_uring | liburing 2.5，multishot accept/recv + provided buffer ring |
+| RDMA | libfabric 1.17，Soft-RoCE `rxe0`，verbs provider |
+| BPF | libbpf 1.3 |
 
-测试工具：`redis-benchmark` (随 Redis 7.x 发行)。
+重要说明：
+
+- 本地 loopback 压测中，client 与 server 抢同一组 vCPU，结果更适合看优化趋势，不适合宣称硬件极限。
+- fastpath 的收益主要是 CPU hot path / hot-key skew 收益，端到端 `redis-benchmark` 容易被 TCP/io_uring 固定开销淹没。
+- BPF/XDP 观测默认关闭，高频观测会单独计入开销，不混入主性能表。
 
 ---
 
-## 1. Phase 8.4 锁定基准 (6c, 单机 loopback, redis-benchmark)
+## 关键结论
 
-> **历史数据，2026-05-17**。`-c 400 -P 10 --threads 6 -n 2000000`，
-> `persistence=none`，无 BPF。每行三次取最佳。
+| 主题 | 结论 |
+|---|---|
+| io_uring proactor | multishot accept/recv、buf ring、`DEFER_TASKRUN` 等优化后，多 pipeline 场景平均提升约 **30%** |
+| 本机 loopback 基准 | 6c 约束下 `threads=2` 时 SET/GET 达到约 **492k / 494k rps** |
+| dispatcher 单核优化 | 去掉 double dict lookup 后，单 worker SET/GET 提升约 **20% / 30%** |
+| AOF | kvstore AOF 历史对照损耗约 **11%**，低于 Redis AOF everysec 的 **35-40%** |
+| unified WAL | `AOF+RDMA` 只写一份 WAL；100k SET WAL 大小与 AOF-only 一致，约 **12.7 MB** |
+| RDMA-only | `persistence none + rdma_sync on` 优化后不再写磁盘 WAL，`wal_bytes=0` |
+| fastpath | in-process microbench 中 `fp_get` 单线程约 **1.9x**，同 shard 4 readers 约 **2.34x** |
+| RDMA fullsync | Soft-RoCE verbs 下 fullsync 正确，fullsync 后 incremental catchup 正确 |
+| correctness | smoke、AOF replay、RDMA catchup、fastpath stress、ASAN/TSAN focused 测试均通过 |
 
-| `threads` | `cpu_pin` | SET (rps) | GET (rps) |
+---
+
+## 1. Baseline：本机 loopback 吞吐
+
+历史锁定基准，2026-05-17。参数：`redis-benchmark -c 400 -P 10 --threads 6 -n 2000000`，`persistence=none`，BPF 关闭。每行三次取最佳。
+
+| KV worker threads | cpu_pin | SET rps | GET rps |
 |---:|---|---:|---:|
 | 1 | auto | 396k | 396k |
 | 2 | auto | **492k** | **494k** |
 | 4 | auto | 464k | 489k |
-| 5 | off  | 492k | 477k |
+| 5 | off | 492k | 477k |
 | 6 | auto | 434k | 493k |
 
-**关键观察**（来自 `assessment-day0.md`）：
-- 6c loopback 上 t=2 是数学最优——bench 4 threads + KV 2 worker 正好填满 6 核
-- t≥4 不再线性 scaling 是因为 bench client + KV worker 抢同一组 P-core，**不是**锁争用
-- 真实瓶颈在 ~2.5 μs/op 的 per-request CPU cost，不是 lock contention
+观察：
 
-> **注**：8c VM 上 `dev_quick.sh` 默认稳定 ~390k SET/GET（不 taskset 约束）。
-> 启动时偶尔出现的 790k 数字不稳定，**不写入简历**。
+- 6c 约束下 `threads=2` 最优，因为 benchmark client 线程和 kvstore worker 正好填满 CPU。
+- `threads>=4` 不再线性增长，主要是同机压测下 client/server 抢核，而不是 shard lock 成为主瓶颈。
+- 8c VM 上未做 taskset 约束时，`dev_quick.sh` 稳定约 390k SET/GET；偶发更高数字不写入展示口径。
 
 ---
 
-## 2. Phase 3 io_uring 进阶优化（before/after）
+## 2. io_uring 进阶优化收益
 
-> **2026-05-16**。三步累积：multishot accept (3.1) → buf_ring + multishot
-> recv (3.2) → SINGLE_ISSUER + DEFER_TASKRUN + COOP_TASKRUN setup flags (3.3)。
+2026-05-16。Phase 3 累积优化：multishot accept、provided buffer ring、multishot recv、`SINGLE_ISSUER`、`DEFER_TASKRUN`、`COOP_TASKRUN`。
 
-| Pipeline | OP | baseline | Phase 3 | Δ |
+| Pipeline | OP | baseline rps | Phase 3 rps | 提升 |
 |---|---|---:|---:|---:|
-| P=1  | SET | 18 560  | 25 654  | **+38.2%** |
-| P=1  | GET | 18 471  | 22 287  | +20.7% |
-| P=4  | SET | 69 348  | 81 169  | +17.0% |
-| P=4  | GET | 69 881  | 100 100 | **+43.2%** |
-| P=10 | SET | 164 474 | 222 222 | +35.1% |
-| P=10 | GET | 163 399 | 198 413 | +21.4% |
-| P=20 | GET | 285 714 | 442 478 | **+54.9%** |
+| P=1 | SET | 18,560 | 25,654 | **+38.2%** |
+| P=1 | GET | 18,471 | 22,287 | +20.7% |
+| P=4 | SET | 69,348 | 81,169 | +17.0% |
+| P=4 | GET | 69,881 | 100,100 | **+43.2%** |
+| P=10 | SET | 164,474 | 222,222 | +35.1% |
+| P=10 | GET | 163,399 | 198,413 | +21.4% |
+| P=20 | GET | 285,714 | 442,478 | **+54.9%** |
 
-**平均 +30%**。低 pipeline 收益最大，符合"syscall 占比越高、io_uring 进阶越甜"
-的理论。原始数据：`test/bench/phase3-*.csv`。
+结论：平均约 **+30%**。低 pipeline 场景收益更明显，因为 syscall 和 buffer 管理成本占比更高。
 
 ---
 
-## 3. Phase 6 单核效率优化（6.1 + 6.2 + 6.4）
+## 3. Dispatcher / 单核效率优化
 
-> **2026-05-17**。在 Phase 8.4 基准上叠加。
+2026-05-17。在 Phase 8.4 基准上叠加 dispatcher 优化。
 
-| metric | Phase 8.4 baseline | + Phase 6.1 (no double dict_find) | + Phase 6.2 (rdlock split) | Δ vs baseline |
+| metric | baseline | no double dict_find | rdlock split | 相对 baseline |
 |---|---:|---:|---:|---:|
 | t=1 SET | 330k | 396k | 396k | **+20%** |
 | t=1 GET | 304k | 396k | 396k | **+30%** |
-| t=2 SET | 491k | 491k | 492k | tie |
-| t=2 GET | 491k | 492k | 494k | tie |
+| t=2 SET | 491k | 491k | 492k | 持平 |
+| t=2 GET | 491k | 492k | 494k | 持平 |
 | t=4 SET | 434k | 438k | 488k | +12% |
 | t=4 GET | 431k | 437k | 489k | +13% |
 
-- Phase 6.1：去掉 `(void)entry;` 后的 `engine_*_raw` 二次 hash + dict_find，
-  单核 +20-30%
-- Phase 6.2：dispatcher 按命令类型分 rdlock/wrlock，t≥4 GET 路径 +12%
-- t=2 已经被 bench client 打满，单核优化看不到，**搬大机器后每个 worker 都吃这份增益**
+优化点：
+
+- dispatcher 已经查到 `entry` 后，类型 handler 不再二次 `hash + dict_find`。
+- 按命令类型拆分 `rdlock` / `wrlock`，读命令不再拿写锁。
+- t=2 时 client/server 已接近同机压测上限，所以单核优化不一定体现在端到端 QPS；但搬到独立压测机后仍能释放 worker CPU。
 
 ---
 
-## 4. AOF 持久化损耗（vs Redis 同设置）
+## 4. Pipeline：KVStore vs Redis
 
-> **历史数据**，相同 redis-benchmark `-c 50 -P 1 -n 100000`：
+测试日期：2026-05-15。参数：100 万请求，50 并发，value size = 16B，VM 环境。
 
-| 场景 | QPS | 损耗 |
+| Pipeline | kvstore SET | Redis SET | SET 倍率 | kvstore GET | Redis GET | GET 倍率 |
+|---:|---:|---:|---:|---:|---:|---:|
+| P=10 | 139,997 | 167,364 | 0.84x | 160,077 | 190,512 | 0.84x |
+| P=20 | 287,770 | 265,041 | **1.09x** | 282,486 | 321,027 | 0.88x |
+| P=40 | 472,144 | 379,795 | **1.24x** | 462,107 | 424,628 | **1.09x** |
+| P=80 | 580,383 | 448,029 | **1.30x** | 637,349 | 508,647 | **1.25x** |
+| P=160 | 683,995 | 445,038 | **1.54x** | 709,220 | 545,256 | **1.30x** |
+
+观察：
+
+- 低 pipeline 下 Redis 单线程模型延迟更低，kvstore 有多 worker/io_uring 固定调度成本。
+- P≥20 后，kvstore SET 开始反超 Redis。
+- P=160 下，Redis SET 基本饱和，kvstore 仍继续增长。
+
+---
+
+## 5. AOF 持久化开销
+
+### 5.1 kvstore vs Redis AOF
+
+测试日期：2026-05-15。参数：100 万 SET，50 并发，P=20，value size = 16B。
+
+| 场景 | QPS | AOF 开销 |
 |---|---:|---:|
-| kvstore 无持久化 | 341,064 | — |
-| kvstore AOF + RDB 双开 | 303,582 | **-11%** |
-| Redis 无持久化 | 311,915 | — |
-| Redis AOF everysec | 188,644 | -40% |
+| kvstore 无持久化 | 290,529 | — |
+| kvstore AOF / WAL | 257,732 | **11.3%** |
+| Redis 无持久化 | 262,192 | — |
+| Redis AOF everysec | 171,674 | **34.5%** |
 
-kvstore 在 AOF 开启时损耗只有 Redis 的 1/4——靠的是 mmap ring buffer +
-io_uring 异步落盘 + consumer 线程聚合 writev。
-
----
-
-## 5. 主从同步开销
-
-| 场景 | QPS |
+| 对比 | 结果 |
 |---|---:|
-| 无主从同步 | 289 184 ~ 321 337 |
-| WAL 增量复制开启 | 293 427 ~ 295 683 |
+| kvstore 无持久化 / Redis 无持久化 | **1.11x** |
+| kvstore AOF / Redis AOF | **1.50x** |
+| WAL 文件大小（100 万 SET × 16B） | 150.7 MB |
 
-条件唤醒优化后（atomic seq + 只在 consumer 睡眠时 eventfd），高负载下 WAL
-路径**热路径零 syscall**，影响在测试误差范围内。
+AOF 低开销来源：
 
----
+- 主线程只做 ring append 和 memcpy，不同步 `fdatasync`。
+- consumer 线程批量 `writev`，最多 128 条记录合并一次 syscall。
+- `fdatasync` 约每秒一次，接近 Redis `appendfsync everysec` 语义。
 
-## 6. 三层 BPF 可观测开销（sockmap 流层）
+### 5.2 AOF replay 正确性
 
-> `redis-benchmark -c 50 -t set,get`，sockmap 流层观测开 vs 关。
+最近验证：写入 1000 条 SET + 1 条 FLUSHALL 后重启，WAL replay 日志：
 
-| Pipeline | 无 BPF (req/s) | sockmap-on (req/s) | Δ |
-|---|---:|---:|---:|
-| P=1 SET | 20 088 | 17 908 | -10.9% |
-| P=1 GET | 19 956 | 19 164 | -4.0% |
-| P=4 GET | 75 301 | 68 775 | -8.7% |
-| P=10 SET | 187k | 183k | < 噪声 |
-| P=10 GET | 173k | 180k | < 噪声 |
+```text
+[AOF] WAL load start, size=55824
+[AOF] load finished, 1001 commands replayed
+```
 
-每条 verdict ~200 ns；P=1 时最显眼，pipelined 场景被摊薄到测量噪声。
-
----
-
-## 7. BGSAVE 主线程 stall
-
-> Phase 4B.4 fork-COW 点时间快照，threads=4，并发写入下：
-
-| metric | 值 |
-|---|---:|
-| 全分片 wrlock acquire 耗时 | 0 ms |
-| fork() + 父进程释放锁总耗时 | 2-4 ms |
-| 并发 SET 吞吐（BGSAVE 期间） | 260k/s（相比稳态 ~390k 略降） |
-| 主线程感知 stall | **~0 ms** |
-
-子进程 COW 内运行 no-lock 迭代器 + io_uring 异步 writev，落盘期间主进程
-请求无阻塞。
+说明统一 WAL 仍能作为 AOF 恢复来源。
 
 ---
 
-## 8. 多 key 并发正确性（Phase 9）
+## 6. AOF / RDMA 增量复制统一 WAL 路径
 
-> 不是性能数字，是**正确性测量**。3 worker（cpu_pin 3,4,5），4 客户端
-> 并发 4 秒。原始：`test/bench/multi_key_smoke.sh`。
+最近复核目标：确认 AOF 与 RDMA incremental replication 合并后不会重复 append，并降低 RDMA-only 写路径开销。
 
-| 测试 | 不变量 | 结果 |
-|---|---|---|
-| SMOVE A↔B | `|A| + |B| ≡ 1000` | ✅ 1000+0 |
-| LMOVE L1↔L2 | `len(L1) + len(L2) ≡ 500` | ✅ 500+0 |
-| RPOPLPUSH R1↔R2 | `len(R1) + len(R2) ≡ 500` | ✅ 500+0 |
-| BLPOP 跨 worker 唤醒 | LPUSH 在 worker A，BLPOP 在 worker B → 收到回复 | ✅ |
-| BLPOP 1s 超时回复 | 1000 ± 50 ms | ✅ 1031 ms |
+### 6.1 四模式 SET 对照
 
-**6/6 PASS**。Phase 9 之前这几个测试会概率性失元素或 race；修复后稳定。
+参数：100k SET，value size = 64B，单机 VM，`fastpath_cache=no`，BPF 关闭。QPS 受 VM 调度影响较大，因此重点看 WAL 大小和相对行为。
+
+| mode | round | QPS | DBSIZE | wal_bytes |
+|---|---:|---:|---:|---:|
+| none | 1 | 45,558 | 99,936 | 0 |
+| rdma | 1 | 90,171 | 99,971 | **0** |
+| aof | 1 | 32,992 | 99,956 | 12,700,038 |
+| both | 1 | 45,208 | 99,948 | 12,700,038 |
+| none | 2 | 35,689 | 99,962 | 0 |
+| rdma | 2 | 48,403 | 99,947 | **0** |
+| aof | 2 | 39,463 | 99,953 | 12,700,038 |
+| both | 2 | 57,176 | 99,943 | 12,700,038 |
+| none | 3 | 34,965 | 99,953 | 0 |
+| rdma | 3 | 38,008 | 99,958 | **0** |
+| aof | 3 | 38,124 | 99,948 | 12,700,038 |
+| both | 3 | 49,480 | 99,958 | 12,700,038 |
+
+结论：
+
+- `AOF+RDMA` 的 WAL 大小与 `AOF-only` 完全一致，说明同一条写命令只追加一次 WAL。
+- `RDMA-only` 不再打开/写入磁盘 WAL，`wal_bytes=0`。
+- RDMA-only 空闲 master 不再进入 producer mutex / ring append / CRC 计算，避免复制开关造成磁盘写放大。
+
+### 6.2 RDMA fullsync + catchup 正确性
+
+Soft-RoCE verbs 环境：master `192.168.30.135:2000`，slave `:2002`，RDMA port `2100`，incremental port `6382`。
+
+验证结果：
+
+```text
+synced=1
+fullsync_ms=328.2
+loaded=99988
+master_dbsize=100955
+slave_dbsize=100955
+sample=d1000
+```
+
+解释：
+
+- slave 先通过 RDMA fullsync 加载约 99,988 个 key。
+- fullsync 期间 / 之后 master 继续写入 `during:*`。
+- slave 通过 incremental catchup 追到与 master 相同 DBSIZE。
+- `GET during:1000` 返回 `d1000`，说明 catchup 数据可见。
 
 ---
 
-## 9. Lock-free seqlock 短键热缓存（Phase 10）
+## 7. RDMA / libfabric fullsync 复测
 
-`src/core/fastpath_cache.{h,c}` — 1024 buckets × 512 B = **512 KB**（L2-resident），
-预格式化 RESP 回复，per-bucket 64-bit seqlock（even=stable，odd=writer），
-读端最多重试 1 次，写端 CAS-on-seq 单写者。在 dispatcher GET 入口、shard
-锁之前查询；SET / DEL / EXPIRE post-hook 维护一致性。
+环境：Soft-RoCE `rxe0`，libfabric verbs provider，master/slave/benchmark 同 VM。
 
-### 9.1 In-process 微基准（`test/bench_fp_inproc.c`）
+| 项 | 结果 |
+|---|---|
+| provider | `verbs` |
+| master | `192.168.30.135:2000` |
+| RDMA listen port | `2100` |
+| incremental port | `6382` |
+| fullsync correctness | master/slave DBSIZE 多轮一致 |
+| sample loaded keys | 99,951 |
+| sample fullsync_time_ms | 322.9 ms |
+| incremental handshake | `+CONTINUE` 成功 |
 
-**为什么不用 redis-benchmark 量这个 feature**：单 op 的 TCP/io_uring 开销
-≈ 50–70 µs，把 fast-path 节省的 200 ns 完全淹没。in-process 直接调用 API
-才能看清楚 CPU 路径的真实差异。
+已做优化：
 
-**单线程公平对比**（两条路径都产出完整 RESP 回复，64 hot keys × 64 B）：
+- RDMA slave 默认关闭 `fastpath_cache`，除非用户显式配置。
+- fullsync child 使用 `kv_shards_iter_init_nolock()`，避免 fork child 触碰继承来的 pthread rwlock。
+- master 在 `fork()` 前短暂锁住所有 shard，fork 后父进程立即释放，保证 COW snapshot 不落在写操作中间。
+
+注意：同 VM 同时跑 master、slave、redis-benchmark 时 fullsync 时间波动明显；这里主要作为功能正确性和工程路径验证。
+
+---
+
+## 8. Lock-free fastpath cache
+
+`src/core/fastpath_cache.{h,c}`：1024 buckets × 512B = 512 KB，direct-mapped，per-bucket 64-bit seqlock。
+
+设计目标：
+
+- 热 key、小 value、STRING GET 命中时跳过 shard rwlock 和 dict lookup。
+- SET 时预格式化 RESP reply，GET 命中后只需一次 memcpy。
+- 通过 demand-driven lazy fill 减少冷 key SET 路径维护成本。
+
+### 8.1 In-process 微基准
+
+默认：64 hot keys × 64B value，两条路径都产出完整 RESP 回复。
 
 | 路径 | ns/op | Mops/s |
 |---|---:|---:|
-| `pthread_rwlock_rdlock` + `dict_find` + `snprintf + memcpy(RESP)` | **375** | 2.67 |
-| `fp_get`（命中后单次 `memcpy` 预格式化回复） | **200** | 4.94 |
-| **加速比** | | **1.90x** |
+| `pthread_rwlock_rdlock + dict_find + snprintf + memcpy` | 375 | 2.67 |
+| `fp_get` 命中后 memcpy 预格式化回复 | 200 | 4.94 |
+| 加速比 | — | **1.90x** |
 
-收益来源：fast-path 在 SET 时**一次**完成 `$len\r\nval\r\n` 拼装并存进 bucket，
-GET 命中只需 `memcpy` 一次到 `DynBuf`；dict 路径每次 GET 都要重新 snprintf
-header + 拷贝 value。
+### 8.2 多读者同 shard 热点
 
-### 9.2 多读者扩展性（`SAME_SHARD=1`，64 keys 强制压同一 shard）
-
-模拟生产中的 hot-key 倾斜：所有热点 key 落在同一 dict shard，rwlock 成为
-单点。
+`SAME_SHARD=1`，64 keys 强制落同一 shard，模拟 hot-key skew。
 
 | readers | dict Mops/s | fp_get Mops/s | fp/dict |
 |---:|---:|---:|---:|
@@ -199,105 +268,196 @@ header + 拷贝 value。
 | 4 | 2.88 | 6.74 | **2.34x** |
 | 8 | 2.83 | 6.61 | **2.34x** |
 
-**关键观察**：
+观察：
 
-- dict 路径 1→4 线程基本**不 scale**（2.49→2.88 Mops/s）—— rwlock cacheline
-  ping-pong 把吞吐锁死在 ~2.9 Mops/s 上限。
-- `fp_get` 完全 lock-free，4 线程仍能达到 6.74 Mops/s，**比 dict 路径快 134%**。
-- 8 线程进一步开始受内存带宽限制；这是 seqlock 数据结构本身的上限，不是锁竞争。
+- dict 路径 1→4 readers 基本不扩展，rwlock cacheline ping-pong 成为瓶颈。
+- `fp_get` 读端 lock-free，4 readers 下比 dict 快 134%。
+- 8 readers 后开始受内存带宽影响。
 
-### 9.3 不要过度承诺：均匀随机工况是中性
+### 8.3 端到端 uniform random 是中性
 
-`test/bench/bench_fastpath.sh`（`redis-benchmark -t get`，`key:__rand_int__`，
-200 k key 均匀分布，d=64，threads=2）：
+`redis-benchmark -t get`，200k key 均匀分布，value size = 64B，threads=2。
 
 | 场景 | baseline QPS | fastpath QPS | 变化 |
 |---|---:|---:|---:|
-| 100% hit | 8286 | 8305 | **+0.2%** |
-| 0% hit | 8247 | 8227 | **−0.2%** |
+| 100% hit | 8,286 | 8,305 | **+0.2%** |
+| 0% hit | 8,247 | 8,227 | **-0.2%** |
 
-均匀随机大工作集**没有时间局部性**，fast-path 命中前也要查一次表 → 等价于
-为每个 GET 多付 1 次 L2 hit。我们把 buckets 从 4096 降到 1024（2 MB → 512 KB，
-能稳进 L2）后，这部分开销几乎归零（−27% → ±0.2%）。
+结论：fastpath 是 CPU-cycle / hot-key skew 优化，不承诺在均匀随机大工作集的端到端 redis-benchmark 中显著提升 QPS。
 
-总结：**fast-path 是 CPU-cycle 优化，不是网络吞吐优化**。它的价值在饱和负载
-下的 p99 延迟、CPU 释放给 AOF / 复制等其他工作，以及 hot-key 倾斜下的
-扩展性，而不是在 redis-benchmark 上把 QPS 数字推高。
+### 8.4 正确性
 
-### 9.4 正确性与 TSAN
+- `test/fp_cache_test.c`：sanity、hash collision、demand fill、stale overwrite、1 writer + 3 readers stress。
+- 最近一次结果：约 1,957 万 reads，388 万 hits，torn=0。
+- TSAN focused 测试 0 warning。
 
-- `test/fp_cache_test.c`：sanity + hash 冲突 + 1 writer + 3 readers × 5 s 压测，
-  `torn_reads = 0`，`writer_collisions = 0`。
-- `test/bench/fastpath_tsan_smoke.sh`：相同压测在 TSAN 下 **0 warning**（seqlock
-  payload 上的数据竞争通过 `__attribute__((no_sanitize_thread))` 标记为有意
-  设计，而不是用互斥消除）。
+---
 
-### 9.5 复现命令
+## 9. BPF/XDP 可观测开销
+
+BPF/XDP 不是零成本，而是低侵入、可控开销。本项目默认关闭高频观测，避免污染主性能结果。
+
+历史 sockmap stream-level 观测开销：`redis-benchmark -c 50 -t set,get`。
+
+| Pipeline | 无 BPF rps | sockmap-on rps | 变化 |
+|---|---:|---:|---:|
+| P=1 SET | 20,088 | 17,908 | -10.9% |
+| P=1 GET | 19,956 | 19,164 | -4.0% |
+| P=4 GET | 75,301 | 68,775 | -8.7% |
+| P=10 SET | 187k | 183k | 约为噪声 |
+| P=10 GET | 173k | 180k | 约为噪声 |
+
+解释：
+
+- P=1 单请求场景中，每次 verdict / map 访问成本更明显。
+- pipeline 增大后，观测成本被摊薄。
+- uprobe 挂在高频写路径时开销更大，因此只适合诊断、采样或慢路径分析。
+
+---
+
+## 10. RDB / BGSAVE
+
+测试日期：2026-05-15。参数：200 万 SET，50 并发，P=20，value size = 16B。
+
+| Key 数量 | baseline QPS | BGSAVE QPS | BGSAVE 降幅 | 同步 SAVE QPS | 同步 SAVE 降幅 | RDB 大小 | 单次 SAVE 耗时 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10,000 | 286,000 | 303,998 | <5% 噪声 | 192,400 | 32.7% | 0.4 MB | 275 ms |
+| 100,000 | 291,928 | 303,444 | <5% 噪声 | 195,561 | 33.0% | 4.1 MB | 270 ms |
+| 1,000,000 | 283,970 | 302,663 | <5% 噪声 | 97,518 | 65.7% | 41.0 MB | 1,319 ms |
+
+结论：
+
+- BGSAVE 使用 fork 子进程异步写盘，主线程感知影响很低。
+- 同步 SAVE 的主要成本来自 VM 虚拟磁盘 `fdatasync`。
+- 1M keys 时单次 SAVE 约 1.3s，主要是大文件 flush。
+
+---
+
+## 11. 内存分配器
+
+50 万 key × 64B value，jemalloc vs glibc malloc。
+
+| 分配器 | 阶段 | VmSize | VmRSS |
+|---|---|---:|---:|
+| jemalloc | 空闲 | 22.5 MB | 6.6 MB |
+| jemalloc | 峰值 | 101.5 MB | 69.8 MB |
+| jemalloc | FLUSHALL 后 | 101.5 MB | 69.7 MB |
+| glibc | 空闲 | 1,033.0 MB | 3.9 MB |
+| glibc | 峰值 | 1,102.7 MB | 73.5 MB |
+| glibc | FLUSHALL 后 | 1,102.7 MB | 73.5 MB |
+
+观察：
+
+- jemalloc 空闲 VmSize 仅为 glibc 的约 2.2%。
+- glibc 高 VmSize 主要来自 arena-per-thread 设计。
+- 两者默认都不主动把 RSS 归还给 OS。
+
+---
+
+## 12. Correctness / Regression
+
+| 套件 | 内容 | 当前状态 |
+|---|---|---|
+| `test/smoke/run_all.sh` | string/list/hash/set/zset 功能 smoke | PASS |
+| `test/bench/multi_thread_smoke.sh` | 多线程功能、BLPOP、AOF reload、BGSAVE | PASS |
+| `test/bench/multi_key_smoke.sh` | SMOVE / LMOVE / RPOPLPUSH 跨 shard 不变量 | PASS |
+| `build/fp_cache_test` | seqlock 单元 + stress，torn-read 检查 | PASS |
+| AOF replay | WAL mmap replay，1001 commands replayed | PASS |
+| RDMA fullsync | Soft-RoCE verbs fullsync | PASS |
+| RDMA catchup | fullsync 后 incremental catchup | PASS |
+| ASAN focused | 多线程 smoke | PASS |
+| TSAN focused | lock / fastpath focused tests | PASS |
+
+最近 smoke 结果：
+
+```text
+smoke_hash.sh    PASS=56 FAIL=0
+smoke_list.sh    PASS=63 FAIL=0
+smoke_set.sh     PASS=50 FAIL=0
+smoke_string.sh  PASS=55 FAIL=0
+smoke_zset.sh    PASS=76 FAIL=0
+```
+
+---
+
+## 13. 复现命令
+
+### 构建
 
 ```bash
-# 单元 + 多线程压测
-cmake --build build --target fp_cache_test && ./build/fp_cache_test 5
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
+```
 
-# TSAN 回归门
-./test/bench/fastpath_tsan_smoke.sh 5
+### smoke
 
-# CPU 微基准（默认 64 keys × 64B，多线程跑到 8）
-cmake --build build --target bench_fp_inproc
-OPS_PER_RUN=20000000 REPEATS=3 MT_OPS=10000000 MAX_THREADS=8 \
-    ./build/bench_fp_inproc
+```bash
+bash test/run_regression.sh quick
+# 或在 kvstore 已启动时：bash test/smoke/run_all.sh
+```
+
+### baseline sweep
+
+```bash
+bash test/bench/baseline_capture.sh --baseline
+```
+
+### pipeline / AOF / SAVE
+
+```bash
+bash test/bench/bench_pipeline.sh
+bash test/bench/bench_aof.sh
+bash test/bench/bench_save.sh
+```
+
+### fastpath
+
+```bash
+cmake --build build --target fp_cache_test bench_fp_inproc
+./build/fp_cache_test
+./build/bench_fp_inproc
 SAME_SHARD=1 MT_OPS=10000000 MAX_THREADS=8 ./build/bench_fp_inproc
 
-# 端到端（uniform random，预期 ~neutral）
-sudo BENCH_N=300000 BENCH_C=200 BENCH_P=10 WARMUP_N=200000 DATA_SIZE=64 \
-    ./test/bench/bench_fastpath.sh
+# 端到端 fastpath benchmark
+bash test/bench/bench_fastpath.sh all
 ```
 
----
-
-## 10. 测试基础设施汇总
-
-| 套件 | 内容 | 状态 |
-|---|---|---|
-| `test/smoke/run_all.sh` | string / list / hash / set / zset 5 类型功能验证 | ✅ |
-| `test/bench/multi_thread_smoke.sh` | threads=4 下 12 项功能（BLPOP / AOF reload / RDB BGSAVE）| ✅ 12/12 |
-| `test/bench/multi_key_smoke.sh` | 3 worker 多 key 并发正确性 | ✅ 6/6 |
-| `test/bench/tsan_lock_smoke.sh` | TSAN focused：rdlock readers / lazy-expire upgrade / cross-shard | ✅ 6/6 + 0 warnings |
-| `build/fp_cache_test` | seqlock 单元 + 1W+3R 压测，torn=0 / collisions=0 | ✅ |
-| `test/bench/fastpath_tsan_smoke.sh` | fp_cache TSAN 回归门，0 warning | ✅ |
-| `build/bench_fp_inproc` | fp_get 1.9x（单线程）/ +134%（4 线程同 shard）| ✅ |
-| `test/bench/baseline_capture.sh` | t={1..6} × pin={off,auto} sweep | sweep ready |
-| `test/bench/soak.sh` | 10/30 min 长跑：内存 / fd / DBSIZE 漂移检查 | 10min PASS, 30min TBD |
-| ASAN 构建 | full multi-thread smoke 12/12 PASS | ✅ 0 findings |
-| TSAN 构建 | tsan_lock_smoke + multi-thread smoke | ✅ 0 warnings |
-
-`smoke-all` 一键跑 Release + ASAN + TSAN：30/30 PASS。
-
----
-
-## TODO（项目完工后全量测试时补齐）
-
-- [ ] **vs Redis 头对头表**（`test/bench/vs_redis.sh`）—— P=1/4/10/20 SET/GET
-- [ ] **t-sweep on 8c P-core**（`baseline_8c_pcore.sh`）—— 当前只有 6c 数据
-- [ ] **2-VM 物理隔离吞吐**（KV 独占 6 P-core, bench 在另一台 VM）
-- [ ] **`perf top` 抓 30s** —— 找出 ~2.5 μs/op 都花在哪（指导 Phase 6.3 是否做 gperf）
-- [ ] **kill -9 重启 + AOF replay 完整性** —— 1M 条 SET 写入后强杀，重启后 DBSIZE 应一致
-- [ ] **30 min soak**（已有脚本，待跑）
-- [ ] **sockmap fast-path before/after**（如 Phase 9.1 实施）
-
----
-
-## 数据复现
+### RDMA / replication
 
 ```bash
-# Phase 8.4 baseline
-bash test/bench/baseline_capture.sh --baseline   # 写入 baseline_<host>_<nproc>c.txt
-
-# Phase 3 io_uring 进阶 before/after
-ls test/bench/phase3-*.csv
-
-# Phase 9 多 key 并发
-bash test/bench/multi_key_smoke.sh
-
-# 一键回归（Release + ASAN + TSAN）
-cmake --build build --target smoke-all
+# 需要 Soft-RoCE/libfabric 环境，示例配置见 conf/bench/
+./build/kvstore conf/bench/kvstore-master-repl.conf
+# 另一个终端/机器上运行 fullsync benchmark
+bash test/bench/bench_fullsync.sh master 100000
+sudo bash test/bench/bench_fullsync.sh slave --payload <PAYLOAD_FROM_MASTER>
 ```
+
+---
+
+## 14. 不建议写入简历的口径
+
+为了避免过度承诺，以下口径不建议使用：
+
+- “完全兼容 Redis”
+- “BPF/XDP 零开销监控”
+- “RDMA 硬件零拷贝生产级复制”
+- “任意 workload 下 fastpath 都能提升端到端 QPS”
+- “本机 VM loopback QPS 等价于物理机生产性能”
+
+建议表述：
+
+- “Redis-like 核心协议与常用命令兼容”
+- “BPF/XDP 低侵入、可控开销观测”
+- “libfabric / Soft-RoCE 环境下验证 RDMA fullsync 和 catchup 机制”
+- “fastpath 针对热 key、小 value、CPU 路径优化，在 microbench 和 hot-key skew 下收益显著”
+
+---
+
+## 15. 后续可补充测试
+
+- 2-VM 隔离 benchmark：client/server 分离，减少同机抢核噪声。
+- 30min / 2h soak：内存、fd、DBSIZE、复制状态漂移检查。
+- kill -9 + 1M WAL replay：强杀恢复完整性。
+- 多 slave 增量复制长测。
+- `perf top` / flamegraph：定位剩余 per-request CPU cost。
+- 物理 RDMA NIC 复测 fullsync。

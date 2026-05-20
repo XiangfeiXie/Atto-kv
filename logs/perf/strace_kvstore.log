@@ -1,0 +1,47 @@
+11288 10:21:26.703988 madvise(0x709698c0c000, 8192, MADV_DONTNEED <unfinished ...>
+11286 10:21:26.706041 futex(0x7096987ff990, FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME, 11288, NULL, FUTEX_BITSET_MATCH_ANY <unfinished ...>
+11288 10:21:26.708049 <... madvise resumed>) = 0
+11288 10:21:26.708524 madvise(0x709698dc3000, 32768, MADV_DONTNEED) = 0
+11288 10:21:26.709164 madvise(0x709695a00000, 897024, MADV_DONTNEED) = 0
+11288 10:21:26.710113 rt_sigprocmask(SIG_BLOCK, ~[RT_1], NULL, 8) = 0
+11288 10:21:26.710668 madvise(0x709697fff000, 8368128, MADV_DONTNEED) = 0
+11288 10:21:26.711216 exit(0)           = ?
+11288 10:21:26.711966 +++ exited with 0 +++
+11286 10:21:26.712019 <... futex resumed>) = 0
+11286 10:21:26.712496 close(4)          = 0
+11286 10:21:26.713204 io_uring_register(11, IORING_UNREGISTER_PBUF_RING, {ring_addr=NULL, ring_entries=0, bgid=1, flags=0}, 1) = 0
+11286 10:21:26.713831 munmap(0x709699d9b000, 16384) = 0
+11286 10:21:26.714436 munmap(0x709696a00000, 4194304) = 0
+11286 10:21:26.714999 munmap(0x709696fed000, 65536) = 0
+11286 10:21:26.715603 munmap(0x70969900a000, 36928) = 0
+11286 10:21:26.716169 close(11)         = 0
+11286 10:21:26.717004 close(3)          = 0
+11286 10:21:26.717867 close(6)          = 0
+11286 10:21:26.718529 io_uring_register(12, IORING_UNREGISTER_PBUF_RING, {ring_addr=NULL, ring_entries=0, bgid=1, flags=0}, 1) = -1 EEXIST (File exists)
+11286 10:21:26.719584 munmap(0x709696600000, 4194304) = 0
+11286 10:21:26.722281 munmap(0x709696fdd000, 65536) = 0
+11286 10:21:26.723488 munmap(0x709699000000, 36928) = 0
+11286 10:21:26.725655 close(12)         = 0
+11286 10:21:26.726894 close(5)          = 0
+11286 10:21:26.727485 close(8)          = 0
+11286 10:21:26.727685 io_uring_register(13, IORING_UNREGISTER_PBUF_RING, {ring_addr=NULL, ring_entries=0, bgid=1, flags=0}, 1) = -1 EEXIST (File exists)
+11286 10:21:26.727855 munmap(0x709696200000, 4194304) = 0
+11286 10:21:26.728035 munmap(0x709696fc3000, 65536) = 0
+11286 10:21:26.728216 munmap(0x709696fd3000, 36928) = 0
+11286 10:21:26.728414 close(13)         = 0
+11286 10:21:26.728566 close(7)          = 0
+11286 10:21:26.729638 close(10)         = 0
+11286 10:21:26.731979 io_uring_register(14, IORING_UNREGISTER_PBUF_RING, {ring_addr=NULL, ring_entries=0, bgid=1, flags=0}, 1) = -1 EEXIST (File exists)
+11286 10:21:26.732686 munmap(0x709695e00000, 4194304) = 0
+11286 10:21:26.733431 munmap(0x709696fa5000, 65536) = 0
+11286 10:21:26.733978 munmap(0x709696fb5000, 36928) = 0
+11286 10:21:26.734618 close(14)         = 0
+11286 10:21:26.735949 close(9)          = 0
+11286 10:21:26.738470 rt_sigaction(SIGSEGV, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x709699645330}, NULL, 8) = 0
+11286 10:21:26.739128 rt_sigaction(SIGBUS, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x709699645330}, NULL, 8) = 0
+11286 10:21:26.739927 rt_sigaction(SIGILL, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x709699645330}, NULL, 8) = 0
+11286 10:21:26.740508 rt_sigaction(SIGABRT, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x709699645330}, NULL, 8) = 0
+11286 10:21:26.744212 rt_sigaction(SIGINT, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x709699645330}, NULL, 8) = 0
+11286 10:21:26.744837 rt_sigaction(SIGTERM, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x709699645330}, NULL, 8) = 0
+11286 10:21:26.745493 exit_group(0)     = ?
+11286 10:21:26.747456 +++ exited with 0 +++

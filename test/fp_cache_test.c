@@ -357,7 +357,7 @@ int main(int argc, char **argv)
     printf("== fp_cache_test ==\n");
     printf("  sizeof(struct fp_entry) = %zu (expected 512)\n",
            sizeof(struct fp_entry));
-    printf("  sizeof(struct fp_cache) = %zu (expected ~512 KB, L2-resident)\n",
+    printf("  sizeof(struct fp_cache) = %zu (expected ~1 MB, L2-resident)\n",
            sizeof(struct fp_cache));
 
     test_sanity();

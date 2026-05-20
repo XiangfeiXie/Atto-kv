@@ -58,7 +58,25 @@
 
 static inline uint32_t fp_index(uint64_t khash)
 {
-    return (uint32_t)(khash ^ (khash >> 32)) & FP_BUCKETS_MASK;
+    khash ^= khash >> 33;
+    khash *= 0xff51afd7ed558ccdULL;
+    khash ^= khash >> 33;
+    khash *= 0xc4ceb9fe1a85ec53ULL;
+    khash ^= khash >> 33;
+    return (uint32_t)khash & FP_BUCKETS_MASK;
+}
+
+static _Atomic uint32_t g_fp_stat_next_slot = 0;
+
+static inline struct fp_stat_slot *fp_stat_slot(struct fp_cache *c)
+{
+    static __thread uint32_t s_slot = UINT32_MAX;
+    if (__builtin_expect(s_slot == UINT32_MAX, 0)) {
+        s_slot = atomic_fetch_add_explicit(&g_fp_stat_next_slot, 1,
+                                           memory_order_relaxed)
+                 & (FP_STATS_SLOTS - 1u);
+    }
+    return &c->stat_slots[s_slot];
 }
 
 /* ---------------- Lifecycle ---------------- */
@@ -96,7 +114,10 @@ FP_NO_TSAN int fp_get(struct fp_cache *c,
                       void *out, uint32_t *outlen, uint32_t out_cap)
 {
     if (!c || klen == 0 || klen > FP_KEY_MAX) {
-        if (c) atomic_fetch_add_explicit(&c->misses, 1, memory_order_relaxed);
+        if (c) {
+            atomic_fetch_add_explicit(&fp_stat_slot(c)->misses, 1,
+                                      memory_order_relaxed);
+        }
         return -1;
     }
     uint32_t idx = fp_index(khash);
@@ -149,7 +170,8 @@ FP_NO_TSAN int fp_get(struct fp_cache *c,
         if (memcmp(kbuf, key, kl) != 0) goto miss;
 
         *outlen = rl;
-        atomic_fetch_add_explicit(&c->hits, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&fp_stat_slot(c)->hits, 1,
+                                  memory_order_relaxed);
         return 0;
     }
 
@@ -158,7 +180,8 @@ miss:
      * actually populates instead of being short-circuited. */
     atomic_store_explicit(&c->demand[idx],
                            FP_DEMAND_HOT, memory_order_relaxed);
-    atomic_fetch_add_explicit(&c->misses, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&fp_stat_slot(c)->misses, 1,
+                              memory_order_relaxed);
     return -1;
 }
 
@@ -387,11 +410,17 @@ void fp_stats(const struct fp_cache *c,
         if (writer_collisions) *writer_collisions = 0;
         return;
     }
-    if (hits) {
-        *hits = atomic_load_explicit(&c->hits, memory_order_relaxed);
-    }
-    if (misses) {
-        *misses = atomic_load_explicit(&c->misses, memory_order_relaxed);
+    if (hits) *hits = 0;
+    if (misses) *misses = 0;
+    for (uint32_t i = 0; i < FP_STATS_SLOTS; i++) {
+        if (hits) {
+            *hits += atomic_load_explicit(&c->stat_slots[i].hits,
+                                          memory_order_relaxed);
+        }
+        if (misses) {
+            *misses += atomic_load_explicit(&c->stat_slots[i].misses,
+                                            memory_order_relaxed);
+        }
     }
     if (invalidations) {
         *invalidations = atomic_load_explicit(&c->invalidations,

@@ -31,7 +31,7 @@
 | 主题 | 结论 |
 |---|---|
 | io_uring proactor | multishot accept/recv、buf ring、`DEFER_TASKRUN` 等优化后，多 pipeline 场景平均提升约 **30%** |
-| 本机 loopback 基准 | 6c 约束下 `threads=2` 时 SET/GET 达到约 **492k / 494k rps** |
+| 本机 loopback 基准 | 当前 8c VM 正式口径单轮最高 SET/GET 约 **391k / 432k rps**；历史 6c 约束高基准约 **492k / 494k rps** |
 | dispatcher 单核优化 | 去掉 double dict lookup 后，单 worker SET/GET 提升约 **20% / 30%** |
 | AOF | kvstore AOF 历史对照损耗约 **11%**，低于 Redis AOF everysec 的 **35-40%** |
 | unified WAL | `AOF+RDMA` 只写一份 WAL；100k SET WAL 大小与 AOF-only 一致，约 **12.7 MB** |
@@ -59,6 +59,62 @@
 - 6c 约束下 `threads=2` 最优，因为 benchmark client 线程和 kvstore worker 正好填满 CPU。
 - `threads>=4` 不再线性增长，主要是同机压测下 client/server 抢核，而不是 shard lock 成为主瓶颈。
 - 8c VM 上未做 taskset 约束时，`dev_quick.sh` 稳定约 390k SET/GET；偶发更高数字不写入展示口径。
+
+### 2026-05-19：单机 pipeline=16、c=64（threads=4）
+
+- 配置：`tmp-kvstore-baseline.conf`（`persistence none`、`threads 4`、`cpu_pin auto`），BPF 关闭。
+- 命令：`redis-benchmark -h 127.0.0.1 -p 2000 -t get,set -n 200000 -c 64 -P 16 --csv`
+
+| 指标 | SET | GET |
+|---|---:|---:|
+| QPS | 223,714 | **240,964** |
+| avg latency | 2.62 ms | 2.41 ms |
+| p95 | 5.29 ms | 4.70 ms |
+| p99 | 7.74 ms | 7.02 ms |
+
+说明：与 5-17 的高线程基准相比，此次更偏向“较小并发 + 高 pipeline”场景，吞吐稳定在 22~24 万 rps，延迟维持在 2~8 ms 区间，可作为后续 fastpath/观测层对照的基础点。
+
+### 2026-05-19 13:13 UTC：按 test-log 3.1 重跑基线（conf/kvstore-dev.conf）
+
+- 配置：`conf/kvstore-dev.conf`，实际启动为 `persistence none`、`network proactor`、`workers=4 [auto]`、`cpu_pin auto`、fastpath 默认开启，BPF/复制关闭。
+- 命令：`redis-benchmark -h 127.0.0.1 -p 2000 -t get,set -n 200000 -c 64 -P 16 --csv`
+- 隔离：每轮重启 `kvstore`、`FLUSHALL` 后单独运行；原始日志在 `logs/perf/20260519_131358_baseline31/`。
+
+| run | SET rps | SET avg | SET p95 | SET p99 | GET rps | GET avg | GET p95 | GET p99 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| run1 | 190,295 | 3.013 ms | 5.319 ms | 6.751 ms | 210,970 | 2.612 ms | 3.943 ms | 5.335 ms |
+| run2 | **223,214** | **2.628 ms** | **4.791 ms** | 6.343 ms | **241,255** | **2.431 ms** | **4.031 ms** | **5.295 ms** |
+| run3 | 219,058 | 2.802 ms | 4.935 ms | **6.295 ms** | 213,904 | 2.840 ms | 5.191 ms | 6.399 ms |
+
+| 汇总口径 | SET | GET |
+|---|---:|---:|
+| best QPS | **223,214 rps** | **241,255 rps** |
+| median QPS | 219,058 rps | 213,904 rps |
+| best-run avg latency | 2.628 ms | 2.431 ms |
+| best-run p95 | 4.791 ms | 4.031 ms |
+| best-run p99 | 6.343 ms | 5.295 ms |
+
+系统观测：`/proc/loadavg` 从约 `0.49~0.57` 到 `0.53~0.57`，整体负载较低；`mpstat -P ALL 1` 在 benchmark 窗口内观测到全局 CPU 约 `9~16% usr`、`13~15% sys`、`6~7% softirq`，同时 iowait 显示约 `49~51%`，该值在当前虚拟化/同机压测环境中偏高，后续对比应沿用同一环境和采样口径。
+
+### 2026-05-19 13:33 UTC：8c 正式口径单轮 sweep（c=400, P=10, client threads=8）
+
+- 机器：8 vCPU，VMware，`nproc=8`。
+- 配置：`persistence none`、`network proactor`、`rdma_sync off`、`xdp no`、`sockmap no`、fastpath 默认开启。
+- 命令：`redis-benchmark -h 127.0.0.1 -p 2000 -t get,set -n 1000000 -c 400 -P 10 --threads 8 --csv`
+- 隔离：每个 `threads/cpu_pin` 组合独立启动 `kvstore`，`FLUSHALL` 后单独运行一轮；原始日志在 `logs/perf/20260519_133334_8c_formal_sweep/`。
+
+| KV worker threads | cpu_pin | SET rps | GET rps | 备注 |
+|---:|---|---:|---:|---|
+| 2 | auto | **391,389** | 349,040 | SET 最优 |
+| 2 | off | 355,366 | 431,593 | GET 接近最优 |
+| 4 | auto | 295,596 | 389,257 | SET 明显下降 |
+| 4 | off | 387,898 | **432,339** | GET 最优，综合较好 |
+| 6 | auto | 322,893 | 351,989 | worker 增多后同机抢核加重 |
+| 6 | off | 323,625 | 349,162 | 无收益 |
+| 8 | auto | 323,520 | 319,387 | worker 过多，client/softirq 空间不足 |
+| 8 | off | 354,359 | 358,166 | 低于 2/4 workers |
+
+结论：8c 机器上采用正式高吞吐口径可以明显高于 dev sanity 的 22~24 万 rps；本次单轮最高 SET 为 `391,389 rps`（`threads=2,cpu_pin=auto`），最高 GET 为 `432,339 rps`（`threads=4,cpu_pin=off`）。`threads=6/8` 没有更高，主要是同机 client/server/softirq 抢核导致，并非简单 worker 越多越快。
 
 ---
 
@@ -285,7 +341,52 @@ sample=d1000
 
 结论：fastpath 是 CPU-cycle / hot-key skew 优化，不承诺在均匀随机大工作集的端到端 redis-benchmark 中显著提升 QPS。
 
-### 8.4 正确性
+### 8.4 threads=2 fastpath 开关对照
+
+2026-05-19。配置：`threads=2`、`cpu_pin=auto`、`persistence none`、`network proactor`、BPF/复制关闭。原始日志：
+
+- `logs/perf/20260519_140102_fastpath32_threads2_rb/`
+- `logs/perf/20260519_140224_fastpath32_threads2_hot64/`
+
+说明：严格 90/10 GET/SET 的 Python RESP 压测器只达到 `2.5k~4k qps`，属于客户端瓶颈，作废不计入结论；有效对照采用 `redis-benchmark` 分段近似。
+
+| 场景 | fastpath | GET rps | SET rps | 估算 90/10 rps | hit rate | 变化 |
+|---|---|---:|---:|---:|---:|---:|
+| 4096 hot keys | on | 358,295 | 394,322 | 361,598 | 24.66% | -7.97% |
+| 4096 hot keys | off | 392,773 | 394,322 | 392,927 | 0.00% | baseline |
+| 64 hot keys | on | 394,166 | — | — | 95.27% | -0.55% |
+| 64 hot keys | off | 396,354 | — | — | 0.00% | baseline |
+
+结论：`threads=2` 下 fastpath 本身没有异常慢；端到端 `redis-benchmark` 仍可达到约 36~39 万 qps。4096 key 场景下 direct-mapped cache 冲突明显，fastpath hit rate 只有 `24.66%`，on 比 off 低约 `8%`；64 hot-key 场景命中率 `95.27%`，on/off 基本持平。fastpath 主要价值仍在 in-process/hot path 微基准和特定 hot-key skew，而不是任意端到端 workload 都提升 QPS。
+
+### 8.5 hash mixing + 2048 buckets 优化验证
+
+改动：
+
+- `fp_index()` 使用 MurmurHash3 finalizer 风格二次混合。
+- `FP_BUCKETS` 从 `1024` 调整为 `2048`，table 从约 `512 KB` 增至约 `1 MB`。
+- `config_print()` 和 `fp_cache_test` 输出同步为 `2048 buckets / ~1 MB`。
+
+验证：
+
+- `cmake --build build --target kvstore fp_cache_test bench_fp_inproc` 通过。
+- `./build/fp_cache_test` 通过，stress 无 torn-read。
+- `bench_fp_inproc`：普通多 reader fastpath 约 `2.33x~2.49x`；同 shard 热点 4/8 readers 约 `7.82x / 7.05x`。
+
+端到端 `threads=2,cpu_pin=auto` 结果：
+
+| 版本 | 场景 | fastpath | GET rps | SET rps | 估算 90/10 rps | hit rate | 变化 |
+|---|---|---|---:|---:|---:|---:|---|
+| 原始 1024 buckets | 4096 hot keys | on | 358,295 | 394,322 | 361,598 | 24.66% | on 比 off 低约 8% |
+| hashmix only | 4096 hot keys | on | 390,778 | 391,083 | 390,808 | 24.38% | hit rate 未改善 |
+| hashmix + 2048 buckets | 4096 hot keys | on | 355,619 | 391,850 | 358,938 | 42.42% | hit rate 提升，混合约持平 |
+| hashmix + 2048 buckets | 4096 hot keys | off | 355,872 | 384,320 | 358,526 | 0.00% | baseline |
+| hashmix + 2048 buckets | 64 hot keys | on | 429,185 | — | — | 99.99% | on 比 off 高约 10.6% |
+| hashmix + 2048 buckets | 64 hot keys | off | 388,048 | — | — | 0.00% | baseline |
+
+结论：hash mixing 本身不能解决 4096 hot-key 低 hit rate，主因是 direct-mapped 容量冲突；`2048 buckets` 可把 hit rate 提升到 `42.42%`，并让高命中 64-key GET 端到端出现约 `10.6%` 收益。4096-key 混合场景仍基本持平，下一步若继续优化应评估 2-way/4-way set-associative cache，而不是简单增大到 4096 buckets。
+
+### 8.6 正确性
 
 - `test/fp_cache_test.c`：sanity、hash collision、demand fill、stale overwrite、1 writer + 3 readers stress。
 - 最近一次结果：约 1,957 万 reads，388 万 hits，torn=0。

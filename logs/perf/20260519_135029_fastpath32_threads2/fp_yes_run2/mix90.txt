@@ -1,0 +1,7 @@
+ops=600000
+seconds=238.908374
+qps=2511.42
+clients=64
+pipeline=16
+hot_keys=4096
+get_ratio=0.9

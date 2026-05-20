@@ -39,8 +39,8 @@
 
 /* Phase 10 sizing rationale.
  *
- * 1024 buckets × 512B = 512 KB total table.  This fits inside the L2
- * cache of every modern x86-64 / aarch64 desktop and server CPU, so
+ * 2048 buckets × 512B = 1 MB total table.  This fits inside the L2
+ * cache of common modern x86-64 / aarch64 desktop and server CPU, so
  * even a *miss* on the seqlock acquire-load only pays an L2 hit
  * (~12 cycles) instead of an L3 round-trip (~30+ cycles).  Earlier
  * sizing (4096 × 512B = 2 MB) over-spilled L2 on uniform-random GET
@@ -53,13 +53,14 @@
  * keeps the cache reserved for value sizes where the copy + reply
  * preformatting actually pays back.
  */
-#define FP_BUCKETS        1024u
+#define FP_BUCKETS        2048u
 #define FP_BUCKETS_MASK   (FP_BUCKETS - 1u)
 #define FP_KEY_MAX        64u
 #define FP_VAL_MIN        32u
 #define FP_VAL_MAX        256u
 #define FP_REPLY_MAX      (16u + FP_VAL_MAX + 2u)  /* "$<len>\r\n" + val + "\r\n" */
 #define FP_ENTRY_BYTES    512u   /* cacheline-aligned (8 × 64B) */
+#define FP_STATS_SLOTS    64u
 
 struct fp_entry {
     _Atomic uint64_t seq;        /* seqlock counter (see header comment) */
@@ -79,6 +80,15 @@ struct fp_entry {
 
 _Static_assert(sizeof(struct fp_entry) == FP_ENTRY_BYTES,
                "fp_entry must be exactly 512 bytes for cacheline isolation");
+
+struct fp_stat_slot {
+    _Atomic uint64_t hits;
+    _Atomic uint64_t misses;
+    uint8_t          _pad[64u - sizeof(_Atomic uint64_t) * 2u];
+} __attribute__((aligned(64)));
+
+_Static_assert(sizeof(struct fp_stat_slot) == 64u,
+               "fp_stat_slot must be exactly one cacheline");
 
 /* Phase 10.9 — demand-driven lazy fill.
  *
@@ -107,8 +117,7 @@ struct fp_cache {
     _Atomic uint8_t  demand[FP_BUCKETS];       /* 1 KB, L1-resident */
     _Atomic uint64_t cached_hash[FP_BUCKETS];  /* 8 KB metadata prefilter */
     _Atomic uint8_t  cached_valid[FP_BUCKETS]; /* 1 KB metadata prefilter */
-    _Atomic uint64_t hits;
-    _Atomic uint64_t misses;
+    struct fp_stat_slot stat_slots[FP_STATS_SLOTS];
     _Atomic uint64_t invalidations;
     _Atomic uint64_t writer_collisions;        /* per-bucket CAS retry count */
     _Atomic uint64_t puts_skipped_cold;        /* fp_put short-circuited, no demand */

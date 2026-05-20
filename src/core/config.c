@@ -401,7 +401,7 @@ void config_print(void) {
     if (kvs_config.latency_histogram_enabled)
         printf("  Latency hist  : sampled dispatch histogram enabled\n");
     if (kvs_config.fastpath_cache_enabled)
-        printf("  Fastpath cache: lock-free seqlock, 1024 buckets, 512 KB (L2-resident)\n");
+        printf("  Fastpath cache: lock-free seqlock, 2048 buckets, 1 MB (L2-resident)\n");
     if (kvs_config.threads > 1) {
         long nproc = sysconf(_SC_NPROCESSORS_ONLN);
         printf("  Workers       : %d %s (nproc=%ld, %d shards, SO_REUSEPORT)\n",

@@ -1,0 +1,6 @@
+]633;E;echo "run_id=$RUN_ID";2e60a200-091e-48b7-bc95-1d0b34694ed1]633;Crun_id=20260519_133334_8c_formal_sweep
+date=2026-05-19T13:33:34+00:00
+host=ubuntu-24
+nproc=8
+git=4cce4a8
+command=redis-benchmark -h 127.0.0.1 -p 2000 -t get,set -n 1000000 -c 400 -P 10 --threads 8 --csv

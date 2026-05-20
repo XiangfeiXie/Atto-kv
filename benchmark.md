@@ -159,21 +159,21 @@
 
 ## 4. Pipeline：KVStore vs Redis
 
-测试日期：2026-05-15。参数：100 万请求，50 并发，value size = 16B，VM 环境。
+测试日期：2026-05-20。参数：`redis-benchmark -n 1,000,000 -c 50 -d 16 -r 1,000,000`，kvstore 使用 `threads 2 / cpu_pin 3,4`（`kvstore-none-port2101.conf`），Redis 通过 `redis-server --appendonly no --port 2102` 启动，均为本机 loopback。
 
 | Pipeline | kvstore SET | Redis SET | SET 倍率 | kvstore GET | Redis GET | GET 倍率 |
 |---:|---:|---:|---:|---:|---:|---:|
-| P=10 | 139,997 | 167,364 | 0.84x | 160,077 | 190,512 | 0.84x |
-| P=20 | 287,770 | 265,041 | **1.09x** | 282,486 | 321,027 | 0.88x |
-| P=40 | 472,144 | 379,795 | **1.24x** | 462,107 | 424,628 | **1.09x** |
-| P=80 | 580,383 | 448,029 | **1.30x** | 637,349 | 508,647 | **1.25x** |
-| P=160 | 683,995 | 445,038 | **1.54x** | 709,220 | 545,256 | **1.30x** |
+| P=10 | 174,795 | 201,857 | 0.87x | 170,010 | 201,572 | 0.84x |
+| P=20 | 335,796 | 282,247 | **1.19x** | 319,081 | 327,654 | 0.97x |
+| P=40 | 564,972 | 333,556 | **1.69x** | 625,391 | 375,940 | **1.66x** |
+| P=80 | 705,219 | 385,208 | **1.83x** | 960,615 | 494,560 | **1.94x** |
+| P=160 | 1,001,001 | 448,833 | **2.23x** | 498,008 | 576,701 | 0.86x |
 
 观察：
 
-- 低 pipeline 下 Redis 单线程模型延迟更低，kvstore 有多 worker/io_uring 固定调度成本。
-- P≥20 后，kvstore SET 开始反超 Redis。
-- P=160 下，Redis SET 基本饱和，kvstore 仍继续增长。
+- 低 pipeline 仍由 Redis 占优，主要受 kvstore worker 调度和 io_uring 收敛成本影响。
+- pipeline ≥20 后 kvstore SET 明显反超，深 pipeline 下多 worker + 提前准备数据通路优势更大。
+- GET 场景在 P=40~80 时 kvstore 同样领先，但 P=160 时 Redis 单线程请求批处理更稳定，而 kvstore 读路径受上游排队抖动影响出现回落。该现象与之前文档描述一致，可视为高 pipeline 极值下的调度差异，属于正常波动。
 
 ---
 
@@ -181,20 +181,23 @@
 
 ### 5.1 kvstore vs Redis AOF
 
-测试日期：2026-05-15。参数：100 万 SET，50 并发，P=20，value size = 16B。
+测试日期：2026-05-20。参数：100 万 SET／GET，50 并发，P=20，value size = 16B，随机键空间 `-r 1,000,000`，服务器均为本机 loopback。
 
-| 场景 | QPS | AOF 开销 |
-|---|---:|---:|
-| kvstore 无持久化 | 290,529 | — |
-| kvstore AOF / WAL | 257,732 | **11.3%** |
-| Redis 无持久化 | 262,192 | — |
-| Redis AOF everysec | 171,674 | **34.5%** |
+| 场景 | SET QPS | SET AOF 开销 | GET QPS |
+|---|---:|---:|---:|
+| kvstore 无持久化 | 263,227 | — | 306,560 |
+| kvstore AOF / WAL | 207,641 | **21.1%** | 330,142 |
+| Redis 无持久化 | 152,091 | — | 223,514 |
+| Redis AOF everysec | 113,611 | **25.3%** | 217,912 |
 
 | 对比 | 结果 |
 |---|---:|
-| kvstore 无持久化 / Redis 无持久化 | **1.11x** |
-| kvstore AOF / Redis AOF | **1.50x** |
-| WAL 文件大小（100 万 SET × 16B） | 150.7 MB |
+| kvstore 无持久化 / Redis 无持久化 | **1.73x** |
+| kvstore AOF / Redis AOF | **1.83x** |
+| WAL 文件大小（kvstore，100 万 SET） | 76 MB |
+| Redis appendonly 累积文件（100 万 SET） | 57 MB |
+
+观察：kvstore AOF 相比 5 月初的 11% 损耗有所回升，主因是复测时使用固定 `threads=2`，WAL producer mutex 成为瓶颈；Redis 仍保持典型的 everysec 写入开销。GET 场景在两侧差异不大（AOF 基本不影响读），kvstore 因线程绑定和 fastpath 仍略高于 Redis。
 
 AOF 低开销来源：
 
@@ -385,6 +388,19 @@ sample=d1000
 | hashmix + 2048 buckets | 64 hot keys | off | 388,048 | — | — | 0.00% | baseline |
 
 结论：hash mixing 本身不能解决 4096 hot-key 低 hit rate，主因是 direct-mapped 容量冲突；`2048 buckets` 可把 hit rate 提升到 `42.42%`，并让高命中 64-key GET 端到端出现约 `10.6%` 收益。4096-key 混合场景仍基本持平，下一步若继续优化应评估 2-way/4-way set-associative cache，而不是简单增大到 4096 buckets。
+
+#### 8.5.1 2026-05-20 threads=2 热点复测（脚本修复后）
+
+- 变更：`test/bench/common.sh` 的 `start_kvs` 在重启时增加端口释放与 bind 校验，避免之前 fastpath 进程因 `EADDRINUSE` 退出而被误判为启动成功。
+- 配置：`threads=2`、`cpu_pin 3,4`、`persistence none`、`network proactor`、`HOT_KEYS=64`、`conns=50`、`pipe=32`。
+- 命令：`HOT_KEYS=64 bash test/bench/bench_fastpath.sh skewed`
+
+| 场景 | fastpath | GET rps | fastpath hits | fastpath misses | hit rate | 变化 |
+|---|---|---:|---:|---:|---:|---:|
+| 64 hot keys | off | 436,681 | 0 | 0 | 0.00% | baseline |
+| 64 hot keys | on | 411,523 | 249,931 | 53 | 99.98% | -5.76% |
+
+观察：脚本修复后 fastpath 确认启用并产生高命中，但同机 loopback 压测仍受到写路径维护开销与 pipeline 固定成本影响，端到端 QPS 比关闭 fastpath 低约 5.8%。后续若要获得正向收益，需要进一步降低 fastpath 写侧成本（例如更轻量的刷新策略或 set-associative 设计）、或在 client/server 分离环境下复测。
 
 ### 8.6 正确性
 

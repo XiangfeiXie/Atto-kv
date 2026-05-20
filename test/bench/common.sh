@@ -85,6 +85,13 @@ stop_kvs() {
             fuser -k ${port}/tcp 2>/dev/null || true
         fi
     done
+    # 等待端口完全释放，避免随后的启动立即命中 EADDRINUSE。
+    for ((i=0; i<20; i++)); do
+        if ! ss -tlnp 2>/dev/null | grep -qE ":(${KVS_PORT}|${KVS_SLAVE_PORT}|${MASTER_RDMA_PORT}|6382) "; then
+            break
+        fi
+        sleep 0.1
+    done
     sleep 0.3
 }
 
@@ -104,10 +111,22 @@ start_kvs() {
     port=${port:-$KVS_PORT}
     nohup "$KVS_BIN" "$conf_path" > "${LOG_DIR}/kvstore_${conf}.log" 2>&1 &
     local pid=$!
+    sleep 0.2
+    if ! kill -0 "$pid" 2>/dev/null; then
+        err "kvstore 启动失败 (conf=$conf, pid=$pid)"
+        tail -20 "${LOG_DIR}/kvstore_${conf}.log"
+        exit 1
+    fi
     echo "$pid" > "${LOG_DIR}/kvstore.pid"
     if ! wait_for_port 127.0.0.1 "$port" 10; then
         err "kvstore 启动超时 ($conf, port=$port)"
         tail -20 "${LOG_DIR}/kvstore_${conf}.log"
+        exit 1
+    fi
+    if ! ss -tnlp 2>/dev/null | grep -q ":${port} .*pid=${pid}"; then
+        err "kvstore 未绑定到端口 ${port} (conf=$conf, pid=$pid)"
+        tail -20 "${LOG_DIR}/kvstore_${conf}.log"
+        kill "$pid" 2>/dev/null || true
         exit 1
     fi
     log "kvstore 已启动 (conf=$conf, pid=$pid, port=$port)"

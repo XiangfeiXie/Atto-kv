@@ -1,7 +1,7 @@
 /*
  * fastpath_cache.h — Phase 10: Lock-free seqlock short-key hot cache
  *
- * A 512 KB direct-mapped cache (1024 buckets × 512B) layered ABOVE the
+ * A ~1 MB direct-mapped cache (2048 buckets × 512B) layered ABOVE the
  * 32-shard rwlock dict.  Hot keys with payload ≤ 256B serve their
  * GET reply from here, completely skipping shard rdlock + dict_find +
  * reply_bulk formatting.  Reader path is lock-free; writer path uses
@@ -155,6 +155,10 @@ int fp_should_refresh(struct fp_cache *c,
 
 int fp_may_hold_key(struct fp_cache *c,
                     const void *key, uint32_t klen, uint64_t khash);
+
+/* Flush per-thread batched stat counters.  Call before fp_stats or at
+ * thread exit to avoid losing recent samples. */
+void fp_stats_flush(struct fp_cache *c);
 
 /* Stats snapshot — relaxed loads, slightly skewed under heavy traffic
  * but adequate for INFO / kvs-top display. */

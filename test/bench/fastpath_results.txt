@@ -1,39 +1,24 @@
-=== Phase 10 fastpath benchmark ===
-date: 2026-05-18 12:40:32
-params: n=300000 c=200 P=10 d=64 warmup=200000
-configs: kvstore-fastpath-off.conf vs kvstore-fastpath.conf
+=== fastpath skewed hot-key benchmark ===
+date: 2026-05-20 05:36:06
+params: hot_keys=64 value_size=64 total_ops=200000 conns=50 pipe=32
 
---- 100% hit baseline / kvstore-fastpath-off.conf ---
-GET_QPS=8286.61
+--- skewed baseline / kvstore-fastpath-off.conf ---
+GET_QPS=436681.22
 fastpath_cache_enabled:0
 fastpath_cache_hits:0
 fastpath_cache_misses:0
+fastpath_cache_writer_collisions:0
 fastpath_cache_hit_rate:0.00
 
---- 100% hit fastpath / kvstore-fastpath.conf ---
-GET_QPS=8305.19
+--- skewed fastpath / kvstore-fastpath.conf ---
+GET_QPS=411522.62
 fastpath_cache_enabled:1
-fastpath_cache_hits:300000
-fastpath_cache_misses:0
-fastpath_cache_hit_rate:100.00
+fastpath_cache_hits:249931
+fastpath_cache_misses:53
+fastpath_cache_writer_collisions:0
+fastpath_cache_hit_rate:99.98
 
---- 0% hit baseline / kvstore-fastpath-off.conf ---
-GET_QPS=8247.42
-fastpath_cache_enabled:0
-fastpath_cache_hits:0
-fastpath_cache_misses:0
-fastpath_cache_hit_rate:0.00
+=== skewed summary ===
+scenario                   baseline     fastpath       gain
+skewed (64 hot keys)      436681.22    411522.62     -5.76%
 
---- 0% hit fastpath / kvstore-fastpath.conf ---
-GET_QPS=8227.07
-fastpath_cache_enabled:1
-fastpath_cache_hits:0
-fastpath_cache_misses:300000
-fastpath_cache_hit_rate:0.00
-
-=== summary ===
-scenario               baseline     fastpath       gain
-100% hit                8286.61      8305.19      0.22%
-0% hit                  8247.42      8227.07     -0.25%
-
-PASS gates: target +25~35% at 100% hit, <=2% overhead at 0% hit.

@@ -170,9 +170,9 @@ observability:
 | 场景 | 结果摘要 |
 |---|---|
 | io_uring 进阶优化 | Phase 3 后多个 pipeline 场景平均提升约 **30%** |
-| 6c loopback 基准 | `threads=2` 时 SET/GET 约 **492k / 494k rps** |
+| 本机 loopback + pipeline | `threads=2` 时 SET/GET 约 **263k / 306k rps**；pipeline=40/80 时 kvstore SET/GET 分别约 **1.7× / 1.9×** Redis |
 | 单核效率优化 | 去除 double dict lookup 后单 worker SET/GET 提升约 **20% / 30%** |
-| AOF 开销 | 历史对照中 kvstore AOF 损耗约 **11%**，Redis AOF everysec 损耗约 **35-40%** |
+| AOF 对比 | kvstore AOF 损耗约 **21%**，Redis AOF everysec 损耗约 **25%**（100 万 SET/GET，P=20） |
 | fastpath microbench | 单线程 `fp_get` 约 **1.9x**；4 readers 同 shard 场景约 **2.34x** |
 | AOF + RDMA WAL 合并 | `AOF+RDMA` 只写一份 WAL；100k SET WAL 大小与 AOF-only 一致，约 **12.7 MB** |
 | RDMA-only 优化 | `persistence none + rdma_sync on` 不再写磁盘 WAL，`wal_bytes=0` |

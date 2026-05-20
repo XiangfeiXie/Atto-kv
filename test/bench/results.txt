@@ -1,36 +1,51 @@
-# KVStore Performance Benchmark Results — 2026-05-16 06:55:50
-=== XDP 被动监控开销对比 (Phase 1) ===
-参数: N=200000, C=50, -r 20000 (keyspace), d=16B
-测试时间: 2026-05-16 06:55:50
-场景 A: kvstore XDP off     (proactor, 标准 TCP 路径) — baseline
-场景 B: kvstore XDP monitor (proactor + XDP 被动监控, 始终 XDP_PASS)
-场景 C: Redis              (单线程, 无 XDP 能力)
-Pipeline 深度: 1 4 10
-预期: 场景 B 与场景 A 误差 ±5% (XDP 监控开销)
+# KVStore Performance Benchmark Results — 2026-05-20 07:22:17
+=== Pipeline 批量处理性能对比 ===
+压测参数: redis-benchmark -n 1000000 -c 50 -P <depth> -d 16
+测试时间: 2026-05-20 07:22:17
 
-XDP-P1-GET | kvs-noXDP: 19080.33 req/s
-XDP-P4-GET | kvs-noXDP: 68681.32 req/s
-XDP-P10-GET | kvs-noXDP: 170794.19 req/s
-XDP-P1-GET | kvs-XDPmon: 17226.53 req/s
-XDP-P4-GET | kvs-XDPmon: 68728.52 req/s
-XDP-P10-GET | kvs-XDPmon: 151171.58 req/s
+Pipeline-10-SET | kvstore: 111495.15 req/s
+Pipeline-10-SET | Redis: 207900.20 req/s
+  SET 比值 (kvstore/Redis): 0.54x
+Pipeline-10-GET | kvstore: 114116.18 req/s
+Pipeline-10-GET | Redis: 195007.81 req/s
+  GET 比值 (kvstore/Redis): 0.59x
 
-=== XDP stats_map (Phase 1 被动监控计数) ===
-  hits     = 198744
-  misses   = 1256
-  tx_drop  = 0
-  bypass   = 361614
-  hit_rate = 99.37%
+Pipeline-20-SET | kvstore: 239980.81 req/s
+Pipeline-20-SET | Redis: 288517.03 req/s
+  SET 比值 (kvstore/Redis): 0.83x
+Pipeline-20-GET | kvstore: 213447.17 req/s
+Pipeline-20-GET | Redis: 319386.78 req/s
+  GET 比值 (kvstore/Redis): 0.67x
 
-XDP-P1-GET | Redis: 18654.98 req/s
-XDP-P4-GET | Redis: 71556.35 req/s
-XDP-P10-GET | Redis: 181653.05 req/s
+Pipeline-40-SET | kvstore: 428816.47 req/s
+Pipeline-40-SET | Redis: 336587.00 req/s
+  SET 比值 (kvstore/Redis): 1.27x
+Pipeline-40-GET | kvstore: 416493.12 req/s
+Pipeline-40-GET | Redis: 426803.25 req/s
+  GET 比值 (kvstore/Redis): 0.98x
 
-=== XDP 汇总 (GET QPS) ===
+Pipeline-80-SET | kvstore: 578369.00 req/s
+Pipeline-80-SET | Redis: 405679.53 req/s
+  SET 比值 (kvstore/Redis): 1.43x
+Pipeline-80-GET | kvstore: 678886.62 req/s
+Pipeline-80-GET | Redis: 498753.09 req/s
+  GET 比值 (kvstore/Redis): 1.36x
 
-  P      |    kvs-noXDP |   kvs-XDPmon | 监控比 |        Redis | kvs/Redis
-  ------ | ------------ | ------------ | -------- | ------------ | --------
-  P=1    |     19080.33 |     17226.53 |    0.90x |     18654.98 |    0.92x
-  P=4    |     68681.32 |     68728.52 |    1.00x |     71556.35 |    0.96x
-  P=10   |    170794.19 |    151171.58 |    0.89x |    181653.05 |    0.83x
+Pipeline-160-SET | kvstore: 854700.88 req/s
+Pipeline-160-SET | Redis: 405022.25 req/s
+  SET 比值 (kvstore/Redis): 2.11x
+Pipeline-160-GET | kvstore: 433839.47 req/s
+Pipeline-160-GET | Redis: 565610.88 req/s
+  GET 比值 (kvstore/Redis): 0.77x
+
+
+=== 汇总 ===
+
+  P      |      kvs-SET |    redis-SET | S倍率 |      kvs-GET |    redis-GET | G倍率
+  ------ | ------------ | ------------ | ------ | ------------ | ------------ | ------
+  P=10   |    111495.15 |    207900.20 |  0.54x |    114116.18 |    195007.81 |  0.59x
+  P=20   |    239980.81 |    288517.03 |  0.83x |    213447.17 |    319386.78 |  0.67x
+  P=40   |    428816.47 |    336587.00 |  1.27x |    416493.12 |    426803.25 |  0.98x
+  P=80   |    578369.00 |    405679.53 |  1.43x |    678886.62 |    498753.09 |  1.36x
+  P=160  |    854700.88 |    405022.25 |  2.11x |    433839.47 |    565610.88 |  0.77x
 

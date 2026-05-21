@@ -8,6 +8,84 @@
 #include <stdlib.h>
 #include <time.h>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
+/* Locate "\r\n" in a bounded region.  RESP headers are short (argc <= 32B,
+ * bulk length <= 24B), but inline commands may scan up to 64KB.  The SIMD
+ * path mainly helps inline/debug commands and large pipelined buffers while
+ * keeping array-form headers on a tiny scalar fast path. */
+static inline const char *resp_find_crlf(const char *p, int n)
+{
+    if (n <= 0) return NULL;
+
+    if (n < 33) {
+        const char *cr = memchr(p, '\r', (size_t)n);
+        while (cr) {
+            int off = (int)(cr - p);
+            if (off + 1 >= n) return NULL;
+            if (cr[1] == '\n') return cr;
+            cr = memchr(cr + 1, '\r', (size_t)(n - off - 1));
+        }
+        return NULL;
+    }
+
+#if defined(__AVX2__)
+    const __m256i vcr = _mm256_set1_epi8('\r');
+    const __m256i vlf = _mm256_set1_epi8('\n');
+    int i = 0;
+    for (; i + 33 <= n; i += 32) {
+        __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)(p + i));
+        __m256i b = _mm256_loadu_si256((const __m256i *)(const void *)(p + i + 1));
+        __m256i m = _mm256_and_si256(_mm256_cmpeq_epi8(a, vcr),
+                                     _mm256_cmpeq_epi8(b, vlf));
+        uint32_t mask = (uint32_t)_mm256_movemask_epi8(m);
+        if (mask) return p + i + __builtin_ctz(mask);
+    }
+    return resp_find_crlf(p + i, n - i);
+#elif defined(__SSE2__)
+    const __m128i vcr = _mm_set1_epi8('\r');
+    const __m128i vlf = _mm_set1_epi8('\n');
+    int i = 0;
+    for (; i + 17 <= n; i += 16) {
+        __m128i a = _mm_loadu_si128((const __m128i *)(const void *)(p + i));
+        __m128i b = _mm_loadu_si128((const __m128i *)(const void *)(p + i + 1));
+        __m128i m = _mm_and_si128(_mm_cmpeq_epi8(a, vcr),
+                                  _mm_cmpeq_epi8(b, vlf));
+        uint32_t mask = (uint32_t)_mm_movemask_epi8(m);
+        if (mask) return p + i + __builtin_ctz(mask);
+    }
+    return resp_find_crlf(p + i, n - i);
+#else
+    const char *cr = memchr(p, '\r', (size_t)n);
+    while (cr) {
+        int off = (int)(cr - p);
+        if (off + 1 >= n) return NULL;
+        if (cr[1] == '\n') return cr;
+        cr = memchr(cr + 1, '\r', (size_t)(n - off - 1));
+    }
+    return NULL;
+#endif
+}
+
+static inline int resp_parse_uint_bounded(const char *p, int n,
+                                          long max_value, long *out)
+{
+    if (n <= 0) return -1;
+    long v = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned c = (unsigned char)p[i] - (unsigned)'0';
+        if (c > 9) return -1;
+        v = v * 10 + (long)c;
+        if (v > max_value) return -1;
+    }
+    *out = v;
+    return 0;
+}
+
 /* ==================== RESP static fragments ==================== */
 
 #define S(id, str) \
@@ -45,7 +123,7 @@ int resp_parse_slices(const char *buf, int buflen,
     if (buf[0] != '*') {
         /* Bound scanning at KVS_MAX_INLINE_LEN to avoid DoS on long garbage */
         int scan = buflen < KVS_MAX_INLINE_LEN ? buflen : KVS_MAX_INLINE_LEN;
-        const char *cr = memchr(buf, '\r', (size_t)scan);
+        const char *cr = resp_find_crlf(buf, scan);
         if (!cr) {
             if (buflen >= KVS_MAX_INLINE_LEN) return -1; /* line too long */
             return 0; /* need more bytes */
@@ -78,7 +156,7 @@ int resp_parse_slices(const char *buf, int buflen,
     /* Locate first CRLF for argc */
     int hdr_scan = buflen - idx;
     if (hdr_scan > 32) hdr_scan = 32; /* argc digits fit easily */
-    const char *cr = memchr(buf + idx, '\r', (size_t)hdr_scan);
+    const char *cr = resp_find_crlf(buf + idx, hdr_scan);
     if (!cr) {
         if (buflen - idx >= 32) return -1; /* argc field too long */
         return 0;
@@ -90,11 +168,9 @@ int resp_parse_slices(const char *buf, int buflen,
 
     /* Parse argc with overflow guard */
     long argc = 0;
-    for (int i = idx; i < hdr_end; i++) {
-        unsigned c = (unsigned char)buf[i] - (unsigned)'0';
-        if (c > 9) return -1;
-        argc = argc * 10 + (long)c;
-        if (argc > max_tokens) return -1;
+    if (resp_parse_uint_bounded(buf + idx, hdr_end - idx,
+                                (long)max_tokens, &argc) != 0) {
+        return -1;
     }
     if (argc <= 0) return -1;
     idx = hdr_end + 2;
@@ -107,7 +183,7 @@ int resp_parse_slices(const char *buf, int buflen,
         /* Bulk length header */
         int blen_scan = buflen - idx;
         if (blen_scan > 24) blen_scan = 24;
-        const char *bcr = memchr(buf + idx, '\r', (size_t)blen_scan);
+        const char *bcr = resp_find_crlf(buf + idx, blen_scan);
         if (!bcr) {
             if (buflen - idx >= 24) return -1; /* length field too long */
             return 0;
@@ -121,13 +197,11 @@ int resp_parse_slices(const char *buf, int buflen,
         int neg = 0;
         int j = idx;
         if (buf[j] == '-') { neg = 1; j++; if (j == blen_end) return -1; }
-        for (; j < blen_end; j++) {
-            unsigned c = (unsigned char)buf[j] - (unsigned)'0';
-            if (c > 9) return -1;
-            slen = slen * 10 + (long)c;
-            if (slen > KVS_MAX_BULK_LEN) return -1;
-        }
         if (neg) return -1;   /* server-side input never has null bulk */
+        if (resp_parse_uint_bounded(buf + j, blen_end - j,
+                                    KVS_MAX_BULK_LEN, &slen) != 0) {
+            return -1;
+        }
         idx = blen_end + 2;
 
         if ((long)idx + slen + 2 > (long)buflen) return 0;

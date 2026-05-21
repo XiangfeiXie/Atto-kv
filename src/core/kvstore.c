@@ -1,9 +1,6 @@
 #include "kvstore.h"
 #include "kv_type_string.h"
-#include "kv_type_list.h"
-#include "kv_type_set.h"
-#include "kv_type_hash.h"
-#include "kv_type_zset.h"
+#include "vector_store.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,11 +15,13 @@
 
 #include "rdma_repl.h"
 #include "wal_repl.h"
+#include "journal.h"
+#include "wal_persist.h"
+#include "repl_stream.h"
 #include "persistence.h"
 #include "block.h"
 #include "xdp_manager.h"
 #include "sockmap_manager.h"
-#include "fastpath_cache.h"
 
 /* Pack first 4 bytes of a command name into a uint32_t for jump-table dispatch */
 #define CMD4(a,b,c,d) ((uint32_t)(uint8_t)(a) | ((uint32_t)(uint8_t)(b) << 8) | \
@@ -182,74 +181,11 @@ void kvs_lat_record_ns(uint64_t ns) {
     atomic_fetch_add_explicit(&s->sum_ns, ns, memory_order_relaxed);
 }
 
-/* ==================== Phase 10 — fast-path cache ====================
- * Allocated when kvs_config.fastpath_cache_enabled.  Reader-path
- * lookups happen at the top of kvs_dispatch (before shard lock);
- * writer-path puts/dels happen in the same post-hook that maintains
- * the XDP hot_cache (see hot_caches_refresh_string / hot_caches_evict).
- * Lifetime is process-long: never freed after init except at shutdown
- * to keep the read path branch-free. */
-struct fp_cache *g_fp_cache = NULL;
-
-/* Helper: refresh both XDP hot_cache and fp_cache for a STRING write.
- * MUST be called with the shard lock held (rdlock is fine — we just
- * read back the value we already wrote).  Eligibility filters are
- * applied per backend separately. */
-static inline void hot_caches_refresh_string(const char *key, int klen,
-                                              uint64_t khash) {
-    if (!kvs_config.xdp_enabled
-        && g_fp_cache
-        && !fp_should_refresh(g_fp_cache, key, (uint32_t)klen, khash)) {
-        return;
-    }
-
-    uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
-    const char *v = string_engine_get(key, (uint32_t)klen, &vlen, &enc);
-    int eligible = (v != NULL && enc == KV_ENCODING_RAW && vlen > 0);
-
-    if (kvs_config.xdp_enabled) {
-        if (eligible && vlen <= XDP_VAL_MAX)
-            xdp_cache_put(key, klen, v, (int)vlen);
-        else
-            xdp_cache_del(key, klen);
-    }
-    if (g_fp_cache) {
-        /* Skip very small values: shard-locked dict path already serves
-         * them in tens of cycles; pulling them through the seqlock would
-         * just pollute the 512KB table without measurable upside. */
-        if (eligible
-            && klen <= (int)FP_KEY_MAX
-            && vlen >= FP_VAL_MIN
-            && vlen <= FP_VAL_MAX)
-            fp_put(g_fp_cache, key, (uint32_t)klen, khash, v, vlen);
-        else
-            fp_del(g_fp_cache, key, (uint32_t)klen, khash);
-    }
-}
-
-static inline void hot_caches_refresh_string_known(const char *key, int klen,
-                                                   uint64_t khash,
-                                                   int known_vlen) {
-    if (!kvs_config.xdp_enabled
-        && g_fp_cache
-        && (known_vlen < (int)FP_VAL_MIN || known_vlen > (int)FP_VAL_MAX)) {
-        if (fp_may_hold_key(g_fp_cache, key, (uint32_t)klen, khash))
-            fp_del(g_fp_cache, key, (uint32_t)klen, khash);
-        return;
-    }
-
-    hot_caches_refresh_string(key, klen, khash);
-}
-
-/* Helper: evict from both hot caches.  Called from DEL / EXPIRE /
- * non-STRING write paths.  No lock requirement. */
-static inline void hot_caches_evict(const char *key, int klen,
-                                     uint64_t khash) {
-    if (kvs_config.xdp_enabled)
-        xdp_cache_del(key, klen);
-    if (g_fp_cache)
-        fp_del(g_fp_cache, key, (uint32_t)klen, khash);
-}
+/* ==================== Vector cache/search layer ====================
+ * AI local cache mode keeps STRING as a lightweight exact-key cache and
+ * adds a separate in-memory vector store for semantic nearest-neighbour
+ * lookup.  The old short-value fastpath cache is intentionally removed
+ * from the main runtime path. */
 
 /* ==================== Utility ==================== */
 
@@ -307,8 +243,22 @@ void kvs_rdma_incr_probe(const char *msg, int length) {
     wal_repl_append(msg, length);
 }
 
-static inline void kvs_write_journal_append(const char *msg, int length) {
+static inline void kvs_write_journal_append_kind(uint16_t kind, const char *msg, int length) {
+    uint64_t seq = 0;
+    if (!msg || length <= 0) return;
+    if (kvs_journal_append(kind, 0, msg, (uint32_t)length, &seq) == 0) {
+        kvs_journal_record_t rec;
+        if (kvs_journal_copy(seq, &rec) == 0) {
+            kvs_wal_persist_append(&rec);
+            repl_stream_publish(&rec);
+            kvs_journal_record_release(&rec);
+        }
+    }
     wal_repl_append(msg, length);
+}
+
+static inline void kvs_write_journal_append(const char *msg, int length) {
+    kvs_write_journal_append_kind(KVS_MUT_KIND_RESP_STRING, msg, length);
 }
 
 /* ── Parse a token as long long (strict). Returns 0 on success, -1 on error. ── */
@@ -333,13 +283,7 @@ static int token_to_ll(kvs_token_t t, long long *out) {
 
 /* ── Per-type cleanup before deleting an entry from the dict ── */
 static void entry_cleanup_by_type(kv_entry_t *e) {
-    switch (entry_type(e)) {
-    case KV_TYPE_LIST: list_cleanup_entry(e); break;
-    case KV_TYPE_SET:  set_cleanup_entry(e);  break;
-    case KV_TYPE_HASH: hash_cleanup_entry(e); break;
-    case KV_TYPE_ZSET: zset_cleanup_entry(e); break;
-    default: break;
-    }
+    (void)e;
 }
 
 /* Public wrapper: free any type-specific internal structures before dict_delete.
@@ -758,28 +702,9 @@ static dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) 
         APPEND("total_commands_processed:%llu\r\n",
                (unsigned long long)atomic_load_explicit(&g_kvs_total_commands,
                                                          memory_order_relaxed));
-        /* Phase 10 — lock-free seqlock fast-path cache stats.  Emitted
-         * unconditionally so INFO consumers can see "0" when disabled
-         * (matches Redis style for module / extension counters). */
-        uint64_t fp_h = 0, fp_m = 0, fp_inv = 0, fp_col = 0, fp_skip = 0;
-        if (g_fp_cache) fp_stats(g_fp_cache, &fp_h, &fp_m, &fp_inv, &fp_col);
-        if (g_fp_cache) fp_skip = fp_puts_skipped_cold(g_fp_cache);
-        APPEND("fastpath_cache_enabled:%d\r\n",
-               kvs_config.fastpath_cache_enabled ? 1 : 0);
-        APPEND("fastpath_cache_hits:%llu\r\n",     (unsigned long long)fp_h);
-        APPEND("fastpath_cache_misses:%llu\r\n",   (unsigned long long)fp_m);
-        APPEND("fastpath_cache_invalidations:%llu\r\n",
-               (unsigned long long)fp_inv);
-        APPEND("fastpath_cache_writer_collisions:%llu\r\n",
-               (unsigned long long)fp_col);
-        APPEND("fastpath_cache_puts_skipped_cold:%llu\r\n",
-               (unsigned long long)fp_skip);
-        if (fp_h + fp_m > 0) {
-            double rate = 100.0 * (double)fp_h / (double)(fp_h + fp_m);
-            APPEND("fastpath_cache_hit_rate:%.2f\r\n", rate);
-        } else {
-            APPEND("fastpath_cache_hit_rate:0.00\r\n");
-        }
+        APPEND("vector_store_enabled:1\r\n");
+        APPEND("vector_store_count:%llu\r\n",
+               (unsigned long long)vector_store_count());
 
         /* Phase 10.6 — dispatch latency histogram (16 log2-spaced buckets,
          * 1 µs .. ≥16 ms).  Emit per-bucket counts for raw consumption
@@ -1029,6 +954,22 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
+    /* VECTOR.* — local AI cache + flat vector search command family. */
+    if (cmd.len >= 7 && memcmp(cmd.ptr, "VECTOR.", 7) == 0) {
+        vector_mutation_buf_t vmut = {0};
+        int is_vector_write = vector_cmd_is_write(cmd);
+        int have_vmut = 0;
+        if (is_vector_write && !g_in_reload &&
+            vector_mutation_encode_from_cmd(cmd, tokens, argc, &vmut) == 0)
+            have_vmut = 1;
+        dispatch_result_t vr = vector_cmd(cmd, tokens, argc, wb);
+        if (vr == DISPATCH_OK && have_vmut) {
+            kvs_write_journal_append_kind(KVS_MUT_KIND_VECTOR_BIN, vmut.buf, (int)vmut.len);
+        }
+        vector_mutation_buf_free(&vmut);
+        return vr;
+    }
+
     /* SELECT — single-DB server: accept "SELECT 0", reject others. */
     if (TOKEN_EQ(cmd, "SELECT")) {
         long long db = 0;
@@ -1160,17 +1101,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         if (!g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
-            if (kvs_config.xdp_enabled || g_fp_cache) {
-                for (int i = 1; i + 1 < argc; i += 2) {
-                    uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
-                                          (uint32_t)tokens[i].len);
-                    /* Hot-cache refresh is read-only (rdlock just reads
-                     * back the value we already wrote); other readers
-                     * continue concurrently. */
-                    SHARD_LOCK(kh, 0);
-                    hot_caches_refresh_string(tokens[i].ptr, tokens[i].len, kh);
-                }
-            }
         }
         return DISPATCH_OK;
     }
@@ -1208,17 +1138,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         reply_integer(wb, 1);
         if (!g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
-            if (kvs_config.xdp_enabled || g_fp_cache) {
-                for (int i = 1; i + 1 < argc; i += 2) {
-                    uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
-                                          (uint32_t)tokens[i].len);
-                    /* Hot-cache read-back: rdlock (read-only). */
-                    SHARD_LOCK(kh, 0);
-                    hot_caches_refresh_string_known(tokens[i].ptr,
-                                                    tokens[i].len, kh,
-                                                    tokens[i+1].len);
-                }
-            }
         }
         return DISPATCH_OK;
     }
@@ -1244,13 +1163,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         reply_integer(wb, ndel);
         if (ndel > 0 && !g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
-            if (kvs_config.xdp_enabled || g_fp_cache) {
-                for (int i = 1; i < argc; i++) {
-                    uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
-                                          (uint32_t)tokens[i].len);
-                    hot_caches_evict(tokens[i].ptr, tokens[i].len, kh);
-                }
-            }
         }
         return DISPATCH_OK;
     }
@@ -1287,124 +1199,23 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     kvs_token_t key_tok = tokens[1];
     uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
 
-    /* ── Phase 10 — Lock-free seqlock fast-path for GET ──
-     *
-     *  Probe BEFORE we classify or take any shard lock.  On hit we
-     *  emit a complete RESP bulk reply directly from the seqlock
-     *  cache, completely skipping shard rdlock + dict_find +
-     *  reply formatting.  On miss we fall through to the normal
-     *  dispatcher path with at most ~30 ns of memory-load overhead.
-     *
-     *  Eligibility:
-     *    - cache enabled
-     *    - cmd is exactly "GET" (3 bytes; case already normalised
-     *      by Phase 6.2b dispatcher prelude)
-     *    - argc == 2 (single key, no options)
-     *    - key length within cache bound
-     *  AOF / WAL / observability are not affected: a GET is read-only
-     *  so there is nothing to log or replicate.  The XDP/sockmap
-     *  observation programs still see the wire bytes regardless. */
-    if (g_fp_cache
-        && argc == 2
-        && cmd.len == 3
-        && cmd.ptr[0] == 'G' && cmd.ptr[1] == 'E' && cmd.ptr[2] == 'T'
-        && key_tok.len > 0
-        && (uint32_t)key_tok.len <= FP_KEY_MAX) {
-        uint8_t fpbuf[FP_REPLY_MAX];
-        uint32_t fpvlen = 0;
-        if (fp_get(g_fp_cache, key_tok.ptr, (uint32_t)key_tok.len, hash,
-                   fpbuf, &fpvlen, sizeof(fpbuf)) == 0) {
-            dynbuf_cat(wb, (char *)fpbuf, (int)fpvlen);
-            return DISPATCH_OK;
-        }
-    }
-
-    /* Phase 6.2 — classify command BEFORE locking, so we can choose rdlock
-     * (for reads) vs wrlock (for writes).  cmd_type < 0 means unknown,
-     * cmd_type == -2 means "generic" (TYPE/TTL/PTTL/EXPIRE/PERSIST — no
-     * value-type engine, handled inline below). */
     int cmd_type = -1;
     int is_write = 0;
     if (TOKEN_EQ(cmd, "TYPE") || TOKEN_EQ(cmd, "TTL") || TOKEN_EQ(cmd, "PTTL")) {
         cmd_type = -2; is_write = 0;
     } else if (TOKEN_EQ(cmd, "EXPIRE") || TOKEN_EQ(cmd, "PERSIST")) {
         cmd_type = -2; is_write = 1;
+    } else if (TOKEN_EQ(cmd, "SET") || TOKEN_EQ(cmd, "SETNX") ||
+               TOKEN_EQ(cmd, "SETEX") || TOKEN_EQ(cmd, "GETSET") ||
+               TOKEN_EQ(cmd, "APPEND") || TOKEN_EQ(cmd, "INCR") ||
+               TOKEN_EQ(cmd, "INCRBY") || TOKEN_EQ(cmd, "DECR") ||
+               TOKEN_EQ(cmd, "DECRBY") || TOKEN_EQ(cmd, "MOD")) {
+        cmd_type = KV_TYPE_STRING; is_write = 1;
+    } else if (TOKEN_EQ(cmd, "GET") || TOKEN_EQ(cmd, "STRLEN")) {
+        cmd_type = KV_TYPE_STRING; is_write = 0;
     } else {
-        uint32_t c4 = 0;
-        memcpy(&c4, cmd.ptr, (size_t)(cmd.len < 4 ? cmd.len : 4));
-        switch (c4) {
-        /* ── STRING ── */
-        case CMD4('S','E','T',0):   cmd_type = KV_TYPE_STRING; is_write = 1; break;
-        case CMD4('S','E','T','N'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* SETNX */
-        case CMD4('S','E','T','E'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* SETEX */
-        case CMD4('G','E','T',0):   cmd_type = KV_TYPE_STRING; break;              /* GET */
-        case CMD4('G','E','T','S'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* GETSET */
-        case CMD4('A','P','P','E'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* APPEND */
-        case CMD4('I','N','C','R'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* INCR / INCRBY / INCRBYFLOAT */
-        case CMD4('D','E','C','R'): cmd_type = KV_TYPE_STRING; is_write = 1; break; /* DECR / DECRBY */
-        case CMD4('M','O','D',0):   cmd_type = KV_TYPE_STRING; is_write = 1; break; /* MOD */
-        case CMD4('S','T','R','L'): cmd_type = KV_TYPE_STRING; break;              /* STRLEN */
-        /* ── SET ── */
-        case CMD4('S','A','D','D'): cmd_type = KV_TYPE_SET; is_write = 1; break;
-        case CMD4('S','R','E','M'): cmd_type = KV_TYPE_SET; is_write = 1; break;
-        case CMD4('S','P','O','P'): cmd_type = KV_TYPE_SET; is_write = 1; break;
-        case CMD4('S','M','O','V'): cmd_type = KV_TYPE_SET; is_write = 1; break;
-        case CMD4('S','M','E','M'): cmd_type = KV_TYPE_SET; break;              /* SMEMBERS */
-        case CMD4('S','C','A','R'): cmd_type = KV_TYPE_SET; break;              /* SCARD */
-        case CMD4('S','I','S','M'): cmd_type = KV_TYPE_SET; break;              /* SISMEMBER */
-        case CMD4('S','M','I','S'): cmd_type = KV_TYPE_SET; break;              /* SMISMEMBER */
-        case CMD4('S','R','A','N'): cmd_type = KV_TYPE_SET; break;              /* SRANDMEMBER */
-        case CMD4('S','I','N','T'):
-            cmd_type = KV_TYPE_SET; is_write = (cmd.len > 6); break;
-        case CMD4('S','U','N','I'):
-            cmd_type = KV_TYPE_SET; is_write = (cmd.len > 6); break;
-        case CMD4('S','D','I','F'):
-            cmd_type = KV_TYPE_SET; is_write = (cmd.len > 5); break;
-        /* ── HASH ── */
-        case CMD4('H','S','E','T'): cmd_type = KV_TYPE_HASH; is_write = 1; break;
-        case CMD4('H','D','E','L'): cmd_type = KV_TYPE_HASH; is_write = 1; break;
-        case CMD4('H','M','S','E'): cmd_type = KV_TYPE_HASH; is_write = 1; break;
-        case CMD4('H','I','N','C'): cmd_type = KV_TYPE_HASH; is_write = 1; break;
-        case CMD4('H','G','E','T'): cmd_type = KV_TYPE_HASH; break;              /* HGET / HGETALL */
-        case CMD4('H','K','E','Y'): cmd_type = KV_TYPE_HASH; break;              /* HKEYS */
-        case CMD4('H','V','A','L'): cmd_type = KV_TYPE_HASH; break;              /* HVALS */
-        case CMD4('H','L','E','N'): cmd_type = KV_TYPE_HASH; break;              /* HLEN */
-        case CMD4('H','E','X','I'): cmd_type = KV_TYPE_HASH; break;              /* HEXISTS */
-        case CMD4('H','M','G','E'): cmd_type = KV_TYPE_HASH; break;              /* HMGET */
-        case CMD4('H','S','T','R'): cmd_type = KV_TYPE_HASH; break;              /* HSTRLEN */
-        case CMD4('H','R','A','N'): cmd_type = KV_TYPE_HASH; break;              /* HRANDFIELD */
-        /* ── ZSET ── */
-        case CMD4('Z','A','D','D'): cmd_type = KV_TYPE_ZSET; is_write = 1; break;
-        case CMD4('Z','R','E','M'): cmd_type = KV_TYPE_ZSET; is_write = 1; break;
-        case CMD4('Z','I','N','C'): cmd_type = KV_TYPE_ZSET; is_write = 1; break;
-        case CMD4('Z','P','O','P'): cmd_type = KV_TYPE_ZSET; is_write = 1; break;
-        case CMD4('Z','S','C','O'): cmd_type = KV_TYPE_ZSET; break;              /* ZSCORE */
-        case CMD4('Z','M','S','C'): cmd_type = KV_TYPE_ZSET; break;              /* ZMSCORE */
-        case CMD4('Z','R','A','N'): cmd_type = KV_TYPE_ZSET; break;              /* ZRANGE / ZRANK / ZRANGEBYSCORE / ZRANDMEMBER */
-        case CMD4('Z','R','E','V'): cmd_type = KV_TYPE_ZSET; break;              /* ZREVRANGE / ZREVRANK / ZREVRANGEBYSCORE */
-        case CMD4('Z','C','A','R'): cmd_type = KV_TYPE_ZSET; break;              /* ZCARD */
-        case CMD4('Z','C','O','U'): cmd_type = KV_TYPE_ZSET; break;              /* ZCOUNT */
-        /* ── LIST ── */
-        case CMD4('L','P','U','S'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
-        case CMD4('L','P','O','P'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
-        case CMD4('L','S','E','T'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
-        case CMD4('L','R','E','M'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
-        case CMD4('L','T','R','I'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
-        case CMD4('L','I','N','S'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
-        case CMD4('L','M','O','V'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
-        case CMD4('L','L','E','N'): cmd_type = KV_TYPE_LIST; break;              /* LLEN */
-        case CMD4('L','R','A','N'): cmd_type = KV_TYPE_LIST; break;              /* LRANGE */
-        case CMD4('L','I','N','D'): cmd_type = KV_TYPE_LIST; break;              /* LINDEX */
-        case CMD4('L','P','O','S'): cmd_type = KV_TYPE_LIST; break;              /* LPOS */
-        case CMD4('R','P','U','S'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
-        case CMD4('R','P','O','P'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
-        case CMD4('B','L','P','O'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
-        case CMD4('B','R','P','O'): cmd_type = KV_TYPE_LIST; is_write = 1; break;
-        }
-        if (cmd_type < 0) {
-            dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
-            return DISPATCH_ERROR;
-        }
+        dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
+        return DISPATCH_ERROR;
     }
 
     /* Acquire the shard lock — rdlock for reads, wrlock for writes.
@@ -1437,13 +1248,8 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         const char *r = "+none\r\n";
         int rlen = 7;
         if (entry) {
-            switch (entry_type(entry)) {
-            case KV_TYPE_STRING: r = "+string\r\n";  rlen = 9; break;
-            case KV_TYPE_LIST:   r = "+list\r\n";    rlen = 7; break;
-            case KV_TYPE_SET:    r = "+set\r\n";     rlen = 6; break;
-            case KV_TYPE_HASH:   r = "+hash\r\n";    rlen = 7; break;
-            case KV_TYPE_ZSET:   r = "+zset\r\n";    rlen = 7; break;
-            }
+            r = "+string\r\n";
+            rlen = 9;
         }
         dynbuf_cat(wb, r, rlen);
         return DISPATCH_OK;
@@ -1468,10 +1274,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         reply_integer(wb, 1);
         if (!g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
-            /* Hot caches cannot represent expiry — evict on EXPIRE.
-             * (fp_cache also has no TTL knowledge by design.) */
-            if (kvs_config.xdp_enabled || g_fp_cache)
-                hot_caches_evict(key_tok.ptr, key_tok.len, hash);
         }
         return DISPATCH_OK;
     }
@@ -1512,40 +1314,12 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     dispatch_result_t r = DISPATCH_OK;
     switch (cmd_type) {
     case KV_TYPE_STRING:
-        /* Phase 6.1 — pass pre-computed hash so string_cmd's engine_*_pre
-         * paths skip the second kv_hash + dict_find on the hot SET/GET. */
         string_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb, msg_raw, msg_len);
-        if (g_fp_cache
-            && argc == 2
-            && cmd.len == 3
-            && cmd.ptr[0] == 'G' && cmd.ptr[1] == 'E' && cmd.ptr[2] == 'T'
-            && entry
-            && entry_encoding(entry) == KV_ENCODING_RAW
-            && entry_payload_len(entry) >= FP_VAL_MIN
-            && entry_payload_len(entry) <= FP_VAL_MAX
-            && (uint32_t)key_tok.len <= FP_KEY_MAX) {
-            fp_put(g_fp_cache, key_tok.ptr, (uint32_t)key_tok.len, hash,
-                   entry_payload(entry), entry_payload_len(entry));
-        }
         r = DISPATCH_OK;
         break;
-    case KV_TYPE_LIST:
-        /* Phase 6.1b — pass pre-computed hash so list_cmd skips redundant
-         * kv_hash recomputes on every command branch. */
-        r = list_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb,
-                     msg_raw, msg_len, c ? c->client : NULL);
-        break;
-    case KV_TYPE_SET:
-        r = set_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb,
-                    msg_raw, msg_len, c ? c->client : NULL);
-        break;
-    case KV_TYPE_HASH:
-        r = hash_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb,
-                     msg_raw, msg_len, c ? c->client : NULL);
-        break;
-    case KV_TYPE_ZSET:
-        r = zset_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb,
-                     msg_raw, msg_len, c ? c->client : NULL);
+    default:
+        dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
+        r = DISPATCH_ERROR;
         break;
     }
 
@@ -1560,29 +1334,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                   !(rlen >= 5 && memcmp(resp, "$-1\r\n", 5) == 0));
         if (ok && !g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
-            /* Hot caches: update on STRING writes, evict on other types.
-             * Lock is still held here (single-key SHARD_LOCK macro), so
-             * the engine read inside hot_caches_refresh_string is safe. */
-            if (kvs_config.xdp_enabled || g_fp_cache) {
-                if (cmd_type == KV_TYPE_STRING) {
-                    int known_vlen = -1;
-                    if ((TOKEN_EQ(cmd, "SET") || TOKEN_EQ(cmd, "SETNX")
-                         || TOKEN_EQ(cmd, "MOD")) && argc >= 3) {
-                        known_vlen = tokens[2].len;
-                    } else if (TOKEN_EQ(cmd, "SETEX") && argc >= 4) {
-                        known_vlen = tokens[3].len;
-                    }
-                    if (known_vlen >= 0)
-                        hot_caches_refresh_string_known(key_tok.ptr,
-                                                        key_tok.len,
-                                                        hash, known_vlen);
-                    else
-                        hot_caches_refresh_string(key_tok.ptr,
-                                                  key_tok.len, hash);
-                } else {
-                    hot_caches_evict(key_tok.ptr, key_tok.len, hash);
-                }
-            }
         }
     }
 
@@ -1599,13 +1350,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
      *  cross-worker → enqueues to owner's wake_evfd and the owner's
      *  proactor_block_notify_local will retry block_cmd_buf. */
     SHARD_RELEASE();
-    if (r == DISPATCH_OK && (TOKEN_EQ(cmd, "LPUSH") || TOKEN_EQ(cmd, "RPUSH"))) {
-        client_t *wc = block_wake_one(key_tok.ptr, (uint32_t)key_tok.len);
-        if (wc) {
-            block_notify_woken(wc);
-        }
-    }
-
     return DISPATCH_OK;
 }
 
@@ -1613,13 +1357,15 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
 
 int init_kvengine(void) {
     kv_shards_init();
+    vector_store_init();
     block_init();
-    printf("Using unified dict engine (%u shards)\n", KV_NR_SHARDS);
+    printf("Using string + vector engine (%u id shards, flat vector search)\n", KV_NR_SHARDS);
     return 0;
 }
 
 void dest_kvengine(void) {
-    kvs_flush_all();  /* clean up nested structures before freeing entries */
+    kvs_flush_all();
+    vector_store_destroy();
     kv_shards_destroy();
 }
 
@@ -1630,6 +1376,7 @@ void kvs_flush_all(void) {
         entry_cleanup_by_type(e);
     kv_shards_iter_free(&it);
     kv_shards_clear();
+    vector_store_clear();
 #ifdef USE_JEMALLOC
     mallctl("arenas.purge", NULL, NULL, NULL, 0);
 #endif
@@ -1689,20 +1436,17 @@ int main(int argc, char *argv[]) {
 
     init_kvengine();
     engine_reload();
-    if (ENABLE_AOF) aof_async_init();
+    kvs_journal_init();
+    if (ENABLE_AOF) {
+        kvs_wal_persist_start();
+        aof_async_init();
+    }
+    if (kvs_config.xdp_repl_enabled && kvs_config.rdma_role == ROLE_MASTER)
+        repl_stream_start_master();
     if (kvs_config.xdp_enabled)
         xdp_manager_init(kvs_config.xdp_iface, kvs_config.port);
     if (kvs_config.sockmap_enabled)
         sockmap_manager_init(kvs_config.port, NULL);
-    /* Phase 10 — lock-free seqlock fast-path cache */
-    if (kvs_config.fastpath_cache_enabled) {
-        g_fp_cache = fp_cache_new();
-        if (!g_fp_cache) {
-            KVS_LOG(LOG_WARN, "fp_cache_new() failed; fastpath disabled");
-            kvs_config.fastpath_cache_enabled = 0;
-        }
-    }
-
     if (kvs_config.rdma_sync_enabled) {
         if (kvs_config.rdma_role == ROLE_MASTER) {
             rdma_repl_master_start();
@@ -1740,6 +1484,9 @@ int main(int argc, char *argv[]) {
     else if (ENABLE_AOF)
         ebpf_incr_stop();  /* standalone WAL started by aof_async_init */
     if (ENABLE_AOF) aof_async_shutdown();
+    repl_stream_stop();
+    kvs_wal_persist_stop();
+    kvs_journal_shutdown();
     if (kvs_config.sockmap_enabled) sockmap_manager_stop();
     if (kvs_config.xdp_enabled) xdp_manager_stop();
     dest_kvengine();

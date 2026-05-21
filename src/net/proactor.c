@@ -18,7 +18,6 @@
 #include "block.h"
 #include "client.h"        /* Phase 8.2 — eager client_t alloc on accept */
 #include "kvstore.h"
-#include "numa_alloc.h"     /* Phase 5.4 — NUMA-aware allocation skeleton */
 
 #define EVENT_ACCEPT    0
 #define EVENT_READ      1
@@ -360,10 +359,7 @@ static int worker_setup_ring(proactor_worker_t *w)
         return -1;
     }
 
-    /* Phase 3.2 buffer ring (Phase 5.4: bind to worker's local NUMA node
-     * so io_uring submissions on this worker hit local memory.  On a
-     * 1-node box and when KVS_USE_NUMA is unset, kvs_numa_bind_local is
-     * a no-op and behaviour is identical to plain mmap.) */
+    /* Phase 3.2 buffer ring */
     w->buf_pool_bytes = (size_t)KVS_NR_BUFS * KVS_BUF_SIZE;
     w->buf_base = mmap(NULL, w->buf_pool_bytes, PROT_READ | PROT_WRITE,
                        MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -372,7 +368,6 @@ static int worker_setup_ring(proactor_worker_t *w)
         io_uring_queue_exit(&w->ring);
         return -1;
     }
-    kvs_numa_bind_local(w->buf_base, w->buf_pool_bytes);
     int br_err = 0;
     w->buf_ring = io_uring_setup_buf_ring(&w->ring, KVS_NR_BUFS,
                                           KVS_BUF_RING_BGID, 0, &br_err);

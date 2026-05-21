@@ -32,6 +32,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <time.h>
 #include <sys/stat.h>
@@ -64,6 +65,13 @@ static int               g_jevt  = -1;  /* eventfd wakeup  */
 
 static _Atomic uint64_t  g_journal_seq     = 0;  /* global seq counter */
 static _Atomic uint64_t  g_dropped         = 0;  /* overrun counter    */
+/* Highest seq number that was assigned but never made it into the journal
+ * ring (i.e. dropped on overflow).  Slaves whose applied seq < this value
+ * cannot resume incrementally because the missing records will never be
+ * delivered — they must be forced through FULLRESYNC.  Updated by
+ * producers under g_journal_producer_mu and read lock-free during
+ * handshake. */
+static _Atomic uint64_t  g_drop_high_seq   = 0;
 static _Atomic int       g_consumer_sleeping = 0; /* 1 = blocked on eventfd read */
 
 /* Phase 4B.3 — the journal ring was originally designed for a single
@@ -319,13 +327,56 @@ void wal_repl_append(const char *msg, int length)
                                              memory_order_relaxed);
     uint32_t h = atomic_load_explicit(&g_jhead, memory_order_relaxed);
     uint32_t t;
-    for (int spin = 0; ; spin++) {
+    /* Backpressure loop.  Previously this dropped records after ~200
+     * spins which silently broke replication (slaves reconnect at a seq
+     * past the dropped range and never get the missing records).
+     *
+     * Strategy:
+     *   - busy-wait briefly so the consumer can drain on its own,
+     *   - then yield / nanosleep to avoid burning CPU,
+     *   - if the consumer is still stuck after a multi-second budget
+     *     the master is unhealthy: record the dropped seq watermark so
+     *     a reconnecting slave is forced through FULLRESYNC instead of
+     *     resuming with a silent gap.
+     *
+     * Because g_journal_producer_mu serialises producers, holding the
+     * mutex while waiting also caps total inflight at JOURNAL_RING_SIZE
+     * which transparently rate-limits writers.
+     *
+     * Wake the consumer if it is sleeping — otherwise on a slow consumer
+     * we may stall waiting for an eventfd that nobody is going to write. */
+    int notified_consumer = 0;
+    for (uint64_t spin = 0; ; spin++) {
         t = atomic_load_explicit((_Atomic uint32_t *)&g_jtail,
                                  memory_order_acquire);
         if (h - t < JOURNAL_RING_SIZE) break;
-        if (spin < 200) { /* busy wait */ }
-        else {
+        if (!notified_consumer
+            && atomic_load_explicit(&g_consumer_sleeping,
+                                    memory_order_acquire)) {
+            uint64_t one = 1;
+            ssize_t wr = write(g_jevt, &one, sizeof(one));
+            (void)wr;
+            notified_consumer = 1;
+        }
+        if (spin < 256) {
+            /* short busy-wait — typical consumer drain latency */
+        } else if (spin < 2048) {
+            sched_yield();
+        } else if (spin < 1u<<22) {
+            struct timespec ts = { 0, 100 * 1000 };  /* 100us */
+            nanosleep(&ts, NULL);
+        } else {
+            /* >5 seconds without progress — accept the loss and mark a
+             * watermark so reconnecting slaves are forced into
+             * FULLRESYNC.  We deliberately do NOT just keep waiting
+             * forever: a hung consumer would otherwise wedge every
+             * worker. */
             atomic_fetch_add(&g_dropped, 1);
+            uint64_t prev = atomic_load_explicit(&g_drop_high_seq,
+                                                 memory_order_relaxed);
+            if (seq > prev)
+                atomic_store_explicit(&g_drop_high_seq, seq,
+                                      memory_order_relaxed);
             pthread_mutex_unlock(&g_journal_producer_mu);
             return;
         }
@@ -673,6 +724,26 @@ static void *tcp_listener_thread(void *arg)
                                 INCR_FULLRESYNC " %s\r\n", g_replid);
             send(fd, resp, (size_t)rlen, MSG_NOSIGNAL);
             close(fd); continue;
+        }
+
+        /* Drop-watermark check → full resync.
+         * If any record with seq >= slave_seq was dropped on journal
+         * overflow it will never reach the backlog, so the slave can
+         * no longer catch up incrementally and must reload from RDB. */
+        if (is_sync) {
+            uint64_t dh = atomic_load_explicit(&g_drop_high_seq,
+                                               memory_order_relaxed);
+            if (dh > 0 && slave_seq <= dh) {
+                char resp[256];
+                int rlen = snprintf(resp, sizeof(resp),
+                                    INCR_FULLRESYNC " %s\r\n", g_replid);
+                send(fd, resp, (size_t)rlen, MSG_NOSIGNAL);
+                fprintf(stderr,
+                        "[WAL-REPL] slave %s: applied=%" PRIu64
+                        " <= drop_high=%" PRIu64 ", forcing FULLRESYNC\n",
+                        peer, slave_seq, dh);
+                close(fd); continue;
+            }
         }
 
         /* Backlog eviction check → full resync */

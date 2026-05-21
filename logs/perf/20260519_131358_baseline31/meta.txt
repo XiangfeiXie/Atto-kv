@@ -1,9 +1,0 @@
-]633;E;echo "run_id=$RUN_ID";ca708b67-feba-4ea2-bf27-b8ca5150fc9e]633;Crun_id=20260519_131358_baseline31
-date=2026-05-19T13:13:58+00:00
-host=ubuntu-24
-nproc=6
-kernel=6.8.0-110-generic
-git=4cce4a8
-config=conf/kvstore-dev.conf
-command=redis-benchmark -h 127.0.0.1 -p 2000 -t get,set -n 200000 -c 64 -P 16 --csv
-mpstat=/usr/bin/mpstat

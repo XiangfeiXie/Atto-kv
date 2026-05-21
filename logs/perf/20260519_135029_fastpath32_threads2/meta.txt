@@ -1,7 +1,0 @@
-]633;E;echo "run_id=$RUN_ID";f287e816-1ce4-40e6-b162-e27616f32a6c]633;Crun_id=20260519_135029_fastpath32_threads2
-date=2026-05-19T13:50:29+00:00
-nproc=8
-git=4cce4a8
-threads=2
-cpu_pin=auto
-workload=90% GET + 10% SET, hot_keys=4096, ops=600000, clients=64, pipeline=16

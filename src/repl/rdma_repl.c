@@ -28,6 +28,7 @@
 #include "config.h"
 #include "server.h"
 #include "wal_repl.h"
+#include "repl_stream.h"
 #include "persistence.h"
 
 #include <stdio.h>
@@ -1308,110 +1309,10 @@ fail:
 
     if (rc_ret != 0) return rc_ret;
 
-    /* ---- Connect to master's TCP incr port with INCR_SYNC handshake ---- */
-    int incr_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (incr_fd < 0) {
-        fprintf(stderr, "[RDMA-REPL] slave: incr socket() failed: %s\n",
-                strerror(errno));
-        return 0;
-    }
-
-    struct sockaddr_in incr_addr;
-    memset(&incr_addr, 0, sizeof(incr_addr));
-    incr_addr.sin_family = AF_INET;
-    incr_addr.sin_port   = htons((uint16_t)kvs_config.incr_port);
-    inet_pton(AF_INET, kvs_config.rdma_master_ip, &incr_addr.sin_addr);
-
-    if (connect(incr_fd, (struct sockaddr *)&incr_addr, sizeof(incr_addr)) < 0) {
-        fprintf(stderr, "[RDMA-REPL] slave: incr connect(%s:%d) failed: %s\n",
-                kvs_config.rdma_master_ip, kvs_config.incr_port,
-                strerror(errno));
-        close(incr_fd);
-        return 0;
-    }
-
-    /* Send INCR_SYNC <base_seq> handshake */
-    char sync_line[256];
-    int sync_len = snprintf(sync_line, sizeof(sync_line),
-                            INCR_SYNC_CMD " %" PRIu64 "\r\n", base_seq);
-    if (send(incr_fd, sync_line, (size_t)sync_len, MSG_NOSIGNAL) != sync_len) {
-        fprintf(stderr, "[RDMA-REPL] slave: INCR_SYNC send failed: %s\n",
-                strerror(errno));
-        close(incr_fd);
-        return 0;
-    }
-
-    printf("[RDMA-REPL] slave: connected to master incr TCP %s:%d, "
-           "sent INCR_SYNC %" PRIu64 "\n",
-           kvs_config.rdma_master_ip, kvs_config.incr_port, base_seq);
-
-    /* Read master response (+CONTINUE <replid> or -FULLRESYNC <replid>) */
-    {
-        char rline[256];
-        int rpos = 0;
-        while (rpos < (int)sizeof(rline) - 1) {
-            char c;
-            ssize_t n = recv(incr_fd, &c, 1, 0);
-            if (n <= 0) {
-                fprintf(stderr, "[RDMA-REPL] slave: failed to read "
-                        "handshake response\n");
-                close(incr_fd);
-                return 0;
-            }
-            if (c == '\n') {
-                if (rpos > 0 && rline[rpos - 1] == '\r') rpos--;
-                rline[rpos] = '\0';
-                break;
-            }
-            rline[rpos++] = c;
-        }
-
-        if (strncmp(rline, INCR_CONTINUE, strlen(INCR_CONTINUE)) == 0) {
-            /* Extract replid from "+CONTINUE <replid>" */
-            const char *rp = rline + strlen(INCR_CONTINUE);
-            if (*rp == ' ') rp++;
-            size_t rlen = strlen(rp);
-            if (rlen > 0 && rlen <= INCR_REPL_ID_LEN) {
-                memcpy(g_slave_replid, rp, rlen);
-                g_slave_replid[rlen] = '\0';
-            }
-            printf("[RDMA-REPL] slave: got +CONTINUE, replid=%s\n",
-                   g_slave_replid);
-        } else if (strncmp(rline, INCR_FULLRESYNC,
-                           strlen(INCR_FULLRESYNC)) == 0) {
-            const char *rp = rline + strlen(INCR_FULLRESYNC);
-            if (*rp == ' ') rp++;
-            size_t rlen = strlen(rp);
-            if (rlen > 0 && rlen <= INCR_REPL_ID_LEN) {
-                memcpy(g_slave_replid, rp, rlen);
-                g_slave_replid[rlen] = '\0';
-            }
-            fprintf(stderr, "[RDMA-REPL] slave: master requested fullresync "
-                    "(new replid=%s), run fullsync again\n", g_slave_replid);
-            g_slave_need_fullresync = 1;
-            close(incr_fd);
-            return 0;
-        } else {
-            fprintf(stderr, "[RDMA-REPL] slave: unexpected handshake "
-                    "response: %s\n", rline);
-            close(incr_fd);
-            return 0;
-        }
-    }
-
-    /* Spawn TCP incremental recv thread */
-    {
-        pthread_t tid;
-        if (pthread_create(&tid, NULL, incr_tcp_slave_recv_thread,
-                           (void *)(intptr_t)incr_fd) != 0) {
-            fprintf(stderr, "[RDMA-REPL] slave: pthread_create incr: %s\n",
-                    strerror(errno));
-            close(incr_fd);
-        } else {
-            pthread_detach(tid);
-            printf("[RDMA-REPL] slave: TCP incremental recv thread spawned\n");
-        }
-    }
+    /* Start AF_XDP incremental stream from RDMA fullsync cutover seq. */
+    repl_stream_start_slave(base_seq);
+    printf("[RDMA-REPL] slave: AF_XDP incremental stream staged from seq=%" PRIu64 "\n",
+           base_seq);
 
     return 0;
 }

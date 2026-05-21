@@ -1,2 +1,0 @@
- GET: rps=0.0 (overall: 0.0) avg_msec=18.046 (overall: 0.000)                                                             GET: 186915.88 requests per second, p50=6.855 msec
-

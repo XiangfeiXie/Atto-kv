@@ -167,283 +167,65 @@ static void rdb_buf_put(rdb_buf_t *b, const void *p, size_t n) {
 
 #include "kv_dict.h"
 
-/* Forward declarations — flattening helpers from type modules */
-extern int list_flatten_to_packed(kv_entry_t *e, char **out_data, uint32_t *out_len);
-extern int set_flatten_to_packed(kv_entry_t *e, char **out_data, uint32_t *out_len);
-extern int hash_flatten_to_packed(kv_entry_t *e, char **out_data, uint32_t *out_len);
-extern int zset_flatten_to_packed(kv_entry_t *e, char **out_data, uint32_t *out_len);
+/* RDB now persists only the STRING exact-key cache. */
+static inline int rdb_entry_payload(kv_entry_t *e, const char **data, int *dlen) {
+    if (!e || entry_type(e) != KV_TYPE_STRING) return -1;
+    *data = entry_payload(e);
+    *dlen = (int)entry_payload_len(e);
+    return 0;
+}
 
-/* Forward declarations — encoding rebuild after RDB load */
-extern void set_rebuild_encoding(kv_entry_t *e);
-extern void hash_rebuild_encoding(kv_entry_t *e);
-extern void zset_rebuild_encoding(kv_entry_t *e);
-
-/* Serialize one dict entry to RDB binary format (appends to rdb_buf_t). */
+/* Serialize one STRING dict entry to RDB binary format. */
 static void rdb_save_callback_buf(kv_entry_t *e, void *priv) {
-    if (!e) return;
+    const char *data_ptr = NULL;
+    int dlen = 0;
+    if (rdb_entry_payload(e, &data_ptr, &dlen) != 0) return;
+
     rdb_buf_t *b = (rdb_buf_t *)priv;
     const char *key = entry_key(e);
     int klen = (int)e->key_len;
-    int dlen;
-    const char *data_ptr;
-    char *flat_buf = NULL;
-
-    /* Flatten encodings that contain heap pointers to packed format */
-    switch (entry_type(e)) {
-    case KV_TYPE_LIST:
-        if (entry_encoding(e) == KV_ENCODING_QUICKLIST) {
-            uint32_t flat_len = 0;
-            if (list_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
-                dlen     = (int)flat_len;
-                data_ptr = flat_buf;
-            } else {
-                dlen     = (int)e->val_len;
-                data_ptr = e->data;
-            }
-        } else {
-            dlen     = (int)e->val_len;
-            data_ptr = e->data;
-        }
-        break;
-    case KV_TYPE_SET:
-        if (entry_encoding(e) == KV_ENCODING_DICT) {
-            uint32_t flat_len = 0;
-            if (set_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
-                dlen     = (int)flat_len;
-                data_ptr = flat_buf;
-            } else {
-                dlen     = (int)e->val_len;
-                data_ptr = e->data;
-            }
-        } else {
-            dlen     = (int)e->val_len;
-            data_ptr = e->data;
-        }
-        break;
-    case KV_TYPE_HASH:
-        if (entry_encoding(e) == KV_ENCODING_DICT) {
-            uint32_t flat_len = 0;
-            if (hash_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
-                dlen     = (int)flat_len;
-                data_ptr = flat_buf;
-            } else {
-                dlen     = (int)e->val_len;
-                data_ptr = e->data;
-            }
-        } else {
-            dlen     = (int)e->val_len;
-            data_ptr = e->data;
-        }
-        break;
-    case KV_TYPE_ZSET:
-        if (entry_encoding(e) == KV_ENCODING_SKIPLIST) {
-            uint32_t flat_len = 0;
-            if (zset_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
-                dlen     = (int)flat_len;
-                data_ptr = flat_buf;
-            } else {
-                dlen     = (int)e->val_len;
-                data_ptr = e->data;
-            }
-        } else {
-            dlen     = (int)e->val_len;
-            data_ptr = e->data;
-        }
-        break;
-    default:
-        dlen     = (int)e->val_len;
-        data_ptr = e->data;
-        break;
-    }
-
     long long expire = e->expire;
+
     rdb_buf_put(b, &klen, sizeof(int));
     rdb_buf_put(b, key, (size_t)klen);
     rdb_buf_put(b, &dlen, sizeof(int));
     rdb_buf_put(b, data_ptr, (size_t)dlen);
-
-    free(flat_buf);
-
     rdb_buf_put(b, &expire, sizeof(long long));
 }
 
-/* Single-entry serialization to DynBuf (reusable, handles quicklist flattening).
-   Appends [klen:4][key:klen][dlen:4][data:dlen][expire:8]. */
 void serialize_entry_to_buf(DynBuf *out, kv_entry_t *e) {
+    const char *data_ptr = NULL;
+    int dlen = 0;
+    if (rdb_entry_payload(e, &data_ptr, &dlen) != 0) return;
+
     const char *key = entry_key(e);
     int klen = (int)e->key_len;
-    int dlen;
-    const char *data_ptr;
-    char *flat_buf = NULL;
-
-    switch (entry_type(e)) {
-    case KV_TYPE_LIST:
-        if (entry_encoding(e) == KV_ENCODING_QUICKLIST) {
-            uint32_t flat_len = 0;
-            if (list_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
-                dlen     = (int)flat_len;
-                data_ptr = flat_buf;
-            } else {
-                dlen     = (int)e->val_len;
-                data_ptr = e->data;
-            }
-        } else {
-            dlen     = (int)e->val_len;
-            data_ptr = e->data;
-        }
-        break;
-    case KV_TYPE_SET:
-        if (entry_encoding(e) == KV_ENCODING_DICT) {
-            uint32_t flat_len = 0;
-            if (set_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
-                dlen     = (int)flat_len;
-                data_ptr = flat_buf;
-            } else {
-                dlen     = (int)e->val_len;
-                data_ptr = e->data;
-            }
-        } else {
-            dlen     = (int)e->val_len;
-            data_ptr = e->data;
-        }
-        break;
-    case KV_TYPE_HASH:
-        if (entry_encoding(e) == KV_ENCODING_DICT) {
-            uint32_t flat_len = 0;
-            if (hash_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
-                dlen     = (int)flat_len;
-                data_ptr = flat_buf;
-            } else {
-                dlen     = (int)e->val_len;
-                data_ptr = e->data;
-            }
-        } else {
-            dlen     = (int)e->val_len;
-            data_ptr = e->data;
-        }
-        break;
-    case KV_TYPE_ZSET:
-        if (entry_encoding(e) == KV_ENCODING_SKIPLIST) {
-            uint32_t flat_len = 0;
-            if (zset_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
-                dlen     = (int)flat_len;
-                data_ptr = flat_buf;
-            } else {
-                dlen     = (int)e->val_len;
-                data_ptr = e->data;
-            }
-        } else {
-            dlen     = (int)e->val_len;
-            data_ptr = e->data;
-        }
-        break;
-    default:
-        dlen     = (int)e->val_len;
-        data_ptr = e->data;
-        break;
-    }
-
     long long expire = e->expire;
+
     dynbuf_append(out, (const char *)&klen, sizeof(int));
     dynbuf_append(out, key, klen);
     dynbuf_append(out, (const char *)&dlen, sizeof(int));
     dynbuf_append(out, data_ptr, dlen);
     dynbuf_append(out, (const char *)&expire, sizeof(long long));
-
-    free(flat_buf);
 }
 
-/* Inline variant: writes directly to dst, returns bytes written.
- * Returns -1 if the serialized entry would exceed max_space. */
 int serialize_entry_inline(char *dst, size_t max_space, kv_entry_t *e) {
+    const char *data_ptr = NULL;
+    int dlen = 0;
+    if (rdb_entry_payload(e, &data_ptr, &dlen) != 0) return 0;
+
     const char *key = entry_key(e);
     int klen = (int)e->key_len;
-    int dlen;
-    const char *data_ptr;
-    char *flat_buf = NULL;
-
-    switch (entry_type(e)) {
-    case KV_TYPE_LIST:
-        if (entry_encoding(e) == KV_ENCODING_QUICKLIST) {
-            uint32_t flat_len = 0;
-            if (list_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
-                dlen     = (int)flat_len;
-                data_ptr = flat_buf;
-            } else {
-                dlen     = (int)e->val_len;
-                data_ptr = e->data;
-            }
-        } else {
-            dlen     = (int)e->val_len;
-            data_ptr = e->data;
-        }
-        break;
-    case KV_TYPE_SET:
-        if (entry_encoding(e) == KV_ENCODING_DICT) {
-            uint32_t flat_len = 0;
-            if (set_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
-                dlen     = (int)flat_len;
-                data_ptr = flat_buf;
-            } else {
-                dlen     = (int)e->val_len;
-                data_ptr = e->data;
-            }
-        } else {
-            dlen     = (int)e->val_len;
-            data_ptr = e->data;
-        }
-        break;
-    case KV_TYPE_HASH:
-        if (entry_encoding(e) == KV_ENCODING_DICT) {
-            uint32_t flat_len = 0;
-            if (hash_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
-                dlen     = (int)flat_len;
-                data_ptr = flat_buf;
-            } else {
-                dlen     = (int)e->val_len;
-                data_ptr = e->data;
-            }
-        } else {
-            dlen     = (int)e->val_len;
-            data_ptr = e->data;
-        }
-        break;
-    case KV_TYPE_ZSET:
-        if (entry_encoding(e) == KV_ENCODING_SKIPLIST) {
-            uint32_t flat_len = 0;
-            if (zset_flatten_to_packed(e, &flat_buf, &flat_len) == 0) {
-                dlen     = (int)flat_len;
-                data_ptr = flat_buf;
-            } else {
-                dlen     = (int)e->val_len;
-                data_ptr = e->data;
-            }
-        } else {
-            dlen     = (int)e->val_len;
-            data_ptr = e->data;
-        }
-        break;
-    default:
-        dlen     = (int)e->val_len;
-        data_ptr = e->data;
-        break;
-    }
-
     long long expire = e->expire;
     int total = (int)(sizeof(int) + klen + sizeof(int) + dlen + sizeof(long long));
-    if (total > (int)max_space) {
-        free(flat_buf);
-        return -1;
-    }
+    if (total > (int)max_space) return -1;
 
-    char *p = dst;
-    memcpy(p, &klen, sizeof(int)); p += sizeof(int);
-    memcpy(p, key, klen);          p += klen;
-    memcpy(p, &dlen, sizeof(int)); p += sizeof(int);
-    memcpy(p, data_ptr, dlen);     p += dlen;
-    memcpy(p, &expire, sizeof(long long));
-
-    free(flat_buf);
+    char *q = dst;
+    memcpy(q, &klen, sizeof(int)); q += sizeof(int);
+    memcpy(q, key, klen);          q += klen;
+    memcpy(q, &dlen, sizeof(int)); q += sizeof(int);
+    memcpy(q, data_ptr, dlen);     q += dlen;
+    memcpy(q, &expire, sizeof(long long));
     return total;
 }
 
@@ -811,21 +593,7 @@ int rdb_load_stream_append(const char *buf, size_t len) {
     return loaded;
 }
 
-/* Rebuild encodings for all loaded entries. After streaming load, SET/HASH/ZSET
- * entries are PACKED; this upgrades them to DICT/SKIPLIST when thresholds met. */
-void rdb_rebuild_all_encodings(void) {
-    kv_shards_iter_t it; kv_shards_iter_init(&it);
-    kv_entry_t *e;
-    while ((e = kv_shards_iter_next(&it)) != NULL) {
-        switch (entry_type(e)) {
-        case KV_TYPE_SET:  set_rebuild_encoding(e);  break;
-        case KV_TYPE_HASH: hash_rebuild_encoding(e); break;
-        case KV_TYPE_ZSET: zset_rebuild_encoding(e); break;
-        default: break;
-        }
-    }
-    kv_shards_iter_free(&it);
-}
+void rdb_rebuild_all_encodings(void) { }
 
 /* In-memory RDB loader: parses the same binary format as rdb_load_mmap()
  * but operates on a buffer already in memory (no file, no mmap).

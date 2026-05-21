@@ -38,10 +38,19 @@ static void config_default(void) {
     kvs_config.xdp_enabled = 0;
     strncpy(kvs_config.xdp_iface, "lo", sizeof(kvs_config.xdp_iface) - 1);
 
+    /* XDP/AF_XDP WAL replication bypass (Phase 11) */
+    kvs_config.xdp_repl_enabled = 0;
+    strncpy(kvs_config.xdp_ifname, "lo", sizeof(kvs_config.xdp_ifname) - 1);
+    kvs_config.xdp_driver_mode = 0;  /* Default: generic (SKB) mode */
+    strncpy(kvs_config.xdp_repl_ifname, "lo", sizeof(kvs_config.xdp_repl_ifname) - 1);
+    kvs_config.xdp_repl_queue = 0;
+    kvs_config.xdp_repl_udp_port = 6383;
+    kvs_config.xdp_repl_zero_copy = 0;
+    kvs_config.xdp_repl_batch = 64;
+    kvs_config.xdp_repl_mtu = 1400;
+
     kvs_config.sockmap_enabled = 0;
 
-    kvs_config.fastpath_cache_enabled = 1;
-    kvs_config.fastpath_cache_explicit = 0;
     kvs_config.latency_histogram_enabled = 0;
 
     /* 0 = auto: max(1, nproc - 1).  Resolved in config_postprocess(). */
@@ -123,11 +132,6 @@ static void config_postprocess(void) {
     if (cgroup_cpus > 0 && kvs_config.threads > cgroup_cpus) {
         printf("[CONFIG] WARN: threads=%d exceeds cgroup cpu.max=%d\n",
                kvs_config.threads, cgroup_cpus);
-    }
-    if (kvs_config.rdma_sync_enabled
-        && kvs_config.rdma_role == ROLE_SLAVE
-        && !kvs_config.fastpath_cache_explicit) {
-        kvs_config.fastpath_cache_enabled = 0;
     }
 }
 
@@ -282,13 +286,41 @@ int config_load(const char *path) {
             strncpy(kvs_config.xdp_iface, val,
                     sizeof(kvs_config.xdp_iface) - 1);
 
-        /* ---- Phase 10: lock-free seqlock fast-path cache ---- */
+        } else if (strcasecmp(key, "xdp_repl") == 0) {
+            int v = parse_bool(val, lineno, "xdp_repl");
+            if (v >= 0) kvs_config.xdp_repl_enabled = v;
+
+        } else if (strcasecmp(key, "xdp_repl_ifname") == 0) {
+            strncpy(kvs_config.xdp_repl_ifname, val,
+                    sizeof(kvs_config.xdp_repl_ifname) - 1);
+            strncpy(kvs_config.xdp_ifname, val,
+                    sizeof(kvs_config.xdp_ifname) - 1);
+
+        } else if (strcasecmp(key, "xdp_repl_queue") == 0) {
+            parse_int(val, lineno, "xdp_repl_queue", 0, 4096, &kvs_config.xdp_repl_queue);
+
+        } else if (strcasecmp(key, "xdp_repl_udp_port") == 0) {
+            parse_int(val, lineno, "xdp_repl_udp_port", 1, 65535, &kvs_config.xdp_repl_udp_port);
+
+        } else if (strcasecmp(key, "xdp_repl_zero_copy") == 0) {
+            if (strcasecmp(val, "auto") == 0 || strcasecmp(val, "copy") == 0) {
+                kvs_config.xdp_repl_zero_copy = 0;
+            } else if (strcasecmp(val, "require") == 0 || strcasecmp(val, "on") == 0) {
+                kvs_config.xdp_repl_zero_copy = 1;
+            } else {
+                printf("[CONFIG] line %d: bad xdp_repl_zero_copy '%s'\n", lineno, val);
+            }
+
+        } else if (strcasecmp(key, "xdp_repl_batch") == 0) {
+            parse_int(val, lineno, "xdp_repl_batch", 1, 1024, &kvs_config.xdp_repl_batch);
+
+        } else if (strcasecmp(key, "xdp_repl_mtu") == 0) {
+            parse_int(val, lineno, "xdp_repl_mtu", 576, 9000, &kvs_config.xdp_repl_mtu);
+
         } else if (strcasecmp(key, "fastpath_cache") == 0) {
             int v = parse_bool(val, lineno, "fastpath_cache");
-            if (v >= 0) {
-                kvs_config.fastpath_cache_enabled = v;
-                kvs_config.fastpath_cache_explicit = 1;
-            }
+            (void)v;
+            printf("[CONFIG] line %d: fastpath_cache is deprecated and ignored\n", lineno);
 
         } else if (strcasecmp(key, "latency_histogram") == 0) {
             int v = parse_bool(val, lineno, "latency_histogram");
@@ -396,12 +428,19 @@ void config_print(void) {
 
     if (kvs_config.xdp_enabled)
         printf("  XDP fast-path : iface=%s\n", kvs_config.xdp_iface);
+    if (kvs_config.xdp_repl_enabled) {
+        printf("  XDP repl      : iface=%s queue=%d udp_port=%d zero_copy=%s batch=%d mtu=%d\n",
+               kvs_config.xdp_repl_ifname,
+               kvs_config.xdp_repl_queue,
+               kvs_config.xdp_repl_udp_port,
+               kvs_config.xdp_repl_zero_copy ? "require" : "auto",
+               kvs_config.xdp_repl_batch,
+               kvs_config.xdp_repl_mtu);
+    }
     if (kvs_config.sockmap_enabled)
         printf("  sockmap       : enabled (stream-layer observability)\n");
     if (kvs_config.latency_histogram_enabled)
         printf("  Latency hist  : sampled dispatch histogram enabled\n");
-    if (kvs_config.fastpath_cache_enabled)
-        printf("  Fastpath cache: lock-free seqlock, 2048 buckets, 1 MB (L2-resident)\n");
     if (kvs_config.threads > 1) {
         long nproc = sysconf(_SC_NPROCESSORS_ONLN);
         printf("  Workers       : %d %s (nproc=%ld, %d shards, SO_REUSEPORT)\n",

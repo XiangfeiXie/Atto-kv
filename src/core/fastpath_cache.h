@@ -113,10 +113,10 @@ _Static_assert(sizeof(struct fp_stat_slot) == 64u,
 #define FP_DEMAND_COLD 0u
 
 struct fp_cache {
-    struct fp_entry  buckets[FP_BUCKETS];      /* 512 KB */
-    _Atomic uint8_t  demand[FP_BUCKETS];       /* 1 KB, L1-resident */
-    _Atomic uint64_t cached_hash[FP_BUCKETS];  /* 8 KB metadata prefilter */
-    _Atomic uint8_t  cached_valid[FP_BUCKETS]; /* 1 KB metadata prefilter */
+    struct fp_entry  buckets[FP_BUCKETS];      /* 1 MB */
+    _Atomic uint8_t  demand[FP_BUCKETS];       /* 2 KB, L1-resident */
+    _Atomic uint64_t cached_hash[FP_BUCKETS];  /* 16 KB metadata prefilter */
+    _Atomic uint8_t  cached_valid[FP_BUCKETS]; /* 2 KB metadata prefilter */
     struct fp_stat_slot stat_slots[FP_STATS_SLOTS];
     _Atomic uint64_t invalidations;
     _Atomic uint64_t writer_collisions;        /* per-bucket CAS retry count */

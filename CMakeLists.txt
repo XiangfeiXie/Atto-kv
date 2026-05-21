@@ -30,6 +30,19 @@ pkg_check_modules(FABRIC   REQUIRED libfabric)
 pkg_check_modules(ZLIB     REQUIRED zlib)
 pkg_check_modules(LIBBPF  REQUIRED libbpf)
 
+# ── XDP/AF_XDP support (Phase 11 - optional) ──────────────────────────
+option(ENABLE_XDP_REPL "Enable XDP/AF_XDP zero-copy WAL replication" OFF)
+if(ENABLE_XDP_REPL)
+    pkg_check_modules(LIBXDP libxdp)
+    add_compile_definitions(ENABLE_XDP_REPL)
+    if(LIBXDP_FOUND)
+        add_compile_definitions(HAVE_LIBXDP)
+        message(STATUS "XDP/AF_XDP replication support enabled with libxdp")
+    else()
+        message(WARNING "libxdp not found; building staged AF_XDP replication manager without libxdp helpers")
+    endif()
+endif()
+
 # ── NtyCo (third-party coroutine library) ─────────────────────────────
 set(NTYCO_DIR  ${CMAKE_SOURCE_DIR}/NtyCo)
 set(NTYCO_LIB  ${NTYCO_DIR}/libntyco.a)
@@ -52,7 +65,10 @@ set(CORE_SRCS
     src/core/config.c
     src/core/protocol.c
     src/core/block.c
-    src/core/fastpath_cache.c
+)
+
+set(VECTOR_SRCS
+    src/vector/vector_store.c
 )
 
 set(ENGINE_SRCS
@@ -61,10 +77,6 @@ set(ENGINE_SRCS
 
 set(TYPE_SRCS
     src/type/kv_type_string.c
-    src/type/kv_type_list.c
-    src/type/kv_type_set.c
-    src/type/kv_type_hash.c
-    src/type/kv_type_zset.c
 )
 
 set(NET_SRCS
@@ -80,13 +92,25 @@ set(PERSIST_SRCS
 set(REPL_SRCS
     src/repl/rdma_repl.c
     src/repl/wal_repl.c
+    src/repl/journal.c
+    src/repl/wal_persist.c
+    src/repl/repl_stream.c
 )
 
 set(BPF_SRCS
     src/bpf/xdp_manager.c
     src/bpf/sockmap_manager.c
     src/bpf/bpf_pin.c
+    src/bpf/xdp_repl_manager.c
 )
+
+# XDP/AF_XDP sources (Phase 11 - conditional)
+if(ENABLE_XDP_REPL AND LIBXDP_FOUND)
+    list(APPEND BPF_SRCS
+        src/bpf/af_xdp_repl.c
+        src/bpf/xdp_wal_manager.c
+    )
+endif()
 
 # ── Compile XDP kernel BPF program ────────────────────────────────────
 set(XDP_KERN_SRC  ${CMAKE_SOURCE_DIR}/src/bpf/xdp_kvs.kern.c)
@@ -124,9 +148,30 @@ add_custom_command(
 
 add_custom_target(sockmap_kern DEPENDS ${SOCKMAP_KERN_OBJ})
 
+# ── Compile WAL XDP kernel BPF program (Phase 11 - conditional) ───────
+if(ENABLE_XDP_REPL)
+    set(WAL_XDP_KERN_SRC  ${CMAKE_SOURCE_DIR}/src/bpf/xdp_repl.kern.c)
+    set(WAL_XDP_KERN_OBJ  ${CMAKE_BINARY_DIR}/xdp_repl.kern.o)
+
+    add_custom_command(
+        OUTPUT  ${WAL_XDP_KERN_OBJ}
+        COMMAND clang -O2 -g -target bpf
+                -I${CMAKE_SOURCE_DIR}/src/bpf
+                -I/usr/include
+                -I/usr/include/x86_64-linux-gnu
+                -c ${WAL_XDP_KERN_SRC}
+                -o ${WAL_XDP_KERN_OBJ}
+        DEPENDS ${WAL_XDP_KERN_SRC}
+        COMMENT "Compiling WAL XDP BPF kernel program"
+    )
+
+    add_custom_target(wal_xdp_kern DEPENDS ${WAL_XDP_KERN_OBJ})
+endif()
+
 set(KVSTORE_SRCS
     ${UTIL_SRCS}
     ${CORE_SRCS}
+    ${VECTOR_SRCS}
     ${ENGINE_SRCS}
     ${TYPE_SRCS}
     ${NET_SRCS}
@@ -143,6 +188,7 @@ target_include_directories(kvstore PRIVATE
     src/core
     src/engine
     src/type
+    src/vector
     src/net
     src/persist
     src/repl
@@ -153,6 +199,10 @@ target_include_directories(kvstore PRIVATE
     ${FABRIC_INCLUDE_DIRS}
     ${LIBBPF_INCLUDE_DIRS}
 )
+
+if(ENABLE_XDP_REPL AND LIBXDP_FOUND)
+    target_include_directories(kvstore PRIVATE ${LIBXDP_INCLUDE_DIRS})
+endif()
 
 target_link_libraries(kvstore PRIVATE
     Threads::Threads
@@ -166,7 +216,15 @@ target_link_libraries(kvstore PRIVATE
     dl
 )
 
+if(ENABLE_XDP_REPL AND LIBXDP_FOUND)
+    target_link_libraries(kvstore PRIVATE ${LIBXDP_LIBRARIES})
+endif()
+
 add_dependencies(kvstore ntyco xdp_kern sockmap_kern)
+
+if(ENABLE_XDP_REPL)
+    add_dependencies(kvstore wal_xdp_kern)
+endif()
 
 # ── kvs_slowlog: uprobe slow-command monitor ──────────────────────────
 set(SLOWLOG_BPF_SRC  ${CMAKE_SOURCE_DIR}/src/tools/kvs_slowlog.bpf.c)
@@ -224,38 +282,6 @@ set_target_properties(kvs_top PROPERTIES OUTPUT_NAME "kvs-top")
 
 # ── testcase target ───────────────────────────────────────────────────
 add_executable(testcase test/testcase.c)
-
-# ── Phase 10.1 — fp_cache standalone test ────────────────────────────
-# Lock-free seqlock fast-path cache unit + stress test.  Builds against
-# fastpath_cache.c only (no engine / dispatcher dependencies) so the
-# test exercises the data structure in isolation.
-add_executable(fp_cache_test
-    test/fp_cache_test.c
-    src/core/fastpath_cache.c
-)
-target_include_directories(fp_cache_test PRIVATE
-    src/core
-)
-target_link_libraries(fp_cache_test PRIVATE Threads::Threads)
-
-# ── Phase 10.5 — fp_cache in-process CPU microbenchmark ──────────────
-# Network-free comparison of (rdlock + dict_find) vs (fp_get).  This is
-# the apples-to-apples lookup-path measurement that redis-benchmark
-# numbers cannot show, because their TCP/io_uring overhead dominates.
-add_executable(bench_fp_inproc
-    test/bench_fp_inproc.c
-    src/core/fastpath_cache.c
-    src/engine/kv_dict.c
-    src/type/kv_type_string.c
-    src/util/dynbuf.c
-)
-target_include_directories(bench_fp_inproc PRIVATE
-    src/core
-    src/engine
-    src/type
-    src/util
-)
-target_link_libraries(bench_fp_inproc PRIVATE Threads::Threads m)
 
 # ── Phase 8.1 — smoke / sanitizer-smoke targets ──────────────────────
 # Run as:

@@ -21,21 +21,13 @@
 /* --- Entry types (the "type" byte in data[0]) --- */
 enum {
     KV_TYPE_STRING = 0,
-    KV_TYPE_LIST   = 1,
-    KV_TYPE_SET    = 2,
-    KV_TYPE_ZSET   = 3,
-    KV_TYPE_HASH   = 4,
     KV_TYPE_COUNT
 };
 
 /* --- Entry encoding (the "encoding" byte in data[1]) --- */
 enum {
-    KV_ENCODING_RAW      = 0,  /* STRING: raw bytes               */
-    KV_ENCODING_PACKED   = 1,  /* LIST/HASH/ZSET: inline packed   */
-    KV_ENCODING_QUICKLIST = 2, /* LIST: linked ziplist nodes      */
-    KV_ENCODING_DICT     = 3,  /* SET/HASH: nested dict           */
-    KV_ENCODING_SKIPLIST = 4,  /* ZSET: dict + skiplist dual idx  */
-    KV_ENCODING_INT      = 5,  /* STRING: inline int64_t           */
+    KV_ENCODING_RAW = 0,
+    KV_ENCODING_INT = 1,
 };
 
 /* --- Single heap allocation entry --- */

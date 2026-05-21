@@ -54,15 +54,19 @@ typedef struct {
     int  xdp_enabled;
     char xdp_iface[32];
 
+    /* XDP/AF_XDP WAL replication bypass (Phase 11) */
+    int  xdp_repl_enabled;
+    char xdp_ifname[32];
+    int  xdp_driver_mode;  /* 0 = generic (SKB), 1 = driver mode */
+    char xdp_repl_ifname[32];
+    int  xdp_repl_queue;
+    int  xdp_repl_udp_port;
+    int  xdp_repl_zero_copy; /* 0 = auto/copy fallback, 1 = require zero-copy */
+    int  xdp_repl_batch;
+    int  xdp_repl_mtu;
+
     /* sockmap stream-layer observability (Phase 2) */
     int  sockmap_enabled;
-
-    /* Phase 10 — Lock-free seqlock fast-path cache for short-key GETs.
-     * 1024 buckets × 512B = 512 KB, layered above 32-shard rwlock dict.
-     * Reader-only on the GET hot path; SET/DEL/EXPIRE post-hooks
-     * keep it in sync. */
-    int  fastpath_cache_enabled;
-    int  fastpath_cache_explicit;
 
     int  latency_histogram_enabled;
 

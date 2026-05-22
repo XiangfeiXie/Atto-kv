@@ -21,6 +21,7 @@
 /* --- Entry types (the "type" byte in data[0]) --- */
 enum {
     KV_TYPE_STRING = 0,
+    KV_TYPE_HASH = 1,
     KV_TYPE_COUNT
 };
 
@@ -28,6 +29,8 @@ enum {
 enum {
     KV_ENCODING_RAW = 0,
     KV_ENCODING_INT = 1,
+    KV_ENCODING_PACKED = 2,
+    KV_ENCODING_DICT = 3,
 };
 
 /* --- Single heap allocation entry --- */

@@ -16,14 +16,7 @@ typedef enum {
 
 typedef enum {
     KVS_MUT_KIND_RESP_STRING = 1,
-    KVS_MUT_KIND_VECTOR_BIN  = 2,
 } kvs_mutation_kind_t;
-
-typedef enum {
-    KVS_VECTOR_MUT_PUT   = 1,
-    KVS_VECTOR_MUT_DEL   = 2,
-    KVS_VECTOR_MUT_CLEAR = 3,
-} kvs_vector_mut_op_t;
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -40,12 +33,5 @@ typedef struct __attribute__((packed)) {
     uint16_t kind;
     uint16_t flags;
 } kvs_repl_frame_hdr_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t  op;
-    uint32_t id_len;
-    uint32_t dim;
-    uint32_t flags;
-} kvs_vector_mut_hdr_t;
 
 #endif

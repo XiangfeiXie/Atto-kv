@@ -35,12 +35,8 @@ static void config_default(void) {
     strncpy(kvs_config.rdma_master_ip, "127.0.0.1",
             sizeof(kvs_config.rdma_master_ip) - 1);
 
-    kvs_config.xdp_enabled = 0;
-    strncpy(kvs_config.xdp_iface, "lo", sizeof(kvs_config.xdp_iface) - 1);
-
     /* XDP/AF_XDP WAL replication bypass (Phase 11) */
     kvs_config.xdp_repl_enabled = 0;
-    strncpy(kvs_config.xdp_ifname, "lo", sizeof(kvs_config.xdp_ifname) - 1);
     kvs_config.xdp_driver_mode = 0;  /* Default: generic (SKB) mode */
     strncpy(kvs_config.xdp_repl_ifname, "lo", sizeof(kvs_config.xdp_repl_ifname) - 1);
     kvs_config.xdp_repl_queue = 0;
@@ -277,15 +273,7 @@ int config_load(const char *path) {
         } else if (strcasecmp(key, "incr_port") == 0) {
             parse_int(val, lineno, "incr_port", 1, 65535, &kvs_config.incr_port);
 
-        /* ---- XDP ---- */
-        } else if (strcasecmp(key, "xdp") == 0) {
-            int v = parse_bool(val, lineno, "xdp");
-            if (v >= 0) kvs_config.xdp_enabled = v;
-
-        } else if (strcasecmp(key, "xdp_iface") == 0) {
-            strncpy(kvs_config.xdp_iface, val,
-                    sizeof(kvs_config.xdp_iface) - 1);
-
+        /* ---- XDP/AF_XDP incremental replication ---- */
         } else if (strcasecmp(key, "xdp_repl") == 0) {
             int v = parse_bool(val, lineno, "xdp_repl");
             if (v >= 0) kvs_config.xdp_repl_enabled = v;
@@ -293,8 +281,6 @@ int config_load(const char *path) {
         } else if (strcasecmp(key, "xdp_repl_ifname") == 0) {
             strncpy(kvs_config.xdp_repl_ifname, val,
                     sizeof(kvs_config.xdp_repl_ifname) - 1);
-            strncpy(kvs_config.xdp_ifname, val,
-                    sizeof(kvs_config.xdp_ifname) - 1);
 
         } else if (strcasecmp(key, "xdp_repl_queue") == 0) {
             parse_int(val, lineno, "xdp_repl_queue", 0, 4096, &kvs_config.xdp_repl_queue);
@@ -316,11 +302,6 @@ int config_load(const char *path) {
 
         } else if (strcasecmp(key, "xdp_repl_mtu") == 0) {
             parse_int(val, lineno, "xdp_repl_mtu", 576, 9000, &kvs_config.xdp_repl_mtu);
-
-        } else if (strcasecmp(key, "fastpath_cache") == 0) {
-            int v = parse_bool(val, lineno, "fastpath_cache");
-            (void)v;
-            printf("[CONFIG] line %d: fastpath_cache is deprecated and ignored\n", lineno);
 
         } else if (strcasecmp(key, "latency_histogram") == 0) {
             int v = parse_bool(val, lineno, "latency_histogram");
@@ -426,8 +407,6 @@ void config_print(void) {
                kvs_config.incr_port);
     }
 
-    if (kvs_config.xdp_enabled)
-        printf("  XDP fast-path : iface=%s\n", kvs_config.xdp_iface);
     if (kvs_config.xdp_repl_enabled) {
         printf("  XDP repl      : iface=%s queue=%d udp_port=%d zero_copy=%s batch=%d mtu=%d\n",
                kvs_config.xdp_repl_ifname,

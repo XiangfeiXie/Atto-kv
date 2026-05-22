@@ -69,6 +69,17 @@ set(CORE_SRCS
 
 set(VECTOR_SRCS
     src/vector/vector_store.c
+    src/vector/vector_math.c
+)
+
+set(STORAGE_SRCS
+    src/storage/vec_engine.c
+    src/storage/vec_collection.c
+    src/storage/vec_segment.c
+)
+
+set(INDEX_SRCS
+    src/index/flat_index.c
 )
 
 set(ENGINE_SRCS
@@ -77,6 +88,7 @@ set(ENGINE_SRCS
 
 set(TYPE_SRCS
     src/type/kv_type_string.c
+    src/type/kv_type_hash.c
 )
 
 set(NET_SRCS
@@ -95,22 +107,36 @@ set(REPL_SRCS
     src/repl/journal.c
     src/repl/wal_persist.c
     src/repl/repl_stream.c
+    src/repl/xdp_repl_manager.c
 )
 
 set(BPF_SRCS
     src/bpf/xdp_manager.c
     src/bpf/sockmap_manager.c
     src/bpf/bpf_pin.c
-    src/bpf/xdp_repl_manager.c
 )
 
-# XDP/AF_XDP sources (Phase 11 - conditional)
+# Replication XDP/AF_XDP sources (Phase 11 - conditional)
 if(ENABLE_XDP_REPL AND LIBXDP_FOUND)
-    list(APPEND BPF_SRCS
-        src/bpf/af_xdp_repl.c
-        src/bpf/xdp_wal_manager.c
+    list(APPEND REPL_SRCS
+        src/repl/af_xdp_repl.c
+        src/repl/xdp_wal_manager.c
     )
 endif()
+
+set(KVSTORE_SRCS
+    ${UTIL_SRCS}
+    ${CORE_SRCS}
+    ${VECTOR_SRCS}
+    ${STORAGE_SRCS}
+    ${INDEX_SRCS}
+    ${ENGINE_SRCS}
+    ${TYPE_SRCS}
+    ${NET_SRCS}
+    ${PERSIST_SRCS}
+    ${REPL_SRCS}
+    ${BPF_SRCS}
+)
 
 # ── Compile XDP kernel BPF program ────────────────────────────────────
 set(XDP_KERN_SRC  ${CMAKE_SOURCE_DIR}/src/bpf/xdp_kvs.kern.c)
@@ -148,37 +174,26 @@ add_custom_command(
 
 add_custom_target(sockmap_kern DEPENDS ${SOCKMAP_KERN_OBJ})
 
-# ── Compile WAL XDP kernel BPF program (Phase 11 - conditional) ───────
+# ── Compile replication XDP kernel BPF program (Phase 11 - conditional) ─
 if(ENABLE_XDP_REPL)
-    set(WAL_XDP_KERN_SRC  ${CMAKE_SOURCE_DIR}/src/bpf/xdp_repl.kern.c)
+    set(WAL_XDP_KERN_SRC  ${CMAKE_SOURCE_DIR}/src/repl/xdp_repl.kern.c)
     set(WAL_XDP_KERN_OBJ  ${CMAKE_BINARY_DIR}/xdp_repl.kern.o)
 
     add_custom_command(
         OUTPUT  ${WAL_XDP_KERN_OBJ}
         COMMAND clang -O2 -g -target bpf
                 -I${CMAKE_SOURCE_DIR}/src/bpf
+                -I${CMAKE_SOURCE_DIR}/src/repl
                 -I/usr/include
                 -I/usr/include/x86_64-linux-gnu
                 -c ${WAL_XDP_KERN_SRC}
                 -o ${WAL_XDP_KERN_OBJ}
         DEPENDS ${WAL_XDP_KERN_SRC}
-        COMMENT "Compiling WAL XDP BPF kernel program"
+        COMMENT "Compiling replication XDP BPF kernel program"
     )
 
     add_custom_target(wal_xdp_kern DEPENDS ${WAL_XDP_KERN_OBJ})
 endif()
-
-set(KVSTORE_SRCS
-    ${UTIL_SRCS}
-    ${CORE_SRCS}
-    ${VECTOR_SRCS}
-    ${ENGINE_SRCS}
-    ${TYPE_SRCS}
-    ${NET_SRCS}
-    ${PERSIST_SRCS}
-    ${REPL_SRCS}
-    ${BPF_SRCS}
-)
 
 # ── kvstore target ────────────────────────────────────────────────────
 add_executable(kvstore ${KVSTORE_SRCS})
@@ -189,6 +204,8 @@ target_include_directories(kvstore PRIVATE
     src/engine
     src/type
     src/vector
+    src/storage
+    src/index
     src/net
     src/persist
     src/repl
@@ -225,60 +242,6 @@ add_dependencies(kvstore ntyco xdp_kern sockmap_kern)
 if(ENABLE_XDP_REPL)
     add_dependencies(kvstore wal_xdp_kern)
 endif()
-
-# ── kvs_slowlog: uprobe slow-command monitor ──────────────────────────
-set(SLOWLOG_BPF_SRC  ${CMAKE_SOURCE_DIR}/src/tools/kvs_slowlog.bpf.c)
-set(SLOWLOG_BPF_OBJ  ${CMAKE_BINARY_DIR}/kvs_slowlog.bpf.o)
-
-add_custom_command(
-    OUTPUT  ${SLOWLOG_BPF_OBJ}
-    COMMAND clang -O2 -g -target bpf
-            -D__TARGET_ARCH_x86
-            -I${CMAKE_SOURCE_DIR}/src/repl
-            -I/usr/include
-            -I/usr/include/x86_64-linux-gnu
-            -c ${SLOWLOG_BPF_SRC}
-            -o ${SLOWLOG_BPF_OBJ}
-    DEPENDS ${SLOWLOG_BPF_SRC}
-    COMMENT "Compiling kvs_slowlog BPF kernel program"
-)
-
-add_custom_target(kvs_slowlog_bpf DEPENDS ${SLOWLOG_BPF_OBJ})
-
-add_executable(kvs_slowlog src/tools/kvs_slowlog.c)
-
-target_include_directories(kvs_slowlog PRIVATE
-    ${LIBBPF_INCLUDE_DIRS}
-)
-
-target_link_libraries(kvs_slowlog PRIVATE
-    ${LIBBPF_LIBRARIES}
-    elf
-    dl
-)
-
-add_dependencies(kvs_slowlog kvs_slowlog_bpf)
-
-# ── kvs-top: live three-layer observability dashboard ────────────────
-add_executable(kvs_top
-    src/tools/kvs_top.c
-    src/bpf/bpf_pin.c
-    src/bpf/xdp_manager.c
-    src/bpf/sockmap_manager.c
-)
-
-target_include_directories(kvs_top PRIVATE
-    src/bpf
-    ${LIBBPF_INCLUDE_DIRS}
-)
-
-target_link_libraries(kvs_top PRIVATE
-    ${LIBBPF_LIBRARIES}
-    elf
-    dl
-)
-
-set_target_properties(kvs_top PROPERTIES OUTPUT_NAME "kvs-top")
 
 # ── testcase target ───────────────────────────────────────────────────
 add_executable(testcase test/testcase.c)

@@ -1,22 +1,8 @@
-/* xdp_kvs.kern.c — XDP passive monitor for kvstore GET hot-path
+/* xdp_kvs.kern.c — XDP passive packet monitor for kvstore GET traffic
  *
- * Phase 1 (monitoring-only):
- *   Parse incoming TCP packets on the configured port, identify RESP GET
- *   commands, look up the key in hot_cache, and record hit/miss stats.
- *   Always returns XDP_PASS — the kernel TCP stack and kvstore handle
- *   every request normally.  This program exists to:
- *     - measure would-be cache hit-rate before sockmap fast-path is built
- *     - keep hot_cache populated by userspace SET/DEL invalidations
- *     - serve as the foundation for Phase 5 (XDP CPU map for RX-side
- *       multi-core dispatch) once the multi-worker proactor lands
- *
- * Why no XDP_TX:
- *   The previous design crafted RESP replies in BPF and used XDP_TX to
- *   short-circuit the kernel TCP stack.  This caused a "dual-track"
- *   inconsistency: kernel TCP rcv_nxt did not advance for XDP-consumed
- *   packets, so any cache miss on a long-lived connection eventually
- *   desynchronised the server-side TCP state and stalled the client.
- *   The replacement plan (sockmap / sk_msg) lives in src/bpf/sockmap_*.
+ * Parse incoming TCP packets on the configured port, identify RESP GET
+ * commands, and record GET/skip/bypass counters in BPF maps.  It always
+ * returns XDP_PASS, so the kernel TCP stack and kvstore handle every request.
  *
  * Compile:
  *   clang -O2 -target bpf -I/usr/include -I/usr/include/x86_64-linux-gnu \
@@ -34,16 +20,6 @@
 
 /* ── BPF Maps ─────────────────────────────────────────────────────────── */
 
-/* Hot-key cache: populated/invalidated by userspace on every SET/DEL.
- * Read here only for hit/miss accounting; future sk_msg fast-path will
- * use the same map to actually serve the response. */
-struct {
-    __uint(type,        BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, XDP_CACHE_MAX_ENTRIES);
-    __type(key,         struct xdp_kvs_key);
-    __type(value,       struct xdp_kvs_val);
-} hot_cache SEC(".maps");
-
 /* Config: single-entry map so userspace can tell us which port to watch */
 struct {
     __uint(type,        BPF_MAP_TYPE_ARRAY);
@@ -52,8 +28,6 @@ struct {
     __type(value,       __u32);   /* host-byte-order port number */
 } config_map SEC(".maps");
 
-/* Stats counters (XDP_STAT_TX_DROP is preserved for ABI compatibility
- * with the userspace manager but is never incremented in monitor mode). */
 struct {
     __uint(type,        BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 4);
@@ -71,11 +45,8 @@ static __always_inline void stat_inc(__u32 idx) {
 /* ── RESP GET Parser ──────────────────────────────────────────────────── */
 /*
  * Match: *2\r\n$3\r\nGET\r\n$<N>\r\n<key>\r\n
- * Returns key length on success (1..XDP_KEY_MAX), 0 otherwise.
- * Writes key bytes into dst (caller must zero it first).
  */
-static __always_inline int parse_resp_get(const char *p, const char *end,
-                                          __u8 *dst)
+static __always_inline int parse_resp_get(const char *p, const char *end)
 {
     /* *2\r\n$3\r\nGET\r\n — 13 fixed bytes */
     if (p + 13 > end) return 0;
@@ -98,18 +69,11 @@ static __always_inline int parse_resp_get(const char *p, const char *end,
     if (p + 1 > end) return 0;
     if (p[0] >= '0' && p[0] <= '9') { klen = klen * 10 + (p[0] - '0'); p++; }
 
-    if (klen <= 0 || klen > XDP_KEY_MAX) return 0;
+    if (klen <= 0 || klen > XDP_PARSE_KEY_MAX) return 0;
     if (p + 2 > end || p[0] != '\r' || p[1] != '\n') return 0;
     p += 2;
 
     if (p + klen + 2 > end) return 0;
-
-    /* Bounded copy: constant loop bound + runtime break for verifier */
-    for (__u32 _i = 0; _i < XDP_KEY_MAX; _i++) {
-        if (_i >= (__u32)klen) break;
-        if (p + _i + 1 > end) break;
-        dst[_i] = ((const __u8 *)p)[_i];
-    }
 
     if (p[klen] != '\r' || p[klen + 1] != '\n') return 0;
     return klen;
@@ -162,39 +126,31 @@ int xdp_kvs_handler(struct xdp_md *ctx)
 
     /* O(1) shortcut for pipelined batches: a single
      * "*2\r\n$3\r\nGET\r\n$<N>\r\n<key>\r\n" is at most
-     * 19 + XDP_KEY_MAX (=64) + 1 (extra digit) = 84 bytes.
+     * 19 + XDP_PARSE_KEY_MAX (=64) + 1 (extra digit) = 84 bytes.
      * Anything larger must be multi-command — skip the parse. */
-    if ((char *)data_end - payload > (long)(20 + XDP_KEY_MAX)) {
+    if ((char *)data_end - payload > (long)(20 + XDP_PARSE_KEY_MAX)) {
         stat_inc(XDP_STAT_BYPASS);
         return XDP_PASS;
     }
 
     /* Parse RESP GET */
-    struct xdp_kvs_key map_key = {};
-    int klen = parse_resp_get(payload, (char *)data_end, map_key.data);
+    int klen = parse_resp_get(payload, (char *)data_end);
     if (klen == 0) {
-        stat_inc(XDP_STAT_BYPASS);
+        stat_inc(XDP_STAT_PARSE_SKIP);
         return XDP_PASS;
     }
-    map_key.len = (__u16)klen;
 
     /* Detect pipelined GETs in this segment (consumed < segment size) */
     {
         __u32 consumed = 19u + (__u32)klen + ((__u32)klen >= 10u ? 1u : 0u);
         const char *next = payload + consumed;
         if ((void *)next < data_end) {
-            stat_inc(XDP_STAT_BYPASS);
+            stat_inc(XDP_STAT_PARSE_SKIP);
             return XDP_PASS;
         }
     }
 
-    /* Single GET on this segment — count hit / miss for monitoring.
-     * Always XDP_PASS so the kernel TCP stack handles the response. */
-    if (bpf_map_lookup_elem(&hot_cache, &map_key)) {
-        stat_inc(XDP_STAT_HITS);
-    } else {
-        stat_inc(XDP_STAT_MISSES);
-    }
+    stat_inc(XDP_STAT_GET);
     return XDP_PASS;
 }
 

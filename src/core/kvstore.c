@@ -1,6 +1,9 @@
 #include "kvstore.h"
 #include "kv_type_string.h"
+#include "kv_type_hash.h"
 #include "vector_store.h"
+#include "vec_engine.h"
+#include "flat_index.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +15,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <pthread.h>      /* kvs_lat_slot_idx tid hash */
+#include <ctype.h>
 
 #include "rdma_repl.h"
 #include "wal_repl.h"
@@ -20,7 +24,6 @@
 #include "repl_stream.h"
 #include "persistence.h"
 #include "block.h"
-#include "xdp_manager.h"
 #include "sockmap_manager.h"
 
 /* Pack first 4 bytes of a command name into a uint32_t for jump-table dispatch */
@@ -181,11 +184,6 @@ void kvs_lat_record_ns(uint64_t ns) {
     atomic_fetch_add_explicit(&s->sum_ns, ns, memory_order_relaxed);
 }
 
-/* ==================== Vector cache/search layer ====================
- * AI local cache mode keeps STRING as a lightweight exact-key cache and
- * adds a separate in-memory vector store for semantic nearest-neighbour
- * lookup.  The old short-value fastpath cache is intentionally removed
- * from the main runtime path. */
 
 /* ==================== Utility ==================== */
 
@@ -283,7 +281,7 @@ static int token_to_ll(kvs_token_t t, long long *out) {
 
 /* ── Per-type cleanup before deleting an entry from the dict ── */
 static void entry_cleanup_by_type(kv_entry_t *e) {
-    (void)e;
+    hash_cleanup_entry(e);
 }
 
 /* Public wrapper: free any type-specific internal structures before dict_delete.
@@ -306,6 +304,320 @@ static inline void reply_bulk(DynBuf *wb, const char *s, int len) {
     dynbuf_cat(wb, hdr, hl);
     if (len > 0) dynbuf_cat(wb, s, len);
     dynbuf_lit(wb, "\r\n");
+}
+
+static int token_eq_ci(kvs_token_t t, const char *lit) {
+    size_t n = strlen(lit);
+    if (t.len != (int)n) return 0;
+    for (int i = 0; i < t.len; i++) {
+        if (toupper((unsigned char)t.ptr[i]) != toupper((unsigned char)lit[i])) return 0;
+    }
+    return 1;
+}
+
+static int token_to_float(kvs_token_t t, float *out) {
+    if (!out || t.len <= 0 || t.len >= 64) return -1;
+    char buf[64];
+    memcpy(buf, t.ptr, (size_t)t.len);
+    buf[t.len] = '\0';
+    char *end = NULL;
+    errno = 0;
+    float v = strtof(buf, &end);
+    if (errno != 0 || !end || *end != '\0') return -1;
+    *out = v;
+    return 0;
+}
+
+static int parse_metric_token(kvs_token_t t, vec_metric_t *out) {
+    if (!out) return -1;
+    char buf[16];
+    if (t.len <= 0 || t.len >= (int)sizeof(buf)) return -1;
+    for (int i = 0; i < t.len; i++) buf[i] = (char)toupper((unsigned char)t.ptr[i]);
+    buf[t.len] = '\0';
+    return vec_metric_parse(buf, (uint32_t)t.len, out);
+}
+
+static void reply_float_bulk(DynBuf *wb, float v) {
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "%.9g", (double)v);
+    reply_bulk(wb, buf, n);
+}
+
+static int parse_vector_args(kvs_token_t *tokens, int start, int argc,
+                             float *vec, uint32_t max_dim, uint32_t *dim_out) {
+    if (!vec || !dim_out || start >= argc) return -1;
+    uint32_t dim = 0;
+    for (int i = start; i < argc; i++) {
+        if (dim >= max_dim) return -1;
+        if (token_to_float(tokens[i], &vec[dim]) != 0) return -1;
+        dim++;
+    }
+    if (dim == 0) return -1;
+    *dim_out = dim;
+    return 0;
+}
+
+static dispatch_result_t vector_cmd_minimal(kvs_token_t cmd, kvs_token_t *tokens,
+                                            int argc, DynBuf *wb) {
+    if (TOKEN_EQ(cmd, "VEC.CREATE") || TOKEN_EQ(cmd, "VECTOR.CREATE")) {
+        if (argc < 4) {
+            dynbuf_lit(wb, "-ERR wrong number of arguments for vector create\r\n");
+            return DISPATCH_ERROR;
+        }
+        uint32_t dim = 0;
+        vec_metric_t metric = VEC_METRIC_L2;
+        for (int i = 2; i < argc; i++) {
+            if (token_eq_ci(tokens[i], "DIM") && i + 1 < argc) {
+                long long v;
+                if (token_to_ll(tokens[++i], &v) < 0 || v <= 0 || v > VEC_MAX_DIM) {
+                    dynbuf_lit(wb, "-ERR invalid vector dimension\r\n");
+                    return DISPATCH_ERROR;
+                }
+                dim = (uint32_t)v;
+            } else if (token_eq_ci(tokens[i], "METRIC") && i + 1 < argc) {
+                if (parse_metric_token(tokens[++i], &metric) != 0) {
+                    dynbuf_lit(wb, "-ERR invalid vector metric\r\n");
+                    return DISPATCH_ERROR;
+                }
+            }
+        }
+        if (dim == 0) {
+            dynbuf_lit(wb, "-ERR missing vector dimension\r\n");
+            return DISPATCH_ERROR;
+        }
+        int rc = vec_engine_create_collection(tokens[1].ptr, (uint32_t)tokens[1].len,
+                                              dim, metric, VEC_INDEX_FLAT);
+        if (rc < 0) dynbuf_lit(wb, "-ERR vector create failed\r\n");
+        else dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        return rc < 0 ? DISPATCH_ERROR : DISPATCH_OK;
+    }
+
+    if (TOKEN_EQ(cmd, "VEC.INSERT") || TOKEN_EQ(cmd, "VECTOR.INSERT")) {
+        if (argc < 5) {
+            dynbuf_lit(wb, "-ERR wrong number of arguments for vector insert\r\n");
+            return DISPATCH_ERROR;
+        }
+        float vec[VEC_MAX_DIM];
+        uint32_t dim = 0;
+        if (parse_vector_args(tokens, 3, argc, vec, VEC_MAX_DIM, &dim) != 0) {
+            dynbuf_lit(wb, "-ERR invalid vector payload\r\n");
+            return DISPATCH_ERROR;
+        }
+        int rc = vec_engine_put(tokens[1].ptr, (uint32_t)tokens[1].len,
+                                tokens[2].ptr, (uint32_t)tokens[2].len,
+                                vec, dim, VEC_METRIC_L2);
+        if (rc < 0) dynbuf_lit(wb, "-ERR vector insert failed\r\n");
+        else dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        return rc < 0 ? DISPATCH_ERROR : DISPATCH_OK;
+    }
+
+    if (TOKEN_EQ(cmd, "VEC.DELETE") || TOKEN_EQ(cmd, "VECTOR.DELETE")) {
+        if (argc != 3) {
+            dynbuf_lit(wb, "-ERR wrong number of arguments for vector delete\r\n");
+            return DISPATCH_ERROR;
+        }
+        int rc = vec_engine_delete(tokens[1].ptr, (uint32_t)tokens[1].len,
+                                   tokens[2].ptr, (uint32_t)tokens[2].len);
+        reply_integer(wb, rc > 0 ? 1 : 0);
+        return DISPATCH_OK;
+    }
+
+    if (TOKEN_EQ(cmd, "VEC.GET") || TOKEN_EQ(cmd, "VECTOR.GET")) {
+        if (argc != 3) {
+            dynbuf_lit(wb, "-ERR wrong number of arguments for vector get\r\n");
+            return DISPATCH_ERROR;
+        }
+        float vec[VEC_MAX_DIM];
+        uint32_t dim = 0;
+        int rc = vec_engine_get(tokens[1].ptr, (uint32_t)tokens[1].len,
+                                tokens[2].ptr, (uint32_t)tokens[2].len,
+                                vec, &dim);
+        if (rc <= 0) {
+            dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
+            return DISPATCH_OK;
+        }
+        char hdr[32];
+        int n = snprintf(hdr, sizeof(hdr), "*%u\r\n", dim);
+        dynbuf_cat(wb, hdr, n);
+        for (uint32_t i = 0; i < dim; i++) reply_float_bulk(wb, vec[i]);
+        return DISPATCH_OK;
+    }
+
+    if (TOKEN_EQ(cmd, "VEC.SEARCH") || TOKEN_EQ(cmd, "VECTOR.SEARCH")) {
+        if (argc < 6 || !token_eq_ci(tokens[2], "TOPK")) {
+            dynbuf_lit(wb, "-ERR syntax: VEC.SEARCH collection TOPK k f1 f2 ...\r\n");
+            return DISPATCH_ERROR;
+        }
+        long long k;
+        if (token_to_ll(tokens[3], &k) < 0 || k <= 0 || k > VEC_MAX_TOPK) {
+            dynbuf_lit(wb, "-ERR invalid topk\r\n");
+            return DISPATCH_ERROR;
+        }
+        float query[VEC_MAX_DIM];
+        uint32_t dim = 0;
+        if (parse_vector_args(tokens, 4, argc, query, VEC_MAX_DIM, &dim) != 0) {
+            dynbuf_lit(wb, "-ERR invalid query vector\r\n");
+            return DISPATCH_ERROR;
+        }
+        vec_search_result_t r;
+        int rc = vec_engine_search(tokens[1].ptr, (uint32_t)tokens[1].len,
+                                   query, dim, (uint32_t)k, &r);
+        if (rc < 0) {
+            dynbuf_lit(wb, "-ERR vector search failed\r\n");
+            return DISPATCH_ERROR;
+        }
+        vec_result_sort(&r);
+        char hdr[32];
+        int n = snprintf(hdr, sizeof(hdr), "*%u\r\n", r.len);
+        dynbuf_cat(wb, hdr, n);
+        for (uint32_t i = 0; i < r.len; i++) {
+            dynbuf_lit(wb, "*2\r\n");
+            reply_bulk(wb, r.items[i].id, (int)r.items[i].id_len);
+            reply_float_bulk(wb, r.items[i].score);
+        }
+        vec_result_free(&r);
+        return DISPATCH_OK;
+    }
+
+    if (TOKEN_EQ(cmd, "VEC.COUNT") || TOKEN_EQ(cmd, "VECTOR.COUNT")) {
+        if (argc != 2) {
+            dynbuf_lit(wb, "-ERR wrong number of arguments for vector count\r\n");
+            return DISPATCH_ERROR;
+        }
+        reply_integer(wb, (long long)vec_engine_count_collection(tokens[1].ptr, (uint32_t)tokens[1].len));
+        return DISPATCH_OK;
+    }
+
+    dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
+    return DISPATCH_ERROR;
+}
+
+static dispatch_result_t ai_cmd_minimal(kvs_token_t cmd, kvs_token_t *tokens,
+                                        int argc, DynBuf *wb) {
+    const char *collection = "ai_cache";
+    const uint32_t collection_len = 8;
+
+    if (TOKEN_EQ(cmd, "AI.PUT")) {
+        if (argc < 5) {
+            dynbuf_lit(wb, "-ERR syntax: AI.PUT key response f1 f2 ...\r\n");
+            return DISPATCH_ERROR;
+        }
+        float vec[VEC_MAX_DIM];
+        uint32_t dim = 0;
+        if (parse_vector_args(tokens, 3, argc, vec, VEC_MAX_DIM, &dim) != 0) {
+            dynbuf_lit(wb, "-ERR invalid embedding\r\n");
+            return DISPATCH_ERROR;
+        }
+        uint64_t hash = kv_hash((const uint8_t *)tokens[1].ptr, (uint32_t)tokens[1].len);
+        SHARD_WRLOCK(hash);
+        if (string_engine_set(tokens[1].ptr, (uint32_t)tokens[1].len,
+                              tokens[2].ptr, (uint32_t)tokens[2].len, 0, 0) != 0) {
+            dynbuf_lit(wb, "-ERR AI cache write failed\r\n");
+            return DISPATCH_ERROR;
+        }
+        SHARD_RELEASE();
+        int rc = vec_engine_put(collection, collection_len,
+                                tokens[1].ptr, (uint32_t)tokens[1].len,
+                                vec, dim, VEC_METRIC_COSINE);
+        if (rc < 0) {
+            dynbuf_lit(wb, "-ERR AI vector index write failed\r\n");
+            return DISPATCH_ERROR;
+        }
+        dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        return DISPATCH_OK;
+    }
+
+    if (TOKEN_EQ(cmd, "AI.GET")) {
+        if (argc != 2) {
+            dynbuf_lit(wb, "-ERR wrong number of arguments for AI.GET\r\n");
+            return DISPATCH_ERROR;
+        }
+        uint64_t hash = kv_hash((const uint8_t *)tokens[1].ptr, (uint32_t)tokens[1].len);
+        SHARD_LOCK(hash, 0);
+        uint32_t vlen = 0;
+        uint8_t enc = 0;
+        const char *v = string_engine_get(tokens[1].ptr, (uint32_t)tokens[1].len, &vlen, &enc);
+        if (!v) dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
+        else if (enc == KV_ENCODING_INT) {
+            char buf[32];
+            int n = snprintf(buf, sizeof(buf), "%lld", (long long)*(const int64_t *)v);
+            reply_bulk(wb, buf, n);
+        } else {
+            reply_bulk(wb, v, (int)vlen);
+        }
+        return DISPATCH_OK;
+    }
+
+    if (TOKEN_EQ(cmd, "AI.SEARCH")) {
+        if (argc < 4) {
+            dynbuf_lit(wb, "-ERR syntax: AI.SEARCH topk f1 f2 ...\r\n");
+            return DISPATCH_ERROR;
+        }
+        long long k;
+        if (token_to_ll(tokens[1], &k) < 0 || k <= 0 || k > VEC_MAX_TOPK) {
+            dynbuf_lit(wb, "-ERR invalid topk\r\n");
+            return DISPATCH_ERROR;
+        }
+        float query[VEC_MAX_DIM];
+        uint32_t dim = 0;
+        if (parse_vector_args(tokens, 2, argc, query, VEC_MAX_DIM, &dim) != 0) {
+            dynbuf_lit(wb, "-ERR invalid query embedding\r\n");
+            return DISPATCH_ERROR;
+        }
+        vec_search_result_t r;
+        int rc = vec_engine_search(collection, collection_len, query, dim, (uint32_t)k, &r);
+        if (rc < 0) {
+            dynbuf_lit(wb, "-ERR AI vector search failed\r\n");
+            return DISPATCH_ERROR;
+        }
+        vec_result_sort(&r);
+        char hdr[32];
+        int n = snprintf(hdr, sizeof(hdr), "*%u\r\n", r.len);
+        dynbuf_cat(wb, hdr, n);
+        for (uint32_t i = 0; i < r.len; i++) {
+            uint64_t hash = kv_hash((const uint8_t *)r.items[i].id, r.items[i].id_len);
+            SHARD_LOCK(hash, 0);
+            uint32_t vlen = 0;
+            uint8_t enc = 0;
+            const char *v = string_engine_get(r.items[i].id, r.items[i].id_len, &vlen, &enc);
+            dynbuf_lit(wb, "*3\r\n");
+            reply_bulk(wb, r.items[i].id, (int)r.items[i].id_len);
+            reply_float_bulk(wb, r.items[i].score);
+            if (!v) dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
+            else if (enc == KV_ENCODING_INT) {
+                char buf[32];
+                int bn = snprintf(buf, sizeof(buf), "%lld", (long long)*(const int64_t *)v);
+                reply_bulk(wb, buf, bn);
+            } else {
+                reply_bulk(wb, v, (int)vlen);
+            }
+            SHARD_RELEASE();
+        }
+        vec_result_free(&r);
+        return DISPATCH_OK;
+    }
+
+    if (TOKEN_EQ(cmd, "AI.DELETE")) {
+        if (argc != 2) {
+            dynbuf_lit(wb, "-ERR wrong number of arguments for AI.DELETE\r\n");
+            return DISPATCH_ERROR;
+        }
+        uint64_t hash = kv_hash((const uint8_t *)tokens[1].ptr, (uint32_t)tokens[1].len);
+        long long ndel = 0;
+        SHARD_WRLOCK(hash);
+        kv_entry_t *e = dict_find(kv_dict_for(hash), tokens[1].ptr, (uint32_t)tokens[1].len, hash);
+        if (e) {
+            entry_cleanup_by_type(e);
+            if (dict_delete(kv_dict_for(hash), tokens[1].ptr, (uint32_t)tokens[1].len, hash) == 0) ndel = 1;
+        }
+        SHARD_RELEASE();
+        vec_engine_delete(collection, collection_len, tokens[1].ptr, (uint32_t)tokens[1].len);
+        reply_integer(wb, ndel);
+        return DISPATCH_OK;
+    }
+
+    dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
+    return DISPATCH_ERROR;
 }
 
 /* =====================================================================
@@ -359,13 +671,6 @@ static int fmt_threads(char *out, int cap) {
 }
 static int fmt_port(char *out, int cap) {
     return snprintf(out, cap, "%d", kvs_config.port);
-}
-static int fmt_xdp(char *out, int cap) {
-    const char *s = kvs_config.xdp_enabled ? "yes" : "no";
-    int n = (int)strlen(s);
-    if (n > cap) n = cap;
-    memcpy(out, s, n);
-    return n;
 }
 static int fmt_appendonly(char *out, int cap) {
     const char *s = ENABLE_AOF ? "yes" : "no";
@@ -441,7 +746,6 @@ static const struct cfg_entry g_cfg_table[] = {
     { "persistence",  fmt_persistence, NULL },
     { "threads",      fmt_threads,     NULL },
     { "port",         fmt_port,        NULL },
-    { "xdp",          fmt_xdp,         NULL },
     { "appendonly",   fmt_appendonly,  NULL },
     { "save",         fmt_save,        NULL },
     { "cpu_pin",      fmt_cpu_pin,     NULL },
@@ -702,10 +1006,6 @@ static dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) 
         APPEND("total_commands_processed:%llu\r\n",
                (unsigned long long)atomic_load_explicit(&g_kvs_total_commands,
                                                          memory_order_relaxed));
-        APPEND("vector_store_enabled:1\r\n");
-        APPEND("vector_store_count:%llu\r\n",
-               (unsigned long long)vector_store_count());
-
         /* Phase 10.6 — dispatch latency histogram (16 log2-spaced buckets,
          * 1 µs .. ≥16 ms).  Emit per-bucket counts for raw consumption
          * (Prometheus, plotting, etc.) plus derived p50/p99/p999/mean for
@@ -954,20 +1254,23 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
-    /* VECTOR.* — local AI cache + flat vector search command family. */
-    if (cmd.len >= 7 && memcmp(cmd.ptr, "VECTOR.", 7) == 0) {
-        vector_mutation_buf_t vmut = {0};
-        int is_vector_write = vector_cmd_is_write(cmd);
-        int have_vmut = 0;
-        if (is_vector_write && !g_in_reload &&
-            vector_mutation_encode_from_cmd(cmd, tokens, argc, &vmut) == 0)
-            have_vmut = 1;
-        dispatch_result_t vr = vector_cmd(cmd, tokens, argc, wb);
-        if (vr == DISPATCH_OK && have_vmut) {
-            kvs_write_journal_append_kind(KVS_MUT_KIND_VECTOR_BIN, vmut.buf, (int)vmut.len);
-        }
-        vector_mutation_buf_free(&vmut);
+    if ((cmd.len >= 4 && memcmp(cmd.ptr, "VEC.", 4) == 0) ||
+        (cmd.len >= 7 && memcmp(cmd.ptr, "VECTOR.", 7) == 0)) {
+        int is_write = TOKEN_EQ(cmd, "VEC.CREATE") || TOKEN_EQ(cmd, "VECTOR.CREATE") ||
+                       TOKEN_EQ(cmd, "VEC.INSERT") || TOKEN_EQ(cmd, "VECTOR.INSERT") ||
+                       TOKEN_EQ(cmd, "VEC.DELETE") || TOKEN_EQ(cmd, "VECTOR.DELETE");
+        dispatch_result_t vr = vector_cmd_minimal(cmd, tokens, argc, wb);
+        if (vr == DISPATCH_OK && is_write && !g_in_reload)
+            kvs_write_journal_append(msg_raw, msg_len);
         return vr;
+    }
+
+    if (cmd.len >= 3 && memcmp(cmd.ptr, "AI.", 3) == 0) {
+        int is_write = TOKEN_EQ(cmd, "AI.PUT") || TOKEN_EQ(cmd, "AI.DELETE");
+        dispatch_result_t ar = ai_cmd_minimal(cmd, tokens, argc, wb);
+        if (ar == DISPATCH_OK && is_write && !g_in_reload)
+            kvs_write_journal_append(msg_raw, msg_len);
+        return ar;
     }
 
     /* SELECT — single-DB server: accept "SELECT 0", reject others. */
@@ -1028,7 +1331,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         if (!g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
-            if (kvs_config.xdp_enabled) xdp_cache_flush_all();
         }
         return DISPATCH_OK;
     }
@@ -1213,6 +1515,16 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         cmd_type = KV_TYPE_STRING; is_write = 1;
     } else if (TOKEN_EQ(cmd, "GET") || TOKEN_EQ(cmd, "STRLEN")) {
         cmd_type = KV_TYPE_STRING; is_write = 0;
+    } else if (TOKEN_EQ(cmd, "HSET") || TOKEN_EQ(cmd, "HMSET") ||
+               TOKEN_EQ(cmd, "HSETNX") || TOKEN_EQ(cmd, "HDEL") ||
+               TOKEN_EQ(cmd, "HINCRBY") || TOKEN_EQ(cmd, "HINCRBYFLOAT")) {
+        cmd_type = KV_TYPE_HASH; is_write = 1;
+    } else if (TOKEN_EQ(cmd, "HGET") || TOKEN_EQ(cmd, "HMGET") ||
+               TOKEN_EQ(cmd, "HGETALL") || TOKEN_EQ(cmd, "HKEYS") ||
+               TOKEN_EQ(cmd, "HVALS") || TOKEN_EQ(cmd, "HLEN") ||
+               TOKEN_EQ(cmd, "HEXISTS") || TOKEN_EQ(cmd, "HSTRLEN") ||
+               TOKEN_EQ(cmd, "HRANDFIELD")) {
+        cmd_type = KV_TYPE_HASH; is_write = 0;
     } else {
         dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
         return DISPATCH_ERROR;
@@ -1248,8 +1560,13 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         const char *r = "+none\r\n";
         int rlen = 7;
         if (entry) {
-            r = "+string\r\n";
-            rlen = 9;
+            if (entry_type(entry) == KV_TYPE_HASH) {
+                r = "+hash\r\n";
+                rlen = 7;
+            } else {
+                r = "+string\r\n";
+                rlen = 9;
+            }
         }
         dynbuf_cat(wb, r, rlen);
         return DISPATCH_OK;
@@ -1317,6 +1634,9 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         string_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb, msg_raw, msg_len);
         r = DISPATCH_OK;
         break;
+    case KV_TYPE_HASH:
+        r = hash_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb, msg_raw, msg_len, c ? c->client : NULL);
+        break;
     default:
         dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
         r = DISPATCH_ERROR;
@@ -1359,7 +1679,7 @@ int init_kvengine(void) {
     kv_shards_init();
     vector_store_init();
     block_init();
-    printf("Using string + vector engine (%u id shards, flat vector search)\n", KV_NR_SHARDS);
+    printf("Using string/hash + vector extension engine (%u id shards, flat vector search)\n", KV_NR_SHARDS);
     return 0;
 }
 
@@ -1443,8 +1763,6 @@ int main(int argc, char *argv[]) {
     }
     if (kvs_config.xdp_repl_enabled && kvs_config.rdma_role == ROLE_MASTER)
         repl_stream_start_master();
-    if (kvs_config.xdp_enabled)
-        xdp_manager_init(kvs_config.xdp_iface, kvs_config.port);
     if (kvs_config.sockmap_enabled)
         sockmap_manager_init(kvs_config.port, NULL);
     if (kvs_config.rdma_sync_enabled) {
@@ -1488,7 +1806,6 @@ int main(int argc, char *argv[]) {
     kvs_wal_persist_stop();
     kvs_journal_shutdown();
     if (kvs_config.sockmap_enabled) sockmap_manager_stop();
-    if (kvs_config.xdp_enabled) xdp_manager_stop();
     dest_kvengine();
     return 0;
 }

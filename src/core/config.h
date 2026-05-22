@@ -50,13 +50,8 @@ typedef struct {
     /* Both: TCP incremental sync port */
     int  incr_port;
 
-    /* XDP hot-path acceleration */
-    int  xdp_enabled;
-    char xdp_iface[32];
-
     /* XDP/AF_XDP WAL replication bypass (Phase 11) */
     int  xdp_repl_enabled;
-    char xdp_ifname[32];
     int  xdp_driver_mode;  /* 0 = generic (SKB), 1 = driver mode */
     char xdp_repl_ifname[32];
     int  xdp_repl_queue;

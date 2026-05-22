@@ -9,19 +9,6 @@
  * Returns 0 on success, -1 on failure (kvstore runs normally without XDP). */
 int  xdp_manager_init(const char *iface, int port);
 
-/* Update or insert a key-value pair in the hot cache.
- * Call after every SET / GETSET command completes.
- * Values longer than XDP_VAL_MAX are silently ignored. */
-void xdp_cache_put(const char *key, int klen, const char *val, int vlen);
-
-/* Remove a key from the hot cache.
- * Call after DEL, RENAME (old key), or EXPIRE expiry. */
-void xdp_cache_del(const char *key, int klen);
-
-/* Remove ALL entries from the hot cache.
- * Call after FLUSHALL / FLUSHDB to prevent stale cache hits. */
-void xdp_cache_flush_all(void);
-
 /* Detach XDP program and release all BPF resources.
  * Safe to call even if xdp_manager_init() failed. */
 void xdp_manager_stop(void);

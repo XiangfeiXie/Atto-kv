@@ -166,20 +166,30 @@ static void rdb_buf_put(rdb_buf_t *b, const void *p, size_t n) {
 }
 
 #include "kv_dict.h"
+#include "kv_type_hash.h"
 
 /* RDB now persists only the STRING exact-key cache. */
 static inline int rdb_entry_payload(kv_entry_t *e, const char **data, int *dlen) {
-    if (!e || entry_type(e) != KV_TYPE_STRING) return -1;
-    *data = entry_payload(e);
-    *dlen = (int)entry_payload_len(e);
+    if (!e) return -1;
+    if (entry_type(e) == KV_TYPE_HASH && entry_encoding(e) == KV_ENCODING_DICT) return -1;
+    *data = e->data;
+    *dlen = (int)e->val_len;
     return 0;
 }
 
 /* Serialize one STRING dict entry to RDB binary format. */
 static void rdb_save_callback_buf(kv_entry_t *e, void *priv) {
+    char *owned = NULL;
     const char *data_ptr = NULL;
     int dlen = 0;
-    if (rdb_entry_payload(e, &data_ptr, &dlen) != 0) return;
+    uint32_t owned_len = 0;
+    if (e && entry_type(e) == KV_TYPE_HASH && entry_encoding(e) == KV_ENCODING_DICT) {
+        if (hash_flatten_to_packed(e, &owned, &owned_len) != 0) return;
+        data_ptr = owned;
+        dlen = (int)owned_len;
+    } else if (rdb_entry_payload(e, &data_ptr, &dlen) != 0) {
+        return;
+    }
 
     rdb_buf_t *b = (rdb_buf_t *)priv;
     const char *key = entry_key(e);
@@ -191,12 +201,21 @@ static void rdb_save_callback_buf(kv_entry_t *e, void *priv) {
     rdb_buf_put(b, &dlen, sizeof(int));
     rdb_buf_put(b, data_ptr, (size_t)dlen);
     rdb_buf_put(b, &expire, sizeof(long long));
+    free(owned);
 }
 
 void serialize_entry_to_buf(DynBuf *out, kv_entry_t *e) {
+    char *owned = NULL;
     const char *data_ptr = NULL;
     int dlen = 0;
-    if (rdb_entry_payload(e, &data_ptr, &dlen) != 0) return;
+    uint32_t owned_len = 0;
+    if (e && entry_type(e) == KV_TYPE_HASH && entry_encoding(e) == KV_ENCODING_DICT) {
+        if (hash_flatten_to_packed(e, &owned, &owned_len) != 0) return;
+        data_ptr = owned;
+        dlen = (int)owned_len;
+    } else if (rdb_entry_payload(e, &data_ptr, &dlen) != 0) {
+        return;
+    }
 
     const char *key = entry_key(e);
     int klen = (int)e->key_len;
@@ -207,18 +226,27 @@ void serialize_entry_to_buf(DynBuf *out, kv_entry_t *e) {
     dynbuf_append(out, (const char *)&dlen, sizeof(int));
     dynbuf_append(out, data_ptr, dlen);
     dynbuf_append(out, (const char *)&expire, sizeof(long long));
+    free(owned);
 }
 
 int serialize_entry_inline(char *dst, size_t max_space, kv_entry_t *e) {
+    char *owned = NULL;
     const char *data_ptr = NULL;
     int dlen = 0;
-    if (rdb_entry_payload(e, &data_ptr, &dlen) != 0) return 0;
+    uint32_t owned_len = 0;
+    if (e && entry_type(e) == KV_TYPE_HASH && entry_encoding(e) == KV_ENCODING_DICT) {
+        if (hash_flatten_to_packed(e, &owned, &owned_len) != 0) return 0;
+        data_ptr = owned;
+        dlen = (int)owned_len;
+    } else if (rdb_entry_payload(e, &data_ptr, &dlen) != 0) {
+        return 0;
+    }
 
     const char *key = entry_key(e);
     int klen = (int)e->key_len;
     long long expire = e->expire;
     int total = (int)(sizeof(int) + klen + sizeof(int) + dlen + sizeof(long long));
-    if (total > (int)max_space) return -1;
+    if (total > (int)max_space) { free(owned); return -1; }
 
     char *q = dst;
     memcpy(q, &klen, sizeof(int)); q += sizeof(int);
@@ -226,6 +254,7 @@ int serialize_entry_inline(char *dst, size_t max_space, kv_entry_t *e) {
     memcpy(q, &dlen, sizeof(int)); q += sizeof(int);
     memcpy(q, data_ptr, dlen);     q += dlen;
     memcpy(q, &expire, sizeof(long long));
+    free(owned);
     return total;
 }
 
@@ -587,13 +616,21 @@ int rdb_load_stream_append(const char *buf, size_t len) {
 
         if (!(p = mread(p, end, &expire, sizeof(long long)))) break;
         if (e && expire) e->expire = expire;
+        if (e) hash_rebuild_encoding(e);
         loaded++;
     }
 
     return loaded;
 }
 
-void rdb_rebuild_all_encodings(void) { }
+void rdb_rebuild_all_encodings(void) {
+    kv_shards_iter_t it;
+    kv_shards_iter_init(&it);
+    kv_entry_t *e;
+    while ((e = kv_shards_iter_next(&it)) != NULL)
+        hash_rebuild_encoding(e);
+    kv_shards_iter_free(&it);
+}
 
 /* In-memory RDB loader: parses the same binary format as rdb_load_mmap()
  * but operates on a buffer already in memory (no file, no mmap).

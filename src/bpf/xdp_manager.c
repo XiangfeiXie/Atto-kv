@@ -1,9 +1,8 @@
-/* xdp_manager.c — userspace side of the XDP hot-path accelerator.
+/* xdp_manager.c — userspace side of the XDP packet monitor.
  *
  * Responsibilities:
  *   - Load xdp_kvs.kern.o (BPF ELF) via libbpf.
  *   - Attach the XDP program to the target network interface.
- *   - Expose put/del helpers that maintain the hot_cache BPF map.
  *   - Expose stats query.
  *   - Clean shutdown (detach + unload).
  */
@@ -28,7 +27,6 @@
 
 static struct bpf_object *g_obj        = NULL;
 static struct bpf_link   *g_link       = NULL;
-static int                g_cache_fd   = -1;   /* hot_cache map fd  */
 static int                g_config_fd  = -1;   /* config_map fd     */
 static int                g_stats_fd   = -1;   /* stats_map fd      */
 static int                g_ifindex    = 0;
@@ -133,16 +131,13 @@ int xdp_manager_init(const char *iface, int port) {
     /* Resolve map file descriptors */
     struct bpf_map *m;
 
-    m = bpf_object__find_map_by_name(g_obj, "hot_cache");
-    g_cache_fd  = m ? bpf_map__fd(m) : -1;
-
     m = bpf_object__find_map_by_name(g_obj, "config_map");
     g_config_fd = m ? bpf_map__fd(m) : -1;
 
     m = bpf_object__find_map_by_name(g_obj, "stats_map");
     g_stats_fd  = m ? bpf_map__fd(m) : -1;
 
-    if (g_cache_fd < 0 || g_config_fd < 0) {
+    if (g_config_fd < 0) {
         fprintf(stderr, "[XDP] failed to find required BPF maps\n");
         xdp_manager_stop();
         return -1;
@@ -162,40 +157,11 @@ int xdp_manager_init(const char *iface, int port) {
 
     /* Pin maps so external observers (kvs-top) can read them. Best-effort. */
     if (g_stats_fd >= 0) kvs_bpf_pin_map(g_stats_fd, "xdp_stats");
-    if (g_cache_fd >= 0) kvs_bpf_pin_map(g_cache_fd, "xdp_hot_cache");
 
     g_xdp_ready = 1;
-    printf("[XDP] attached to %s (ifindex=%d) port=%d, hot_cache=%d slots\n",
-           iface, g_ifindex, port, XDP_CACHE_MAX_ENTRIES);
+    printf("[XDP] attached to %s (ifindex=%d) port=%d\n",
+           iface, g_ifindex, port);
     return 0;
-}
-
-void xdp_cache_put(const char *key, int klen, const char *val, int vlen) {
-    if (!g_xdp_ready || g_cache_fd < 0) return;
-    if (klen <= 0 || klen > XDP_KEY_MAX) return;
-    if (vlen <= 0 || vlen > XDP_VAL_MAX) return;
-
-    struct xdp_kvs_key k = {};
-    struct xdp_kvs_val v = {};
-
-    k.len = (__u16)klen;
-    memcpy(k.data, key, (size_t)klen);
-
-    v.len = (__u16)vlen;
-    memcpy(v.data, val, (size_t)vlen);
-
-    bpf_map_update_elem(g_cache_fd, &k, &v, BPF_ANY);
-}
-
-void xdp_cache_del(const char *key, int klen) {
-    if (!g_xdp_ready || g_cache_fd < 0) return;
-    if (klen <= 0 || klen > XDP_KEY_MAX) return;
-
-    struct xdp_kvs_key k = {};
-    k.len = (__u16)klen;
-    memcpy(k.data, key, (size_t)klen);
-
-    bpf_map_delete_elem(g_cache_fd, &k);
 }
 
 void xdp_manager_stats(uint64_t *hits, uint64_t *misses,
@@ -211,26 +177,15 @@ void xdp_manager_stats(uint64_t *hits, uint64_t *misses,
     __u32 k;
     __u64 v = 0;
 
-    if (hits)    { k = XDP_STAT_HITS;    v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *hits    = v; }
-    if (misses)  { k = XDP_STAT_MISSES;  v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *misses  = v; }
-    if (tx_drop) { k = XDP_STAT_TX_DROP; v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *tx_drop = v; }
+    if (hits)    { k = XDP_STAT_GET;        v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *hits    = v; }
+    if (misses)  { k = XDP_STAT_PARSE_SKIP; v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *misses  = v; }
+    if (tx_drop) { k = XDP_STAT_RESERVED;   v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *tx_drop = v; }
     if (bypass)  { k = XDP_STAT_BYPASS;  v = 0; bpf_map_lookup_elem(g_stats_fd, &k, &v); *bypass  = v; }
-}
-
-void xdp_cache_flush_all(void) {
-    if (!g_xdp_ready || g_cache_fd < 0) return;
-    struct xdp_kvs_key next;
-    /* Always pass NULL as prev_key so we restart from the first entry after
-     * each deletion; this is the safe iteration-with-deletion pattern for
-     * BPF LRU hash maps. */
-    while (bpf_map_get_next_key(g_cache_fd, NULL, &next) == 0)
-        bpf_map_delete_elem(g_cache_fd, &next);
 }
 
 void xdp_manager_stop(void) {
     if (g_xdp_ready) {
         kvs_bpf_unpin_map("xdp_stats");
-        kvs_bpf_unpin_map("xdp_hot_cache");
     }
 
     if (g_link) {
@@ -246,7 +201,6 @@ void xdp_manager_stop(void) {
         g_obj = NULL;
     }
 
-    g_cache_fd  = -1;
     g_config_fd = -1;
     g_stats_fd  = -1;
     g_ifindex   = 0;

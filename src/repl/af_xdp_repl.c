@@ -358,11 +358,11 @@ int af_xdp_check_drv_support(const char *ifname)
     int ifindex = if_nametoindex(ifname);
     if (ifindex == 0) return 0;
     
-    struct xdp_program *prog = NULL;
-    int ret = xdp_program__create(&prog, NULL, "xdp", NULL);
-    if (ret) return 0;
-    
-    ret = xdp_program__attach(prog, ifindex, XDP_MODE_NATIVE, 0);
+    DECLARE_LIBXDP_OPTS(xdp_program_opts, opts, .open_filename = "xdp");
+    struct xdp_program *prog = xdp_program__create(&opts);
+    if (!prog) return 0;
+
+    int ret = xdp_program__attach(prog, ifindex, XDP_MODE_NATIVE, 0);
     int supported = (ret == 0);
     
     if (supported) {

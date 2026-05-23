@@ -1,4 +1,7 @@
 #include "xdp_repl_manager.h"
+#include "xdp_incr_repl.h"
+#include "dynbuf.h"
+#include "config.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -127,7 +130,13 @@ static int xsk_init(void)
     struct xsk_umem_config uc = {.fill_size=RING_SIZE,.comp_size=RING_SIZE,.frame_size=FRAME_SIZE,.frame_headroom=XSK_UMEM__DEFAULT_FRAME_HEADROOM,.flags=0};
     int rc = xsk_umem__create(&g.umem, g.umem_area, g.umem_size, &g.fq, &g.cq, &uc);
     if (rc) return -1;
-    struct xsk_socket_config xc = {.rx_size=RING_SIZE,.tx_size=RING_SIZE,.xdp_flags=g.xdp_flags,.bind_flags=XDP_USE_NEED_WAKEUP | (g.zero_copy ? XDP_ZEROCOPY : XDP_COPY)};
+    struct xsk_socket_config xc = {
+        .rx_size = RING_SIZE,
+        .tx_size = RING_SIZE,
+        .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
+        .xdp_flags = g.xdp_flags,
+        .bind_flags = XDP_USE_NEED_WAKEUP | (g.zero_copy ? XDP_ZEROCOPY : XDP_COPY)
+    };
     rc = xsk_socket__create(&g.xsk, g.ifname, g.queue_id, g.umem, &g.rx, &g.tx, &xc);
     if (rc) return -1;
     int fd = xsk_socket__fd(g.xsk);
@@ -145,7 +154,8 @@ int xdp_repl_manager_init(const char *ifname, int queue_id, int udp_port, int ze
     snprintf(g.ifname, sizeof(g.ifname), "%s", ifname);
     g.queue_id = queue_id; g.udp_port = udp_port; g.zero_copy = zero_copy_required;
     g.ifindex = (int)if_nametoindex(ifname);
-    g.xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST | XDP_FLAGS_SKB_MODE;
+    g.xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST |
+                  (kvs_config.xdp_driver_mode ? XDP_FLAGS_DRV_MODE : XDP_FLAGS_SKB_MODE);
     if (g.ifindex <= 0 || bpf_load_attach() != 0 || xsk_init() != 0) {
         fprintf(stderr, "[XDP-REPL] AF_XDP init failed on %s: %s\n", ifname, strerror(errno));
         xdp_repl_manager_stop();
@@ -211,8 +221,20 @@ int xdp_repl_poll(void)
             const struct iphdr *ip = (const struct iphdr *)(eth + 1);
             const struct udphdr *udp = (const struct udphdr *)((const char *)ip + ip->ihl * 4);
             const kvs_repl_frame_hdr_t *h = (const kvs_repl_frame_hdr_t *)(udp + 1);
+            uint32_t udp_len = ntohs(udp->len);
+            uint32_t repl_len = udp_len >= sizeof(*udp) + sizeof(*h)
+                ? udp_len - (uint32_t)sizeof(*udp) - (uint32_t)sizeof(*h)
+                : 0;
+            const char *payload = (const char *)(h + 1);
             if (ntohs(eth->h_proto) == ETH_P_IP && ip->protocol == IPPROTO_UDP && ntohs(udp->dest) == (uint16_t)g.udp_port && h->magic == KVS_REPL_FRAME_MAGIC) {
-                g.rx_packets++; g.rx_bytes += d->len;
+                DynBuf wb;
+                dynbuf_init(&wb, 4096);
+                if (xdp_incr_apply_frame(h, payload, repl_len, &wb) == 0) {
+                    g.rx_packets++; g.rx_bytes += d->len;
+                } else {
+                    g.rx_errors++;
+                }
+                dynbuf_free(&wb);
             } else g.rx_errors++;
         } else g.rx_errors++;
         frame_free(d->addr);

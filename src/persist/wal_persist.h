@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #define KVS_WAL2_MAGIC 0x4a57414cU  /* "JWAL" */
+#define KVS_WAL2_VERSION 1u
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;

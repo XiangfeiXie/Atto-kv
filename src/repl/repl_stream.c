@@ -1,16 +1,29 @@
 #include "repl_stream.h"
 #include "config.h"
 #include "xdp_repl_manager.h"
+#include "xdp_incr_repl.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
-
-#define KVS_REPL_STREAM_MAX_REASSEMBLY (1024u * 1024u)
+#include <pthread.h>
+#include <unistd.h>
 
 static _Atomic uint64_t g_last_ack = 0;
 static _Atomic int g_master_started = 0;
 static _Atomic int g_slave_started = 0;
 static _Atomic int g_need_fullsync = 0;
+static pthread_t g_slave_poll_tid;
+static _Atomic int g_slave_poll_running = 0;
+
+static void *slave_xdp_poll_loop(void *arg)
+{
+    (void)arg;
+    while (atomic_load_explicit(&g_slave_poll_running, memory_order_acquire)) {
+        int n = xdp_repl_poll();
+        if (n <= 0) usleep(1000);
+    }
+    return NULL;
+}
 
 int repl_stream_start_master(void)
 {
@@ -23,10 +36,15 @@ int repl_stream_start_master(void)
                kvs_config.xdp_repl_mtu,
                kvs_config.xdp_repl_batch,
                kvs_config.xdp_repl_zero_copy ? "require" : "auto");
-        xdp_repl_manager_init(kvs_config.xdp_repl_ifname,
-                              kvs_config.xdp_repl_queue,
-                              kvs_config.xdp_repl_udp_port,
-                              kvs_config.xdp_repl_zero_copy);
+        if (xdp_repl_manager_init(kvs_config.xdp_repl_ifname,
+                                  kvs_config.xdp_repl_queue,
+                                  kvs_config.xdp_repl_udp_port,
+                                  kvs_config.xdp_repl_zero_copy) == 0) {
+            xdp_incr_master_start();
+        } else {
+            xdp_incr_request_fullsync();
+            return -1;
+        }
     }
     return 0;
 }
@@ -36,6 +54,32 @@ int repl_stream_start_slave(uint64_t start_seq)
     atomic_store_explicit(&g_last_ack, start_seq, memory_order_release);
     atomic_store_explicit(&g_slave_started, 1, memory_order_release);
     atomic_store_explicit(&g_need_fullsync, 0, memory_order_release);
+    xdp_incr_slave_start(0, 0, start_seq);
+    if (kvs_config.xdp_repl_enabled) {
+        printf("[REPL-STREAM] slave AF_XDP data plane requested: iface=%s queue=%d port=%d mtu=%d batch=%d zero_copy=%s\n",
+               kvs_config.xdp_repl_ifname,
+               kvs_config.xdp_repl_queue,
+               kvs_config.xdp_repl_udp_port,
+               kvs_config.xdp_repl_mtu,
+               kvs_config.xdp_repl_batch,
+               kvs_config.xdp_repl_zero_copy ? "require" : "auto");
+        if (xdp_repl_manager_init(kvs_config.xdp_repl_ifname,
+                                  kvs_config.xdp_repl_queue,
+                                  kvs_config.xdp_repl_udp_port,
+                                  kvs_config.xdp_repl_zero_copy) == 0) {
+            atomic_store_explicit(&g_slave_poll_running, 1, memory_order_release);
+            int rc = pthread_create(&g_slave_poll_tid, NULL, slave_xdp_poll_loop, NULL);
+            if (rc != 0) {
+                atomic_store_explicit(&g_slave_poll_running, 0, memory_order_release);
+                fprintf(stderr, "[REPL-STREAM] slave XDP poll thread failed: %d\n", rc);
+                xdp_incr_request_fullsync();
+                return -1;
+            }
+        } else {
+            xdp_incr_request_fullsync();
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -45,33 +89,7 @@ int repl_stream_publish(const kvs_journal_record_t *rec)
     if (!atomic_load_explicit(&g_master_started, memory_order_acquire))
         return 0;
     if (!kvs_config.xdp_repl_enabled) return 0;
-
-    uint32_t mtu = (uint32_t)kvs_config.xdp_repl_mtu;
-    uint32_t hdr_room = (uint32_t)sizeof(kvs_repl_frame_hdr_t) + 42u;
-    uint32_t frag_payload = (mtu > hdr_room + 64u) ? (mtu - hdr_room) : 512u;
-    uint16_t frag_cnt = (uint16_t)((rec->len + frag_payload - 1u) / frag_payload);
-    if (frag_cnt == 0) frag_cnt = 1;
-    for (uint16_t i = 0; i < frag_cnt; i++) {
-        uint32_t off = (uint32_t)i * frag_payload;
-        uint32_t left = rec->len - off;
-        uint32_t chunk = left > frag_payload ? frag_payload : left;
-        kvs_repl_frame_hdr_t hdr;
-        hdr.magic = KVS_REPL_FRAME_MAGIC;
-        hdr.version = KVS_REPL_FRAME_VERSION;
-        hdr.type = KVS_REPL_FRAME_DATA;
-        hdr.repl_epoch = 0;
-        hdr.seq = rec->seq;
-        hdr.payload_len = chunk;
-        hdr.crc32 = rec->crc32;
-        hdr.frag_idx = i;
-        hdr.frag_cnt = frag_cnt;
-        hdr.frag_off = off;
-        hdr.total_len = rec->len;
-        hdr.kind = rec->kind;
-        hdr.flags = rec->flags;
-        xdp_repl_send_fragment(&hdr, rec->payload + off, chunk);
-    }
-    return 0;
+    return xdp_incr_publish(rec);
 }
 
 void repl_stream_ack(uint64_t seq)
@@ -82,11 +100,15 @@ void repl_stream_ack(uint64_t seq)
 void repl_stream_request_fullsync(void)
 {
     atomic_store_explicit(&g_need_fullsync, 1, memory_order_release);
+    xdp_incr_request_fullsync();
 }
 
 void repl_stream_stop(void)
 {
-    xdp_repl_manager_stop();
+    if (atomic_exchange_explicit(&g_slave_poll_running, 0, memory_order_acq_rel)) {
+        pthread_join(g_slave_poll_tid, NULL);
+    }
+    xdp_incr_stop();
     atomic_store_explicit(&g_master_started, 0, memory_order_release);
     atomic_store_explicit(&g_slave_started, 0, memory_order_release);
 }

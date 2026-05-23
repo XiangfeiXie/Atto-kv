@@ -1,0 +1,39 @@
+[tsc] calibrated 0.3428 ns/tick (~2.92 GHz)
+[CONFIG] Loading conf/kvstore-master.conf
+
+========================================
+  KVStore 10.0 — Configuration
+========================================
+  Service   : 0.0.0.0:2000   loglevel=info  maxclients=10000
+  Engine    : dict        persistence=aof
+  Network   : proactor
+
+  Replication [MASTER]
+    RDMA fullsync : tcp://0.0.0.0:2100
+    Incremental  : XDP/AF_XDP udp://0.0.0.0:6382
+  XDP repl      : mode=skb iface=vethm queue=0 udp_port=6383 zero_copy=auto batch=64 mtu=1400
+  Workers       : 1 (single-thread proactor)
+  CPU pin       : auto (worker i → core (i+1) mod nproc)
+========================================
+
+Using string/hash + vector extension engine (32 id shards, flat vector search)
+Loading AOF/WAL (mmap)...
+[AOF] WAL load start, size=640
+[AOF] load finished, 9 commands replayed
+[AOF] unified with journal persistence — writes go to /home/xxf/9.1-kvstore/build/incr.wal
+[REPL-STREAM] master AF_XDP data plane requested: iface=vethm queue=0 port=6383 mtu=1400 batch=64 zero_copy=auto
+[XDP-REPL] AF_XDP ready iface=vethm queue=0 port=6383 mode=copy
+[proactor] conn pool: 10000 slots (0 MB)
+[proactor] worker 0 pinned to core 1
+[proactor] io_uring flags: 0x3180 (single_issuer/defer_taskrun/coop)
+[proactor] buf ring: 1024 x 4096 B = 4 MB per worker
+[RDMA-REPL] master: using provider 'tcp' on 0.0.0.0:2100
+[RDMA-REPL] master: listening for slaves
+[RDMA-REPL] master: slave connected, starting streaming full sync
+[REPL-STREAM] master AF_XDP data plane requested: iface=vethm queue=0 port=6383 mtu=1400 batch=64 zero_copy=auto
+[RDMA-REPL] master: post-fork base_seq=0
+[RDMA-REPL] child: serialization done, waiting for parent
+[RDMA-REPL] parent: send thread started
+[RDMA-REPL] parent: all chunks sent and acked by transport
+[RDMA-REPL] child: exiting
+[RDMA-REPL] master: streaming full sync done (base_seq=0)

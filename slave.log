@@ -1,0 +1,34 @@
+[tsc] calibrated 0.3428 ns/tick (~2.92 GHz)
+[CONFIG] Loading conf/kvstore-slave.conf
+
+========================================
+  KVStore 10.0 — Configuration
+========================================
+  Service   : 0.0.0.0:2002   loglevel=info  maxclients=10000
+  Engine    : dict        persistence=none
+  Network   : proactor
+
+  Replication [SLAVE]
+    RDMA fullsync : tcp://127.0.0.1:2100
+    Incremental  : XDP/AF_XDP udp://0.0.0.0:6382
+  XDP repl      : mode=skb iface=veths queue=0 udp_port=6383 zero_copy=auto batch=64 mtu=1400
+  Workers       : 1 (single-thread proactor)
+  CPU pin       : auto (worker i → core (i+1) mod nproc)
+========================================
+
+Using string/hash + vector extension engine (32 id shards, flat vector search)
+Engine reload: no persistence file
+[RDMA-REPL] slave: using provider 'tcp', connecting to 127.0.0.1:2100
+[RDMA-REPL] slave: connected, awaiting streaming full sync
+[RDB] stream begin: version=2, expected keys=2
+[RDMA-REPL] slave: header — base_seq=0, expected=2 keys
+[RDMA-REPL] slave: EOF received, rebuilding encodings
+[RDMA-REPL] slave: fullsync_time_ms=195.9
+[RDMA-REPL] slave: loaded 2 keys from fullsync (rdb streaming)
+[REPL-STREAM] slave AF_XDP data plane requested: iface=veths queue=0 port=6383 mtu=1400 batch=64 zero_copy=auto
+[XDP-REPL] AF_XDP ready iface=veths queue=0 port=6383 mode=copy
+[RDMA-REPL] slave: XDP incremental ready (session=0, epoch=0, base_seq=0)
+[proactor] conn pool: 10000 slots (0 MB)
+[proactor] worker 0 pinned to core 1
+[proactor] io_uring flags: 0x3180 (single_issuer/defer_taskrun/coop)
+[proactor] buf ring: 1024 x 4096 B = 4 MB per worker

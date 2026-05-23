@@ -1,0 +1,22 @@
+[tsc] calibrated 0.3428 ns/tick (~2.92 GHz)
+[CONFIG] Loading .tmp-aof.conf
+
+========================================
+  KVStore 10.0 — Configuration
+========================================
+  Service   : 0.0.0.0:6391   loglevel=error  maxclients=10000
+  Engine    : dict        persistence=aof
+  Network   : proactor
+
+  Replication [DISABLED]
+  Workers       : 1 (single-thread proactor)
+  CPU pin       : off
+========================================
+
+Using string/hash + vector extension engine (32 id shards, flat vector search)
+Engine reload: no persistence file
+[AOF] unified with journal persistence — writes go to /home/xxf/9.1-kvstore/build/incr.wal
+[RDMA-REPL] rdma replication disabled by config
+[proactor] conn pool: 10000 slots (0 MB)
+[proactor] io_uring flags: 0x3180 (single_issuer/defer_taskrun/coop)
+[proactor] buf ring: 1024 x 4096 B = 4 MB per worker

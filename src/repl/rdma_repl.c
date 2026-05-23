@@ -2,24 +2,22 @@
  * rdma_repl.c  —  Streaming full-sync over libfabric (Soft-RoCE / verbs)
  *                 with fork() + MAP_SHARED ring buffer + parent worker.
  *
- * Architecture (Plan B):
+ * Architecture:
  *   Master listener thread accepts RDMA connections. On each connect:
- *     1. Read eBPF global_seq → base_seq (fullsync cut point)
- *     2. Signal incr thread: status = INPROGRESS (pause direct send)
- *     3. Create memfd + mmap(MAP_SHARED) ring buffer + eventfd pair
- *     4. Register MR on domain BEFORE fork (MAP_SHARED → physical pages stable)
- *     5. fork()
- *     6. Child: iterates dict, serializes entries into ring slots,
+ *     1. Begin a new XDP incremental epoch/session and mark fullsync active
+ *     2. Create memfd + mmap(MAP_SHARED) ring buffer + eventfd pair
+ *     3. Register MR on domain BEFORE fork (MAP_SHARED → physical pages stable)
+ *     4. fork()
+ *     5. Child: iterates dict, serializes entries into ring slots,
  *        signals parent via eventfd. Does NOT touch libfabric.
- *     7. Parent: worker thread polls child_evt + CQ, sends chunks via
- *        RDMA in a 8-slot pipeline. Sets child_should_exit when done.
- *     8. Worker joins, child reaped, incr thread transitions to CATCHUP.
- *     9. Slave connects TCP incr, sends INCR_SYNC, catches up backlog.
+ *     6. Parent: worker thread polls child_evt + CQ, sends chunks via
+ *        RDMA in a pipeline. Sets child_should_exit when done.
+ *     7. Worker joins, child reaped, incremental stream switches to XDP/AF_XDP.
  *
  * Slave:
- *   Connects to master RDMA, pre-posts 4 recv buffers (CHUNK_WIRE_SIZE),
+ *   Connects to master RDMA, pre-posts recv buffers (CHUNK_WIRE_SIZE),
  *   receives streaming chunks (HEADER/DATA/EOF), incrementally loads
- *   entries, then connects TCP incr with INCR_SYNC <base_seq>.
+ *   entries, then stages XDP/AF_XDP incremental mode from base_seq.
  * =================================================================== */
 
 #define _GNU_SOURCE   /* memfd_create, eventfd_read/write, SYS_pidfd_open */
@@ -27,8 +25,8 @@
 #include "kvstore.h"
 #include "config.h"
 #include "server.h"
-#include "wal_repl.h"
 #include "repl_stream.h"
+#include "xdp_incr_repl.h"
 #include "persistence.h"
 
 #include <stdio.h>
@@ -580,21 +578,21 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
     /* 3) Begin fullsync: read eBPF global_seq, set status=INPROGRESS */
     /* Begin fullsync: set INPROGRESS, read pre-fork global_seq.
      * The authoritative base_seq is read again after fork(). */
-    (void)ebpf_incr_fullsync_begin();
+    (void)xdp_incr_fullsync_begin();
 
     /* 4) Create shared memory ring: memfd + ftruncate + mmap */
     shm_fd = memfd_create("kvstore_fullsync", 0);
     if (shm_fd < 0) {
         fprintf(stderr, "[RDMA-REPL] memfd_create failed: %s\n",
                 strerror(errno));
-        ebpf_incr_fullsync_finish();
+        xdp_incr_fullsync_finish();
         goto fail;
     }
     if (ftruncate(shm_fd, (off_t)shm_size) < 0) {
         fprintf(stderr, "[RDMA-REPL] ftruncate failed: %s\n",
                 strerror(errno));
         close(shm_fd);
-        ebpf_incr_fullsync_finish();
+        xdp_incr_fullsync_finish();
         goto fail;
     }
     shm = (shm_ring_t *)mmap(NULL, shm_size, PROT_READ | PROT_WRITE,
@@ -605,7 +603,7 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
     if (shm == MAP_FAILED) {
         fprintf(stderr, "[RDMA-REPL] mmap failed: %s\n", strerror(errno));
         shm = NULL;
-        ebpf_incr_fullsync_finish();
+        xdp_incr_fullsync_finish();
         goto fail;
     }
 
@@ -625,7 +623,7 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
     parent_evt_fd = eventfd(0, 0);
     if (child_evt_fd < 0 || parent_evt_fd < 0) {
         fprintf(stderr, "[RDMA-REPL] eventfd failed: %s\n", strerror(errno));
-        ebpf_incr_fullsync_finish();
+        xdp_incr_fullsync_finish();
         goto fail;
     }
 
@@ -639,7 +637,7 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
         kv_shards_unlock_all_snapshot();
         close(child_evt_fd);
         close(parent_evt_fd);
-        ebpf_incr_fullsync_finish();
+        xdp_incr_fullsync_finish();
         goto fail;
     }
 
@@ -670,12 +668,11 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
      * seq < post_fork_seq, and the backlog will contain every write
      * with seq >= post_fork_seq.  No overlap, no duplicates. */
     {
-        uint64_t post_fork_seq = ebpf_incr_read_global_seq();
-        ebpf_incr_fullsync_set_base_seq(post_fork_seq);
+        uint64_t post_fork_seq = xdp_incr_read_global_seq();
         shm->base_seq = post_fork_seq;
-        /* Wake the child — it is blocked on parent_evt_fd waiting
-         * for base_seq to be ready. */
-        eventfd_write(parent_evt_fd, (eventfd_t)1);
+        eventfd_write(parent_evt_fd, 1);
+        xdp_incr_fullsync_finish();
+        repl_stream_start_master();
         printf("[RDMA-REPL] master: post-fork base_seq=%" PRIu64 "\n",
                post_fork_seq);
     }
@@ -716,13 +713,13 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
 
     printf("[RDMA-REPL] master: streaming full sync done "
            "(base_seq=%" PRIu64 ")\n",
-           ebpf_incr_fullsync_base_seq());
+           xdp_incr_fullsync_base_seq());
 
     /* Transition incr to IDLE (or CATCHUP if no slave connected yet) */
     if (rc == 0)
-        ebpf_incr_fullsync_send_done();
+        xdp_incr_fullsync_finish();
     else
-        ebpf_incr_fullsync_finish();
+        xdp_incr_fullsync_finish();
 
 fail:
     /* Release resources */
@@ -780,9 +777,9 @@ static void *rdma_master_thread(void *arg) {
     RDMA_CHK(fi_pep_bind(pep, &eq->fid, 0),               "fi_pep_bind");
     RDMA_CHK(fi_listen(pep),                              "fi_listen");
 
-    /* Start WAL-based incremental sync module + TCP incr listener. */
-    if (ebpf_incr_master_start() != 0) {
-        fprintf(stderr, "[RDMA-REPL] WAL incr sync unavailable "
+    /* Start XDP/AF_XDP incremental replication state machine. */
+    if (xdp_incr_master_start() != 0) {
+        fprintf(stderr, "[RDMA-REPL] XDP incremental sync unavailable "
                         "(full sync only)\n");
     }
 
@@ -837,219 +834,28 @@ int rdma_repl_master_start(void) {
 }
 
 /* ==========================================================
- * 7. SLAVE: TCP incremental recv thread (with reconnect)
+ * 7. SLAVE: minimal incremental handoff
  *
- *    Wire frames: [uint64_t cmd_len][cmd_len bytes]
- *    cmd_len = 0 → disconnect sentinel
- *
- *    On first connect: reads +CONTINUE or -FULLRESYNC after INCR_SYNC.
- *    On disconnect: reconnects with exponential backoff, sends
- *    INCR_SYNC <replid> <last_seq+1>, reads response, continues.
+ * Old TCP-based incremental replication has been removed.
+ * Full-sync now hands off to the XDP/AF_XDP incremental stream.
  * ========================================================== */
 
-/* Shared state between incr thread and main slave flow */
-static char     g_slave_replid[INCR_REPL_ID_LEN + 1];
-static uint64_t g_slave_base_seq       = 0;
-static volatile uint64_t g_slave_applied     = 0;
-static volatile int    g_slave_need_fullresync = 0;
+static uint64_t g_slave_base_seq = 0;
+static volatile int g_slave_need_fullresync = 0;
 
 int rdma_repl_slave_need_fullresync(void)
 {
     return g_slave_need_fullresync;
 }
 
-static void *incr_tcp_slave_recv_thread(void *arg)
+static void xdp_slave_incremental_ready(uint64_t session_id, uint64_t epoch,
+                                        uint64_t base_seq)
 {
-    int fd = (int)(intptr_t)arg;
-    int applied = (int)g_slave_applied;
-    char *buf = NULL;
-
-    /* ── Outer loop: connection lifecycle ── */
-    while (1) {
-
-        /* ── Allocate recv buffer ── */
-        if (!buf) {
-            buf = (char *)malloc((size_t)INCR_MAX_CMD);
-            if (!buf) {
-                fprintf(stderr, "[RDMA-REPL] slave incr: OOM\n");
-                close(fd);
-                return NULL;
-            }
-        }
-
-        printf("[RDMA-REPL] slave incr: connected, receiving (applied=%d, "
-               "next_seq=%" PRIu64 ")\n",
-               applied, g_slave_base_seq + (uint64_t)applied);
-
-        /* ── Inner loop: recv wire frames ── */
-        while (1) {
-            uint64_t cmd_len = 0;
-            size_t  len_off  = 0;
-            while (len_off < sizeof(cmd_len)) {
-                ssize_t n = recv(fd, (char *)&cmd_len + len_off,
-                                 sizeof(cmd_len) - len_off, 0);
-                if (n <= 0) {
-                    fprintf(stderr, "[RDMA-REPL] slave incr: connection closed "
-                            "(recv len), applied=%d\n", applied);
-                    goto reconnect;
-                }
-                len_off += (size_t)n;
-            }
-
-            if (cmd_len == 0) {
-                printf("[RDMA-REPL] slave incr: received disconnect sentinel\n");
-                goto done;
-            }
-            if (cmd_len > INCR_MAX_CMD) {
-                fprintf(stderr, "[RDMA-REPL] slave incr: oversized cmd %" PRIu64 "\n",
-                        cmd_len);
-                goto done;
-            }
-
-            size_t remain = (size_t)cmd_len;
-            char *p = buf;
-            while (remain > 0) {
-                ssize_t nr = recv(fd, p, remain, 0);
-                if (nr <= 0) {
-                    fprintf(stderr, "[RDMA-REPL] slave incr: recv payload "
-                            "failed\n");
-                    goto reconnect;
-                }
-                p += nr;
-                remain -= (size_t)nr;
-            }
-
-            DynBuf wb;
-            dynbuf_init(&wb, 256);
-            kvs_protocol(buf, (int)cmd_len, &wb);
-            dynbuf_free(&wb);
-            applied++;
-            g_slave_applied = (uint64_t)applied;
-        }
-
-reconnect:
-        /* ── Connection lost — attempt reconnect with backoff ── */
-        printf("[RDMA-REPL] slave incr: reconnecting (applied=%d, "
-               "next_seq=%" PRIu64 ")\n",
-               applied, g_slave_base_seq + (uint64_t)applied);
-        free(buf);
-        buf = NULL;
-        close(fd);
-
-        {
-            int backoff_ms = 250;
-            int max_backoff = 8000;
-            int attempts = 0;
-
-            while (1) {
-                usleep((unsigned int)(backoff_ms * 1000));
-
-                fd = socket(AF_INET, SOCK_STREAM, 0);
-                if (fd < 0) goto retry;
-
-                struct sockaddr_in incr_addr;
-                memset(&incr_addr, 0, sizeof(incr_addr));
-                incr_addr.sin_family = AF_INET;
-                incr_addr.sin_port   = htons((uint16_t)kvs_config.incr_port);
-                inet_pton(AF_INET, kvs_config.rdma_master_ip,
-                          &incr_addr.sin_addr);
-
-                if (connect(fd, (struct sockaddr *)&incr_addr,
-                            sizeof(incr_addr)) < 0) {
-                    close(fd);
-                    goto retry;
-                }
-
-                /* Send INCR_SYNC <replid> <next_seq> */
-                {
-                    uint64_t next_seq = g_slave_base_seq + (uint64_t)applied;
-                    char sync_line[512];
-                    int sync_len = snprintf(sync_line, sizeof(sync_line),
-                                            INCR_SYNC_CMD " %s %" PRIu64 "\r\n",
-                                            g_slave_replid, next_seq);
-                    if (send(fd, sync_line, (size_t)sync_len,
-                             MSG_NOSIGNAL) != sync_len) {
-                        close(fd);
-                        goto retry;
-                    }
-                    printf("[RDMA-REPL] slave incr: reconnect attempt %d, "
-                           "INCR_SYNC %s %" PRIu64 "\n",
-                           attempts + 1, g_slave_replid, next_seq);
-                }
-
-                /* Read master response */
-                {
-                    char rline[256];
-                    int rpos = 0;
-                    while (rpos < (int)sizeof(rline) - 1) {
-                        char c;
-                        ssize_t n = recv(fd, &c, 1, 0);
-                        if (n <= 0) break;
-                        if (c == '\n') {
-                            if (rpos > 0 && rline[rpos - 1] == '\r') rpos--;
-                            rline[rpos] = '\0';
-                            break;
-                        }
-                        rline[rpos++] = c;
-                    }
-
-                    if (strncmp(rline, INCR_CONTINUE,
-                                strlen(INCR_CONTINUE)) == 0) {
-                        /* Update replid (normally unchanged, but
-                         * extracted for consistency) */
-                        const char *rp = rline + strlen(INCR_CONTINUE);
-                        if (*rp == ' ') rp++;
-                        size_t rlen = strlen(rp);
-                        if (rlen > 0 && rlen <= INCR_REPL_ID_LEN) {
-                            memcpy(g_slave_replid, rp, rlen);
-                            g_slave_replid[rlen] = '\0';
-                        }
-                        printf("[RDMA-REPL] slave incr: +CONTINUE, "
-                               "resuming stream\n");
-                        break;  /* Success — re-enter recv loop */
-                    }
-
-                    if (strncmp(rline, INCR_FULLRESYNC,
-                                strlen(INCR_FULLRESYNC)) == 0) {
-                        const char *p = rline + strlen(INCR_FULLRESYNC);
-                        if (*p == ' ') p++;
-                        size_t rlen = strlen(p);
-                        if (rlen <= INCR_REPL_ID_LEN && rlen > 0) {
-                            memcpy(g_slave_replid, p, rlen);
-                            g_slave_replid[rlen] = '\0';
-                        }
-                        printf("[RDMA-REPL] slave incr: master requested "
-                               "fullresync (new replid=%s)\n", g_slave_replid);
-                        g_slave_need_fullresync = 1;
-                        close(fd);
-                        return NULL;
-                    }
-                    close(fd);
-                }
-
-retry:
-                attempts++;
-                if (backoff_ms < max_backoff)
-                    backoff_ms *= 2;
-                if (attempts >= 20) {
-                    fprintf(stderr, "[RDMA-REPL] slave incr: reconnect "
-                            "failed after %d attempts, requesting fullresync\n",
-                            attempts);
-                    g_slave_need_fullresync = 1;
-                    return NULL;
-                }
-            }
-        }
-        /* Continue outer loop — buf will be re-allocated */
-    }
-
-done:
-    printf("[RDMA-REPL] slave incr: thread exiting, applied %d commands\n",
-           applied);
-    g_slave_applied = (uint64_t)applied;
-    free(buf);
-    close(fd);
-    return NULL;
+    g_slave_base_seq = base_seq;
+    repl_stream_start_slave(base_seq);
+    xdp_incr_slave_start(session_id, epoch, base_seq);
+    printf("[RDMA-REPL] slave: XDP incremental ready (session=%" PRIu64 ", epoch=%" PRIu64 ", base_seq=%" PRIu64 ")\n",
+           session_id, epoch, base_seq);
 }
 
 /* ==========================================================
@@ -1062,8 +868,8 @@ done:
  *   chunk_type = 1 DATA    (payload: serialized entries)
  *   chunk_type = 2 EOF     (chunk_len=0, end of stream)
  *
- * Slave pre-posts 4 recv buffers of CHUNK_WIRE_SIZE.
- * After EOF, closes RDMA, connects TCP incr with INCR_SYNC <base_seq>.
+ * Slave pre-posts recv buffers of CHUNK_WIRE_SIZE.
+ * After EOF, closes RDMA and starts XDP/AF_XDP incremental apply from base_seq.
  * ========================================================== */
 
 int rdma_repl_slave_run(void) {
@@ -1310,9 +1116,7 @@ fail:
     if (rc_ret != 0) return rc_ret;
 
     /* Start AF_XDP incremental stream from RDMA fullsync cutover seq. */
-    repl_stream_start_slave(base_seq);
-    printf("[RDMA-REPL] slave: AF_XDP incremental stream staged from seq=%" PRIu64 "\n",
-           base_seq);
+    xdp_slave_incremental_ready(0, 0, base_seq);
 
     return 0;
 }

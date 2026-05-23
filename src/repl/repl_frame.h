@@ -14,10 +14,6 @@ typedef enum {
     KVS_REPL_FRAME_FULLREQ   = 5,
 } kvs_repl_frame_type_t;
 
-typedef enum {
-    KVS_MUT_KIND_RESP_STRING = 1,
-} kvs_mutation_kind_t;
-
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint16_t version;

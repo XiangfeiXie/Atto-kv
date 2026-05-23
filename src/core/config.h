@@ -47,10 +47,7 @@ typedef struct {
     char rdma_master_ip[64];
     int  rdma_master_port;
 
-    /* Both: TCP incremental sync port */
-    int  incr_port;
-
-    /* XDP/AF_XDP WAL replication bypass (Phase 11) */
+    /* XDP/AF_XDP incremental replication */
     int  xdp_repl_enabled;
     int  xdp_driver_mode;  /* 0 = generic (SKB), 1 = driver mode */
     char xdp_repl_ifname[32];

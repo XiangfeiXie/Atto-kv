@@ -26,7 +26,6 @@ static void config_default(void) {
     kvs_config.rdma_role         = ROLE_MASTER;
     kvs_config.rdma_listen_port  = 2100;
     kvs_config.rdma_master_port  = 2100;
-    kvs_config.incr_port         = 6382;
 
     strncpy(kvs_config.rdma_provider,  "tcp",
             sizeof(kvs_config.rdma_provider) - 1);
@@ -270,9 +269,6 @@ int config_load(const char *path) {
         } else if (strcasecmp(key, "rdma_master_port") == 0) {
             parse_int(val, lineno, "rdma_master_port", 1, 65535, &kvs_config.rdma_master_port);
 
-        } else if (strcasecmp(key, "incr_port") == 0) {
-            parse_int(val, lineno, "incr_port", 1, 65535, &kvs_config.incr_port);
-
         /* ---- XDP/AF_XDP incremental replication ---- */
         } else if (strcasecmp(key, "xdp_repl") == 0) {
             int v = parse_bool(val, lineno, "xdp_repl");
@@ -289,12 +285,25 @@ int config_load(const char *path) {
             parse_int(val, lineno, "xdp_repl_udp_port", 1, 65535, &kvs_config.xdp_repl_udp_port);
 
         } else if (strcasecmp(key, "xdp_repl_zero_copy") == 0) {
-            if (strcasecmp(val, "auto") == 0 || strcasecmp(val, "copy") == 0) {
+            if (strcasecmp(val, "auto") == 0 || strcasecmp(val, "copy") == 0 ||
+                strcasecmp(val, "off") == 0 || strcasecmp(val, "no") == 0) {
                 kvs_config.xdp_repl_zero_copy = 0;
-            } else if (strcasecmp(val, "require") == 0 || strcasecmp(val, "on") == 0) {
+            } else if (strcasecmp(val, "require") == 0 || strcasecmp(val, "on") == 0 ||
+                       strcasecmp(val, "yes") == 0) {
                 kvs_config.xdp_repl_zero_copy = 1;
             } else {
                 printf("[CONFIG] line %d: bad xdp_repl_zero_copy '%s'\n", lineno, val);
+            }
+
+        } else if (strcasecmp(key, "xdp_driver_mode") == 0 ||
+                   strcasecmp(key, "xdp_repl_mode") == 0) {
+            if (strcasecmp(val, "skb") == 0 || strcasecmp(val, "generic") == 0) {
+                kvs_config.xdp_driver_mode = 0;
+            } else if (strcasecmp(val, "driver") == 0 || strcasecmp(val, "drv") == 0 ||
+                       strcasecmp(val, "native") == 0) {
+                kvs_config.xdp_driver_mode = 1;
+            } else {
+                printf("[CONFIG] line %d: bad xdp mode '%s'\n", lineno, val);
             }
 
         } else if (strcasecmp(key, "xdp_repl_batch") == 0) {
@@ -395,7 +404,7 @@ void config_print(void) {
         printf("\n"
                "  Replication [%s]\n"
                "    RDMA fullsync : %s://%s:%d\n"
-               "    TCP incr sync : 0.0.0.0:%d\n",
+               "    Incremental  : XDP/AF_XDP udp://0.0.0.0:%d\n",
                role,
                kvs_config.rdma_provider,
                (kvs_config.rdma_role == ROLE_MASTER)
@@ -404,11 +413,12 @@ void config_print(void) {
                (kvs_config.rdma_role == ROLE_MASTER)
                    ? kvs_config.rdma_listen_port
                    : kvs_config.rdma_master_port,
-               kvs_config.incr_port);
+               kvs_config.xdp_repl_udp_port);
     }
 
     if (kvs_config.xdp_repl_enabled) {
-        printf("  XDP repl      : iface=%s queue=%d udp_port=%d zero_copy=%s batch=%d mtu=%d\n",
+        printf("  XDP repl      : mode=%s iface=%s queue=%d udp_port=%d zero_copy=%s batch=%d mtu=%d\n",
+               kvs_config.xdp_driver_mode ? "driver" : "skb",
                kvs_config.xdp_repl_ifname,
                kvs_config.xdp_repl_queue,
                kvs_config.xdp_repl_udp_port,

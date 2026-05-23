@@ -1,0 +1,7 @@
+
+kvstore:24923 terminated with signal 11 at PC=5b700a2064cf SP=7f5114ffe348.  Backtrace:
+./build/kvstore(+0x214cf)[0x5b700a2064cf]
+./build/kvstore(+0x218b7)[0x5b700a2068b7]
+./build/kvstore(+0x20ca7)[0x5b700a205ca7]
+/lib/x86_64-linux-gnu/libc.so.6(+0x9caa4)[0x7f511ba9caa4]
+/lib/x86_64-linux-gnu/libc.so.6(+0x129c6c)[0x7f511bb29c6c]

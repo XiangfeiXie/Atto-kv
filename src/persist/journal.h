@@ -2,11 +2,12 @@
 #define KVS_JOURNAL_H
 
 #include <stdint.h>
-#include "repl_frame.h"
 
 #define KVS_JOURNAL_BACKLOG_CAP 16384u
 #define KVS_JOURNAL_BACKLOG_MASK (KVS_JOURNAL_BACKLOG_CAP - 1u)
 #define KVS_JOURNAL_MAX_PAYLOAD (1024u * 1024u)
+
+#define KVS_MUT_KIND_RESP_STRING 1u
 
 typedef struct {
     uint64_t seq;

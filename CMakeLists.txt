@@ -99,14 +99,14 @@ set(NET_SRCS
 
 set(PERSIST_SRCS
     src/persist/persistence.c
+    src/persist/journal.c
+    src/persist/wal_persist.c
 )
 
 set(REPL_SRCS
     src/repl/rdma_repl.c
-    src/repl/wal_repl.c
-    src/repl/journal.c
-    src/repl/wal_persist.c
     src/repl/repl_stream.c
+    src/repl/xdp_incr_repl.c
     src/repl/xdp_repl_manager.c
 )
 
@@ -115,14 +115,6 @@ set(BPF_SRCS
     src/bpf/sockmap_manager.c
     src/bpf/bpf_pin.c
 )
-
-# Replication XDP/AF_XDP sources (Phase 11 - conditional)
-if(ENABLE_XDP_REPL AND LIBXDP_FOUND)
-    list(APPEND REPL_SRCS
-        src/repl/af_xdp_repl.c
-        src/repl/xdp_wal_manager.c
-    )
-endif()
 
 set(KVSTORE_SRCS
     ${UTIL_SRCS}

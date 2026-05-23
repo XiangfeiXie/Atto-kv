@@ -1,24 +1,20 @@
 /* =========================================================
  * persistence.c
  *
- *  AOF/RDB 异步化 + io_uring 写入加速 + mmap 加载加速
- *
- *  设计要点：
- *  1) AOF：主线程仅做 memcpy + 入队（O(1)），一个后台线程用
- *     io_uring 批量 submit 写请求，一次 io_uring_submit 可以
- *     同时提交多条 write SQE，避免逐次 syscall 开销，主线程
- *     完全不阻塞在磁盘 IO 上。
- *  2) RDB：保持 fork(BGSAVE) 语义不阻塞主线程；子进程内
- *     使用 io_uring 将大 buffer 切成若干块并发提交写入，
- *     最后一次性 fsync。
- *  3) 加载：使用 mmap 直接映射整个 dump.rdb / appendonly.aof
- *     到虚拟内存，解析时只做指针算术 + 数据读取，避免 fread
- *     的用户态/内核态拷贝与多次 syscall。
+ *  持久化层当前职责：
+ *  1) WAL：写命令进入 journal 内存 backlog 后，由 wal_persist 使用
+ *     io_uring 追加到 build/incr.wal；WAL record 格式独立于复制协议。
+ *  2) WAL replay：启动时 mmap 读取 incr.wal，校验 JWAL header + CRC，
+ *     然后按 RESP 命令回放到 KV 引擎。
+ *  3) RDB：保留 fork/io_uring 异步保存、mmap 加载，以及需要的纯内存
+ *     序列化/流式加载接口。RDB/WAL 与主从同步不相互依赖，只通过
+ *     KV 引擎和 journal record 这种通用数据结构衔接。
  * ========================================================= */
 
 #define _GNU_SOURCE
 #include "persistence.h"
 #include "kvstore.h"
+#include "wal_persist.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,7 +35,7 @@
 #include <liburing.h>
 #include <zlib.h>
 #include <inttypes.h>
-#include "wal_repl.h"
+
 
 /* ── 项目根目录：由 persist_set_basedir 在启动时设置 ── */
 static char  g_basedir[1024] = ".";
@@ -115,30 +111,26 @@ KVItem* create_kvitem(char *value_str, char *expire_str);
  * Part 1. AOF — unified with WAL replication
  *
  * The legacy AOF async writer (ring buffer + io_uring worker) has been
- * retired.  Every write command flows through wal_repl_append() which
+ * retired.  Every write command flows through the current replication
+ * journal path, which fans out to XDP/AF_XDP via repl_stream.
  * feeds the unified journal ring.  The consumer thread serialises records
  * to wal/incr.wal (binary WAL + CRC32) for crash recovery.
  *
- * aof_async_append  →  wal_repl_append()      (journal the command)
- * aof_reload_mmap   →  reads wal/incr.wal      (crash recovery)
+ * aof_async_append  →  current journal path      (journal the command)
+ * aof_reload_mmap   →  reads wal/incr.wal        (crash recovery)
  * ============================================================================= */
 
 int aof_async_init(void) {
-    /* Standalone WAL mode: when rdma_sync is off, start the WAL module
-     * here so that AOF persistence (wal/incr.wal) still works. */
-    if (!ebpf_incr_is_started()) {
-        ebpf_incr_master_start();
-    }
-    printf("[AOF] unified with WAL — writes go to %s\n", persist_path(WAL_REL));
+    printf("[AOF] unified with journal persistence — writes go to %s\n", persist_path(WAL_REL));
     return 0;
 }
 
 void aof_async_shutdown(void) {
-    /* WAL shutdown is handled by ebpf_incr_stop() */
 }
 
 void aof_async_append(const char *buf, int len) {
-    wal_repl_append(buf, len);
+    (void)buf;
+    (void)len;
 }
 
 /* =============================================================================
@@ -705,28 +697,32 @@ void aof_reload_mmap(void) {
     if (wal_format) {
         const char *p   = base;
         const char *end = base + fsz;
-        while (p + WAL_HDR_SIZE <= end) {
-            wal_record_hdr_t hdr;
-            memcpy(&hdr, p, (size_t)WAL_HDR_SIZE);
-            if (hdr.magic != WAL_MAGIC) break;
-            if (p + WAL_HDR_SIZE + hdr.length > end) break;
-            const char *payload = p + WAL_HDR_SIZE;
-            uint32_t computed = (uint32_t)crc32(0,
-                (const Bytef *)payload, (uInt)hdr.length);
+        while (p + sizeof(kvs_wal2_record_hdr_t) <= end) {
+            kvs_wal2_record_hdr_t hdr;
+            memcpy(&hdr, p, sizeof(hdr));
+            if (hdr.magic != KVS_WAL2_MAGIC) break;
+            if (p + sizeof(kvs_wal2_record_hdr_t) + hdr.len > end) break;
+            const char *payload = p + sizeof(kvs_wal2_record_hdr_t);
+            uint32_t computed = crc32(0L, Z_NULL, 0);
+            computed = crc32(computed, (const Bytef *)&hdr.seq, sizeof(hdr.seq));
+            computed = crc32(computed, (const Bytef *)&hdr.kind, sizeof(hdr.kind));
+            computed = crc32(computed, (const Bytef *)&hdr.flags, sizeof(hdr.flags));
+            computed = crc32(computed, (const Bytef *)&hdr.len, sizeof(hdr.len));
+            computed = crc32(computed, (const Bytef *)payload, (uInt)hdr.len);
             if (hdr.crc32 != computed) {
                 fprintf(stderr, "[AOF] WAL CRC32 mismatch seq=%" PRIu64
                         ", stopping replay\n", hdr.seq);
                 break;
             }
             int argc = 0;
-            int cmd_len = resp_parse_slices(payload, (int)hdr.length,
+            int cmd_len = resp_parse_slices(payload, (int)hdr.len,
                                             tokens, KVS_MAX_TOKENS, &argc);
             if (cmd_len > 0) {
                 dynbuf_clear(&wb);
                 kvs_dispatch(tokens, argc, payload, cmd_len, &wb, NULL);
                 loaded++;
             }
-            p += WAL_HDR_SIZE + hdr.length;
+            p += sizeof(kvs_wal2_record_hdr_t) + hdr.len;
         }
     } else {
         const char *p = base;

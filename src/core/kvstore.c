@@ -1817,6 +1817,7 @@ int main(int argc, char *argv[]) {
     engine_reload();
     kvs_journal_init();
     if (ENABLE_AOF) {
+        kvs_wal_set_fsync_policy(kvs_config.wal_fsync_policy);
         kvs_wal_persist_start();
         aof_async_init();
     }

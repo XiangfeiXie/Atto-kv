@@ -33,6 +33,7 @@ typedef struct {
     int  persist_mode;
     int  network_model;
     int  maxclients;
+    char wal_fsync_policy[16];  /* "always", "everysec", or "no" */
 
     /* Replication master switch */
     int  rdma_sync_enabled;

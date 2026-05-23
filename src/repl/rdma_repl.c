@@ -152,6 +152,22 @@ static int rdma_wait_eq(struct fid_eq *eq, uint32_t *event,
 #define CHUNK_HDR_SIZE     5               /* [chunk_len:4][type:1] */
 #define CHUNK_WIRE_SIZE    (CHUNK_HDR_SIZE + CHUNK_DATA_SIZE)
 
+/* Rewrite buffer: captures incremental writes during fullsync */
+#define REWRITE_BUF_SIZE   4096
+typedef struct {
+    kvs_journal_record_t *records[REWRITE_BUF_SIZE];
+    int count;
+    int enabled;
+    pthread_mutex_t mutex;
+} rewrite_buffer_t;
+
+static rewrite_buffer_t g_rewrite_buf = {
+    .records = {0},
+    .count = 0,
+    .enabled = 0,
+    .mutex = PTHREAD_MUTEX_INITIALIZER
+};
+
 /* Chunk types (wire protocol) */
 #define CHUNK_TYPE_HEADER  0
 #define CHUNK_TYPE_DATA    1
@@ -246,6 +262,81 @@ static void fullsync_sigchld_install(void) {
     sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa, NULL);
     sigchld_installed = 1;
+}
+
+/* ========================================================== */
+/* 2.5 Rewrite buffer functions                               */
+/* ========================================================== */
+
+static void rewrite_buffer_enable(void) {
+    pthread_mutex_lock(&g_rewrite_buf.mutex);
+    g_rewrite_buf.enabled = 1;
+    g_rewrite_buf.count = 0;
+    pthread_mutex_unlock(&g_rewrite_buf.mutex);
+}
+
+static void rewrite_buffer_disable(void) {
+    pthread_mutex_lock(&g_rewrite_buf.mutex);
+    g_rewrite_buf.enabled = 0;
+    pthread_mutex_unlock(&g_rewrite_buf.mutex);
+}
+
+int rdma_repl_capture_write(const kvs_journal_record_t *rec) {
+    if (!rec) return -1;
+
+    pthread_mutex_lock(&g_rewrite_buf.mutex);
+    if (!g_rewrite_buf.enabled) {
+        pthread_mutex_unlock(&g_rewrite_buf.mutex);
+        return 0;
+    }
+
+    if (g_rewrite_buf.count >= REWRITE_BUF_SIZE) {
+        pthread_mutex_unlock(&g_rewrite_buf.mutex);
+        return -1;
+    }
+
+    kvs_journal_record_t *copy = (kvs_journal_record_t *)malloc(sizeof(kvs_journal_record_t) + rec->len);
+    if (!copy) {
+        pthread_mutex_unlock(&g_rewrite_buf.mutex);
+        return -1;
+    }
+
+    copy->kind = rec->kind;
+    copy->flags = rec->flags;
+    copy->len = rec->len;
+    memcpy(copy->payload, rec->payload, rec->len);
+
+    g_rewrite_buf.records[g_rewrite_buf.count++] = copy;
+    pthread_mutex_unlock(&g_rewrite_buf.mutex);
+    return 0;
+}
+
+static int rewrite_buffer_replay(void) {
+    pthread_mutex_lock(&g_rewrite_buf.mutex);
+    int count = g_rewrite_buf.count;
+
+    printf("[RDMA-REPL] replaying %d rewrite buffer entries\n", count);
+
+    for (int i = 0; i < count; i++) {
+        kvs_journal_record_t *rec = g_rewrite_buf.records[i];
+        if (rec) {
+            DynBuf wb;
+            dynbuf_init(&wb, 4096);
+            kvs_token_t tokens[KVS_MAX_TOKENS];
+            int argc = 0;
+            int cmd_len = resp_parse_slices(rec->payload, (int)rec->len, tokens, KVS_MAX_TOKENS, &argc);
+            if (cmd_len > 0) {
+                kvs_dispatch(tokens, argc, rec->payload, cmd_len, &wb, NULL);
+            }
+            dynbuf_free(&wb);
+            free(rec);
+            g_rewrite_buf.records[i] = NULL;
+        }
+    }
+
+    g_rewrite_buf.count = 0;
+    pthread_mutex_unlock(&g_rewrite_buf.mutex);
+    return 0;
 }
 
 /* ========================================================== */
@@ -512,6 +603,10 @@ static void *parent_send_thread(void *arg) {
 
     printf("[RDMA-REPL] parent: all chunks sent and acked by transport\n");
 
+    /* Disable rewrite buffer and replay captured writes */
+    rewrite_buffer_disable();
+    rewrite_buffer_replay();
+
 done:
     /* Signal child that it can exit */
     shm->child_should_exit = 1;
@@ -575,9 +670,8 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
     }
     printf("[RDMA-REPL] master: slave connected, starting streaming full sync\n");
 
-    /* 3) Begin fullsync: read eBPF global_seq, set status=INPROGRESS */
-    /* Begin fullsync: set INPROGRESS, read pre-fork global_seq.
-     * The authoritative base_seq is read again after fork(). */
+    /* 3) Begin fullsync: enable rewrite buffer, read base_seq */
+    rewrite_buffer_enable();
     (void)xdp_incr_fullsync_begin();
 
     /* 4) Create shared memory ring: memfd + ftruncate + mmap */

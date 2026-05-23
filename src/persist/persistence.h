@@ -54,6 +54,10 @@ void rdb_save_async_uring(void);
  * BGREWRITEAOF command replies with -ERR. */
 int aof_rewrite_bg(void);
 
+/* Finalize AOF rewrite: append rewrite buffer and rename temp file.
+ * Called after BGREWRITEAOF child completes. Returns 0 on success. */
+int aof_rewrite_finalize(void);
+
 /* mmap 加载：避免逐条 fread 的系统调用开销 */
 void rdb_load_mmap(void);
 void aof_reload_mmap(void);

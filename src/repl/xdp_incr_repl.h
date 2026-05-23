@@ -32,4 +32,7 @@ uint64_t xdp_incr_current_session_id(void);
 uint64_t xdp_incr_current_epoch(void);
 uint64_t xdp_incr_read_global_seq(void);
 
+void     xdp_incr_handle_ack(uint64_t ack_seq);
+int      xdp_incr_retrans_tick(void);
+
 #endif /* KVS_XDP_INCR_REPL_H */

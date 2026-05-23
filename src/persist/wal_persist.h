@@ -23,4 +23,10 @@ int  kvs_wal_persist_start(void);
 int  kvs_wal_persist_append(const kvs_journal_record_t *rec);
 void kvs_wal_persist_stop(void);
 
+/* Set fsync policy: "always", "everysec", or "no" */
+void kvs_wal_set_fsync_policy(const char *policy);
+
+/* Get last synced sequence number */
+uint64_t kvs_wal_last_synced_seq(void);
+
 #endif

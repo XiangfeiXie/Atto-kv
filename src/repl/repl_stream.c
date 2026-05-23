@@ -2,6 +2,7 @@
 #include "config.h"
 #include "xdp_repl_manager.h"
 #include "xdp_incr_repl.h"
+#include "rdma_repl.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -14,6 +15,8 @@ static _Atomic int g_slave_started = 0;
 static _Atomic int g_need_fullsync = 0;
 static pthread_t g_slave_poll_tid;
 static _Atomic int g_slave_poll_running = 0;
+static pthread_t g_master_retrans_tid;
+static _Atomic int g_master_retrans_running = 0;
 
 static void *slave_xdp_poll_loop(void *arg)
 {
@@ -21,6 +24,17 @@ static void *slave_xdp_poll_loop(void *arg)
     while (atomic_load_explicit(&g_slave_poll_running, memory_order_acquire)) {
         int n = xdp_repl_poll();
         if (n <= 0) usleep(1000);
+    }
+    return NULL;
+}
+
+static void *master_retrans_loop(void *arg)
+{
+    (void)arg;
+    while (atomic_load_explicit(&g_master_retrans_running, memory_order_acquire)) {
+        xdp_repl_poll();
+        xdp_incr_retrans_tick();
+        usleep(10000);  /* 10ms tick */
     }
     return NULL;
 }
@@ -41,6 +55,14 @@ int repl_stream_start_master(void)
                                   kvs_config.xdp_repl_udp_port,
                                   kvs_config.xdp_repl_zero_copy) == 0) {
             xdp_incr_master_start();
+            atomic_store_explicit(&g_master_retrans_running, 1, memory_order_release);
+            int rc = pthread_create(&g_master_retrans_tid, NULL, master_retrans_loop, NULL);
+            if (rc != 0) {
+                atomic_store_explicit(&g_master_retrans_running, 0, memory_order_release);
+                fprintf(stderr, "[REPL-STREAM] master retrans thread failed: %d\n", rc);
+                xdp_incr_request_fullsync();
+                return -1;
+            }
         } else {
             xdp_incr_request_fullsync();
             return -1;
@@ -89,6 +111,10 @@ int repl_stream_publish(const kvs_journal_record_t *rec)
     if (!atomic_load_explicit(&g_master_started, memory_order_acquire))
         return 0;
     if (!kvs_config.xdp_repl_enabled) return 0;
+
+    /* Capture to rewrite buffer during fullsync */
+    rdma_repl_capture_write(rec);
+
     return xdp_incr_publish(rec);
 }
 
@@ -107,6 +133,9 @@ void repl_stream_stop(void)
 {
     if (atomic_exchange_explicit(&g_slave_poll_running, 0, memory_order_acq_rel)) {
         pthread_join(g_slave_poll_tid, NULL);
+    }
+    if (atomic_exchange_explicit(&g_master_retrans_running, 0, memory_order_acq_rel)) {
+        pthread_join(g_master_retrans_tid, NULL);
     }
     xdp_incr_stop();
     atomic_store_explicit(&g_master_started, 0, memory_order_release);

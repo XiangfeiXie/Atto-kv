@@ -21,6 +21,7 @@ static void config_default(void) {
     kvs_config.persist_mode  = PERSIST_AOF;
     kvs_config.network_model = NET_REACTOR;
     kvs_config.maxclients    = 10000;
+    strncpy(kvs_config.wal_fsync_policy, "everysec", sizeof(kvs_config.wal_fsync_policy) - 1);
 
     kvs_config.rdma_sync_enabled = 0;
     kvs_config.rdma_role         = ROLE_MASTER;
@@ -240,6 +241,10 @@ int config_load(const char *path) {
             else if (strcasecmp(val, "rdb")  == 0) kvs_config.persist_mode = PERSIST_RDB;
             else if (strcasecmp(val, "aof")  == 0) kvs_config.persist_mode = PERSIST_AOF;
             else printf("[CONFIG] line %d: unknown persistence '%s'\n", lineno, val);
+
+        } else if (strcasecmp(key, "wal_fsync_policy") == 0) {
+            strncpy(kvs_config.wal_fsync_policy, val,
+                    sizeof(kvs_config.wal_fsync_policy) - 1);
 
         /* ---- Replication ---- */
         } else if (strcasecmp(key, "rdma_sync") == 0) {

@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <zlib.h>
+#include <pthread.h>
+#include <time.h>
+#include <sys/time.h>
 
 static _Atomic int g_started = 0;
 static _Atomic int g_state = XDP_INCR_STATE_STOPPED;
@@ -20,6 +23,29 @@ static _Atomic uint64_t g_session_id = 0;
 static _Atomic uint64_t g_epoch = 0;
 static _Atomic uint64_t g_base_seq = 0;
 static _Atomic int g_need_fullsync = 0;
+
+/* Sliding window for retransmission */
+#define WINDOW_SIZE 1024
+#define RETRANS_TIMEOUT_MS 100
+
+typedef struct {
+    uint64_t seq;
+    kvs_repl_frame_hdr_t hdr;
+    char *payload;
+    uint32_t len;
+    uint64_t send_time_ms;
+    int valid;
+} window_slot_t;
+
+static window_slot_t g_window[WINDOW_SIZE];
+static pthread_mutex_t g_window_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_window_base = 0;
+
+static uint64_t get_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
 
 static uint64_t next_session_id(void)
 {
@@ -31,6 +57,73 @@ static uint64_t next_session_id(void)
 static uint32_t calc_checksum(const void *buf, uint32_t len)
 {
     return (uint32_t)crc32(0L, (const Bytef *)buf, len);
+}
+
+static void window_add(uint64_t seq, const kvs_repl_frame_hdr_t *hdr, const char *payload, uint32_t len)
+{
+    pthread_mutex_lock(&g_window_mu);
+    uint32_t idx = (uint32_t)(seq % WINDOW_SIZE);
+    window_slot_t *slot = &g_window[idx];
+
+    if (slot->valid && slot->payload) {
+        free(slot->payload);
+    }
+
+    slot->seq = seq;
+    slot->hdr = *hdr;
+    slot->len = len;
+    slot->payload = malloc(len);
+    if (slot->payload) {
+        memcpy(slot->payload, payload, len);
+        slot->send_time_ms = get_time_ms();
+        slot->valid = 1;
+    } else {
+        slot->valid = 0;
+    }
+    pthread_mutex_unlock(&g_window_mu);
+}
+
+static void window_ack(uint64_t ack_seq)
+{
+    pthread_mutex_lock(&g_window_mu);
+    uint64_t base = atomic_load_explicit(&g_window_base, memory_order_acquire);
+
+    for (uint64_t s = base; s <= ack_seq && s < base + WINDOW_SIZE; s++) {
+        uint32_t idx = (uint32_t)(s % WINDOW_SIZE);
+        if (g_window[idx].valid && g_window[idx].seq == s) {
+            free(g_window[idx].payload);
+            g_window[idx].payload = NULL;
+            g_window[idx].valid = 0;
+        }
+    }
+
+    if (ack_seq >= base) {
+        atomic_store_explicit(&g_window_base, ack_seq + 1, memory_order_release);
+    }
+    pthread_mutex_unlock(&g_window_mu);
+}
+
+static int window_retrans_check(void)
+{
+    uint64_t now = get_time_ms();
+    int retrans_count = 0;
+
+    pthread_mutex_lock(&g_window_mu);
+    uint64_t base = atomic_load_explicit(&g_window_base, memory_order_acquire);
+
+    for (uint32_t i = 0; i < WINDOW_SIZE; i++) {
+        window_slot_t *slot = &g_window[i];
+        if (slot->valid && slot->seq >= base) {
+            if (now - slot->send_time_ms > RETRANS_TIMEOUT_MS) {
+                if (xdp_repl_send_fragment(&slot->hdr, slot->payload, slot->len) == 0) {
+                    slot->send_time_ms = now;
+                    retrans_count++;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_window_mu);
+    return retrans_count;
 }
 
 int xdp_incr_master_start(void)
@@ -139,6 +232,18 @@ int xdp_incr_apply_frame(const kvs_repl_frame_hdr_t *hdr,
     }
 
     atomic_store_explicit(&g_last_ack, hdr->seq, memory_order_release);
+
+    /* Send ACK back to master */
+    kvs_repl_frame_hdr_t ack_hdr;
+    memset(&ack_hdr, 0, sizeof(ack_hdr));
+    ack_hdr.magic = KVS_REPL_FRAME_MAGIC;
+    ack_hdr.version = KVS_REPL_FRAME_VERSION;
+    ack_hdr.type = KVS_REPL_FRAME_ACK;
+    ack_hdr.repl_epoch = hdr->repl_epoch;
+    ack_hdr.seq = hdr->seq;
+    ack_hdr.payload_len = 0;
+    xdp_repl_send_fragment(&ack_hdr, NULL, 0);
+
     return 0;
 }
 
@@ -192,4 +297,14 @@ uint64_t xdp_incr_current_epoch(void)
 uint64_t xdp_incr_read_global_seq(void)
 {
     return atomic_load_explicit(&g_global_seq, memory_order_acquire);
+}
+
+void xdp_incr_handle_ack(uint64_t ack_seq)
+{
+    window_ack(ack_seq);
+}
+
+int xdp_incr_retrans_tick(void)
+{
+    return window_retrans_check();
 }

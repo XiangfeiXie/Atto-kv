@@ -227,14 +227,19 @@ int xdp_repl_poll(void)
                 : 0;
             const char *payload = (const char *)(h + 1);
             if (ntohs(eth->h_proto) == ETH_P_IP && ip->protocol == IPPROTO_UDP && ntohs(udp->dest) == (uint16_t)g.udp_port && h->magic == KVS_REPL_FRAME_MAGIC) {
-                DynBuf wb;
-                dynbuf_init(&wb, 4096);
-                if (xdp_incr_apply_frame(h, payload, repl_len, &wb) == 0) {
+                if (h->type == KVS_REPL_FRAME_ACK) {
+                    xdp_incr_handle_ack(h->seq);
                     g.rx_packets++; g.rx_bytes += d->len;
                 } else {
-                    g.rx_errors++;
+                    DynBuf wb;
+                    dynbuf_init(&wb, 4096);
+                    if (xdp_incr_apply_frame(h, payload, repl_len, &wb) == 0) {
+                        g.rx_packets++; g.rx_bytes += d->len;
+                    } else {
+                        g.rx_errors++;
+                    }
+                    dynbuf_free(&wb);
                 }
-                dynbuf_free(&wb);
             } else g.rx_errors++;
         } else g.rx_errors++;
         frame_free(d->addr);

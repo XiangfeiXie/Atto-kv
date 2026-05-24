@@ -2,10 +2,9 @@
 #include <bpf/bpf_helpers.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
-#include <linux/udp.h>
+#include <linux/tcp.h>
 
-#define IPPROTO_UDP 17
-#define KVS_REPL_FRAME_MAGIC 0x5852504cU
+#define IPPROTO_TCP 6
 
 struct {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
@@ -26,21 +25,27 @@ int xdp_kvs_repl(struct xdp_md *ctx)
 {
     void *data = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
+
+    /* Parse Ethernet header */
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end) return XDP_PASS;
     if (eth->h_proto != __builtin_bswap16(ETH_P_IP)) return XDP_PASS;
 
+    /* Parse IP header */
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end) return XDP_PASS;
-    if (iph->protocol != IPPROTO_UDP) return XDP_PASS;
+    if (iph->protocol != IPPROTO_TCP) return XDP_PASS;
 
-    struct udphdr *udp = (void *)iph + iph->ihl * 4;
-    if ((void *)(udp + 1) > data_end) return XDP_PASS;
+    /* Parse TCP header */
+    struct tcphdr *tcp = (void *)iph + (iph->ihl * 4);
+    if ((void *)(tcp + 1) > data_end) return XDP_PASS;
 
+    /* Check destination port */
     __u32 key = 0;
     __u16 *port = bpf_map_lookup_elem(&kvs_repl_port, &key);
-    if (!port || udp->dest != __builtin_bswap16(*port)) return XDP_PASS;
+    if (!port || tcp->dest != __builtin_bswap16(*port)) return XDP_PASS;
 
+    /* Redirect to AF_XDP socket for zero-copy receive */
     __u32 rxq = ctx->rx_queue_index;
     return bpf_redirect_map(&kvs_repl_xsks, rxq, XDP_PASS);
 }

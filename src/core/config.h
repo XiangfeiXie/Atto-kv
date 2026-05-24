@@ -54,6 +54,7 @@ typedef struct {
     char xdp_repl_ifname[32];
     int  xdp_repl_queue;
     int  xdp_repl_udp_port;
+    int  xdp_repl_tcp_port;  /* TCP port for replication (default: udp_port + 100) */
     int  xdp_repl_zero_copy; /* 0 = auto/copy fallback, 1 = require zero-copy */
     int  xdp_repl_batch;
     int  xdp_repl_mtu;

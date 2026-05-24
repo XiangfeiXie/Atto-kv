@@ -41,6 +41,7 @@ static void config_default(void) {
     strncpy(kvs_config.xdp_repl_ifname, "lo", sizeof(kvs_config.xdp_repl_ifname) - 1);
     kvs_config.xdp_repl_queue = 0;
     kvs_config.xdp_repl_udp_port = 6383;
+    kvs_config.xdp_repl_tcp_port = 6483;  /* Default: udp_port + 100 */
     kvs_config.xdp_repl_zero_copy = 0;
     kvs_config.xdp_repl_batch = 64;
     kvs_config.xdp_repl_mtu = 1400;
@@ -288,6 +289,9 @@ int config_load(const char *path) {
 
         } else if (strcasecmp(key, "xdp_repl_udp_port") == 0) {
             parse_int(val, lineno, "xdp_repl_udp_port", 1, 65535, &kvs_config.xdp_repl_udp_port);
+
+        } else if (strcasecmp(key, "xdp_repl_tcp_port") == 0) {
+            parse_int(val, lineno, "xdp_repl_tcp_port", 1, 65535, &kvs_config.xdp_repl_tcp_port);
 
         } else if (strcasecmp(key, "xdp_repl_zero_copy") == 0) {
             if (strcasecmp(val, "auto") == 0 || strcasecmp(val, "copy") == 0 ||

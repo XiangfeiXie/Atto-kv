@@ -108,6 +108,8 @@ set(REPL_SRCS
     src/repl/repl_stream.c
     src/repl/xdp_incr_repl.c
     src/repl/xdp_repl_manager.c
+    src/repl/tcp_xdp_repl.c
+    src/repl/repl_backlog.c
 )
 
 set(BPF_SRCS

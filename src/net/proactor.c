@@ -139,30 +139,28 @@ static inline void buf_ring_recycle(unsigned bid) {
     io_uring_buf_ring_advance(w->buf_ring, 1);
 }
 
-/* Phase 3.2: arm a recv that pulls buffers from the buf ring. */
+/* Arm a true multishot recv (IORING_RECV_MULTISHOT) that pulls
+ * buffers from the provided buffer ring (buf_group KVS_BUF_RING_BGID).
+ *
+ * One SQE delivers multiple CQEs — the kernel picks a fresh buffer from
+ * the ring for each chunk of received data.  CQEs carry IORING_CQE_F_MORE
+ * until the last delivery.  This eliminates the per-read re-arm overhead:
+ * a single SQE can service an entire connection's read workload.
+ *
+ * The buffer and length parameters are left zero — the kernel obtains
+ * them from the provided-buffer ring via IOSQE_BUFFER_SELECT. */
 static int set_event_recv_multishot(struct io_uring *ring, int sockfd, uint32_t gen) {
     struct io_uring_sqe *sqe = get_sqe_submit(ring);
     if (!sqe) return -1;
-    struct conn *c = (sockfd >= 0 && sockfd < conn_pool_size) ? &conn_pool[sockfd] : NULL;
-    if (!c || !c->read_buf.buf)
-        return -1;
-    size_t tail = (size_t)c->r_off + c->read_buf.len;
-    if (tail >= c->read_buf.cap) {
-        size_t new_cap = c->read_buf.cap * 2;
-        char *new_buf = realloc(c->read_buf.buf, new_cap);
-        if (!new_buf)
-            return -1;
-        c->read_buf.buf = new_buf;
-        c->read_buf.cap = new_cap;
-    }
-    io_uring_prep_recv(sqe, sockfd, c->read_buf.buf + tail,
-                       c->read_buf.cap - tail, 0);
+    io_uring_prep_recv_multishot(sqe, sockfd, NULL, 0, 0);
+    sqe->buf_group = KVS_BUF_RING_BGID;
+    sqe->flags |= IOSQE_BUFFER_SELECT;
     sqe->user_data = conn_info_pack(sockfd, EVENT_READ, gen);
     return 0;
 }
 
 static int conn_arm_recv(struct io_uring *ring, struct conn *c) {
-    if (!c || !c->active || c->recv_armed || c->send_armed || c->write_buf.len > 0)
+    if (!c || !c->active || c->recv_armed)
         return 0;
     if (c->client && c->client->state == CLIENT_BLOCKED)
         return 0;
@@ -235,6 +233,8 @@ static int worker_arm_accept(proactor_worker_t *w) {
     return 0;
 }
 
+static void conn_release(int fd);
+
 /* ── Local notify: drain pipelined input, post send SQE on **this** worker's
  *    ring.  Only safe when invoked on the conn's owner worker.  Caller in
  *    cross-worker scenarios must route through proactor_block_notify().
@@ -282,9 +282,11 @@ static void proactor_block_notify_local(client_t *cl) {
                                      &conn->write_buf, conn);
     }
     if (conn->write_buf.len > 0) {
-        conn_arm_send(&tls_worker->ring, conn);
+        if (conn_arm_send(&tls_worker->ring, conn) != 0)
+            conn_release(conn->fd);
     } else {
-        conn_arm_recv(&tls_worker->ring, conn);
+        if (conn_arm_recv(&tls_worker->ring, conn) != 0)
+            conn_release(conn->fd);
     }
 }
 
@@ -431,15 +433,35 @@ static int worker_listen(proactor_worker_t *w, unsigned short port, int reusepor
 
 static int worker_setup_ring(proactor_worker_t *w)
 {
-    /* Phase 3.3 setup flags.  With multiple workers each ring still has
-     * a single issuer thread, so SINGLE_ISSUER + DEFER_TASKRUN remain
-     * legal per-ring.  Falls back gracefully on older kernels. */
+    /* Request SINGLE_ISSUER + DEFER_TASKRUN + COOP_TASKRUN for maximum
+     * batching.  DEFER_TASKRUN defers work execution until the next
+     * submit_and_wait, reducing context-switch overhead.  COOP_TASKRUN
+     * signals the kernel that only this task will wait on the ring,
+     * allowing further batching optimisations.  Falls back gracefully on
+     * older kernels that lack these flags. */
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
-    params.flags = 0;
+    params.flags = IORING_SETUP_SINGLE_ISSUER
+                 | IORING_SETUP_DEFER_TASKRUN
+                 | IORING_SETUP_COOP_TASKRUN;
     int qret = io_uring_queue_init_params(ENTRIES_LENGTH, &w->ring, &params);
     if (qret == -EINVAL) {
+        /* Retry without COOP_TASKRUN (kernel < 6.1) */
         memset(&params, 0, sizeof(params));
+        params.flags = IORING_SETUP_SINGLE_ISSUER
+                     | IORING_SETUP_DEFER_TASKRUN;
+        qret = io_uring_queue_init_params(ENTRIES_LENGTH, &w->ring, &params);
+    }
+    if (qret == -EINVAL) {
+        /* Retry with only SINGLE_ISSUER (kernel < 5.19) */
+        memset(&params, 0, sizeof(params));
+        params.flags = IORING_SETUP_SINGLE_ISSUER;
+        qret = io_uring_queue_init_params(ENTRIES_LENGTH, &w->ring, &params);
+    }
+    if (qret == -EINVAL) {
+        /* Bare minimum (kernel < 5.13) */
+        memset(&params, 0, sizeof(params));
+        params.flags = 0;
         qret = io_uring_queue_init_params(ENTRIES_LENGTH, &w->ring, &params);
     }
     if (qret < 0) {
@@ -475,6 +497,14 @@ static int worker_setup_ring(proactor_worker_t *w)
                               (unsigned short)i, br_mask, i);
     }
     io_uring_buf_ring_advance(w->buf_ring, KVS_NR_BUFS);
+
+    /* Arm the cross-worker wake eventfd so other workers can kick
+     * this worker out of io_uring_submit_and_wait(). */
+    if (set_event_wake_read(&w->ring, w->wake_evfd) != 0) {
+        fprintf(stderr, "[proactor#%d] failed to arm wake eventfd\n",
+                w->id);
+        return -1;
+    }
 
     if (w->id == 0) {
         printf("[proactor] io_uring flags: 0x%x (single_issuer/defer_taskrun/coop)\n",
@@ -687,7 +717,12 @@ static void *worker_loop(void *arg) {
                         buf_ring_recycle(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
                     continue;
                 }
-                c->recv_armed = 0;
+                /* Multishot recv: the SQE stays armed across multiple CQEs.
+                 * Only clear recv_armed when the kernel signals termination
+                 * (IORING_CQE_F_MORE absent).  On the last delivery — or on
+                 * error/close — conn_arm_recv() will submit a fresh SQE. */
+                if (!(cqe->flags & IORING_CQE_F_MORE))
+                    c->recv_armed = 0;
                 DynBuf *rb = &c->read_buf;
                 DynBuf *wb = &c->write_buf;
 
@@ -716,7 +751,8 @@ static void *worker_loop(void *arg) {
 
                 if (res <= 0) {
                     if (res == -ENOBUFS) {
-                        conn_arm_recv(ring, c);
+                        if (conn_arm_recv(ring, c) != 0)
+                            conn_release(fd);
                         continue;
                     }
                     if (res < 0 && res != -ECANCELED)
@@ -729,13 +765,20 @@ static void *worker_loop(void *arg) {
                             fprintf(stderr, "[proactor#%d] fd=%d eof-drain res=%d rb_len=%d r_off=%d wb_len=%d\n",
                                     w->id, fd, drained, rb->len, c->r_off, wb->len);
                     }
-                    if (wb->len > 0)
-                        conn_arm_send(ring, c);
-                    else
+                    if (wb->len > 0) {
+                        if (conn_arm_send(ring, c) != 0)
+                            conn_release(fd);
+                    } else {
                         conn_release(fd);
+                    }
                     continue;
                 } else {
+                    /* Defer drain while a send SQE is in flight: drain may
+                     * append to write_buf and trigger realloc, which would
+                     * corrupt the in-flight send buffer pointer.  Re-arm
+                     * recv so more data can arrive while we wait. */
                     if (c->send_armed || wb->len > 0) {
+                        conn_arm_recv(ring, c);
                         goto event_read_done;
                     }
 
@@ -746,17 +789,21 @@ static void *worker_loop(void *arg) {
                                 c->send_armed, c->recv_armed);
 
                     if (c->client && c->client->state == CLIENT_BLOCKED) {
-                        if (wb->len > 0)
-                            conn_arm_send(ring, c);
-                    } else if (c->status) {
-                        if (wb->len > 0)
-                            conn_arm_send(ring, c);
-                        else
+                        if (wb->len > 0 && conn_arm_send(ring, c) != 0)
                             conn_release(fd);
+                    } else if (c->status) {
+                        if (wb->len > 0) {
+                            if (conn_arm_send(ring, c) != 0)
+                                conn_release(fd);
+                        } else {
+                            conn_release(fd);
+                        }
                     } else if (wb->len > 0) {
-                        conn_arm_send(ring, c);
+                        if (conn_arm_send(ring, c) != 0)
+                            conn_release(fd);
                     } else {
-                        conn_arm_recv(ring, c);
+                        if (conn_arm_recv(ring, c) != 0)
+                            conn_release(fd);
                     }
                 }
 event_read_done: ;
@@ -767,6 +814,7 @@ event_read_done: ;
                  * Re-arm the read first, then drain the queue.  This
                  * keeps the per-iteration hot path lock-free. */
                 proactor_drain_wakes(w);
+                set_event_wake_read(ring, w->wake_evfd);
             }
             else if (result.event == EVENT_WRITE) {
                 if (fd < 0 || fd >= conn_pool_size) continue;
@@ -786,7 +834,8 @@ event_read_done: ;
 
                 if (wb->len > 0) {
                     /* More data to send */
-                    conn_arm_send(ring, c);
+                    if (conn_arm_send(ring, c) != 0)
+                        conn_release(fd);
                 } else {
                     /* Write complete */
                     c->w_off = 0;
@@ -799,21 +848,28 @@ event_read_done: ;
                             fprintf(stderr, "[proactor#%d] fd=%d post-send-drain drained=%d rb_len=%d r_off=%d wb_len=%d\n",
                                     w->id, fd, drained, c->read_buf.len, c->r_off, wb->len);
                         if (c->status) {
-                            if (wb->len > 0)
-                                conn_arm_send(ring, c);
-                            else
+                            if (wb->len > 0) {
+                                if (conn_arm_send(ring, c) != 0)
+                                    conn_release(fd);
+                            } else {
                                 conn_release(fd);
+                            }
                         } else if (c->client && c->client->state == CLIENT_BLOCKED) {
-                            if (wb->len > 0)
-                                conn_arm_send(ring, c);
+                            if (wb->len > 0 && conn_arm_send(ring, c) != 0)
+                                conn_release(fd);
                         } else if (wb->len > 0) {
-                            conn_arm_send(ring, c);
+                            if (conn_arm_send(ring, c) != 0)
+                                conn_release(fd);
                         } else {
-                            if (conn_arm_recv(ring, c) == 0)
+                            if (conn_arm_recv(ring, c) != 0)
+                                conn_release(fd);
+                            else
                                 io_uring_submit(ring);
                         }
                     } else {
-                        if (conn_arm_recv(ring, c) == 0)
+                        if (conn_arm_recv(ring, c) != 0)
+                            conn_release(fd);
+                        else
                             io_uring_submit(ring);
                     }
                 }

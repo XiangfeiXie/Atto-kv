@@ -1,0 +1,51 @@
+# KVStore Performance Benchmark Results — 2026-05-24 12:00:43
+=== Pipeline 批量处理性能对比 ===
+压测参数: redis-benchmark -n 1000000 -c 50 -P <depth> -d 16
+测试时间: 2026-05-24 12:00:43
+
+Pipeline-10-SET | kvstore: 181950.52 req/s
+Pipeline-10-SET | Redis: 208550.56 req/s
+  SET 比值 (kvstore/Redis): 0.87x
+Pipeline-10-GET | kvstore: 180050.42 req/s
+Pipeline-10-GET | Redis: 209161.25 req/s
+  GET 比值 (kvstore/Redis): 0.86x
+
+Pipeline-20-SET | kvstore: 356760.62 req/s
+Pipeline-20-SET | Redis: 277854.97 req/s
+  SET 比值 (kvstore/Redis): 1.28x
+Pipeline-20-GET | kvstore: 347342.84 req/s
+Pipeline-20-GET | Redis: 330360.09 req/s
+  GET 比值 (kvstore/Redis): 1.05x
+
+Pipeline-40-SET | kvstore: 588928.19 req/s
+Pipeline-40-SET | Redis: 340483.47 req/s
+  SET 比值 (kvstore/Redis): 1.73x
+Pipeline-40-GET | kvstore: 635324.00 req/s
+Pipeline-40-GET | Redis: 443066.03 req/s
+  GET 比值 (kvstore/Redis): 1.43x
+
+Pipeline-80-SET | kvstore: 582750.62 req/s
+Pipeline-80-SET | Redis: 421585.16 req/s
+  SET 比值 (kvstore/Redis): 1.38x
+Pipeline-80-GET | kvstore: 1112347.12 req/s
+Pipeline-80-GET | Redis: 489476.25 req/s
+  GET 比值 (kvstore/Redis): 2.27x
+
+Pipeline-160-SET | kvstore: 616142.94 req/s
+Pipeline-160-SET | Redis: 424268.12 req/s
+  SET 比值 (kvstore/Redis): 1.45x
+Pipeline-160-GET | kvstore: 1097694.88 req/s
+Pipeline-160-GET | Redis: 567536.88 req/s
+  GET 比值 (kvstore/Redis): 1.93x
+
+
+=== 汇总 ===
+
+  P      |      kvs-SET |    redis-SET | S倍率 |      kvs-GET |    redis-GET | G倍率
+  ------ | ------------ | ------------ | ------ | ------------ | ------------ | ------
+  P=10   |    181950.52 |    208550.56 |  0.87x |    180050.42 |    209161.25 |  0.86x
+  P=20   |    356760.62 |    277854.97 |  1.28x |    347342.84 |    330360.09 |  1.05x
+  P=40   |    588928.19 |    340483.47 |  1.73x |    635324.00 |    443066.03 |  1.43x
+  P=80   |    582750.62 |    421585.16 |  1.38x |   1112347.12 |    489476.25 |  2.27x
+  P=160  |    616142.94 |    424268.12 |  1.45x |   1097694.88 |    567536.88 |  1.93x
+

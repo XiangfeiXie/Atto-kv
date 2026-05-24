@@ -249,6 +249,7 @@ void kvs_rdma_incr_probe(const char *msg, int length) {
 static inline void kvs_write_journal_append_kind(uint16_t kind, const char *msg, int length) {
     uint64_t seq = 0;
     if (!msg || length <= 0) return;
+    if (!ENABLE_AOF && !kvs_config.xdp_repl_enabled) return;
     if (kvs_journal_append(kind, 0, msg, (uint32_t)length, &seq) != 0)
         return;
 
@@ -256,7 +257,8 @@ static inline void kvs_write_journal_append_kind(uint16_t kind, const char *msg,
     if (kvs_journal_copy(seq, &rec) != 0)
         return;
 
-    kvs_wal_persist_append(&rec);
+    if (ENABLE_AOF)
+        kvs_wal_persist_append(&rec);
     repl_stream_publish(&rec);
     kvs_journal_record_release(&rec);
 }

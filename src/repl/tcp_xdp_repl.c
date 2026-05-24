@@ -108,14 +108,17 @@ static int send_frame(int fd, uint8_t type, const char *payload, uint32_t len) {
 }
 
 static int recv_frame(int fd, repl_frame_hdr_t *hdr, char *payload, size_t max_len) {
-    /* Receive header with timeout to allow graceful shutdown */
-    ssize_t n = recv(fd, hdr, sizeof(*hdr), MSG_WAITALL);
-    if (n != sizeof(*hdr)) {
+    ssize_t n;
+
+    /* Receive header, retrying on EAGAIN/EINTR */
+    while (1) {
+        n = recv(fd, hdr, sizeof(*hdr), MSG_WAITALL);
+        if (n == sizeof(*hdr)) break;
         if (n == 0 || errno == ECONNRESET || errno == EPIPE) {
             return -1;  /* Connection closed */
         }
         if (errno == EINTR || errno == EAGAIN) {
-            return -1;  /* Interrupted or timeout */
+            continue;  /* Retry on timeout or signal */
         }
         return -1;
     }
@@ -127,8 +130,17 @@ static int recv_frame(int fd, repl_frame_hdr_t *hdr, char *payload, size_t max_l
             return -1;
         }
 
-        n = recv(fd, payload, hdr->len, MSG_WAITALL);
-        if (n != (ssize_t)hdr->len) return -1;
+        while (1) {
+            n = recv(fd, payload, hdr->len, MSG_WAITALL);
+            if (n == (ssize_t)hdr->len) break;
+            if (n == 0 || errno == ECONNRESET || errno == EPIPE) {
+                return -1;
+            }
+            if (errno == EINTR || errno == EAGAIN) {
+                continue;
+            }
+            return -1;
+        }
     }
 
     return 0;

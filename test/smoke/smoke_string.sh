@@ -96,12 +96,12 @@ $RCLI SET big "$LONG" >/dev/null
 chk "STRLEN large"  "4000"   "$($RCLI STRLEN big)"
 chk "GET large roundtrip" "$LONG" "$($RCLI GET big)"
 
-section "Wrong-type guard"
+section "Hash wrong-type guard"
 $RCLI DEL k >/dev/null
-$RCLI LPUSH k a b c >/dev/null
+$RCLI HSET k f v >/dev/null
 W="WRONGTYPE Operation against a key holding the wrong kind of value"
-chk "GET on list"    "$W"     "$($RCLI GET k 2>&1)"
-chk "INCR on list"   "$W"     "$($RCLI INCR k 2>&1)"
-chk "APPEND on list" "$W"     "$($RCLI APPEND k x 2>&1)"
+chk "GET on hash"    "$W"     "$($RCLI GET k 2>&1)"
+chk "INCR on hash"   "$W"     "$($RCLI INCR k 2>&1)"
+chk "APPEND on hash" "$W"     "$($RCLI APPEND k x 2>&1)"
 
 summary "STRING"

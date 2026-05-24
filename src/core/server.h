@@ -27,6 +27,9 @@ struct conn {
     int w_off;              /* write buffer sent offset (avoids memmove) */
     int active;             /* slot is in use (dynamic pool) */
     uint32_t cur_events;    /* cached epoll mask (lazy MOD optimization) */
+    int recv_armed;
+    int send_armed;
+    uint32_t gen;
 
     struct client *client;  /* application-layer session (NULL until first command) */
 

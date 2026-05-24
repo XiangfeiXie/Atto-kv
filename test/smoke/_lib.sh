@@ -4,7 +4,8 @@
 
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-2000}"
-RCLI="redis-cli -h ${HOST} -p ${PORT}"
+REDIS_CLI_TIMEOUT="${REDIS_CLI_TIMEOUT:-3s}"
+RCLI="timeout ${REDIS_CLI_TIMEOUT} redis-cli -h ${HOST} -p ${PORT}"
 
 PASS=0
 FAIL=0

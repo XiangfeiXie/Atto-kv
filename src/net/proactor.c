@@ -23,11 +23,11 @@
 #define EVENT_READ      1
 #define EVENT_WRITE     2
 #define EVENT_WAKE      3   /* Phase 4B.2: cross-worker wake eventfd readable */
-#define ENTRIES_LENGTH  1024
+#define ENTRIES_LENGTH  4096
 
 /* Phase 3.2: provided buffer ring for multishot recv. */
 #define KVS_BUF_RING_BGID  1
-#define KVS_NR_BUFS        1024     /* must be power of two */
+#define KVS_NR_BUFS        4096     /* must be power of two */
 #define KVS_BUF_SIZE       4096
 
 /* Phase 4: per-worker proactor.
@@ -69,6 +69,7 @@ typedef struct proactor_worker {
     int                       wake_evfd;   /* eventfd; another worker writes to it
                                               to nudge this worker out of
                                               io_uring_submit_and_wait */
+    int                       accept_armed;
 } proactor_worker_t;
 
 static struct conn   *conn_pool = NULL;
@@ -76,16 +77,55 @@ static int            conn_pool_size = 0;
 static msg_handler    kvs_handler;
 static proactor_worker_t *g_workers = NULL;
 static int                g_n_workers = 0;
+static atomic_uint         g_next_conn_gen = 1;
+static int                 g_proactor_debug = -1;
 
 /* Thread-local pointer to the currently-executing worker.  Used by
  * buf_ring_recycle() and the block-notify callback so they don't need
  * an explicit worker argument plumbed through every call site. */
 static __thread proactor_worker_t *tls_worker = NULL;
 
+static int proactor_debug_enabled(void) {
+    if (g_proactor_debug < 0)
+        g_proactor_debug = getenv("KVS_PROACTOR_DEBUG") ? 1 : 0;
+    return g_proactor_debug;
+}
+
 struct conn_info {
     int fd;
     int event;
+    uint32_t gen;
 };
+
+static uint64_t conn_info_pack(int fd, int event, uint32_t gen) {
+    return ((uint64_t)(uint32_t)fd)
+         | ((uint64_t)(uint8_t)event << 32)
+         | ((uint64_t)(gen & 0xFFFFFFu) << 40);
+}
+
+static struct conn_info conn_info_unpack(uint64_t data) {
+    struct conn_info ci;
+    ci.fd = (int)(uint32_t)data;
+    ci.event = (int)((data >> 32) & 0xFFu);
+    ci.gen = (uint32_t)((data >> 40) & 0xFFFFFFu);
+    return ci;
+}
+
+static uint32_t next_conn_gen(void) {
+    uint32_t gen;
+    do {
+        gen = atomic_fetch_add_explicit(&g_next_conn_gen, 1,
+                                        memory_order_relaxed) & 0xFFFFFFu;
+    } while (gen == 0);
+    return gen;
+}
+
+static struct io_uring_sqe *get_sqe_submit(struct io_uring *ring) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (sqe) return sqe;
+    if (io_uring_submit(ring) < 0) return NULL;
+    return io_uring_get_sqe(ring);
+}
 
 /* Hand a buffer back to the kernel ring so it can be reused. */
 static inline void buf_ring_recycle(unsigned bid) {
@@ -99,14 +139,41 @@ static inline void buf_ring_recycle(unsigned bid) {
     io_uring_buf_ring_advance(w->buf_ring, 1);
 }
 
-/* Phase 3.2: arm a multishot recv that pulls buffers from the buf ring. */
-static void set_event_recv_multishot(struct io_uring *ring, int sockfd) {
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    struct conn_info ci = {.fd = sockfd, .event = EVENT_READ};
-    io_uring_prep_recv_multishot(sqe, sockfd, NULL, 0, 0);
-    sqe->buf_group = KVS_BUF_RING_BGID;
-    sqe->flags |= IOSQE_BUFFER_SELECT;
-    memcpy(&sqe->user_data, &ci, sizeof(ci));
+/* Phase 3.2: arm a recv that pulls buffers from the buf ring. */
+static int set_event_recv_multishot(struct io_uring *ring, int sockfd, uint32_t gen) {
+    struct io_uring_sqe *sqe = get_sqe_submit(ring);
+    if (!sqe) return -1;
+    struct conn *c = (sockfd >= 0 && sockfd < conn_pool_size) ? &conn_pool[sockfd] : NULL;
+    if (!c || !c->read_buf.buf)
+        return -1;
+    size_t tail = (size_t)c->r_off + c->read_buf.len;
+    if (tail >= c->read_buf.cap) {
+        size_t new_cap = c->read_buf.cap * 2;
+        char *new_buf = realloc(c->read_buf.buf, new_cap);
+        if (!new_buf)
+            return -1;
+        c->read_buf.buf = new_buf;
+        c->read_buf.cap = new_cap;
+    }
+    io_uring_prep_recv(sqe, sockfd, c->read_buf.buf + tail,
+                       c->read_buf.cap - tail, 0);
+    sqe->user_data = conn_info_pack(sockfd, EVENT_READ, gen);
+    return 0;
+}
+
+static int conn_arm_recv(struct io_uring *ring, struct conn *c) {
+    if (!c || !c->active || c->recv_armed || c->send_armed || c->write_buf.len > 0)
+        return 0;
+    if (c->client && c->client->state == CLIENT_BLOCKED)
+        return 0;
+    if (c->status)
+        return 0;
+    if (set_event_recv_multishot(ring, c->fd, c->gen) != 0)
+        return -1;
+    c->recv_armed = 1;
+    if (proactor_debug_enabled())
+        fprintf(stderr, "[proactor] arm recv fd=%d gen=%u\n", c->fd, c->gen);
+    return 0;
 }
 
 static int p_init_listen(unsigned short port, int reuseport) {
@@ -131,19 +198,41 @@ static int p_init_listen(unsigned short port, int reuseport) {
     return sockfd;
 }
 
-void set_event_send(struct io_uring *ring, int sockfd, void *buf, size_t len) {
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    struct conn_info ci = {.fd = sockfd, .event = EVENT_WRITE};
+static int set_event_send(struct io_uring *ring, int sockfd, uint32_t gen, void *buf, size_t len) {
+    struct io_uring_sqe *sqe = get_sqe_submit(ring);
+    if (!sqe) return -1;
     io_uring_prep_send(sqe, sockfd, buf, len, MSG_NOSIGNAL);
-    memcpy(&sqe->user_data, &ci, sizeof(ci));
+    sqe->user_data = conn_info_pack(sockfd, EVENT_WRITE, gen);
+    return 0;
 }
 
-/* Phase 3.1: multishot accept. */
-void set_event_accept(struct io_uring *ring, int sockfd) {
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    struct conn_info ci = {.fd = sockfd, .event = EVENT_ACCEPT};
+static int conn_arm_send(struct io_uring *ring, struct conn *c) {
+    if (!c || !c->active || c->send_armed || c->write_buf.len <= 0)
+        return 0;
+    if (set_event_send(ring, c->fd, c->gen, c->write_buf.buf + c->w_off,
+                       c->write_buf.len) != 0)
+        return -1;
+    c->send_armed = 1;
+    return 0;
+}
+
+static int set_event_accept(struct io_uring *ring, int sockfd) {
+    struct io_uring_sqe *sqe = get_sqe_submit(ring);
+    if (!sqe) return -1;
     io_uring_prep_multishot_accept(sqe, sockfd, NULL, NULL, SOCK_NONBLOCK);
-    memcpy(&sqe->user_data, &ci, sizeof(ci));
+    sqe->user_data = conn_info_pack(sockfd, EVENT_ACCEPT, 0);
+    return 0;
+}
+
+static int worker_arm_accept(proactor_worker_t *w) {
+    if (!w || w->accept_armed)
+        return 0;
+    if (set_event_accept(&w->ring, w->listen_fd) != 0)
+        return -1;
+    w->accept_armed = 1;
+    if (proactor_debug_enabled())
+        fprintf(stderr, "[proactor#%d] accept armed\n", w->id);
+    return 0;
 }
 
 /* ── Local notify: drain pipelined input, post send SQE on **this** worker's
@@ -193,9 +282,9 @@ static void proactor_block_notify_local(client_t *cl) {
                                      &conn->write_buf, conn);
     }
     if (conn->write_buf.len > 0) {
-        set_event_send(&tls_worker->ring, conn->fd,
-                       conn->write_buf.buf + conn->w_off,
-                       conn->write_buf.len);
+        conn_arm_send(&tls_worker->ring, conn);
+    } else {
+        conn_arm_recv(&tls_worker->ring, conn);
     }
 }
 
@@ -266,13 +355,13 @@ static __thread uint64_t tls_wake_evfd_buf;
 /* Arm a read on the worker's wake eventfd so that cross-worker kicks
  * unblock io_uring_submit_and_wait().  The CQE is handled as
  * EVENT_WAKE in the main loop, which re-arms it and drains the queue. */
-static void set_event_wake_read(struct io_uring *ring, int evfd) {
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    if (!sqe) return;
-    struct conn_info ci = {.fd = evfd, .event = EVENT_WAKE};
+static int set_event_wake_read(struct io_uring *ring, int evfd) {
+    struct io_uring_sqe *sqe = get_sqe_submit(ring);
+    if (!sqe) return -1;
     io_uring_prep_read(sqe, evfd, &tls_wake_evfd_buf,
                        sizeof(tls_wake_evfd_buf), 0);
-    memcpy(&sqe->user_data, &ci, sizeof(ci));
+    sqe->user_data = conn_info_pack(evfd, EVENT_WAKE, 0);
+    return 0;
 }
 
 /* ── Release a connection slot ──
@@ -310,6 +399,9 @@ static void conn_release(int fd) {
         atomic_fetch_sub_explicit(&g_kvs_connected_clients, 1,
                                    memory_order_relaxed);
     }
+    if (proactor_debug_enabled())
+        fprintf(stderr, "[proactor] release fd=%d gen=%u recv_armed=%d send_armed=%d rb_len=%d wb_len=%d\n",
+                fd, c->gen, c->recv_armed, c->send_armed, c->read_buf.len, c->write_buf.len);
     dynbuf_free(&c->read_buf);
     dynbuf_free(&c->write_buf);
     memset(c, 0, sizeof(*c));   /* clear slot BEFORE releasing fd */
@@ -344,10 +436,7 @@ static int worker_setup_ring(proactor_worker_t *w)
      * legal per-ring.  Falls back gracefully on older kernels. */
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
-    params.flags = IORING_SETUP_SINGLE_ISSUER
-                 | IORING_SETUP_DEFER_TASKRUN
-                 | IORING_SETUP_COOP_TASKRUN
-                 | IORING_SETUP_SUBMIT_ALL;
+    params.flags = 0;
     int qret = io_uring_queue_init_params(ENTRIES_LENGTH, &w->ring, &params);
     if (qret == -EINVAL) {
         memset(&params, 0, sizeof(params));
@@ -468,14 +557,16 @@ static void *worker_loop(void *arg) {
     struct io_uring *ring = &w->ring;
     int sockfd = w->listen_fd;
 
-    set_event_accept(ring, sockfd);
-    set_event_wake_read(ring, w->wake_evfd);     /* Phase 4B.2 */
+    if (worker_arm_accept(w) != 0) {
+        fprintf(stderr, "[proactor#%d] failed to arm accept\n", w->id);
+        return NULL;
+    }
 
     while (!g_kvs_stop) {
         if (w->id == 0) update_cached_time();   /* one writer is enough */
 
-        struct io_uring_cqe *cqes[128];
-        int nready = io_uring_peek_batch_cqe(ring, cqes, 128);
+        struct io_uring_cqe *cqes[256];
+        int nready = io_uring_peek_batch_cqe(ring, cqes, 256);
 
         if (nready == 0) {
             /* Block subsystem is now MT-safe; only worker 0 sweeps timeouts
@@ -484,28 +575,29 @@ static void *worker_loop(void *arg) {
             if (w->id == 0) block_check_timeouts();
             int to_ms = (w->id == 0) ? block_nearest_timeout() : -1;
             if (to_ms >= 0) {
-                struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+                struct io_uring_sqe *sqe = get_sqe_submit(ring);
                 if (sqe) {
                     struct __kernel_timespec ts;
                     ts.tv_sec  = to_ms / 1000;
                     ts.tv_nsec = (to_ms % 1000) * 1000000L;
                     io_uring_prep_timeout(sqe, &ts, 0, 0);
-                    sqe->user_data = 0;
+                    sqe->user_data = conn_info_pack(0, 0, 0);
                 }
             }
             int ret = io_uring_submit_and_wait(ring, 1);
             if (ret < 0) {
                 if (ret == -EINTR) continue;
+                fprintf(stderr, "[proactor#%d] submit_and_wait: %s\n",
+                        w->id, strerror(-ret));
                 break;
             }
-            nready = io_uring_peek_batch_cqe(ring, cqes, 128);
+            nready = io_uring_peek_batch_cqe(ring, cqes, 256);
             if (nready <= 0) continue;
         }
 
         for (int i = 0; i < nready; i++) {
             struct io_uring_cqe *cqe = cqes[i];
-            struct conn_info result;
-            memcpy(&result, &cqe->user_data, sizeof(result));
+            struct conn_info result = conn_info_unpack(cqe->user_data);
             int fd = result.fd;
             int res = cqe->res;
 
@@ -513,9 +605,16 @@ static void *worker_loop(void *arg) {
 
             if (result.event == EVENT_ACCEPT) {
                 if (!(cqe->flags & IORING_CQE_F_MORE))
-                    set_event_accept(ring, sockfd);
+                    w->accept_armed = 0;
                 int connfd = res;
-                if (connfd < 0) continue;
+                if (connfd < 0) {
+                    if (connfd != -EAGAIN && connfd != -ECANCELED)
+                        fprintf(stderr, "[proactor#%d] accept cqe: %s\n",
+                                w->id, strerror(-connfd));
+                    continue;
+                }
+                if (proactor_debug_enabled())
+                    fprintf(stderr, "[proactor#%d] accept fd=%d\n", w->id, connfd);
                 if (connfd >= conn_pool_size) {
                     fprintf(stderr, "[proactor#%d] fd %d exceeds maxclients %d\n",
                             w->id, connfd, conn_pool_size);
@@ -540,6 +639,9 @@ static void *worker_loop(void *arg) {
                 nc->active = 1;
                 nc->r_off = 0;
                 nc->w_off = 0;
+                nc->recv_armed = 0;
+                nc->send_armed = 0;
+                nc->gen = next_conn_gen();
                 nc->owner_worker_id = w->id;   /* Phase 4B.2 */
                 /* Phase 9 — INFO total/live counters. */
                 atomic_fetch_add_explicit(&g_kvs_total_connections, 1,
@@ -553,7 +655,15 @@ static void *worker_loop(void *arg) {
                  * the kernel-mediated accept→close ownership window. */
                 nc->client = (client_t *)calloc(1, sizeof(client_t));
                 if (nc->client) nc->client->conn = nc;
-                set_event_recv_multishot(ring, connfd);
+                if (conn_arm_recv(ring, nc) != 0)
+                    conn_release(connfd);
+                else if (proactor_debug_enabled()) {
+                    int submitted = io_uring_submit(ring);
+                    fprintf(stderr, "[proactor#%d] submit after accept fd=%d ret=%d\n",
+                            w->id, connfd, submitted);
+                } else {
+                    io_uring_submit(ring);
+                }
             }
             else if (result.event == EVENT_READ) {
                 if (fd < 0 || fd >= conn_pool_size) {
@@ -562,13 +672,22 @@ static void *worker_loop(void *arg) {
                     continue;
                 }
                 struct conn *c = &conn_pool[fd];
-                int multishot_dead = !(cqe->flags & IORING_CQE_F_MORE);
 
                 if (!c->active) {
                     if (cqe->flags & IORING_CQE_F_BUFFER)
                         buf_ring_recycle(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
                     continue;
                 }
+                if (result.gen != (c->gen & 0xFFFFFFu)) {
+                    if (proactor_debug_enabled())
+                        fprintf(stderr, "[proactor#%d] stale read fd=%d cqe_gen=%u cur_gen=%u res=%d flags=0x%x\n",
+                                w->id, fd, result.gen, c->gen & 0xFFFFFFu,
+                                res, cqe->flags);
+                    if (cqe->flags & IORING_CQE_F_BUFFER)
+                        buf_ring_recycle(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
+                    continue;
+                }
+                c->recv_armed = 0;
                 DynBuf *rb = &c->read_buf;
                 DynBuf *wb = &c->write_buf;
 
@@ -591,39 +710,55 @@ static void *worker_loop(void *arg) {
                     memcpy(rb->buf + c->r_off + rb->len, src, (size_t)res);
                     rb->len += res;
                     buf_ring_recycle(bid);
+                } else if (res > 0) {
+                    rb->len += res;
                 }
 
                 if (res <= 0) {
                     if (res == -ENOBUFS) {
-                        /* multishot died; will re-arm below */
-                    } else {
-                        if (rb->len > 0)
-                            kvs_drain_resp_commands_off(rb, &c->r_off, wb, c);
-                        if (wb->len > 0)
-                            set_event_send(ring, fd, wb->buf + c->w_off, wb->len);
-                        else
-                            conn_release(fd);
+                        conn_arm_recv(ring, c);
                         continue;
                     }
+                    if (res < 0 && res != -ECANCELED)
+                        fprintf(stderr, "[proactor#%d] recv fd=%d cqe: %s\n",
+                                w->id, fd, strerror(-res));
+                    /* Connection closed or error */
+                    if (rb->len > 0) {
+                        int drained = kvs_drain_resp_commands_off(rb, &c->r_off, wb, c);
+                        if (proactor_debug_enabled())
+                            fprintf(stderr, "[proactor#%d] fd=%d eof-drain res=%d rb_len=%d r_off=%d wb_len=%d\n",
+                                    w->id, fd, drained, rb->len, c->r_off, wb->len);
+                    }
+                    if (wb->len > 0)
+                        conn_arm_send(ring, c);
+                    else
+                        conn_release(fd);
+                    continue;
                 } else {
-                    kvs_drain_resp_commands_off(rb, &c->r_off, wb, c);
+                    if (c->send_armed || wb->len > 0) {
+                        goto event_read_done;
+                    }
+
+                    int drained = kvs_drain_resp_commands_off(rb, &c->r_off, wb, c);
+                    if (proactor_debug_enabled())
+                        fprintf(stderr, "[proactor#%d] fd=%d read res=%d drained=%d rb_len=%d r_off=%d wb_len=%d send_armed=%d recv_armed=%d\n",
+                                w->id, fd, res, drained, rb->len, c->r_off, wb->len,
+                                c->send_armed, c->recv_armed);
 
                     if (c->client && c->client->state == CLIENT_BLOCKED) {
                         if (wb->len > 0)
-                            set_event_send(ring, fd, wb->buf + c->w_off, wb->len);
+                            conn_arm_send(ring, c);
                     } else if (c->status) {
                         if (wb->len > 0)
-                            set_event_send(ring, fd, wb->buf + c->w_off, wb->len);
+                            conn_arm_send(ring, c);
                         else
                             conn_release(fd);
-                        if (multishot_dead) multishot_dead = 0;
                     } else if (wb->len > 0) {
-                        set_event_send(ring, fd, wb->buf + c->w_off, wb->len);
+                        conn_arm_send(ring, c);
+                    } else {
+                        conn_arm_recv(ring, c);
                     }
                 }
-
-                if (multishot_dead && c->active && !c->status)
-                    set_event_recv_multishot(ring, fd);
 event_read_done: ;
             }
             else if (result.event == EVENT_WAKE) {
@@ -631,31 +766,65 @@ event_read_done: ;
                  * (or someone kicked worker 0 to recompute timeouts).
                  * Re-arm the read first, then drain the queue.  This
                  * keeps the per-iteration hot path lock-free. */
-                set_event_wake_read(ring, w->wake_evfd);
                 proactor_drain_wakes(w);
             }
             else if (result.event == EVENT_WRITE) {
                 if (fd < 0 || fd >= conn_pool_size) continue;
                 struct conn *c = &conn_pool[fd];
                 if (!c->active) continue;
+                if (result.gen != (c->gen & 0xFFFFFFu)) continue;
+                c->send_armed = 0;
                 DynBuf *wb = &c->write_buf;
 
                 if (res <= 0) { conn_release(fd); continue; }
 
                 c->w_off += res;
                 wb->len  -= res;
+                if (proactor_debug_enabled())
+                    fprintf(stderr, "[proactor#%d] fd=%d send res=%d wb_len=%d w_off=%d rb_len=%d r_off=%d\n",
+                            w->id, fd, res, wb->len, c->w_off, c->read_buf.len, c->r_off);
 
                 if (wb->len > 0) {
-                    set_event_send(ring, fd, wb->buf + c->w_off, wb->len);
+                    /* More data to send */
+                    conn_arm_send(ring, c);
                 } else {
+                    /* Write complete */
                     c->w_off = 0;
                     dynbuf_clear(wb);
-                    if (c->status) { conn_release(fd); continue; }
+                    if (c->status) {
+                        conn_release(fd);
+                    } else if (c->read_buf.len > 0) {
+                        int drained = kvs_drain_resp_commands_off(&c->read_buf, &c->r_off, wb, c);
+                        if (proactor_debug_enabled())
+                            fprintf(stderr, "[proactor#%d] fd=%d post-send-drain drained=%d rb_len=%d r_off=%d wb_len=%d\n",
+                                    w->id, fd, drained, c->read_buf.len, c->r_off, wb->len);
+                        if (c->status) {
+                            if (wb->len > 0)
+                                conn_arm_send(ring, c);
+                            else
+                                conn_release(fd);
+                        } else if (c->client && c->client->state == CLIENT_BLOCKED) {
+                            if (wb->len > 0)
+                                conn_arm_send(ring, c);
+                        } else if (wb->len > 0) {
+                            conn_arm_send(ring, c);
+                        } else {
+                            if (conn_arm_recv(ring, c) == 0)
+                                io_uring_submit(ring);
+                        }
+                    } else {
+                        if (conn_arm_recv(ring, c) == 0)
+                            io_uring_submit(ring);
+                    }
                 }
             }
         }
+        if (worker_arm_accept(w) != 0)
+            fprintf(stderr, "[proactor#%d] failed to re-arm accept\n", w->id);
         io_uring_cq_advance(ring, nready);
+        io_uring_submit(ring);
     }
+    fprintf(stderr, "[proactor#%d] worker exit stop=%d\n", w->id, (int)g_kvs_stop);
     return NULL;
 }
 

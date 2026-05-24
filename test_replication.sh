@@ -8,11 +8,47 @@ MASTER_CONF=./test_master.conf
 SLAVE_CONF=./test_slave.conf
 MASTER_LOG=/tmp/kvstore_master.log
 SLAVE_LOG=/tmp/kvstore_slave.log
+MASTER_PID=""
+SLAVE_PID=""
+
+cleanup() {
+    if [ -n "$SLAVE_PID" ]; then
+        kill "$SLAVE_PID" 2>/dev/null || true
+        wait "$SLAVE_PID" 2>/dev/null || true
+    fi
+    if [ -n "$MASTER_PID" ]; then
+        kill "$MASTER_PID" 2>/dev/null || true
+        wait "$MASTER_PID" 2>/dev/null || true
+    fi
+    pkill -9 -f './build/kvstore ./test_master.conf' 2>/dev/null || true
+    pkill -9 -f './build/kvstore ./test_slave.conf' 2>/dev/null || true
+    fuser -k 7379/tcp 7380/tcp 2100/tcp 6483/tcp 2>/dev/null || true
+}
+trap cleanup EXIT
+
+redis_set() {
+    if command -v redis-cli >/dev/null 2>&1; then
+        redis-cli -p 7379 SET "$1" "$2" >/dev/null
+    else
+        printf '*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n' \
+            "${#1}" "$1" "${#2}" "$2" | nc -w 1 localhost 7379 >/dev/null 2>&1
+    fi
+}
+
+redis_get() {
+    if command -v redis-cli >/dev/null 2>&1; then
+        redis-cli -p 7380 GET "$1" 2>/dev/null | tr -d '\r'
+    else
+        printf '*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n' "${#1}" "$1" | nc -w 1 localhost 7380 2>/dev/null | tail -1 | tr -d '\r'
+    fi
+}
 
 echo "=========================================="
 echo "  TCP + XDP Replication Test"
 echo "=========================================="
 
+echo "[0/5] Cleaning up old kvstore processes..."
+cleanup
 rm -f /tmp/kvstore_*.log
 rm -f build/*.aof build/*.rdb build/*.wal
 
@@ -30,7 +66,7 @@ echo "Master started (PID: $MASTER_PID)"
 
 echo "[2/5] Writing test data to Master..."
 for i in {1..100}; do
-    echo -e "*3\r\n\$3\r\nSET\r\n\$4\r\nkey$i\r\n\$6\r\nvalue$i\r" | nc -w 1 localhost 7379 > /dev/null 2>&1
+    redis_set "key$i" "value$i"
 done
 echo "Wrote 100 keys to Master"
 
@@ -42,12 +78,11 @@ sleep 3
 if ! kill -0 $SLAVE_PID 2>/dev/null; then
     echo "ERROR: Slave failed to start"
     cat $SLAVE_LOG
-    kill $MASTER_PID 2>/dev/null
     exit 1
 fi
 echo "Slave started (PID: $SLAVE_PID)"
 
-echo "[4/5] Waiting for replication..."
+echo "[4/5] Waiting for replication handshake..."
 sleep 5
 
 echo "[5/5] Verifying replicated data..."
@@ -55,18 +90,21 @@ SUCCESS=0
 FAILED=0
 
 for i in {1..100}; do
-    RESULT=$(echo -e "*2\r\n\$3\r\nGET\r\n\$4\r\nkey$i\r" | nc -w 1 localhost 7380 2>/dev/null | tail -1)
+    RESULT=$(redis_get "key$i")
     if [[ "$RESULT" == "value$i" ]]; then
-        ((SUCCESS++))
+        SUCCESS=$((SUCCESS + 1))
     else
-        ((FAILED++))
+        FAILED=$((FAILED + 1))
     fi
 done
 
 echo ""
 echo "Stopping processes..."
-kill $MASTER_PID $SLAVE_PID 2>/dev/null
-wait $MASTER_PID $SLAVE_PID 2>/dev/null || true
+cleanup
+
+# Avoid double cleanup from trap after explicit stop.
+MASTER_PID=""
+SLAVE_PID=""
 
 echo ""
 echo "=========================================="

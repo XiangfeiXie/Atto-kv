@@ -58,6 +58,12 @@ static int optimize_tcp_socket(int fd) {
 
     setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &flag, sizeof(flag));
 
+    /* Set receive timeout to allow graceful shutdown */
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     return 0;
 }
 
@@ -72,20 +78,47 @@ static int send_frame(int fd, uint8_t type, const char *payload, uint32_t len) {
     hdr.reserved = 0;
     hdr.len = len;
 
-    ssize_t n = send(fd, &hdr, sizeof(hdr), 0);
-    if (n != sizeof(hdr)) return -1;
+    const char *p = (const char *)&hdr;
+    size_t left = sizeof(hdr);
+    while (left > 0) {
+        ssize_t n = send(fd, p, left, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += (size_t)n;
+        left -= (size_t)n;
+    }
 
     if (len > 0 && payload) {
-        n = send(fd, payload, len, 0);
-        if (n != (ssize_t)len) return -1;
+        p = payload;
+        left = len;
+        while (left > 0) {
+            ssize_t n = send(fd, p, left, MSG_NOSIGNAL);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            p += (size_t)n;
+            left -= (size_t)n;
+        }
     }
 
     return 0;
 }
 
 static int recv_frame(int fd, repl_frame_hdr_t *hdr, char *payload, size_t max_len) {
+    /* Receive header with timeout to allow graceful shutdown */
     ssize_t n = recv(fd, hdr, sizeof(*hdr), MSG_WAITALL);
-    if (n != sizeof(*hdr)) return -1;
+    if (n != sizeof(*hdr)) {
+        if (n == 0 || errno == ECONNRESET || errno == EPIPE) {
+            return -1;  /* Connection closed */
+        }
+        if (errno == EINTR || errno == EAGAIN) {
+            return -1;  /* Interrupted or timeout */
+        }
+        return -1;
+    }
 
     if (hdr->len > 0) {
         if (hdr->len > max_len) {
@@ -362,8 +395,24 @@ int tcp_xdp_repl_master_start(void) {
 void tcp_xdp_repl_master_stop(void) {
     atomic_store_explicit(&g_ctx.running, 0, memory_order_release);
 
+    /* Shutdown sockets first to unblock recv/send calls */
     if (g_ctx.tcp_fd > 0) {
         shutdown(g_ctx.tcp_fd, SHUT_RDWR);
+    }
+
+    if (g_ctx.listen_fd > 0) {
+        shutdown(g_ctx.listen_fd, SHUT_RDWR);
+    }
+
+    /* Wait for threads to exit */
+    if (atomic_load_explicit(&g_ctx.slave_connected, memory_order_acquire)) {
+        pthread_join(g_ctx.send_thread, NULL);
+        pthread_join(g_ctx.recv_thread, NULL);
+    }
+    pthread_join(g_ctx.accept_thread, NULL);
+
+    /* Close file descriptors */
+    if (g_ctx.tcp_fd > 0) {
         close(g_ctx.tcp_fd);
         g_ctx.tcp_fd = -1;
     }
@@ -372,9 +421,6 @@ void tcp_xdp_repl_master_stop(void) {
         close(g_ctx.listen_fd);
         g_ctx.listen_fd = -1;
     }
-
-    pthread_join(g_ctx.send_thread, NULL);
-    pthread_join(g_ctx.recv_thread, NULL);
 
     repl_backlog_free();
 
@@ -438,13 +484,19 @@ int tcp_xdp_repl_slave_start(const char *master_ip, int master_port) {
 void tcp_xdp_repl_slave_stop(void) {
     atomic_store_explicit(&g_ctx.running, 0, memory_order_release);
 
+    /* Shutdown socket first to unblock recv calls */
     if (g_ctx.tcp_fd > 0) {
         shutdown(g_ctx.tcp_fd, SHUT_RDWR);
+    }
+
+    /* Wait for thread to exit */
+    pthread_join(g_ctx.recv_thread, NULL);
+
+    /* Close file descriptor */
+    if (g_ctx.tcp_fd > 0) {
         close(g_ctx.tcp_fd);
         g_ctx.tcp_fd = -1;
     }
-
-    pthread_join(g_ctx.recv_thread, NULL);
 
     printf("[TCP-XDP-REPL] Slave stopped\n");
 }

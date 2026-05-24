@@ -89,8 +89,12 @@ int repl_backlog_get_range(uint64_t start_offset, char *out, size_t max_len, siz
         return -1;
     }
 
-    /* Check if offset is too old (outside ring buffer) */
-    if (start_offset < g_backlog.master_offset - g_backlog.size) {
+    /* Check if offset is too old (outside ring buffer). */
+    uint64_t oldest = 0;
+    if (g_backlog.master_offset > g_backlog.size) {
+        oldest = g_backlog.master_offset - g_backlog.size;
+    }
+    if (start_offset < oldest) {
         pthread_mutex_unlock(&g_backlog.mutex);
         return -1;  /* Need full resync */
     }

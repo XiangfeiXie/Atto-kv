@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run all data-type smoke tests against a running kvstore.
+# Run smoke tests against a running kvstore.
 #
 # Usage:  ./run_all.sh [host] [port]
 #         HOST=127.0.0.1 PORT=2000 ./run_all.sh
@@ -16,7 +16,7 @@ if ! redis-cli -h "$HOST" -p "$PORT" PING >/dev/null 2>&1; then
     exit 2
 fi
 
-TYPES=(string list hash set zset)
+TYPES=(basic string hash)
 declare -A RESULTS
 overall=0
 

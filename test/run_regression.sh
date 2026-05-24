@@ -61,9 +61,11 @@ run_step() {
 }
 
 run_quick() {
+  trap stop_kvs EXIT
   start_kvs
-  run_step "data-type smoke" bash "$ROOT/test/smoke/run_all.sh" 127.0.0.1 "$PORT"
+  run_step "basic/string/hash smoke" timeout 90s bash "$ROOT/test/smoke/run_all.sh" 127.0.0.1 "$PORT"
   stop_kvs
+  trap - EXIT
 }
 
 run_full() {

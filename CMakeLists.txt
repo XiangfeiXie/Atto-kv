@@ -30,17 +30,11 @@ pkg_check_modules(FABRIC   REQUIRED libfabric)
 pkg_check_modules(ZLIB     REQUIRED zlib)
 pkg_check_modules(LIBBPF  REQUIRED libbpf)
 
-# ── XDP/AF_XDP support (Phase 11 - optional) ──────────────────────────
+# ── XDP/AF_XDP support (Phase 11 - optional, unused by repl-agent) ────
 option(ENABLE_XDP_REPL "Enable XDP/AF_XDP zero-copy WAL replication" OFF)
+
 if(ENABLE_XDP_REPL)
-    pkg_check_modules(LIBXDP libxdp)
     add_compile_definitions(ENABLE_XDP_REPL)
-    if(LIBXDP_FOUND)
-        add_compile_definitions(HAVE_LIBXDP)
-        message(STATUS "XDP/AF_XDP replication support enabled with libxdp")
-    else()
-        message(WARNING "libxdp not found; building staged AF_XDP replication manager without libxdp helpers")
-    endif()
 endif()
 
 # ── NtyCo (third-party coroutine library) ─────────────────────────────
@@ -168,6 +162,25 @@ add_custom_command(
 
 add_custom_target(sockmap_kern DEPENDS ${SOCKMAP_KERN_OBJ})
 
+# ── Compile repl-agent BPF programs ───────────────────────────────────
+# repl_observe.bpf.o — socket-layer observation for replication
+set(REPL_OBSERVE_KERN_SRC ${CMAKE_SOURCE_DIR}/src/repl/repl_observe.bpf.c)
+set(REPL_OBSERVE_KERN_OBJ ${CMAKE_BINARY_DIR}/repl_observe.bpf.o)
+
+add_custom_command(
+    OUTPUT  ${REPL_OBSERVE_KERN_OBJ}
+    COMMAND clang -O2 -g -target bpf
+            -I${CMAKE_SOURCE_DIR}/src/repl
+            -I/usr/include
+            -I/usr/include/x86_64-linux-gnu
+            -c ${REPL_OBSERVE_KERN_SRC}
+            -o ${REPL_OBSERVE_KERN_OBJ}
+    DEPENDS ${REPL_OBSERVE_KERN_SRC} ${CMAKE_SOURCE_DIR}/src/repl/repl_observe.h
+    COMMENT "Compiling repl_observe BPF program"
+)
+
+add_custom_target(repl_observe_kern DEPENDS ${REPL_OBSERVE_KERN_OBJ})
+
 # ── Compile replication XDP kernel BPF program (Phase 11 - conditional) ─
 if(ENABLE_XDP_REPL)
     set(WAL_XDP_KERN_SRC  ${CMAKE_SOURCE_DIR}/src/repl/xdp_repl.kern.c)
@@ -211,10 +224,6 @@ target_include_directories(kvstore PRIVATE
     ${LIBBPF_INCLUDE_DIRS}
 )
 
-if(ENABLE_XDP_REPL AND LIBXDP_FOUND)
-    target_include_directories(kvstore PRIVATE ${LIBXDP_INCLUDE_DIRS})
-endif()
-
 target_link_libraries(kvstore PRIVATE
     Threads::Threads
     ${NTYCO_LIB}
@@ -227,15 +236,32 @@ target_link_libraries(kvstore PRIVATE
     dl
 )
 
-if(ENABLE_XDP_REPL AND LIBXDP_FOUND)
-    target_link_libraries(kvstore PRIVATE ${LIBXDP_LIBRARIES})
-endif()
-
 add_dependencies(kvstore ntyco xdp_kern sockmap_kern)
 
 if(ENABLE_XDP_REPL)
     add_dependencies(kvstore wal_xdp_kern)
 endif()
+
+# ── repl-agent target (independent replication agent) ──────────────────
+set(REPL_AGENT_SRCS
+    src/repl/repl_agent.c
+)
+
+add_executable(repl-agent ${REPL_AGENT_SRCS})
+
+target_include_directories(repl-agent PRIVATE
+    src/repl
+    ${LIBBPF_INCLUDE_DIRS}
+)
+
+target_link_libraries(repl-agent PRIVATE
+    Threads::Threads
+    ${LIBBPF_LIBRARIES}
+    elf
+    dl
+)
+
+add_dependencies(repl-agent repl_observe_kern)
 
 # ── testcase target ───────────────────────────────────────────────────
 add_executable(testcase test/testcase.c)

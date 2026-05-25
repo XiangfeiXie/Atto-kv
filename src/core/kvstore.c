@@ -1500,6 +1500,33 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
+    /* KEYS pattern — return all matching keys as a RESP array.
+     * For simplicity, only "*" (all keys) is supported. */
+    if (TOKEN_EQ(cmd, "KEYS")) {
+        /* count keys first */
+        kv_shards_iter_t it; kv_shards_iter_init(&it);
+        kv_entry_t *ke;
+        long long nkeys = 0;
+        while ((ke = kv_shards_iter_next(&it)) != NULL) {
+            if (!(ke->expire && get_time_now() > ke->expire))
+                nkeys++;
+        }
+        kv_shards_iter_free(&it);
+
+        /* build response: *N\r\n, then $len\r\nkey\r\n for each */
+        char hdr[32];
+        int hl = snprintf(hdr, sizeof(hdr), "*%lld\r\n", nkeys);
+        dynbuf_cat(wb, hdr, hl);
+
+        kv_shards_iter_init(&it);
+        while ((ke = kv_shards_iter_next(&it)) != NULL) {
+            if (ke->expire && get_time_now() > ke->expire) continue;
+            reply_bulk(wb, entry_key(ke), ke->key_len);
+        }
+        kv_shards_iter_free(&it);
+        return DISPATCH_OK;
+    }
+
     /* ── Single-key commands (lock the relevant shard for the duration). ── */
     if (argc < 2) {
         dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);

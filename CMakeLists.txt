@@ -30,6 +30,21 @@ pkg_check_modules(FABRIC   REQUIRED libfabric)
 pkg_check_modules(ZLIB     REQUIRED zlib)
 pkg_check_modules(LIBBPF  REQUIRED libbpf)
 
+# ── AF_XDP support (libxdp for zero-copy networking) ──────────────────
+option(ENABLE_AF_XDP "Enable AF_XDP zero-copy replication" ON)
+
+if(ENABLE_AF_XDP)
+    pkg_check_modules(LIBXDP libxdp)
+    if(LIBXDP_FOUND)
+        add_compile_definitions(ENABLE_AF_XDP)
+        message(STATUS "AF_XDP support enabled")
+    else()
+        message(WARNING "libxdp not found - AF_XDP support disabled")
+        message(WARNING "Install libxdp: sudo apt-get install libxdp-dev")
+        set(ENABLE_AF_XDP OFF)
+    endif()
+endif()
+
 # ── XDP/AF_XDP support (Phase 11 - optional, unused by repl-agent) ────
 option(ENABLE_XDP_REPL "Enable XDP/AF_XDP zero-copy WAL replication" OFF)
 
@@ -109,6 +124,7 @@ set(REPL_SRCS
     src/repl/repl_stream.c
     src/repl/repl_backlog.c
     src/repl/repl_kcp_xdp.c
+    src/repl/af_xdp_socket.c
     # Deprecated: old implementations
     # src/repl/xdp_incr_repl.c
     # src/repl/xdp_repl_manager.c
@@ -208,6 +224,24 @@ add_custom_command(
 
 add_custom_target(repl_filter_kern DEPENDS ${REPL_FILTER_KERN_OBJ})
 
+# ── Compile XDP KCP filter BPF program (AF_XDP zero-copy) ──────────────
+set(XDP_KCP_FILTER_KERN_SRC ${CMAKE_SOURCE_DIR}/src/repl/xdp_kcp_filter.bpf.c)
+set(XDP_KCP_FILTER_KERN_OBJ ${CMAKE_BINARY_DIR}/xdp_kcp_filter.bpf.o)
+
+add_custom_command(
+    OUTPUT  ${XDP_KCP_FILTER_KERN_OBJ}
+    COMMAND clang -O2 -g -target bpf
+            -I${CMAKE_SOURCE_DIR}/src/repl
+            -I/usr/include
+            -I/usr/include/x86_64-linux-gnu
+            -c ${XDP_KCP_FILTER_KERN_SRC}
+            -o ${XDP_KCP_FILTER_KERN_OBJ}
+    DEPENDS ${XDP_KCP_FILTER_KERN_SRC}
+    COMMENT "Compiling xdp_kcp_filter.bpf.c for AF_XDP"
+)
+
+add_custom_target(xdp_kcp_filter_kern DEPENDS ${XDP_KCP_FILTER_KERN_OBJ})
+
 # ── Compile replication XDP kernel BPF program (Phase 11 - conditional) ─
 if(ENABLE_XDP_REPL)
     set(WAL_XDP_KERN_SRC  ${CMAKE_SOURCE_DIR}/src/repl/xdp_repl.kern.c)
@@ -264,7 +298,12 @@ target_link_libraries(kvstore PRIVATE
     dl
 )
 
-add_dependencies(kvstore ntyco xdp_kern sockmap_kern repl_filter_kern)
+if(ENABLE_AF_XDP)
+    target_link_libraries(kvstore PRIVATE ${LIBXDP_LIBRARIES})
+    target_include_directories(kvstore PRIVATE ${LIBXDP_INCLUDE_DIRS})
+endif()
+
+add_dependencies(kvstore ntyco xdp_kern sockmap_kern repl_filter_kern xdp_kcp_filter_kern)
 
 if(ENABLE_XDP_REPL)
     add_dependencies(kvstore wal_xdp_kern)

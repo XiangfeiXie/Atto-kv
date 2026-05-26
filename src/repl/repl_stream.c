@@ -29,6 +29,8 @@ int repl_stream_start_master(void)
             .role = REPL_ROLE_MASTER,
             .repl_port = kvs_config.xdp_repl_tcp_port,
             .kv_port = kvs_config.port,
+            .use_af_xdp = kvs_config.xdp_repl_zero_copy,
+            .queue_id = kvs_config.xdp_repl_queue,
         };
         snprintf(cfg.ifname, sizeof(cfg.ifname), "%s", kvs_config.xdp_repl_ifname);
 
@@ -61,6 +63,8 @@ int repl_stream_start_slave(uint64_t start_seq)
             .role = REPL_ROLE_SLAVE,
             .repl_port = kvs_config.xdp_repl_tcp_port,
             .kv_port = kvs_config.port,
+            .use_af_xdp = kvs_config.xdp_repl_zero_copy,
+            .queue_id = kvs_config.xdp_repl_queue,
         };
         snprintf(cfg.master_ip, sizeof(cfg.master_ip), "%s", kvs_config.rdma_master_ip);
         snprintf(cfg.ifname, sizeof(cfg.ifname), "%s", kvs_config.xdp_repl_ifname);

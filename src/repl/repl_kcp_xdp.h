@@ -21,14 +21,22 @@ typedef enum {
     REPL_ROLE_SLAVE
 } repl_role_t;
 
+/* Transport mode */
+typedef enum {
+    TRANSPORT_UDP = 0,      /* UDP socket (current default) */
+    TRANSPORT_AF_XDP        /* AF_XDP zero-copy (requires libxdp) */
+} transport_mode_t;
+
 /* Replication configuration */
 struct repl_kcp_config {
-    repl_role_t role;
-    char        master_ip[64];    /* slave: master IP address */
-    uint16_t    repl_port;        /* UDP port for replication */
-    uint16_t    kv_port;          /* local kvstore TCP port */
-    char        ifname[16];       /* network interface for AF_XDP */
-    int         queue_id;         /* XDP queue ID */
+    repl_role_t      role;
+    transport_mode_t transport;   /* UDP or AF_XDP */
+    char             master_ip[64];    /* slave: master IP address */
+    uint16_t         repl_port;        /* UDP port for replication */
+    uint16_t         kv_port;          /* local kvstore TCP port */
+    char             ifname[16];       /* network interface for AF_XDP */
+    int              queue_id;         /* XDP queue ID (default: 0) */
+    int              use_af_xdp;       /* 1 = try AF_XDP, 0 = UDP only */
 };
 
 /* Initialize replication subsystem (called from kvstore main) */

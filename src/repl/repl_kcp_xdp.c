@@ -34,9 +34,9 @@
 
 #include "ikcp.h"
 
-/* AF_XDP ring structures (forward declarations for future implementation) */
-struct xsk_ring_prod { int dummy; };
-struct xsk_ring_cons { int dummy; };
+#ifdef ENABLE_AF_XDP
+#include "af_xdp_socket.h"
+#endif
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
@@ -58,6 +58,9 @@ static struct {
     pthread_t              thread;
     volatile int           running;
 
+    /* Transport mode */
+    transport_mode_t       transport;
+
     /* KCP state */
     ikcpcb                *kcp;
     uint32_t               conv_id;
@@ -67,13 +70,12 @@ static struct {
     struct ring_buffer    *ringbuf;
     int                    cgroup_fd;
 
+#ifdef ENABLE_AF_XDP
     /* AF_XDP state */
-    int                    xsk_fd;
-    struct xsk_ring_prod   tx_ring;
-    struct xsk_ring_cons   rx_ring;
-    struct xsk_ring_prod   fill_ring;
-    struct xsk_ring_cons   comp_ring;
-    void                  *umem_area;
+    struct af_xdp_socket  *xsk;
+    struct bpf_object     *xdp_obj;  /* XDP program object */
+    int                    xdp_prog_fd;
+#endif
 
     /* UDP socket for fallback */
     int                    udp_fd;
@@ -91,10 +93,20 @@ static int kcp_output(const char *buf, int len, ikcpcb *kcp, void *user)
 {
     (void)kcp; (void)user;
 
-    if (g_repl.xsk_fd >= 0) {
-        /* TODO: AF_XDP zero-copy send */
-        /* For now, fallback to UDP */
+#ifdef ENABLE_AF_XDP
+    /* AF_XDP zero-copy send */
+    if (g_repl.transport == TRANSPORT_AF_XDP && g_repl.xsk) {
+        int ret = af_xdp_send(g_repl.xsk, buf, len);
+        if (ret > 0) {
+            pthread_mutex_lock(&g_repl.stats_lock);
+            g_repl.stats.bytes_sent += ret;
+            g_repl.stats.pkts_sent++;
+            pthread_mutex_unlock(&g_repl.stats_lock);
+            return ret;
+        }
+        /* Fall through to UDP on error */
     }
+#endif
 
     /* UDP fallback */
     if (g_repl.udp_fd >= 0 && g_repl.peer_addr.sin_port != 0) {
@@ -247,6 +259,94 @@ static int setup_udp_socket(void)
     return 0;
 }
 
+#ifdef ENABLE_AF_XDP
+/* ── XDP program loader (slave only) ────────────────────────────────── */
+
+static int load_xdp_program(void)
+{
+    char obj_path[512];
+    snprintf(obj_path, sizeof(obj_path), "%s/xdp_kcp_filter.bpf.o",
+             getenv("BUILD_DIR") ?: "build");
+
+    if (access(obj_path, R_OK) != 0) {
+        fprintf(stderr, "[REPL] XDP object not found: %s\n", obj_path);
+        return -1;
+    }
+
+    g_repl.xdp_obj = bpf_object__open_file(obj_path, NULL);
+    if (!g_repl.xdp_obj) {
+        fprintf(stderr, "[REPL] Failed to open XDP object: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (bpf_object__load(g_repl.xdp_obj)) {
+        fprintf(stderr, "[REPL] Failed to load XDP object\n");
+        bpf_object__close(g_repl.xdp_obj);
+        g_repl.xdp_obj = NULL;
+        return -1;
+    }
+
+    /* Find XDP program */
+    struct bpf_program *prog = bpf_object__find_program_by_name(g_repl.xdp_obj, "xdp_kcp_filter_prog");
+    if (!prog) {
+        fprintf(stderr, "[REPL] XDP program 'xdp_kcp_filter_prog' not found\n");
+        bpf_object__close(g_repl.xdp_obj);
+        g_repl.xdp_obj = NULL;
+        return -1;
+    }
+
+    g_repl.xdp_prog_fd = bpf_program__fd(prog);
+
+    /* Attach XDP program to interface */
+    int ifindex = if_nametoindex(g_repl.cfg.ifname);
+    if (ifindex == 0) {
+        fprintf(stderr, "[REPL] Interface %s not found\n", g_repl.cfg.ifname);
+        bpf_object__close(g_repl.xdp_obj);
+        g_repl.xdp_obj = NULL;
+        return -1;
+    }
+
+    if (bpf_xdp_attach(ifindex, g_repl.xdp_prog_fd, XDP_FLAGS_UPDATE_IF_NOEXIST, NULL) < 0) {
+        fprintf(stderr, "[REPL] Failed to attach XDP program: %s\n", strerror(errno));
+        bpf_object__close(g_repl.xdp_obj);
+        g_repl.xdp_obj = NULL;
+        return -1;
+    }
+
+    /* Update xsks_map with AF_XDP socket */
+    struct bpf_map *xsks_map = bpf_object__find_map_by_name(g_repl.xdp_obj, "xsks_map");
+    if (xsks_map && g_repl.xsk) {
+        int map_fd = bpf_map__fd(xsks_map);
+        int xsk_fd = xsk_socket__fd(g_repl.xsk->xsk);
+        uint32_t key = g_repl.cfg.queue_id;
+        if (bpf_map_update_elem(map_fd, &key, &xsk_fd, BPF_ANY) < 0) {
+            fprintf(stderr, "[REPL] Failed to update xsks_map: %s\n", strerror(errno));
+        }
+    }
+
+    printf("[REPL] XDP program attached to %s\n", g_repl.cfg.ifname);
+    return 0;
+}
+
+/* ── AF_XDP socket setup ────────────────────────────────────────────── */
+
+static int setup_af_xdp_socket(void)
+{
+    int ret = af_xdp_socket_create(&g_repl.xsk,
+                                   g_repl.cfg.ifname,
+                                   g_repl.cfg.queue_id,
+                                   NULL);
+    if (ret < 0) {
+        fprintf(stderr, "[REPL] Failed to create AF_XDP socket\n");
+        return -1;
+    }
+
+    printf("[REPL] AF_XDP socket created on %s queue %d\n",
+           g_repl.cfg.ifname, g_repl.cfg.queue_id);
+    return 0;
+}
+#endif /* ENABLE_AF_XDP */
+
 /* ── Slave: receive and apply commands ──────────────────────────────── */
 
 static int slave_apply_command(const uint8_t *data, uint32_t len)
@@ -324,28 +424,49 @@ static void *repl_thread_func(void *arg)
             ring_buffer__poll(g_repl.ringbuf, 10);
         }
 
-        /* Receive UDP packets */
-        struct sockaddr_in from;
-        socklen_t fromlen = sizeof(from);
-        ssize_t n = recvfrom(g_repl.udp_fd, recv_buf, sizeof(recv_buf), 0,
-                            (struct sockaddr *)&from, &fromlen);
+        /* Receive packets (AF_XDP or UDP) */
+#ifdef ENABLE_AF_XDP
+        if (g_repl.transport == TRANSPORT_AF_XDP && g_repl.xsk) {
+            /* AF_XDP receive */
+            size_t recv_len = sizeof(recv_buf);
+            ssize_t n = af_xdp_recv(g_repl.xsk, recv_buf, &recv_len);
 
-        if (n > 0) {
-            pthread_mutex_lock(&g_repl.stats_lock);
-            g_repl.stats.bytes_recv += n;
-            g_repl.stats.pkts_recv++;
-            pthread_mutex_unlock(&g_repl.stats_lock);
+            if (n > 0) {
+                pthread_mutex_lock(&g_repl.stats_lock);
+                g_repl.stats.bytes_recv += n;
+                g_repl.stats.pkts_recv++;
+                pthread_mutex_unlock(&g_repl.stats_lock);
 
-            /* Master: record slave address on first packet */
-            if (g_repl.cfg.role == REPL_ROLE_MASTER && g_repl.peer_addr.sin_port == 0) {
-                memcpy(&g_repl.peer_addr, &from, sizeof(from));
-                printf("[REPL] slave connected from %s:%u\n",
-                       inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+                /* Feed to KCP */
+                if (g_repl.kcp)
+                    ikcp_input(g_repl.kcp, (const char *)recv_buf, n);
             }
+        } else
+#endif
+        {
+            /* UDP receive */
+            struct sockaddr_in from;
+            socklen_t fromlen = sizeof(from);
+            ssize_t n = recvfrom(g_repl.udp_fd, recv_buf, sizeof(recv_buf), 0,
+                                (struct sockaddr *)&from, &fromlen);
 
-            /* Feed to KCP */
-            if (g_repl.kcp)
-                ikcp_input(g_repl.kcp, (const char *)recv_buf, n);
+            if (n > 0) {
+                pthread_mutex_lock(&g_repl.stats_lock);
+                g_repl.stats.bytes_recv += n;
+                g_repl.stats.pkts_recv++;
+                pthread_mutex_unlock(&g_repl.stats_lock);
+
+                /* Master: record slave address on first packet */
+                if (g_repl.cfg.role == REPL_ROLE_MASTER && g_repl.peer_addr.sin_port == 0) {
+                    memcpy(&g_repl.peer_addr, &from, sizeof(from));
+                    printf("[REPL] slave connected from %s:%u\n",
+                           inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+                }
+
+                /* Feed to KCP */
+                if (g_repl.kcp)
+                    ikcp_input(g_repl.kcp, (const char *)recv_buf, n);
+            }
         }
 
         /* Slave: receive KCP data and apply commands */
@@ -396,37 +517,67 @@ int repl_kcp_init(const struct repl_kcp_config *cfg)
 
     memcpy(&g_repl.cfg, cfg, sizeof(*cfg));
     g_repl.running = 1;
-    g_repl.conv_id = 0x12345678;  /* TODO: generate from config */
+    g_repl.conv_id = 0x12345678;
+    g_repl.transport = TRANSPORT_UDP;
 
     pthread_mutex_init(&g_repl.stats_lock, NULL);
 
-    /* Setup UDP socket */
-    if (setup_udp_socket() != 0)
-        return -1;
+#ifdef ENABLE_AF_XDP
+    if (cfg->use_af_xdp) {
+        printf("[REPL] Attempting AF_XDP mode on %s...\n", cfg->ifname);
 
-    /* Initialize KCP */
+        if (setup_af_xdp_socket() == 0) {
+            if (cfg->role == REPL_ROLE_SLAVE) {
+                if (load_xdp_program() == 0) {
+                    g_repl.transport = TRANSPORT_AF_XDP;
+                    printf("[REPL] AF_XDP mode enabled (slave with XDP filter)\n");
+                } else {
+                    fprintf(stderr, "[REPL] XDP program load failed, falling back to UDP\n");
+                    af_xdp_socket_destroy(g_repl.xsk);
+                    g_repl.xsk = NULL;
+                }
+            } else {
+                g_repl.transport = TRANSPORT_AF_XDP;
+                printf("[REPL] AF_XDP mode enabled (master TX only)\n");
+            }
+        } else {
+            fprintf(stderr, "[REPL] AF_XDP socket creation failed, falling back to UDP\n");
+        }
+    }
+#endif
+
+    if (setup_udp_socket() != 0) {
+        fprintf(stderr, "[REPL] UDP socket setup failed\n");
+#ifdef ENABLE_AF_XDP
+        if (g_repl.xsk) af_xdp_socket_destroy(g_repl.xsk);
+        if (g_repl.xdp_obj) bpf_object__close(g_repl.xdp_obj);
+#endif
+        return -1;
+    }
+
     g_repl.kcp = ikcp_create(g_repl.conv_id, NULL);
     if (!g_repl.kcp) {
         fprintf(stderr, "[REPL] ikcp_create failed\n");
         close(g_repl.udp_fd);
+#ifdef ENABLE_AF_XDP
+        if (g_repl.xsk) af_xdp_socket_destroy(g_repl.xsk);
+        if (g_repl.xdp_obj) bpf_object__close(g_repl.xdp_obj);
+#endif
         return -1;
     }
 
     ikcp_setoutput(g_repl.kcp, kcp_output);
     ikcp_wndsize(g_repl.kcp, REPL_KCP_WND, REPL_KCP_WND);
-    ikcp_nodelay(g_repl.kcp, 1, 10, 2, 1);  /* fast mode */
+    ikcp_nodelay(g_repl.kcp, 1, 10, 2, 1);
     g_repl.kcp->rx_minrto = 10;
     g_repl.kcp->interval = REPL_KCP_INTERVAL;
 
-    /* Master: load eBPF filter (optional - fallback to manual capture) */
     if (cfg->role == REPL_ROLE_MASTER) {
         if (master_load_bpf() != 0) {
             fprintf(stderr, "[REPL] Warning: eBPF filter failed, using fallback mode\n");
-            /* Continue without eBPF - replication will work via manual capture */
         }
     }
 
-    /* Start replication thread */
     if (pthread_create(&g_repl.thread, NULL, repl_thread_func, NULL) != 0) {
         fprintf(stderr, "[REPL] pthread_create failed\n");
         if (g_repl.ringbuf) ring_buffer__free(g_repl.ringbuf);
@@ -434,12 +585,17 @@ int repl_kcp_init(const struct repl_kcp_config *cfg)
         if (g_repl.cgroup_fd >= 0) close(g_repl.cgroup_fd);
         ikcp_release(g_repl.kcp);
         close(g_repl.udp_fd);
+#ifdef ENABLE_AF_XDP
+        if (g_repl.xsk) af_xdp_socket_destroy(g_repl.xsk);
+        if (g_repl.xdp_obj) bpf_object__close(g_repl.xdp_obj);
+#endif
         return -1;
     }
 
-    printf("[REPL] initialized, role=%s port=%u\n",
+    printf("[REPL] initialized, role=%s port=%u transport=%s\n",
            cfg->role == REPL_ROLE_MASTER ? "master" : "slave",
-           cfg->repl_port);
+           cfg->repl_port,
+           g_repl.transport == TRANSPORT_AF_XDP ? "AF_XDP" : "UDP");
 
     return 0;
 }
@@ -460,6 +616,14 @@ void repl_kcp_shutdown(void)
 
     if (g_repl.cgroup_fd >= 0)
         close(g_repl.cgroup_fd);
+
+#ifdef ENABLE_AF_XDP
+    if (g_repl.xsk)
+        af_xdp_socket_destroy(g_repl.xsk);
+
+    if (g_repl.xdp_obj)
+        bpf_object__close(g_repl.xdp_obj);
+#endif
 
     if (g_repl.kcp)
         ikcp_release(g_repl.kcp);

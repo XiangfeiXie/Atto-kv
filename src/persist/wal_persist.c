@@ -11,11 +11,14 @@
 #include <unistd.h>
 #include <time.h>
 #include <stdatomic.h>
+#include <liburing.h>
 
 /* ── WAL batch writer configuration ── */
 #define WAL_BATCH_SIZE 8192         /* max records per buffer */
 #define WAL_FLUSH_INTERVAL_MS 10    /* flush every 10ms if not full */
 #define WAL_INLINE_PAYLOAD 128      /* payloads <= this are stored inline */
+#define WAL_URING_DEPTH 256         /* io_uring queue depth */
+#define WAL_URING_CHUNK_SIZE (1024 * 1024)  /* 1MB per SQE */
 
 /* ── WAL writer state ── */
 static pthread_mutex_t g_wal_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -24,6 +27,8 @@ static pthread_t g_wal_thread;
 static int g_wal_thread_running = 0;
 static int g_wal_fd = -1;
 static _Atomic uint64_t g_wal_last_synced_seq = 0;
+static struct io_uring g_wal_ring;
+static int g_wal_ring_initialized = 0;
 
 /* ── Pending record with inline payload for small records ── */
 typedef struct {
@@ -69,26 +74,57 @@ static int wal_open_locked(void)
     return 0;
 }
 
+/* io_uring-based fsync: submit fsync SQE and wait for completion */
 static void wal_fsync_if_needed(int force)
 {
     if (g_wal_fsync_policy == WAL_FSYNC_NO && !force) return;
     if (g_wal_fd < 0) return;
+    if (!g_wal_ring_initialized) {
+        fdatasync(g_wal_fd);
+        return;
+    }
 
     time_t now = time(NULL);
     if (g_wal_fsync_policy == WAL_FSYNC_ALWAYS || force ||
         (g_wal_fsync_policy == WAL_FSYNC_EVERYSEC && now > g_wal_last_fsync_time)) {
-        fdatasync(g_wal_fd);
+
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&g_wal_ring);
+        if (sqe) {
+            io_uring_prep_fsync(sqe, g_wal_fd, IORING_FSYNC_DATASYNC);
+            int ret = io_uring_submit(&g_wal_ring);
+            if (ret < 0) {
+                fprintf(stderr, "[WAL-PERSIST] fsync submit failed: %s\n", strerror(-ret));
+                fdatasync(g_wal_fd);
+                g_wal_last_fsync_time = now;
+                return;
+            }
+
+            struct io_uring_cqe *cqe = NULL;
+            ret = io_uring_wait_cqe(&g_wal_ring, &cqe);
+            if (ret < 0) {
+                fprintf(stderr, "[WAL-PERSIST] fsync wait failed: %s\n", strerror(-ret));
+            } else if (cqe) {
+                if (cqe->res < 0) {
+                    fprintf(stderr, "[WAL-PERSIST] fsync failed: %s\n", strerror(-cqe->res));
+                }
+                io_uring_cqe_seen(&g_wal_ring, cqe);
+            }
+        } else {
+            fdatasync(g_wal_fd);
+        }
         g_wal_last_fsync_time = now;
     }
 }
 
+/* io_uring-based flush: batch submit write SQEs, then reap CQEs */
 static int wal_flush_records(wal_pending_t *records, int count)
 {
     if (count == 0) return 0;
     if (g_wal_fd < 0) return -1;
+    if (!g_wal_ring_initialized) return -1;
 
+    /* Step 1: Prepare iovec array for all records */
     int iov_idx = 0;
-    size_t total_bytes = 0;
     for (int i = 0; i < count; i++) {
         if (!records[i].valid) continue;
 
@@ -103,33 +139,96 @@ static int wal_flush_records(wal_pending_t *records, int count)
 
         g_wal_iovs[iov_idx].iov_base = &g_wal_hdrs[i];
         g_wal_iovs[iov_idx].iov_len  = sizeof(kvs_wal2_record_hdr_t);
-        total_bytes += sizeof(kvs_wal2_record_hdr_t);
         iov_idx++;
 
         g_wal_iovs[iov_idx].iov_base = records[i].payload;
         g_wal_iovs[iov_idx].iov_len  = records[i].len;
-        total_bytes += records[i].len;
         iov_idx++;
     }
 
-    ssize_t written = writev(g_wal_fd, g_wal_iovs, iov_idx);
+    /* Step 2: Submit write operations via io_uring in chunks */
+    int inflight = 0;
+    int iov_pos = 0;
 
-    if (written < 0) {
-        fprintf(stderr, "[WAL-PERSIST] writev failed: %s\n", strerror(errno));
-        return -1;
-    }
-    if ((size_t)written != total_bytes) {
-        fprintf(stderr, "[WAL-PERSIST] short write: %zd/%zu bytes\n",
-                written, total_bytes);
-        return -1;
+    while (iov_pos < iov_idx || inflight > 0) {
+        /* Submit as many SQEs as possible */
+        while (iov_pos < iov_idx && inflight < WAL_URING_DEPTH) {
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&g_wal_ring);
+            if (!sqe) break;
+
+            /* Calculate how many iovecs fit in this chunk */
+            size_t chunk_bytes = 0;
+            int chunk_iovs = 0;
+            while (iov_pos + chunk_iovs < iov_idx &&
+                   chunk_bytes + g_wal_iovs[iov_pos + chunk_iovs].iov_len <= WAL_URING_CHUNK_SIZE) {
+                chunk_bytes += g_wal_iovs[iov_pos + chunk_iovs].iov_len;
+                chunk_iovs++;
+            }
+
+            if (chunk_iovs == 0) {
+                /* Single iovec exceeds chunk size, submit it alone */
+                chunk_iovs = 1;
+                chunk_bytes = g_wal_iovs[iov_pos].iov_len;
+            }
+
+            /* Use offset -1 for append mode (O_APPEND) */
+            io_uring_prep_writev(sqe, g_wal_fd, &g_wal_iovs[iov_pos], chunk_iovs, -1);
+            sqe->user_data = chunk_bytes;  /* Store bytes for verification */
+
+            iov_pos += chunk_iovs;
+            inflight++;
+        }
+
+        if (inflight > 0) {
+            int submitted = io_uring_submit(&g_wal_ring);
+            if (submitted < 0) {
+                fprintf(stderr, "[WAL-PERSIST] io_uring_submit failed: %s\n", strerror(-submitted));
+                return -1;
+            }
+
+            /* Reap completed CQEs */
+            while (inflight > 0) {
+                struct io_uring_cqe *cqe = NULL;
+                int ret = io_uring_peek_cqe(&g_wal_ring, &cqe);
+
+                if (ret == -EAGAIN) {
+                    /* No more completed CQEs, wait for at least one */
+                    ret = io_uring_wait_cqe(&g_wal_ring, &cqe);
+                    if (ret < 0) {
+                        fprintf(stderr, "[WAL-PERSIST] io_uring_wait_cqe failed: %s\n", strerror(-ret));
+                        return -1;
+                    }
+                }
+
+                if (cqe) {
+                    if (cqe->res < 0) {
+                        fprintf(stderr, "[WAL-PERSIST] write failed: %s\n", strerror(-cqe->res));
+                        io_uring_cqe_seen(&g_wal_ring, cqe);
+                        return -1;
+                    }
+
+                    size_t expected = cqe->user_data;
+                    if ((size_t)cqe->res != expected) {
+                        fprintf(stderr, "[WAL-PERSIST] short write: %d/%zu bytes\n", cqe->res, expected);
+                        io_uring_cqe_seen(&g_wal_ring, cqe);
+                        return -1;
+                    }
+
+                    io_uring_cqe_seen(&g_wal_ring, cqe);
+                    inflight--;
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
+    /* Step 3: Update synced sequence and free payloads */
     uint64_t max_seq = 0;
     for (int i = 0; i < count; i++) {
         if (!records[i].valid) continue;
         if (records[i].seq > max_seq)
             max_seq = records[i].seq;
-        /* Free heap payloads; inline payloads are part of the struct */
         if (records[i].payload != records[i].inline_payload)
             free(records[i].payload);
         records[i].valid = 0;
@@ -250,6 +349,18 @@ int kvs_wal_persist_start(void)
     int rc = wal_open_locked();
 
     if (rc == 0 && !g_wal_thread_running) {
+        /* Initialize io_uring */
+        if (!g_wal_ring_initialized) {
+            rc = io_uring_queue_init(WAL_URING_DEPTH, &g_wal_ring, 0);
+            if (rc < 0) {
+                fprintf(stderr, "[WAL-PERSIST] io_uring_queue_init failed: %s\n", strerror(-rc));
+                pthread_mutex_unlock(&g_wal_mu);
+                return -1;
+            }
+            g_wal_ring_initialized = 1;
+            printf("[WAL-PERSIST] io_uring initialized (depth=%d)\n", WAL_URING_DEPTH);
+        }
+
         g_wal_thread_running = 1;
         memset(g_wal_buf, 0, sizeof(g_wal_buf));
         g_wal_buf_count[0] = 0;
@@ -265,7 +376,7 @@ int kvs_wal_persist_start(void)
             pthread_mutex_unlock(&g_wal_mu);
             return -1;
         }
-        printf("[WAL-PERSIST] consumer started (batch=%d, inline=%d)\n",
+        printf("[WAL-PERSIST] consumer started (batch=%d, inline=%d, io_uring)\n",
                WAL_BATCH_SIZE, WAL_INLINE_PAYLOAD);
     }
 
@@ -357,9 +468,16 @@ void kvs_wal_persist_stop(void)
     }
 
     if (g_wal_fd >= 0) {
-        fdatasync(g_wal_fd);
+        wal_fsync_if_needed(1);
         close(g_wal_fd);
         g_wal_fd = -1;
+    }
+
+    /* Cleanup io_uring */
+    if (g_wal_ring_initialized) {
+        io_uring_queue_exit(&g_wal_ring);
+        g_wal_ring_initialized = 0;
+        printf("[WAL-PERSIST] io_uring cleaned up\n");
     }
 
     pthread_mutex_unlock(&g_wal_mu);

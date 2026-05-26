@@ -1,0 +1,60 @@
+# 在 CMakeLists.txt 中添加 KCP 库支持
+
+# 1. 在依赖部分后添加 (约第 38 行后)
+# ── KCP library (third-party reliable UDP library) ────────────────────
+set(KCP_DIR ${CMAKE_SOURCE_DIR}/third_party/kcp)
+set(KCP_SRCS ${KCP_DIR}/ikcp.c)
+
+add_library(kcp STATIC ${KCP_SRCS})
+target_include_directories(kcp PUBLIC ${KCP_DIR})
+
+# 2. 在 REPL_SRCS 中移除旧文件，添加新文件 (约第 100 行)
+set(REPL_SRCS
+    src/repl/repl_stream.c
+    src/repl/repl_backlog.c
+    src/repl/rdma_repl.c
+    src/repl/repl_kcp_xdp.c        # 新增：KCP + AF_XDP 传输层
+    # 移除以下旧文件：
+    # src/repl/tcp_xdp_repl.c      # 旧的 TCP 实现
+    # src/repl/xdp_incr_repl.c     # 旧的 XDP 实现
+    # src/repl/repl_agent.c        # 独立进程实现
+)
+
+# 3. 在 kvstore target 的 target_link_libraries 中添加 kcp (约第 237 行)
+target_link_libraries(kvstore PRIVATE
+    Threads::Threads
+    ${NTYCO_LIB}
+    ${URING_LIBRARIES}
+    ${JEMALLOC_LIBRARIES}
+    ${FABRIC_LIBRARIES}
+    ${ZLIB_LIBRARIES}
+    ${LIBBPF_LIBRARIES}
+    kcp                            # 新增：链接 KCP 库
+    elf
+    dl
+)
+
+# 4. 移除 repl-agent target (约第 245-264 行)
+# 注释掉或删除整个 repl-agent 相关的部分
+
+# 5. 添加新的 eBPF 程序编译 (约第 180 行后)
+# ── Compile repl_filter BPF program ───────────────────────────────────
+set(REPL_FILTER_KERN_SRC ${CMAKE_SOURCE_DIR}/src/repl/repl_filter.bpf.c)
+set(REPL_FILTER_KERN_OBJ ${CMAKE_BINARY_DIR}/repl_filter.bpf.o)
+
+add_custom_command(
+    OUTPUT  ${REPL_FILTER_KERN_OBJ}
+    COMMAND clang -O2 -g -target bpf
+            -I${CMAKE_SOURCE_DIR}/src/repl
+            -I/usr/include
+            -I/usr/include/x86_64-linux-gnu
+            -c ${REPL_FILTER_KERN_SRC}
+            -o ${REPL_FILTER_KERN_OBJ}
+    DEPENDS ${REPL_FILTER_KERN_SRC}
+    COMMENT "Compiling repl_filter.bpf.c"
+)
+
+add_custom_target(repl_filter_kern DEPENDS ${REPL_FILTER_KERN_OBJ})
+
+# 6. 在 kvstore 的 add_dependencies 中添加 (约第 239 行)
+add_dependencies(kvstore ntyco xdp_kern sockmap_kern repl_filter_kern)

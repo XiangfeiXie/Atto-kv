@@ -23,11 +23,12 @@
 #define EVENT_READ      1
 #define EVENT_WRITE     2
 #define EVENT_WAKE      3   /* Phase 4B.2: cross-worker wake eventfd readable */
-#define ENTRIES_LENGTH  4096
+#define ENTRIES_LENGTH  8192     /* Increased from 4096 for high-concurrency workloads */
+#define CQE_BATCH_SIZE  512      /* Increased from 256 for better batching */
 
 /* Phase 3.2: provided buffer ring for multishot recv. */
 #define KVS_BUF_RING_BGID  1
-#define KVS_NR_BUFS        4096     /* must be power of two */
+#define KVS_NR_BUFS        8192     /* Increased from 4096 for high-concurrency (must be power of two) */
 #define KVS_BUF_SIZE       4096
 
 /* Phase 4: per-worker proactor.
@@ -595,8 +596,8 @@ static void *worker_loop(void *arg) {
     while (!g_kvs_stop) {
         if (w->id == 0) update_cached_time();   /* one writer is enough */
 
-        struct io_uring_cqe *cqes[256];
-        int nready = io_uring_peek_batch_cqe(ring, cqes, 256);
+        struct io_uring_cqe *cqes[CQE_BATCH_SIZE];
+        int nready = io_uring_peek_batch_cqe(ring, cqes, CQE_BATCH_SIZE);
 
         if (nready == 0) {
             /* Block subsystem is now MT-safe; only worker 0 sweeps timeouts
@@ -621,7 +622,7 @@ static void *worker_loop(void *arg) {
                         w->id, strerror(-ret));
                 break;
             }
-            nready = io_uring_peek_batch_cqe(ring, cqes, 256);
+            nready = io_uring_peek_batch_cqe(ring, cqes, CQE_BATCH_SIZE);
             if (nready <= 0) continue;
         }
 
@@ -731,8 +732,16 @@ static void *worker_loop(void *arg) {
                     char *src = w->buf_base + (size_t)bid * KVS_BUF_SIZE;
 
                     size_t need = c->r_off + rb->len + (size_t)res;
-                    while (need > rb->cap) {
-                        size_t new_cap = rb->cap * 2;
+                    if (need > rb->cap) {
+                        /* Optimized growth strategy: for large jumps (pipeline bursts),
+                         * allocate 1.25x the needed size to reduce realloc calls.
+                         * For smaller growth, use 2x doubling. */
+                        size_t new_cap = rb->cap;
+                        if (need > rb->cap * 2)
+                            new_cap = need + (need >> 2);  /* need * 1.25 */
+                        else
+                            while (new_cap < need) new_cap *= 2;
+
                         char *new_buf = realloc(rb->buf, new_cap);
                         if (!new_buf) {
                             buf_ring_recycle(bid);

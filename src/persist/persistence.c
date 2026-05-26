@@ -145,8 +145,18 @@ typedef struct {
 
 static void rdb_buf_reserve(rdb_buf_t *b, size_t need) {
     if (b->len + need <= b->cap) return;
+
     size_t ncap = b->cap ? b->cap : 64 * 1024;
-    while (ncap < b->len + need) ncap *= 2;
+
+    /* 如果需要的空间远大于当前容量，直接分配 need * 1.25 避免多次 realloc */
+    if (b->len + need > ncap * 2) {
+        ncap = b->len + need + (need >> 2);  /* need * 1.25 */
+    } else {
+        /* 否则使用 2x 增长策略 */
+        while (ncap < b->len + need)
+            ncap *= 2;
+    }
+
     b->buf = (char *)realloc(b->buf, ncap);
     b->cap = ncap;
 }
@@ -299,15 +309,19 @@ void rdb_serialize_to_buf(DynBuf *out) {
 /* 子进程：使用 io_uring 将整个 buffer 分块写入，最后 fsync */
 static void rdb_write_uring(int fd, const char *data, size_t total) {
     const size_t CHUNK = 1 * 1024 * 1024; /* 1MB/SQE */
-    const int    DEPTH = 32;
+    const int    DEPTH = 128;  /* 增加队列深度以提升性能 */
 
     struct io_uring ring;
     if (io_uring_queue_init(DEPTH, &ring, 0) < 0) {
-        /* 回退：普通 write */
+        /* 回退：普通 write，增加错误处理 */
         size_t off = 0;
         while (off < total) {
             ssize_t w = write(fd, data + off, total - off);
-            if (w <= 0) break;
+            if (w <= 0) {
+                fprintf(stderr, "[RDB] fallback write failed at offset %zu: %s\n",
+                        off, strerror(errno));
+                return;
+            }
             off += (size_t)w;
         }
         return;
@@ -315,62 +329,87 @@ static void rdb_write_uring(int fd, const char *data, size_t total) {
 
     size_t off = 0;
     int    inflight = 0;
+    int    write_error = 0;
+
     while (off < total || inflight > 0) {
         /* 尽量把 SQ 填满 */
-        while (off < total && inflight < DEPTH) {
+        while (off < total && inflight < DEPTH && !write_error) {
             struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
             if (!sqe) break;
             size_t n = total - off;
             if (n > CHUNK) n = CHUNK;
             io_uring_prep_write(sqe, fd, data + off, n, off);
+            sqe->user_data = n;  /* 传递期望写入的字节数 */
             off += n;
             inflight++;
         }
+
         if (inflight > 0) {
             io_uring_submit(&ring);
 
             /* 批量收割所有已完成的 CQE */
-            int reaped = 0;
             while (inflight > 0) {
                 struct io_uring_cqe *cqe = NULL;
                 int ret = io_uring_peek_cqe(&ring, &cqe);
+
                 if (ret == -EAGAIN) {
                     /* 没有更多完成的 CQE，等待至少一个 */
-                    if (reaped == 0 && io_uring_wait_cqe(&ring, &cqe) == 0) {
-                        if (cqe->res < 0) {
-                            fprintf(stderr, "[RDB] uring write error: %s\n", strerror(-cqe->res));
-                        }
-                        io_uring_cqe_seen(&ring, cqe);
-                        inflight--;
-                        reaped++;
+                    ret = io_uring_wait_cqe(&ring, &cqe);
+                    if (ret < 0) {
+                        fprintf(stderr, "[RDB] io_uring_wait_cqe failed: %s\n", strerror(-ret));
+                        write_error = 1;
+                        break;
                     }
-                    break;
                 }
-                if (ret == 0 && cqe) {
+
+                if (cqe) {
+                    /* 检查写入错误 */
                     if (cqe->res < 0) {
                         fprintf(stderr, "[RDB] uring write error: %s\n", strerror(-cqe->res));
+                        write_error = 1;
+                        io_uring_cqe_seen(&ring, cqe);
+                        inflight--;
+                        break;
                     }
+
+                    /* 检查 short write */
+                    size_t expected = (size_t)cqe->user_data;
+                    if ((size_t)cqe->res != expected) {
+                        fprintf(stderr, "[RDB] short write: %d/%zu bytes\n", cqe->res, expected);
+                        write_error = 1;
+                        io_uring_cqe_seen(&ring, cqe);
+                        inflight--;
+                        break;
+                    }
+
                     io_uring_cqe_seen(&ring, cqe);
                     inflight--;
-                    reaped++;
                 }
+            }
+
+            if (write_error) {
+                io_uring_queue_exit(&ring);
+                return;
             }
         }
     }
 
-    /* 用 io_uring fdatasync（IOSQE_IO_DRAIN 保证所有写入完成后才执行）
-     * 比阻塞 fsync() 少一次内核切换，且只刷数据不刷文件元数据 */
+    /* 用 io_uring fdatasync（IOSQE_IO_DRAIN 保证所有写入完成后才执行） */
     {
         struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
         if (sqe) {
             io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
-            sqe->flags |= IOSQE_IO_DRAIN;   /* 等前面所有写 SQE 完成 */
+            sqe->flags |= IOSQE_IO_DRAIN;
             io_uring_submit(&ring);
             struct io_uring_cqe *cqe = NULL;
-            if (io_uring_wait_cqe(&ring, &cqe) == 0)
+            if (io_uring_wait_cqe(&ring, &cqe) == 0) {
+                if (cqe->res < 0) {
+                    fprintf(stderr, "[RDB] fsync failed: %s\n", strerror(-cqe->res));
+                }
                 io_uring_cqe_seen(&ring, cqe);
+            }
         } else {
-            fdatasync(fd);   /* SQ 满时回退 */
+            fdatasync(fd);
         }
     }
     io_uring_queue_exit(&ring);
@@ -384,6 +423,9 @@ void rdb_save_sync(void) {
     int version = 2;
     int db_num = 0;
     int key_count = (int)kv_shards_count();
+
+    /* 预分配：header (16 bytes) + 每个 key 平均 256 bytes */
+    rdb_buf_reserve(&b, 16 + (size_t)key_count * 256);
 
     rdb_buf_put(&b, &magic, sizeof(int));
     rdb_buf_put(&b, &version, sizeof(int));
@@ -417,6 +459,11 @@ void rdb_save_sync(void) {
 
 /* Track the currently running BGSAVE child so we never run two at once. */
 static volatile pid_t g_rdb_child_pid = 0;
+
+/* Check if BGSAVE is in progress */
+int rdb_bgsave_in_progress(void) {
+    return (g_rdb_child_pid > 0) ? 1 : 0;
+}
 
 /* Track the currently running BGREWRITEAOF child */
 static volatile pid_t g_aof_rewrite_child_pid = 0;

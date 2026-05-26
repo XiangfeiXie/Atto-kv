@@ -1009,6 +1009,7 @@ static dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) 
         APPEND("aof_enabled:%d\r\n", ENABLE_AOF ? 1 : 0);
         APPEND("rdb_enabled:%d\r\n", ENABLE_RDB ? 1 : 0);
         APPEND("loading:%d\r\n", g_in_reload ? 1 : 0);
+        APPEND("rdb_bgsave_in_progress:%d\r\n", rdb_bgsave_in_progress());
         APPEND("\r\n");
     }
 

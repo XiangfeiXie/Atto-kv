@@ -40,6 +40,8 @@ void aof_async_append(const char *buf, int len);
 void rdb_save_sync(void);
 /* RDB：fork + io_uring 批量写，主线程不阻塞 */
 void rdb_save_async_uring(void);
+/* RDB：检查 BGSAVE 是否正在进行（返回 1 表示正在进行，0 表示空闲） */
+int rdb_bgsave_in_progress(void);
 
 /* Phase 7.1.0 — BGREWRITEAOF stub.
  *

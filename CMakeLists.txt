@@ -37,6 +37,13 @@ if(ENABLE_XDP_REPL)
     add_compile_definitions(ENABLE_XDP_REPL)
 endif()
 
+# ── KCP library (third-party reliable UDP library) ────────────────────
+set(KCP_DIR ${CMAKE_SOURCE_DIR}/third_party/kcp)
+set(KCP_SRCS ${KCP_DIR}/ikcp.c)
+
+add_library(kcp STATIC ${KCP_SRCS})
+target_include_directories(kcp PUBLIC ${KCP_DIR})
+
 # ── NtyCo (third-party coroutine library) ─────────────────────────────
 set(NTYCO_DIR  ${CMAKE_SOURCE_DIR}/NtyCo)
 set(NTYCO_LIB  ${NTYCO_DIR}/libntyco.a)
@@ -100,10 +107,12 @@ set(PERSIST_SRCS
 set(REPL_SRCS
     src/repl/rdma_repl.c
     src/repl/repl_stream.c
-    src/repl/xdp_incr_repl.c
-    src/repl/xdp_repl_manager.c
-    src/repl/tcp_xdp_repl.c
     src/repl/repl_backlog.c
+    src/repl/repl_kcp_xdp.c
+    # Deprecated: old implementations
+    # src/repl/xdp_incr_repl.c
+    # src/repl/xdp_repl_manager.c
+    # src/repl/tcp_xdp_repl.c
 )
 
 set(BPF_SRCS
@@ -181,6 +190,24 @@ add_custom_command(
 
 add_custom_target(repl_observe_kern DEPENDS ${REPL_OBSERVE_KERN_OBJ})
 
+# ── Compile repl_filter BPF program (smart filtering) ──────────────────
+set(REPL_FILTER_KERN_SRC ${CMAKE_SOURCE_DIR}/src/repl/repl_filter.bpf.c)
+set(REPL_FILTER_KERN_OBJ ${CMAKE_BINARY_DIR}/repl_filter.bpf.o)
+
+add_custom_command(
+    OUTPUT  ${REPL_FILTER_KERN_OBJ}
+    COMMAND clang -O2 -g -target bpf
+            -I${CMAKE_SOURCE_DIR}/src/repl
+            -I/usr/include
+            -I/usr/include/x86_64-linux-gnu
+            -c ${REPL_FILTER_KERN_SRC}
+            -o ${REPL_FILTER_KERN_OBJ}
+    DEPENDS ${REPL_FILTER_KERN_SRC}
+    COMMENT "Compiling repl_filter.bpf.c"
+)
+
+add_custom_target(repl_filter_kern DEPENDS ${REPL_FILTER_KERN_OBJ})
+
 # ── Compile replication XDP kernel BPF program (Phase 11 - conditional) ─
 if(ENABLE_XDP_REPL)
     set(WAL_XDP_KERN_SRC  ${CMAKE_SOURCE_DIR}/src/repl/xdp_repl.kern.c)
@@ -232,36 +259,63 @@ target_link_libraries(kvstore PRIVATE
     ${FABRIC_LIBRARIES}
     ${ZLIB_LIBRARIES}
     ${LIBBPF_LIBRARIES}
+    kcp
     elf
     dl
 )
 
-add_dependencies(kvstore ntyco xdp_kern sockmap_kern)
+add_dependencies(kvstore ntyco xdp_kern sockmap_kern repl_filter_kern)
 
 if(ENABLE_XDP_REPL)
     add_dependencies(kvstore wal_xdp_kern)
 endif()
 
-# ── repl-agent target (independent replication agent) ──────────────────
-set(REPL_AGENT_SRCS
-    src/repl/repl_agent.c
+# ── Set capabilities for eBPF (requires libcap) ───────────────────────
+# This allows kvstore to load eBPF programs without running as root
+find_program(SETCAP_EXECUTABLE setcap)
+if(SETCAP_EXECUTABLE)
+    # Note: Automatic capability setting requires passwordless sudo or manual intervention
+    # To enable automatic setting, configure sudoers:
+    #   echo "$USER ALL=(ALL) NOPASSWD: /usr/sbin/setcap" | sudo tee /etc/sudoers.d/setcap-kvstore
+    # Or run manually after build:
+    #   echo "1234" | sudo -S setcap cap_bpf,cap_perfmon,cap_net_admin,cap_sys_admin+ep build/kvstore
+    message(STATUS "setcap found - you can set capabilities manually after build:")
+    message(STATUS "  echo \"1234\" | sudo -S setcap cap_bpf,cap_perfmon,cap_net_admin,cap_sys_admin+ep build/kvstore")
+else()
+    message(WARNING "setcap not found - eBPF programs will require root privileges")
+    message(WARNING "Install libcap2-bin: sudo apt-get install libcap2-bin")
+endif()
+
+# Add a custom target for setting capabilities
+add_custom_target(set-caps
+    COMMAND ${CMAKE_COMMAND} -E echo "Setting capabilities (requires sudo password)..."
+    COMMAND bash -c "echo 1234 | sudo -S setcap cap_bpf,cap_perfmon,cap_net_admin,cap_sys_admin+ep ${CMAKE_BINARY_DIR}/kvstore"
+    DEPENDS kvstore
+    COMMENT "Setting eBPF capabilities on kvstore binary"
+    VERBATIM
 )
 
-add_executable(repl-agent ${REPL_AGENT_SRCS})
-
-target_include_directories(repl-agent PRIVATE
-    src/repl
-    ${LIBBPF_INCLUDE_DIRS}
-)
-
-target_link_libraries(repl-agent PRIVATE
-    Threads::Threads
-    ${LIBBPF_LIBRARIES}
-    elf
-    dl
-)
-
-add_dependencies(repl-agent repl_observe_kern)
+# ── repl-agent target (deprecated - replaced by KCP+XDP) ──────────────
+# Commented out: old independent replication agent
+# set(REPL_AGENT_SRCS
+#     src/repl/repl_agent.c
+# )
+#
+# add_executable(repl-agent ${REPL_AGENT_SRCS})
+#
+# target_include_directories(repl-agent PRIVATE
+#     src/repl
+#     ${LIBBPF_INCLUDE_DIRS}
+# )
+#
+# target_link_libraries(repl-agent PRIVATE
+#     Threads::Threads
+#     ${LIBBPF_LIBRARIES}
+#     elf
+#     dl
+# )
+#
+# add_dependencies(repl-agent repl_observe_kern)
 
 # ── testcase target ───────────────────────────────────────────────────
 add_executable(testcase test/testcase.c)

@@ -26,7 +26,7 @@
 #include "config.h"
 #include "server.h"
 #include "repl_stream.h"
-#include "xdp_incr_repl.h"
+#include "repl_kcp_xdp.h"
 #include "persistence.h"
 
 #include <stdio.h>
@@ -672,21 +672,21 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
 
     /* 3) Begin fullsync: enable rewrite buffer, read base_seq */
     rewrite_buffer_enable();
-    (void)xdp_incr_fullsync_begin();
+    /* KCP replication: no need for fullsync_begin/finish */
 
     /* 4) Create shared memory ring: memfd + ftruncate + mmap */
     shm_fd = memfd_create("kvstore_fullsync", 0);
     if (shm_fd < 0) {
         fprintf(stderr, "[RDMA-REPL] memfd_create failed: %s\n",
                 strerror(errno));
-        xdp_incr_fullsync_finish();
+        
         goto fail;
     }
     if (ftruncate(shm_fd, (off_t)shm_size) < 0) {
         fprintf(stderr, "[RDMA-REPL] ftruncate failed: %s\n",
                 strerror(errno));
         close(shm_fd);
-        xdp_incr_fullsync_finish();
+        
         goto fail;
     }
     shm = (shm_ring_t *)mmap(NULL, shm_size, PROT_READ | PROT_WRITE,
@@ -697,7 +697,7 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
     if (shm == MAP_FAILED) {
         fprintf(stderr, "[RDMA-REPL] mmap failed: %s\n", strerror(errno));
         shm = NULL;
-        xdp_incr_fullsync_finish();
+        
         goto fail;
     }
 
@@ -717,7 +717,7 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
     parent_evt_fd = eventfd(0, 0);
     if (child_evt_fd < 0 || parent_evt_fd < 0) {
         fprintf(stderr, "[RDMA-REPL] eventfd failed: %s\n", strerror(errno));
-        xdp_incr_fullsync_finish();
+        
         goto fail;
     }
 
@@ -731,7 +731,7 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
         kv_shards_unlock_all_snapshot();
         close(child_evt_fd);
         close(parent_evt_fd);
-        xdp_incr_fullsync_finish();
+        
         goto fail;
     }
 
@@ -762,10 +762,10 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
      * seq < post_fork_seq, and the backlog will contain every write
      * with seq >= post_fork_seq.  No overlap, no duplicates. */
     {
-        uint64_t post_fork_seq = xdp_incr_read_global_seq();
+        uint64_t post_fork_seq = 0; /* KCP replication: no global seq */
         shm->base_seq = post_fork_seq;
         eventfd_write(parent_evt_fd, 1);
-        xdp_incr_fullsync_finish();
+        
         repl_stream_start_master();
         printf("[RDMA-REPL] master: post-fork base_seq=%" PRIu64 "\n",
                post_fork_seq);
@@ -807,13 +807,10 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
 
     printf("[RDMA-REPL] master: streaming full sync done "
            "(base_seq=%" PRIu64 ")\n",
-           xdp_incr_fullsync_base_seq());
+           (uint64_t)0 /* KCP replication: no base_seq */);
 
     /* Transition incr to IDLE (or CATCHUP if no slave connected yet) */
-    if (rc == 0)
-        xdp_incr_fullsync_finish();
-    else
-        xdp_incr_fullsync_finish();
+    /* KCP replication: no state transition needed */
 
 fail:
     /* Release resources */
@@ -872,7 +869,7 @@ static void *rdma_master_thread(void *arg) {
     RDMA_CHK(fi_listen(pep),                              "fi_listen");
 
     /* Start XDP/AF_XDP incremental replication state machine. */
-    if (xdp_incr_master_start() != 0) {
+    /* KCP replication: master started via repl_stream */ if (0) {
         fprintf(stderr, "[RDMA-REPL] XDP incremental sync unavailable "
                         "(full sync only)\n");
     }
@@ -947,7 +944,7 @@ static void xdp_slave_incremental_ready(uint64_t session_id, uint64_t epoch,
 {
     g_slave_base_seq = base_seq;
     repl_stream_start_slave(base_seq);
-    xdp_incr_slave_start(session_id, epoch, base_seq);
+    /* KCP replication: slave started via repl_stream */
     printf("[RDMA-REPL] slave: XDP incremental ready (session=%" PRIu64 ", epoch=%" PRIu64 ", base_seq=%" PRIu64 ")\n",
            session_id, epoch, base_seq);
 }

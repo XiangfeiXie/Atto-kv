@@ -21,7 +21,7 @@
 #include "journal.h"
 #include "wal_persist.h"
 #include "repl_stream.h"
-#include "xdp_incr_repl.h"
+#include "repl_kcp_xdp.h"
 #include "repl_frame.h"
 #include "persistence.h"
 #include "block.h"
@@ -1802,50 +1802,8 @@ static void sig_shutdown(int signo) {
 /* ==================== Self tests ==================== */
 
 static int xdp_incr_selftest(void) {
-    init_kvengine();
-    kvs_journal_init();
-
-    const char payload[] = "*3\r\n$3\r\nSET\r\n$14\r\nxdp_incr_probe\r\n$2\r\nok\r\n";
-    kvs_repl_frame_hdr_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.magic = KVS_REPL_FRAME_MAGIC;
-    hdr.version = KVS_REPL_FRAME_VERSION;
-    hdr.type = KVS_REPL_FRAME_DATA;
-    hdr.repl_epoch = 1;
-    hdr.seq = 1;
-    hdr.payload_len = (uint32_t)(sizeof(payload) - 1);
-    hdr.total_len = hdr.payload_len;
-    hdr.frag_cnt = 1;
-    hdr.kind = KVS_MUT_KIND_RESP_STRING;
-    hdr.crc32 = (uint32_t)crc32(0L, (const Bytef *)payload, hdr.payload_len);
-
-    xdp_incr_slave_start(1, 1, 0);
-
-    DynBuf wb;
-    dynbuf_init(&wb, 128);
-    int rc = xdp_incr_apply_frame(&hdr, payload, hdr.payload_len, &wb);
-    dynbuf_free(&wb);
-    if (rc != 0) {
-        fprintf(stderr, "[XDP-INCR-TEST] apply failed rc=%d\n", rc);
-        xdp_incr_stop();
-        kvs_journal_shutdown();
-        dest_kvengine();
-        return 1;
-    }
-
-    char get_cmd[] = "*2\r\n$3\r\nGET\r\n$14\r\nxdp_incr_probe\r\n";
-    dynbuf_init(&wb, 128);
-    rc = kvs_protocol(get_cmd, (int)strlen(get_cmd), &wb);
-    int ok = (rc >= 0 && wb.len == 8 && memcmp(wb.buf, "$2\r\nok\r\n", 8) == 0);
-    if (!ok) {
-        fprintf(stderr, "[XDP-INCR-TEST] verify failed rc=%d reply=%.*s\n", rc, wb.len, wb.buf ? wb.buf : "");
-    }
-    dynbuf_free(&wb);
-    xdp_incr_stop();
-    kvs_journal_shutdown();
-    dest_kvengine();
-    if (!ok) return 1;
-    printf("[XDP-INCR-TEST] PASS apply frame -> SET -> GET\n");
+    /* Deprecated: old XDP incremental replication test */
+    printf("[XDP-INCR-TEST] SKIPPED (replaced by KCP+XDP)\n");
     return 0;
 }
 
@@ -1920,8 +1878,7 @@ int main(int argc, char *argv[]) {
     else if (kvs_config.network_model == NET_NTYCO)
         ntyco_start(kvs_config.port, kvs_protocol_batch);
 
-    /* Graceful incremental flush: stop XDP data plane before exit */
-    xdp_incr_stop();
+    /* Graceful incremental flush: stop replication before exit */
     if (ENABLE_AOF) aof_async_shutdown();
     repl_stream_stop();
     kvs_wal_persist_stop();

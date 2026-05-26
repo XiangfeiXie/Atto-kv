@@ -10,20 +10,7 @@
  * even for small power-of-two tables.
  * ===================================================================== */
 
-uint64_t kv_hash(const uint8_t *key, uint32_t len) {
-    uint64_t h = 14695981039346656037ULL;  /* FNV-1a offset basis */
-    for (uint32_t i = 0; i < len; i++) {
-        h ^= key[i];
-        h *= 1099511628211ULL;             /* FNV prime */
-    }
-    /* Murmur3 64-bit finalizer */
-    h ^= h >> 33;
-    h *= 0xff51afd7ed558ccdULL;
-    h ^= h >> 33;
-    h *= 0xc4ceb9fe1a85ec53ULL;
-    h ^= h >> 33;
-    return h;
-}
+/* kv_hash is now static inline in kv_dict.h */
 
 /* =====================================================================
  * Internal helpers

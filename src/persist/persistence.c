@@ -33,7 +33,6 @@
 #include <sys/eventfd.h>
 #include <stdatomic.h>
 #include <liburing.h>
-#include <zlib.h>
 #include <inttypes.h>
 
 
@@ -1004,12 +1003,11 @@ void aof_reload_mmap(void) {
             if (hdr.magic != KVS_WAL2_MAGIC) break;
             if (p + sizeof(kvs_wal2_record_hdr_t) + hdr.len > end) break;
             const char *payload = p + sizeof(kvs_wal2_record_hdr_t);
-            uint32_t computed = crc32(0L, Z_NULL, 0);
-            computed = crc32(computed, (const Bytef *)&hdr.seq, sizeof(hdr.seq));
-            computed = crc32(computed, (const Bytef *)&hdr.kind, sizeof(hdr.kind));
-            computed = crc32(computed, (const Bytef *)&hdr.flags, sizeof(hdr.flags));
-            computed = crc32(computed, (const Bytef *)&hdr.len, sizeof(hdr.len));
-            computed = crc32(computed, (const Bytef *)payload, (uInt)hdr.len);
+            uint32_t computed = kvs_crc32c(0, &hdr.seq, sizeof(hdr.seq));
+            computed = kvs_crc32c(computed, &hdr.kind, sizeof(hdr.kind));
+            computed = kvs_crc32c(computed, &hdr.flags, sizeof(hdr.flags));
+            computed = kvs_crc32c(computed, &hdr.len, sizeof(hdr.len));
+            computed = kvs_crc32c(computed, payload, (size_t)hdr.len);
             if (hdr.crc32 != computed) {
                 fprintf(stderr, "[AOF] WAL CRC32 mismatch seq=%" PRIu64
                         ", stopping replay\n", hdr.seq);

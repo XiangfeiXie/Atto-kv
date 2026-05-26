@@ -4,8 +4,6 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
-#include <zlib.h>
-
 typedef struct {
     uint64_t seq;
     uint16_t kind;
@@ -51,19 +49,18 @@ uint64_t kvs_journal_next_seq(void)
 
 int kvs_journal_append(uint16_t kind, uint16_t flags,
                        const char *payload, uint32_t len,
-                       uint64_t *out_seq)
+                       uint64_t *out_seq, uint32_t *out_crc)
 {
     if (!payload || len == 0 || len > KVS_JOURNAL_MAX_PAYLOAD) return -1;
     if (!g_journal_ready && kvs_journal_init() != 0) return -1;
 
     uint64_t seq = atomic_fetch_add_explicit(&g_next_seq, 1, memory_order_acq_rel);
     uint32_t idx = (uint32_t)seq & KVS_JOURNAL_BACKLOG_MASK;
-    uint32_t crc = crc32(0L, Z_NULL, 0);
-    crc = crc32(crc, (const Bytef *)&seq, sizeof(seq));
-    crc = crc32(crc, (const Bytef *)&kind, sizeof(kind));
-    crc = crc32(crc, (const Bytef *)&flags, sizeof(flags));
-    crc = crc32(crc, (const Bytef *)&len, sizeof(len));
-    crc = crc32(crc, (const Bytef *)payload, len);
+    uint32_t crc = kvs_crc32c(0, &seq, sizeof(seq));
+    crc = kvs_crc32c(crc, &kind, sizeof(kind));
+    crc = kvs_crc32c(crc, &flags, sizeof(flags));
+    crc = kvs_crc32c(crc, &len, sizeof(len));
+    crc = kvs_crc32c(crc, payload, len);
 
     pthread_mutex_lock(&g_journal_mu);
     journal_backlog_slot_t *s = &g_backlog[idx];
@@ -85,6 +82,7 @@ int kvs_journal_append(uint16_t kind, uint16_t flags,
     pthread_mutex_unlock(&g_journal_mu);
 
     if (out_seq) *out_seq = seq;
+    if (out_crc) *out_crc = crc;
     return 0;
 }
 

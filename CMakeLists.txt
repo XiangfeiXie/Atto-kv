@@ -13,7 +13,7 @@ if(NOT CMAKE_BUILD_TYPE)
         "Build type: Release/RelWithDebInfo/Debug" FORCE)
 endif()
 # Keep frame pointers in Release so perf top is still useful.
-add_compile_options(-fno-omit-frame-pointer)
+add_compile_options(-fno-omit-frame-pointer -msse4.2)
 
 # ── Dependencies ──────────────────────────────────────────────────────
 find_package(PkgConfig REQUIRED)

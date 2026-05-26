@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <pthread.h>
 
 /* =====================================================================
@@ -75,7 +76,29 @@ typedef struct {
 } kv_iter_t;
 
 /* --- Hash function --- */
-uint64_t kv_hash(const uint8_t *key, uint32_t len);
+static inline uint64_t kv_hash(const uint8_t *key, uint32_t len) {
+    uint64_t h = 14695981039346656037ULL;  /* FNV-1a offset basis */
+    uint32_t i = 0;
+    /* Process 8 bytes at a time */
+    for (; i + 8 <= len; i += 8) {
+        uint64_t word;
+        memcpy(&word, key + i, 8);
+        h ^= word;
+        h *= 1099511628211ULL;             /* FNV prime */
+    }
+    /* Process remaining bytes */
+    for (; i < len; i++) {
+        h ^= key[i];
+        h *= 1099511628211ULL;
+    }
+    /* Murmur3 64-bit finalizer */
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+    return h;
+}
 
 /* --- Dict lifecycle --- */
 void     dict_init(kv_dict_t *d);

@@ -21,6 +21,9 @@ typedef struct __attribute__((packed)) {
 
 int  kvs_wal_persist_start(void);
 int  kvs_wal_persist_append(const kvs_journal_record_t *rec);
+/* Fast path: append raw payload directly, bypassing journal copy overhead */
+int  kvs_wal_persist_append_raw(uint64_t seq, uint16_t kind, uint16_t flags,
+                                const char *payload, uint32_t len, uint32_t crc);
 void kvs_wal_persist_stop(void);
 
 /* Set fsync policy: "always", "everysec", or "no" */

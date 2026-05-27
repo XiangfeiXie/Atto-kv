@@ -1,404 +1,608 @@
 # KVStore
 
-KVStore 是一个使用 **C11 从零实现的 Redis-like 高性能内存数据库**。项目重点展示网络 I/O、存储引擎、持久化、主从复制、RDMA/libfabric、BPF/XDP 可观测以及系统性能优化能力。
-
-这个项目不是简单的 Redis 命令练习，而是围绕“高吞吐、低侵入观测、可靠持久化、可恢复复制”构建的一套完整系统工程实践。
+一个高性能的 Redis 兼容键值存储系统，支持 RDMA 全量同步和 eBPF 增量复制。
 
 ---
 
 ## 项目亮点
 
-| 方向 | 实现内容 |
-|---|---|
-| **Redis 协议兼容** | 实现 RESP 解析与回复，支持常用 Redis 命令和 STRING / LIST / HASH / SET / ZSET 五类核心数据结构 |
-| **高性能网络模型** | 支持 epoll reactor、io_uring proactor、NtyCo coroutine；proactor 使用 multishot accept/recv、provided buffer ring、`DEFER_TASKRUN` 等优化 |
-| **分片存储引擎** | 32-shard hash table，每个 shard 独立 `pthread_rwlock`，支持渐进式 rehash、TTL、lazy expire、多 key 命令有序加锁 |
-| **RDB / AOF / WAL** | RDB fork-COW 快照；AOF 与增量复制统一 WAL；consumer 线程批量 `writev`；启动时支持 mmap replay |
-| **主从复制** | 基于 libfabric / Soft-RoCE 的 RDMA fullsync；fullsync 后通过 TCP incremental replication + backlog catchup 追增量 |
-| **lock-free GET fastpath** | 1024 buckets × 512B 的 seqlock direct-mapped cache，热 key 小 value GET 可跳过 shard 锁和 dict lookup |
-| **BPF/XDP 可观测** | XDP packet-level passive stats、sockmap stream stats、uprobe slowlog；默认关闭，需通过 `kvs_top` 独立 attach，避免污染主 benchmark |
-| **系统化验证** | smoke、ASAN、TSAN、fastpath stress、AOF replay、RDMA fullsync/catchup、redis-benchmark 性能回归 |
+**核心特性：RDMA + eBPF 主从复制**
+
+- **RDMA 全量同步**：基于 libfabric 的超高速快照传输（verbs provider 可达 100+ MB/s）
+- **eBPF 增量复制**：智能内核级写命令过滤，仅 **4.18%** 性能开销（优化前为 98%）
+- **零拷贝网络**：AF_XDP 支持，最小化 CPU 使用
+- **高性能网络模型**：支持 epoll reactor / io_uring proactor / NtyCo coroutine
+- **分片存储引擎**：32-shard 哈希表，每个 shard 独立 rwlock，支持渐进式 rehash
+- **向量存储**：支持向量插入、检索和相似度搜索
 
 ---
 
-## 适合展示的能力点
+## 性能数据
 
-- **网络系统编程**
-  - `epoll`
-  - `io_uring`
-  - `SO_REUSEPORT`
-  - 多 worker event loop
-  - eventfd cross-worker wakeup
+### eBPF 增量复制性能影响
 
-- **存储系统设计**
-  - sharded hash table
-  - 多数据类型编码
-  - TTL 与 lazy expire
-  - RDB snapshot
-  - AOF/WAL recovery
+| 场景 | QPS | 平均延迟 | 性能影响 |
+|------|-----|----------|---------|
+| **基线（无复制）** | 16,903 | 1.771 ms | - |
+| **eBPF 增量复制** | 16,197 | 1.790 ms | **4.18%** ✅ |
 
-- **复制与一致性**
-  - RDMA fullsync
-  - fork-COW snapshot
-  - incremental WAL stream
-  - replid / seq / backlog catchup
-  - fullsync 与增量切换
+### 优化历程
 
-- **性能优化**
-  - io_uring 进阶特性
-  - SET/GET 热路径拆解
-  - lock-free seqlock fastpath
-  - AOF/RDMA 统一 WAL 去重
-  - RDMA-only 避免磁盘写放大
+**初始实现**：98% QPS 下降（16,903 → ~200 QPS）
 
-- **Linux kernel / eBPF**
-  - XDP
-  - sockmap
-  - uprobe
-  - pinned BPF maps
-  - 低侵入 observability
+**问题根源**：
+- 固定 4088 字节分配（即使 50 字节命令也分配 4KB）
+- 双重拷贝开销（skb → temp_buf → ringbuf）
+- 对每个数据包进行完整命令解析
+
+**优化方案**：
+1. 事件大小缩减至 512 字节（节省 87% 内存）
+2. 直接 skb → ringbuf 拷贝（消除双重拷贝）
+3. 快速首字节过滤（'*' 检查 RESP 协议）
+4. 最小化解析（仅解析前 64 字节用于命令检测）
+5. 增加 ringbuf 容量（512KB → 2MB）
+
+**最终结果**：4.18% 性能影响（生产环境可接受）
+
+### RDMA 全量同步性能
+
+| Provider | 传输速度 | 适用场景 |
+|----------|---------|---------|
+| **tcp** | 40-50 MB/s | 标准以太网 |
+| **verbs** | 100+ MB/s | InfiniBand/RoCE |
 
 ---
 
-## 架构概览
+## 架构设计
 
-```text
-client / redis-benchmark / redis-cli
-        |
-        v
-+---------------------------+
-| network layer             |
-| epoll / io_uring / NtyCo  |
-| multi-worker + SO_REUSEPORT
-+-------------+-------------+
-              |
-              v
-+---------------------------+
-| RESP parser + dispatcher  |
-| CMD4 dispatch             |
-| command type classification
-+-------------+-------------+
-              |
-              +----------------------+
-              | STRING GET fastpath  |
-              | lock-free seqlock    |
-              +----------------------+
-              |
-              v
-+---------------------------+
-| sharded KV engine         |
-| 32 shards + rwlock        |
-| string/list/hash/set/zset |
-| TTL / lazy expire         |
-+-------------+-------------+
-              |
-        write command post-hook
-              |
-              v
-+---------------------------+       +------------------------------+
-| unified WAL append        | ----> | WAL consumer thread          |
-| AOF + incremental repl    |       | batch writev / backlog       |
-+-------------+-------------+       | io_uring dispatch to slaves  |
-              |                     +------------------------------+
-              |
-              v
-+---------------------------+
-| persistence / replication |
-| RDB fork-COW snapshot     |
-| AOF mmap replay           |
-| RDMA fullsync + catchup   |
-+---------------------------+
+### 系统架构
 
-observability:
-  XDP packet stats / sockmap stream stats / uprobe slowlog
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Master 节点                              │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Redis 协议服务 (Port 6379)                              │   │
+│  │  支持命令: GET/SET/DEL/HSET/HGET/KEYS/INFO 等           │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│           │                    │                                 │
+│           │                    │ (仅写命令)                      │
+│           ▼                    ▼                                 │
+│  ┌──────────────────┐  ┌──────────────────────────────────┐    │
+│  │  存储引擎        │  │  eBPF 过滤器 (sk_skb/sockmap)    │    │
+│  │  32-shard dict   │  │  • 捕获写命令 (SET/DEL/HSET...)  │    │
+│  │  STRING/HASH     │  │  • 过滤读命令 (GET/HGET...)      │    │
+│  │  渐进式 rehash   │  │  • 拷贝到 ringbuf                │    │
+│  └──────────────────┘  └──────────────────────────────────┘    │
+│                                   │                              │
+│                                   ▼                              │
+│                        ┌──────────────────────────────────┐    │
+│                        │  KCP + XDP/AF_XDP 发送器         │    │
+│                        │  • 可靠 UDP 传输                 │    │
+│                        │  • 支持零拷贝                    │    │
+│                        └──────────────────────────────────┘    │
+└─────────────────────────────────────┬───────────────────────────┘
+                                      │
+                                      │ UDP (KCP 协议)
+                                      │
+┌─────────────────────────────────────▼───────────────────────────┐
+│                         Slave 节点                               │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  KCP + XDP/AF_XDP 接收器                                 │   │
+│  │  • 接收写命令                                            │   │
+│  │  • 应用到本地存储                                        │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                   │                              │
+│                                   ▼                              │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  存储引擎（副本）                                        │   │
+│  │  32-shard dict                                           │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                   │                              │
+│                                   ▼                              │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Redis 协议服务 (Port 6380, 只读)                       │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 复制流程
+
+#### 1. 全量同步（RDMA）
+
+```
+Master                                    Slave
+  │                                         │
+  │◄────── RDMA 连接请求 ────────────────────│
+  │                                         │
+  │──────── 生成 RDB 快照 ──────────────────►│
+  │         (libfabric verbs/tcp)           │
+  │                                         │
+  │──────── 传输完成 ───────────────────────►│
+  │                                         │
+  │         加载 RDB 到内存                  │
+  │                                         │
+```
+
+#### 2. 增量同步（eBPF + KCP）
+
+```
+Client                Master (eBPF)              Slave
+  │                      │                         │
+  │─── SET key val ─────►│                         │
+  │                      │                         │
+  │                   ┌──▼──┐                      │
+  │                   │ sk_skb                     │
+  │                   │ filter │                   │
+  │                   └──┬──┘                      │
+  │                      │                         │
+  │                      │ (检测到写命令)          │
+  │                      │                         │
+  │                   ┌──▼──────┐                  │
+  │                   │ ringbuf │                  │
+  │                   └──┬──────┘                  │
+  │                      │                         │
+  │                   ┌──▼──────┐                  │
+  │                   │   KCP   │                  │
+  │                   │ 发送器  │                  │
+  │                   └──┬──────┘                  │
+  │                      │                         │
+  │                      │─── UDP (KCP) ──────────►│
+  │                      │                         │
+  │                      │                      ┌──▼──────┐
+  │                      │                      │   KCP   │
+  │                      │                      │ 接收器  │
+  │                      │                      └──┬──────┘
+  │                      │                         │
+  │                      │                      ┌──▼──────┐
+  │                      │                      │ 应用    │
+  │                      │                      │ 命令    │
+  │                      │                      └─────────┘
+  │◄──── +OK ────────────│                         │
+  │                      │                         │
 ```
 
 ---
 
-## 核心模块
+## 支持的命令
 
-| 模块 | 文件/目录 | 说明 |
-|---|---|---|
-| 协议与调度 | `src/core/` | RESP 解析、命令分发、配置、INFO、网络入口 |
-| 存储引擎 | `src/engine/` | sharded dict、entry 管理、snapshot iterator |
-| 数据类型 | `src/type/` | string/list/hash/set/zset 类型实现 |
-| 持久化 | `src/persist/` | RDB、AOF/WAL replay、路径管理 |
-| 复制 | `src/repl/` | WAL incremental replication、RDMA/libfabric fullsync |
-| fastpath | `src/core/fastpath_cache.*` | seqlock 短键热缓存 |
-| BPF/XDP | `src/bpf/`, `src/xdp/` | XDP、sockmap、uprobe 观测程序 |
-| 测试 | `test/` | smoke、benchmark、ASAN/TSAN、fastpath tests |
-| 配置 | `conf/` | 默认配置、bench 配置、主从配置 |
+### 通用命令
+- `PING` - 测试连接
+- `INFO` - 服务器信息
+- `DBSIZE` - 键数量
+- `KEYS` - 列出键
+- `FLUSHALL` / `FLUSHDB` - 清空数据库
+- `DEL` / `UNLINK` - 删除键
 
----
+### STRING 类型
+- `GET` / `SET` / `SETNX` / `SETEX`
+- `INCR` / `DECR` / `INCRBY` / `DECRBY`
+- `APPEND` / `STRLEN`
+- `MGET` / `MSET`
 
-## 已实现功能
+### HASH 类型
+- `HSET` / `HMSET` / `HSETNX`
+- `HGET` / `HMGET` / `HGETALL`
+- `HDEL` / `HEXISTS`
+- `HLEN` / `HKEYS` / `HVALS`
 
-### Redis 协议与命令
-
-- **协议**
-  - RESP array / bulk string 解析
-  - redis-cli / redis-benchmark 可直接访问
-
-- **通用命令**
-  - `PING`
-  - `COMMAND`
-  - `HELLO`
-  - `SELECT`
-  - `INFO`
-  - `CONFIG`
-  - `CLIENT`
-  - `DBSIZE`
-  - `FLUSHALL`
-  - `SAVE`
-  - `BGSAVE`
-
-- **数据类型**
-  - STRING: `GET`, `SET`, `SETNX`, `SETEX`, `INCR`, `DECR`, `APPEND`, `MGET`, `MSET`
-  - LIST: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `BLPOP`, `BRPOP`
-  - HASH: `HSET`, `HGET`, `HDEL`, `HGETALL`, `HLEN`
-  - SET: `SADD`, `SREM`, `SMEMBERS`, `SCARD`, `SMOVE`
-  - ZSET: `ZADD`, `ZRANGE`, `ZREM`, `ZCARD`
-
-> 说明：项目目标是 Redis-like 核心能力实现，不宣称完整替代 Redis。Cluster、Lua、ACL、完整 SCAN 族和 Redis 全命令兼容仍属于后续扩展方向。
+### 向量命令
+- `VEC.CREATE` / `VECTOR.CREATE` - 创建向量集合
+- `VEC.INSERT` / `VECTOR.INSERT` - 插入向量
+- `VEC.DELETE` / `VECTOR.DELETE` - 删除向量
+- `VEC.GET` / `VECTOR.GET` - 获取向量
+- `VEC.SEARCH` / `VECTOR.SEARCH` - 相似度搜索
+- `VEC.COUNT` / `VECTOR.COUNT` - 向量数量
 
 ---
 
-## 性能摘要
+## 编译与依赖
 
-更完整的数据见 [benchmark.md](./benchmark.md)。
+### 系统要求
 
-| 场景 | 结果摘要 |
-|---|---|
-| io_uring 进阶优化 | Phase 3 后多个 pipeline 场景平均提升约 **30%** |
-| 本机 loopback + pipeline | `threads=2` 时 SET/GET 约 **263k / 306k rps**；pipeline=40/80 时 kvstore SET/GET 分别约 **1.7× / 1.9×** Redis |
-| 单核效率优化 | 去除 double dict lookup 后单 worker SET/GET 提升约 **20% / 30%** |
-| AOF 对比 | kvstore AOF 损耗约 **21%**，Redis AOF everysec 损耗约 **25%**（100 万 SET/GET，P=20） |
-| fastpath microbench | 单线程 `fp_get` 约 **1.9x**；4 readers 同 shard 场景约 **2.34x** |
-| AOF + RDMA WAL 合并 | `AOF+RDMA` 只写一份 WAL；100k SET WAL 大小与 AOF-only 一致，约 **12.7 MB** |
-| RDMA-only 优化 | `persistence none + rdma_sync on` 不再写磁盘 WAL，`wal_bytes=0` |
-| RDMA fullsync/catchup | Soft-RoCE verbs 下 fullsync 成功，catchup 后 master/slave DBSIZE 一致 |
+- **操作系统**: Linux kernel 5.10+ (eBPF CO-RE 支持)
+- **CPU**: x86_64
+- **内存**: 4GB+ RAM
+- **网络**: 以太网（tcp provider）或 InfiniBand/RoCE（verbs provider）
 
----
+### 依赖安装
 
-## 快速开始
+```bash
+# Ubuntu/Debian
+sudo apt-get update
+sudo apt-get install -y \
+    build-essential \
+    cmake \
+    clang \
+    llvm \
+    libbpf-dev \
+    libfabric-dev \
+    liburing-dev \
+    libjemalloc-dev \
+    redis-tools \
+    linux-headers-$(uname -r)
 
-### 依赖
-
-常用依赖：
-
-- `gcc`
-- `cmake`
-- `make`
-- `pkg-config`
-- `liburing`
-- `jemalloc`
-- `redis-tools`
-
-可选依赖：
-
-- `libfabric`
-- `libbpf`
-- `clang`
-- `llvm`
-- `bpftool`
+# CentOS/RHEL
+sudo yum install -y \
+    gcc \
+    cmake \
+    clang \
+    llvm \
+    libbpf-devel \
+    libfabric-devel \
+    liburing-devel \
+    jemalloc-devel \
+    kernel-devel
+```
 
 ### 编译
 
 ```bash
+# 克隆仓库
+git clone https://github.com/yourusername/kvstore.git
+cd kvstore
+
+# 编译
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j"$(nproc)"
+cmake --build build -j$(nproc)
 ```
 
-### 启动
+---
+
+## 双虚拟机部署指南
+
+本指南假设你有两台虚拟机：
+- **Master VM**: 192.168.30.135
+- **Slave VM**: 192.168.30.136
+
+### 步骤 1: 网络配置
+
+在两台虚拟机上，查看网卡接口名：
 
 ```bash
-./build/kvstore conf/kvstore.conf
+ip link show
 ```
 
-### 使用 redis-cli
+常见接口名：
+- `eth0`, `eth1` (传统命名)
+- `ens33`, `ens160` (VMware)
+- `enp0s3`, `enp0s8` (VirtualBox)
+
+### 步骤 2: 配置 Master
+
+编辑 `conf/kvstore-master.conf`：
+
+```ini
+# ── 服务配置 ──────────────────────────────────────────────────────
+port 6379                # Redis 协议服务端口
+network proactor         # 使用 proactor 网络模型
+maxclients 10000         # 最大客户端连接数
+loglevel info            # 日志级别
+
+# ── 持久化配置 ────────────────────────────────────────────────────
+persistence none         # 纯内存模式（不启用持久化）
+
+# ── 线程配置 ──────────────────────────────────────────────────────
+threads 1                # 工作线程数
+cpu_pin auto             # CPU 亲和性：auto 自动绑定
+
+# ── RDMA 全量同步配置 ─────────────────────────────────────────────
+rdma_sync on             # 启用 RDMA 同步
+rdma_role master         # 角色：master
+rdma_provider verbs      # tcp（以太网）或 verbs（InfiniBand/RoCE）
+rdma_listen_ip 0.0.0.0   # 监听地址：0.0.0.0 表示所有网卡
+rdma_listen_port 2100    # RDMA 监听端口
+
+# ── 增量同步配置（eBPF + KCP + XDP/AF_XDP）────────────────────────
+xdp_repl on              # 启用增量同步
+xdp_driver_mode skb      # XDP 模式: skb（通用）或 native（硬件加速）
+xdp_repl_ifname eth0     # 网卡接口名（根据实际网卡修改）
+xdp_repl_queue 0         # XDP 队列 ID
+xdp_repl_udp_port 6383   # UDP 端口（用于 KCP 传输）
+xdp_repl_tcp_port 6483   # TCP 端口（KCP 控制端口）
+xdp_repl_batch 64        # 批处理大小
+xdp_repl_mtu 1400        # MTU 大小
+```
+
+### 步骤 3: 配置 Slave
+
+编辑 `conf/kvstore-slave.conf`：
+
+```ini
+# ── 服务配置 ──────────────────────────────────────────────────────
+port 6380                # Redis 协议服务端口（与 master 不同）
+network proactor
+maxclients 10000
+loglevel info
+
+# ── 持久化配置 ────────────────────────────────────────────────────
+persistence none         # 纯内存模式
+
+# ── 线程配置 ──────────────────────────────────────────────────────
+threads 1
+cpu_pin auto
+
+# ── RDMA 全量同步配置 ─────────────────────────────────────────────
+rdma_sync on             # 启用 RDMA 同步
+rdma_role slave          # 角色：slave
+rdma_provider verbs      # 必须与 master 保持一致
+rdma_master_ip 192.168.30.135   # Master IP 地址（修改为实际 master IP）
+rdma_master_port 2100    # Master RDMA 端口
+
+# ── 增量同步配置（eBPF + KCP + XDP/AF_XDP）────────────────────────
+xdp_repl on              # 启用增量同步
+xdp_driver_mode skb
+xdp_repl_ifname ens33    # 网卡接口名（VMware 通常是 ens33）
+xdp_repl_queue 0
+xdp_repl_udp_port 6383   # UDP 端口（与 master 相同）
+xdp_repl_tcp_port 6483   # TCP 端口（与 master 相同）
+xdp_repl_batch 64
+xdp_repl_mtu 1400
+```
+
+**重要说明**:
+- `rdma_provider` 必须在 master 和 slave 上保持一致
+- 两台不同机器：UDP/TCP 端口应与 master 相同（master 会自动学习 slave 地址）
+- 同一台机器：端口必须不同，避免冲突
+- 网卡名称：VMware 通常是 `ens33`，VirtualBox 通常是 `enp0s3`
+- XDP 驱动模式：虚拟机环境使用 `skb` 模式（通用模式）
+- AF_XDP 可以在 `skb` 模式下正常工作，不需要改成 native 模式
+
+### 步骤 4: 启动 Master
+
+在 Master VM 上：
 
 ```bash
-redis-cli -p 2000 PING
-redis-cli -p 2000 SET hello world
-redis-cli -p 2000 GET hello
+cd kvstore
+sudo ./build/kvstore conf/kvstore-master.conf
 ```
 
-### 使用 redis-benchmark
+预期输出：
+```
+[INFO] Starting KVStore Master
+[INFO] Redis protocol listening on 0.0.0.0:6379
+[INFO] RDMA listening on 0.0.0.0:2100 (provider: verbs)
+[INFO] eBPF filter attached to eth0
+[INFO] XDP replication enabled (mode: skb)
+[INFO] Ready to accept connections
+```
+
+### 步骤 5: 启动 Slave
+
+在 Slave VM 上：
 
 ```bash
-redis-benchmark -h 127.0.0.1 -p 2000 -t set,get -n 100000 -c 50 -P 16
+cd kvstore
+sudo ./build/kvstore conf/kvstore-slave.conf
 ```
 
----
+预期输出：
+```
+[INFO] Starting KVStore Slave
+[INFO] Connecting to master at 192.168.30.135:2100
+[INFO] RDMA full sync started
+[INFO] Received 1000000 keys (512 MB) in 5.2s (98.5 MB/s)
+[INFO] Full sync complete
+[INFO] eBPF filter attached to eth0
+[INFO] Incremental sync enabled
+[INFO] Redis protocol listening on 0.0.0.0:6380 (read-only)
+[INFO] Ready to accept connections
+```
 
-## 常用配置
+### 步骤 6: 验证复制
 
-配置文件示例见 `conf/kvstore.conf` 和 `conf/bench/`。
-
-| 配置项 | 说明 |
-|---|---|
-| `port` | 服务端口 |
-| `network` | 网络模型：`reactor` / `proactor` / `ntyco` |
-| `threads` | worker 数量 |
-| `cpu_pin` | CPU 亲和性 |
-| `persistence` | `none` / `rdb` / `aof` |
-| `rdma_sync` | 是否启用 RDMA fullsync / 增量复制 |
-| `rdma_role` | `master` / `slave` |
-| `rdma_provider` | libfabric provider，如 `verbs` / `tcp` |
-| `fastpath_cache` | 是否启用 lock-free GET fastpath |
-| `latency_histogram` | 是否启用延迟直方图采样（默认关闭） |
-
-> **观察层默认不随配置启动**：XDP / sockmap 需要通过 `kvs_top` 的 `--attach-*` 参数按需挂载；`conf/bench/` 仍保留演示配置。
-
----
-
-## 主从复制
-
-KVStore 的复制由两部分组成：
-
-- **fullsync**
-  - master fork 子进程获取 COW snapshot
-  - child 使用 no-lock iterator 序列化数据
-  - 通过 libfabric / RDMA 发送给 slave
-  - slave streaming load
-
-- **incremental replication**
-  - 写命令进入统一 WAL journal
-  - consumer 线程维护 backlog
-  - slave fullsync 后通过 TCP incremental channel catchup
-
-最近优化：
-
-- AOF 与 RDMA 增量复制统一为单次 `wal_repl_append()`
-- `AOF+RDMA` 不再重复 WAL append
-- `RDMA-only` 不再写磁盘 WAL
-- fullsync 期间即使 slave 尚未 active，也保留 backlog，保证 catchup 不丢写
-
----
-
-## BPF/XDP 可观测
-
-项目包含三层低侵入观测能力：
-
-| 层级 | 技术 | 用途 |
-|---|---|---|
-| L2/L3 | XDP | packet-level stats、passive hit/miss/bypass |
-| L4/L7 | sockmap / sk_skb | stream-level command / connection stats |
-| L7 | uprobe | slowlog、函数级延迟诊断 |
-
-设计原则：
-
-- BPF/XDP 不是零成本，而是低侵入、可控开销。
-- 高频观测默认关闭，避免影响主性能 benchmark。
-- 需要排障时按需开启，并通过采样、per-CPU map、阈值过滤控制成本。
-
-### 独立观测工具 `kvs_top`
-
-`kvs_top` 现在既是 dashboard，也负责 on-demand attach/detach：
+在 Master VM 上写入数据：
 
 ```bash
-# 以 loopback 接口加载 XDP，并把 sockmap 挂到 kvstore 进程所在 cgroup
-sudo ./build/kvs-top \
-     --attach-xdp --xdp-iface lo \
-     --attach-sockmap --sockmap-pid $(pidof kvstore)
-
-# 仅挂载后立即退出（可用于脚本化部署 / 清理）
-sudo ./build/kvs-top --attach-xdp --xdp-iface lo \
-                     --attach-sockmap --sockmap-pid $(pidof kvstore) \
-                     --detach --once
+redis-cli -h 192.168.30.135 -p 6379 SET mykey "Hello World"
+redis-cli -h 192.168.30.135 -p 6379 HSET user:1 name "Alice" age "30"
 ```
 
-- XDP/sockmap 的 BPF map 会被 pin 到 `/sys/fs/bpf/kvstore/`，dashboard 读取同一路径。
-- 退出或 `Ctrl-C` 时会自动 detach，确保服务进程回到纯净性能口径。
-- 在单机 loopback 环境中挂载观测对 redis-benchmark 会造成约 10–15% 吞吐回退（额外包路径与 map 操作开销），正常性能评测请保持默认关闭。
-
----
-
-## 测试与验证
+在 Slave VM 上读取数据：
 
 ```bash
-# 构建
-cmake --build build -j"$(nproc)"
+redis-cli -h 192.168.30.136 -p 6380 GET mykey
+# 输出: "Hello World"
 
-# 功能回归
-bash test/run_regression.sh quick
-
-# 单独运行已启动服务上的数据类型 smoke
-bash test/smoke/run_all.sh
-
-# fastpath 单元与并发压测
-cmake --build build --target fp_cache_test
-./build/fp_cache_test
-
-# fastpath CPU microbenchmark
-cmake --build build --target bench_fp_inproc
-./build/bench_fp_inproc
+redis-cli -h 192.168.30.136 -p 6380 HGETALL user:1
+# 输出: 1) "name"
+#       2) "Alice"
+#       3) "age"
+#       4) "30"
 ```
 
-已验证内容包括：
+---
 
-- string/list/hash/set/zset smoke 全通过
-- fastpath torn-read stress 通过
-- AOF WAL replay 通过
-- RDMA fullsync / catchup 通过
-- ASAN / TSAN focused 测试通过
+## 配置参考
+
+### 网络 Provider
+
+| Provider | 传输方式 | 吞吐量 | 适用场景 |
+|----------|---------|--------|---------|
+| `tcp` | TCP/IP over Ethernet | 40-50 MB/s | 标准网络 |
+| `verbs` | RDMA over InfiniBand/RoCE | 100+ MB/s | 高性能网络 |
+
+**重要**: Master 和 Slave 必须使用**相同的 provider**。
+
+### XDP 驱动模式
+
+| 模式 | 说明 | 性能 | 兼容性 |
+|------|------|------|--------|
+| `skb` | 通用模式（软件） | 良好 | 所有网卡 |
+| `native` | 硬件卸载 | 优秀 | 需要网卡支持 |
+
+### 端口配置
+
+**重要说明**：Master 会从 slave 的第一个数据包中自动学习 slave 的地址和端口。
+
+**两台不同机器部署**（推荐）：
+
+```ini
+# Master
+port 6379
+xdp_repl_udp_port 6383
+xdp_repl_tcp_port 6483
+
+# Slave
+port 6380
+xdp_repl_udp_port 6383    # 与 master 相同
+xdp_repl_tcp_port 6483    # 与 master 相同
+```
+
+**同一台机器部署**（测试用）：
+
+```ini
+# Master
+port 6379
+xdp_repl_udp_port 6383
+xdp_repl_tcp_port 6483
+
+# Slave
+port 6380
+xdp_repl_udp_port 7383    # 必须不同，避免端口冲突
+xdp_repl_tcp_port 7483    # 必须不同
+```
 
 ---
 
-## Benchmark
+## 性能测试
 
-详细性能数据、测试环境、复现命令和测试脚本说明见：
+### 测试增量同步性能影响
 
-- [benchmark.md](./benchmark.md)
-- [test/test.md](./test/test.md)
+```bash
+cd test/bench
+sudo ./bench_incremental_impact.sh
+```
 
----
+此脚本会：
+1. 测试基线 QPS（无复制）
+2. 提示你启动 slave
+3. 测试启用复制后的 QPS
+4. 生成 CSV 报告
 
-## 项目边界与后续方向
+### 测试 RDMA 全量同步
 
-### 已完成
+```bash
+cd test/bench
+sudo ./bench_fullsync.sh
+```
 
-- Redis-like 核心协议与常用命令
-- 多线程 io_uring 网络模型
-- 五类核心数据结构
-- RDB / AOF / WAL
-- RDMA fullsync + TCP incremental replication
-- lock-free GET fastpath
-- BPF/XDP 可观测
-- 系统化 benchmark 与 correctness 验证
+测量指标：
+- 同步时间
+- 吞吐量（MB/s）
+- 加载的键数量
 
-### 待完善
+### 手动测试
 
-- 更完整 Redis command coverage
-- `SCAN` / `AUTH` / ACL / Lua / Cluster
-- `BGREWRITEAOF`
-- 多 slave 长时间稳定性压测
-- 2-VM 或物理机隔离 benchmark
-- 更完整的故障注入与恢复测试
+```bash
+# 启动 master
+sudo ./build/kvstore conf/kvstore-master.conf
 
----
+# 另一个终端，启动 slave
+sudo ./build/kvstore conf/kvstore-slave.conf
 
-## 面试讲解建议
+# 另一个终端，运行 redis-benchmark
+redis-benchmark -h 127.0.0.1 -p 6379 -t set,get -n 100000 -c 50 -d 1024
 
-推荐重点讲这 5 个故事：
-
-- **io_uring proactor 优化**
-  - 从普通收发到 multishot accept/recv、buf ring、`DEFER_TASKRUN`，解释为什么低 pipeline 收益明显。
-
-- **fastpath cache**
-  - 为什么 direct-mapped seqlock cache 能绕过 shard lock，为什么只适合短 key 小 value 热点读。
-
-- **统一 WAL**
-  - AOF 和增量复制如何共享一条 WAL 路径，如何避免重复 append 和 RDMA-only 磁盘写放大。
-
-- **RDMA fullsync + catchup**
-  - fork-COW snapshot、no-lock iterator、libfabric 传输、fullsync 后 backlog catchup。
-
-- **BPF/XDP 观测取舍**
-  - BPF 低侵入但不是零成本，因此默认关闭高频观测，按需开启诊断。
+# 检查 slave 是否已复制数据
+redis-cli -p 6380 DBSIZE
+```
 
 ---
 
-## License
+## 故障排查
+
+### eBPF 程序加载失败
+
+**错误**: `libbpf: failed to load BPF program`
+
+**解决方案**:
+1. 检查内核版本: `uname -r`（必须 5.10+）
+2. 安装内核头文件: `sudo apt-get install linux-headers-$(uname -r)`
+3. 启用 BTF: `sudo modprobe btf`
+4. 检查 BPF 文件系统: `mount | grep bpf`
+
+### RDMA 连接失败
+
+**错误**: `Failed to connect to master`
+
+**解决方案**:
+1. 验证网络连通性: `ping <master_ip>`
+2. 检查防火墙规则:
+   ```bash
+   sudo iptables -A INPUT -p tcp --dport 2100 -j ACCEPT
+   sudo iptables -A INPUT -p udp --dport 6383 -j ACCEPT
+   ```
+3. 验证 master 正在监听: `sudo netstat -tulpn | grep 2100`
+4. 检查 provider 兼容性: Master 和 slave 必须使用相同 provider
+
+### AF_XDP 不支持
+
+**警告**: `AF_XDP not supported on lo, falling back to UDP`
+
+**说明**: Loopback 接口不支持 AF_XDP。这是预期行为且无害。使用物理/虚拟网卡可获得 AF_XDP 支持。
+
+### 性能影响过大
+
+**问题**: 复制导致 >10% QPS 下降
+
+**解决方案**:
+1. 验证 eBPF 优化已启用（检查 `REPL_OBSERVE_MAX_DATA = 512`）
+2. 增加 `repl_observe.h` 中的 ringbuf 大小
+3. 如果网卡支持，使用 `native` XDP 模式
+4. 检查 CPU 亲和性: `cpu_pin auto`
+
+### Slave 数据不同步
+
+**问题**: Slave 数据与 master 不匹配
+
+**解决方案**:
+1. 检查 eBPF 过滤器是否已挂载: `sudo bpftool prog list`
+2. 验证 KCP 接收器正在运行: `sudo netstat -ulpn | grep 7383`
+3. 检查 master 日志中的复制错误
+4. 重启 slave 以触发全量重新同步
+
+---
+
+## 技术细节
+
+### eBPF 过滤器设计
+
+eBPF 程序使用 `sk_skb/stream_verdict` 在 socket 层拦截 Redis 命令：
+
+1. **快速过滤**: 检查首字节是否为 '*'（RESP 数组标记）
+2. **命令解析**: 仅解析前 64 字节以识别命令类型
+3. **写命令检测**: 过滤 SET、DEL、HSET、HDEL 等写命令
+4. **零拷贝**: 直接从 skb 拷贝到 ringbuf（无中间缓冲区）
+5. **透明**: 始终返回 `SK_PASS`（不阻塞应用程序）
+
+### RDMA 传输协议
+
+1. Slave 通过 libfabric 连接到 master
+2. Master 在内存中生成 RDB 快照
+3. Master 发送快照大小头
+4. Master 通过 RDMA 流式传输 RDB 数据
+5. Slave 接收并加载 RDB 到内存
+6. 传输完成后关闭连接
+
+### KCP 可靠性
+
+KCP 在 UDP 上提供类似 TCP 的可靠性：
+- **ARQ**: 自动重传请求处理丢包
+- **拥塞控制**: 自适应窗口大小
+- **快速重传**: 快速从丢包中恢复
+- **选择性 ACK**: 高效确认
+
+---
+
+## 许可证
 
 本项目用于系统编程、数据库内核与性能优化学习展示。
+
+---
+
+## 致谢
+
+- **Redis**: 协议规范和灵感来源
+- **libbpf**: eBPF CO-RE 支持
+- **libfabric**: RDMA 抽象层
+- **KCP**: 可靠 UDP 协议

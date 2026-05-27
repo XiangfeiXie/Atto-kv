@@ -143,6 +143,9 @@ static int master_on_data(void *ctx, void *data, size_t len)
     ikcp_send(g_repl.kcp, (const char *)&frame_len, REPL_FRAME_HEADER);
     ikcp_send(g_repl.kcp, (const char *)e->data, e->len);
 
+    /* BUG FIX: Flush immediately to avoid data being stuck in KCP buffer */
+    ikcp_flush(g_repl.kcp);
+
     return 0;
 }
 
@@ -415,12 +418,15 @@ static void *repl_thread_func(void *arg)
     uint32_t last_update = 0;
 
     while (g_repl.running) {
-        uint32_t now = (uint32_t)time(NULL);  /* Use time() instead of ikcp_getconv */
+        /* BUG FIX: Use millisecond-precision time for KCP update */
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint32_t now = (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 
         /* KCP update (every 10ms) */
         if (now - last_update >= REPL_KCP_INTERVAL) {
             if (g_repl.kcp)
-                ikcp_update(g_repl.kcp, now * 1000);  /* KCP expects milliseconds */
+                ikcp_update(g_repl.kcp, now);
             last_update = now;
         }
 

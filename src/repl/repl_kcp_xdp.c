@@ -242,9 +242,14 @@ static int setup_udp_socket(void)
     int flags = fcntl(g_repl.udp_fd, F_GETFL, 0);
     fcntl(g_repl.udp_fd, F_SETFL, flags | O_NONBLOCK);
 
+    /* Slave: use local_port if set, otherwise use repl_port */
+    uint16_t bind_port = (g_repl.cfg.role == REPL_ROLE_SLAVE && g_repl.cfg.local_port != 0)
+                         ? g_repl.cfg.local_port
+                         : g_repl.cfg.repl_port;
+
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
-        .sin_port = htons(g_repl.cfg.repl_port),
+        .sin_port = htons(bind_port),
         .sin_addr.s_addr = INADDR_ANY
     };
 
@@ -255,7 +260,7 @@ static int setup_udp_socket(void)
         return -1;
     }
 
-    printf("[REPL] UDP socket bound to port %u\n", g_repl.cfg.repl_port);
+    printf("[REPL] UDP socket bound to port %u\n", bind_port);
     return 0;
 }
 

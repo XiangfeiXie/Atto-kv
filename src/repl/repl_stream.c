@@ -22,12 +22,12 @@ int repl_stream_start_master(void)
     if (kvs_config.xdp_repl_enabled) {
         printf("[REPL-STREAM] Starting KCP + XDP incremental replication (master)\n");
         printf("[REPL-STREAM] UDP Port: %d, Interface: %s\n",
-               kvs_config.xdp_repl_tcp_port,
+               kvs_config.xdp_repl_port,
                kvs_config.xdp_repl_ifname);
 
         struct repl_kcp_config cfg = {
             .role = REPL_ROLE_MASTER,
-            .repl_port = kvs_config.xdp_repl_tcp_port,
+            .repl_port = kvs_config.xdp_repl_port,
             .kv_port = kvs_config.port,
             .use_af_xdp = kvs_config.xdp_repl_zero_copy,
             .queue_id = kvs_config.xdp_repl_queue,
@@ -55,13 +55,15 @@ int repl_stream_start_slave(uint64_t start_seq)
 
     if (kvs_config.xdp_repl_enabled) {
         printf("[REPL-STREAM] Starting KCP + XDP incremental replication (slave)\n");
-        printf("[REPL-STREAM] Master: %s:%d\n",
+        printf("[REPL-STREAM] Local port: %d, Master: %s:%d\n",
+               kvs_config.xdp_repl_port,
                kvs_config.rdma_master_ip,
-               kvs_config.xdp_repl_tcp_port);
+               kvs_config.xdp_repl_master_port);
 
         struct repl_kcp_config cfg = {
             .role = REPL_ROLE_SLAVE,
-            .repl_port = kvs_config.xdp_repl_tcp_port,
+            .repl_port = kvs_config.xdp_repl_master_port,  /* Master's port to connect */
+            .local_port = kvs_config.xdp_repl_port,        /* Slave's local bind port */
             .kv_port = kvs_config.port,
             .use_af_xdp = kvs_config.xdp_repl_zero_copy,
             .queue_id = kvs_config.xdp_repl_queue,

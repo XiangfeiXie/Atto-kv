@@ -765,8 +765,9 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
         uint64_t post_fork_seq = 0; /* KCP replication: no global seq */
         shm->base_seq = post_fork_seq;
         eventfd_write(parent_evt_fd, 1);
-        
-        repl_stream_start_master();
+
+        /* repl_stream already started in main, no need to restart here */
+        /* repl_stream_start_master(); */
         printf("[RDMA-REPL] master: post-fork base_seq=%" PRIu64 "\n",
                post_fork_seq);
     }

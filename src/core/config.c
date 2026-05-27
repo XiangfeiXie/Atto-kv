@@ -40,8 +40,8 @@ static void config_default(void) {
     kvs_config.xdp_driver_mode = 0;  /* Default: generic (SKB) mode */
     strncpy(kvs_config.xdp_repl_ifname, "lo", sizeof(kvs_config.xdp_repl_ifname) - 1);
     kvs_config.xdp_repl_queue = 0;
-    kvs_config.xdp_repl_udp_port = 6383;
-    kvs_config.xdp_repl_tcp_port = 6483;  /* Default: udp_port + 100 */
+    kvs_config.xdp_repl_port = 6483;  /* Default port for replication */
+    kvs_config.xdp_repl_master_port = 6483;  /* Slave: master's port to connect */
     kvs_config.xdp_repl_zero_copy = 0;
     kvs_config.xdp_repl_batch = 64;
     kvs_config.xdp_repl_mtu = 1400;
@@ -287,11 +287,12 @@ int config_load(const char *path) {
         } else if (strcasecmp(key, "xdp_repl_queue") == 0) {
             parse_int(val, lineno, "xdp_repl_queue", 0, 4096, &kvs_config.xdp_repl_queue);
 
-        } else if (strcasecmp(key, "xdp_repl_udp_port") == 0) {
-            parse_int(val, lineno, "xdp_repl_udp_port", 1, 65535, &kvs_config.xdp_repl_udp_port);
 
-        } else if (strcasecmp(key, "xdp_repl_tcp_port") == 0) {
-            parse_int(val, lineno, "xdp_repl_tcp_port", 1, 65535, &kvs_config.xdp_repl_tcp_port);
+        } else if (strcasecmp(key, "xdp_repl_port") == 0) {
+            parse_int(val, lineno, "xdp_repl_port", 1, 65535, &kvs_config.xdp_repl_port);
+
+        } else if (strcasecmp(key, "xdp_repl_master_port") == 0) {
+            parse_int(val, lineno, "xdp_repl_master_port", 1, 65535, &kvs_config.xdp_repl_master_port);
 
         } else if (strcasecmp(key, "xdp_repl_zero_copy") == 0) {
             if (strcasecmp(val, "auto") == 0 || strcasecmp(val, "copy") == 0 ||
@@ -422,7 +423,7 @@ void config_print(void) {
                (kvs_config.rdma_role == ROLE_MASTER)
                    ? kvs_config.rdma_listen_port
                    : kvs_config.rdma_master_port,
-               kvs_config.xdp_repl_udp_port);
+               kvs_config.xdp_repl_port);
     }
 
     if (kvs_config.xdp_repl_enabled) {
@@ -430,7 +431,7 @@ void config_print(void) {
                kvs_config.xdp_driver_mode ? "driver" : "skb",
                kvs_config.xdp_repl_ifname,
                kvs_config.xdp_repl_queue,
-               kvs_config.xdp_repl_udp_port,
+               kvs_config.xdp_repl_port,
                kvs_config.xdp_repl_zero_copy ? "require" : "auto",
                kvs_config.xdp_repl_batch,
                kvs_config.xdp_repl_mtu);

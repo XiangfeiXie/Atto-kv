@@ -53,9 +53,9 @@ typedef struct {
     int  xdp_driver_mode;  /* 0 = generic (SKB), 1 = driver mode */
     char xdp_repl_ifname[32];
     int  xdp_repl_queue;
-    int  xdp_repl_udp_port;
-    int  xdp_repl_tcp_port;  /* TCP port for replication (default: udp_port + 100) */
-    int  xdp_repl_zero_copy; /* 0 = auto/copy fallback, 1 = require zero-copy */
+    int  xdp_repl_port;        /* Master: listen port; Slave: local bind port */
+    int  xdp_repl_master_port; /* Slave only: master's replication port to connect */
+    int  xdp_repl_zero_copy;   /* 0 = auto/copy fallback, 1 = require zero-copy */
     int  xdp_repl_batch;
     int  xdp_repl_mtu;
 

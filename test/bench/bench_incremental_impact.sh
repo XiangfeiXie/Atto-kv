@@ -30,12 +30,14 @@ NC='\033[0m'
 
 # 默认参数
 MASTER_IP="127.0.0.1"
-MASTER_PORT=6379
+MASTER_PORT=2000
 TEST_DURATION=30
 CLIENTS=50
 VALUE_SIZE=1024
-REQUESTS=100000
+REQUESTS=500000
 OUTPUT_CSV="incremental_impact_$(date +%Y%m%d_%H%M%S).csv"
+MASTER_CONF="../conf/kvstore-master.conf"
+SLAVE_CONF="../conf/kvstore-slave.conf"
 
 # 使用说明
 usage() {

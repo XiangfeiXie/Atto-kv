@@ -978,6 +978,7 @@ int rdma_repl_slave_run(void) {
     int    eof_received  = 0;
     int    header_parsed = 0;
     int    total_keys    = 0;
+    size_t total_bytes   = 0;
     int    pending       = 0;
 
     hints = rdma_build_hints();
@@ -1046,12 +1047,13 @@ int rdma_repl_slave_run(void) {
             goto fail;
         }
     }
-    printf("[RDMA-REPL] slave: connected, awaiting streaming full sync\n");
-    fflush(stdout);
-
     /* Timing: measure pure transfer + load time, not process startup */
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    printf("[RDMA-REPL] slave: connected, awaiting streaming full sync (start_time=%ld.%09ld)\n",
+           t0.tv_sec, t0.tv_nsec);
+    fflush(stdout);
 
     /* Streaming recv loop */
     while (!eof_received && pending > 0) {
@@ -1086,6 +1088,9 @@ int rdma_repl_slave_run(void) {
 
         char   *buf = recv_buf[buf_idx];
         size_t  msg_len = ce.len;
+
+        /* Accumulate total bytes received */
+        total_bytes += msg_len;
 
         if (msg_len < CHUNK_HDR_SIZE) {
             fprintf(stderr, "[RDMA-REPL] slave: short chunk %zu bytes\n",
@@ -1180,7 +1185,9 @@ done:
     {
         double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
                             (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
-        printf("[RDMA-REPL] slave: fullsync_time_ms=%.1f\n", elapsed_ms);
+        double throughput_mbps = (total_bytes / 1048576.0) / (elapsed_ms / 1000.0);
+        printf("[RDMA-REPL] slave: fullsync_time_ms=%.1f payload_bytes=%zu throughput_mbps=%.2f\n",
+               elapsed_ms, total_bytes, throughput_mbps);
     }
     printf("[RDMA-REPL] slave: loaded %d keys from fullsync (rdb streaming)\n",
            total_keys);

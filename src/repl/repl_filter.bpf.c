@@ -169,34 +169,45 @@ int repl_filter_verdict(struct __sk_buff *skb) {
     if (len == 0 || len > REPL_OBSERVE_MAX_DATA)
         return SK_PASS;
 
-    /* Get per-CPU temporary buffer */
+    /* Quick filter check: only process if starts with '*' (RESP array) */
+    __u8 first_byte = 0;
+    if (bpf_skb_load_bytes(skb, 0, &first_byte, 1) != 0)
+        return SK_PASS;
+    if (first_byte != '*')
+        return SK_PASS;
+
+    /* Get per-CPU temporary buffer for command parsing */
     __u32 key = 0;
     __u8 *data = bpf_map_lookup_elem(&repl_temp_buf, &key);
     if (!data)
         return SK_PASS;
 
-    /* Load data from skb */
-    if (bpf_skb_load_bytes(skb, 0, data, len) != 0)
+    /* Load minimal data for command detection (first 64 bytes is enough) */
+    __u32 parse_len = len < 64 ? len : 64;
+    if (bpf_skb_load_bytes(skb, 0, data, parse_len) != 0)
         return SK_PASS;
 
     /* Filter: only intercept write commands */
-    if (!is_write_command((const char *)data, len))
+    if (!is_write_command((const char *)data, parse_len))
         return SK_PASS;
 
     /* Allocate ringbuf entry */
     struct repl_observe_event *e =
-        bpf_ringbuf_reserve(&repl_ringbuf, sizeof(*e) + len, 0);
+        bpf_ringbuf_reserve(&repl_ringbuf, sizeof(*e), 0);
     if (!e)
         return SK_PASS;
 
     e->len = len;
     e->padding = 0;
 
-    /* Copy data to ringbuf */
-    #pragma unroll
-    for (__u32 i = 0; i < REPL_OBSERVE_MAX_DATA; i++) {
-        if (i >= len) break;
-        e->data[i] = data[i];
+    /* Copy full command data directly from skb to ringbuf */
+    __u32 copy_len = len;
+    if (copy_len > REPL_OBSERVE_MAX_DATA)
+        copy_len = REPL_OBSERVE_MAX_DATA;
+
+    if (bpf_skb_load_bytes(skb, 0, e->data, copy_len) != 0) {
+        bpf_ringbuf_discard(e, 0);
+        return SK_PASS;
     }
 
     bpf_ringbuf_submit(e, 0);

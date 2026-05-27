@@ -45,12 +45,6 @@ if(ENABLE_AF_XDP)
     endif()
 endif()
 
-# ── XDP/AF_XDP support (Phase 11 - optional, unused by repl-agent) ────
-option(ENABLE_XDP_REPL "Enable XDP/AF_XDP zero-copy WAL replication" OFF)
-
-if(ENABLE_XDP_REPL)
-    add_compile_definitions(ENABLE_XDP_REPL)
-endif()
 
 # ── KCP library (third-party reliable UDP library) ────────────────────
 set(KCP_DIR ${CMAKE_SOURCE_DIR}/third_party/kcp)
@@ -125,10 +119,6 @@ set(REPL_SRCS
     src/repl/repl_backlog.c
     src/repl/repl_kcp_xdp.c
     src/repl/af_xdp_socket.c
-    # Deprecated: old implementations
-    # src/repl/xdp_incr_repl.c
-    # src/repl/xdp_repl_manager.c
-    # src/repl/tcp_xdp_repl.c
 )
 
 set(BPF_SRCS
@@ -242,26 +232,7 @@ add_custom_command(
 
 add_custom_target(xdp_kcp_filter_kern DEPENDS ${XDP_KCP_FILTER_KERN_OBJ})
 
-# ── Compile replication XDP kernel BPF program (Phase 11 - conditional) ─
-if(ENABLE_XDP_REPL)
-    set(WAL_XDP_KERN_SRC  ${CMAKE_SOURCE_DIR}/src/repl/xdp_repl.kern.c)
-    set(WAL_XDP_KERN_OBJ  ${CMAKE_BINARY_DIR}/xdp_repl.kern.o)
-
-    add_custom_command(
-        OUTPUT  ${WAL_XDP_KERN_OBJ}
-        COMMAND clang -O2 -g -target bpf
-                -I${CMAKE_SOURCE_DIR}/src/bpf
-                -I${CMAKE_SOURCE_DIR}/src/repl
-                -I/usr/include
-                -I/usr/include/x86_64-linux-gnu
-                -c ${WAL_XDP_KERN_SRC}
-                -o ${WAL_XDP_KERN_OBJ}
-        DEPENDS ${WAL_XDP_KERN_SRC}
-        COMMENT "Compiling replication XDP BPF kernel program"
-    )
-
-    add_custom_target(wal_xdp_kern DEPENDS ${WAL_XDP_KERN_OBJ})
-endif()
+# ── Old XDP replication removed (replaced by KCP+AF_XDP) ─────────────
 
 # ── kvstore target ────────────────────────────────────────────────────
 add_executable(kvstore ${KVSTORE_SRCS})
@@ -304,10 +275,6 @@ if(ENABLE_AF_XDP)
 endif()
 
 add_dependencies(kvstore ntyco xdp_kern sockmap_kern repl_filter_kern xdp_kcp_filter_kern)
-
-if(ENABLE_XDP_REPL)
-    add_dependencies(kvstore wal_xdp_kern)
-endif()
 
 # ── Set capabilities for eBPF (requires libcap) ───────────────────────
 # This allows kvstore to load eBPF programs without running as root

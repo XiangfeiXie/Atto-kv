@@ -1896,20 +1896,9 @@ static void sig_shutdown(int signo) {
     g_kvs_stop = 1;
 }
 
-/* ==================== Self tests ==================== */
-
-static int xdp_incr_selftest(void) {
-    /* Deprecated: old XDP incremental replication test */
-    printf("[XDP-INCR-TEST] SKIPPED (replaced by KCP+XDP)\n");
-    return 0;
-}
-
 /* ==================== Main ==================== */
 
 int main(int argc, char *argv[]) {
-    if (argc == 2 && strcmp(argv[1], "--xdp-incr-selftest") == 0) {
-        return xdp_incr_selftest();
-    }
     signal(SIGPIPE, SIG_IGN);
     /* Use sigaction without SA_RESTART so epoll_wait/io_uring_wait
      * are interrupted (return EINTR) instead of being auto-restarted. */

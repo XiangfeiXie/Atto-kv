@@ -1,3 +1,4 @@
 # Build artifacts
 *.o
 build/
+build-glibc/

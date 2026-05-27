@@ -220,6 +220,99 @@ void update_cached_time(void) {
                           memory_order_relaxed);
 }
 
+/* =====================================================================
+ * Active expire cycle — background thread periodically samples keys
+ * and deletes expired ones to prevent memory leaks.
+ * ===================================================================== */
+
+/* Forward declaration */
+static void entry_cleanup_by_type(kv_entry_t *e);
+
+#define ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_SHARD 20  /* keys to sample per shard */
+
+static _Atomic uint64_t g_expired_keys = 0;       /* total expired keys deleted */
+static pthread_t g_expire_thread;
+static volatile int g_expire_thread_stop = 0;
+
+/* Sample random keys from all shards and delete expired ones.
+ * Uses trywrlock to avoid blocking normal requests. */
+static void active_expire_cycle(void) {
+    long long start_ms = get_time_now();
+    int expired_total = 0;
+    int sampled_total = 0;
+
+    /* Iterate all shards */
+    for (int shard_idx = 0; shard_idx < KV_NR_SHARDS; shard_idx++) {
+        kv_shard_t *shard = &g_shards.shards[shard_idx];
+
+        /* Try to acquire write lock (non-blocking) */
+        if (pthread_rwlock_trywrlock(&shard->lock) != 0) {
+            continue;  /* Lock busy, skip this shard */
+        }
+
+        /* Sample ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_SHARD random keys */
+        for (int i = 0; i < ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_SHARD; i++) {
+            kv_entry_t *entry = dict_get_random_key(&shard->dict);
+            if (!entry) break;
+
+            sampled_total++;
+
+            /* Check if expired */
+            if (entry->expire && get_time_now() > entry->expire) {
+                const char *key = entry_key(entry);
+                uint32_t key_len = entry->key_len;
+                uint64_t hash = entry->hash;
+
+                /* Delete expired key */
+                entry_cleanup_by_type(entry);
+                dict_delete(&shard->dict, key, key_len, hash);
+
+                expired_total++;
+                atomic_fetch_add_explicit(&g_expired_keys, 1, memory_order_relaxed);
+            }
+        }
+
+        pthread_rwlock_unlock(&shard->lock);
+    }
+
+    /* If expire rate > 25%, recursively scan again */
+    if (sampled_total > 0 && expired_total * 4 > sampled_total) {
+        active_expire_cycle();
+    }
+}
+
+/* Background thread main loop */
+static void *expire_thread_main(void *arg) {
+    (void)arg;
+
+    while (!g_expire_thread_stop) {
+        /* Sleep 100ms */
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 100 * 1000000;  /* 100ms */
+        nanosleep(&ts, NULL);
+
+        /* Run expire cycle */
+        active_expire_cycle();
+    }
+
+    return NULL;
+}
+
+/* Start the background expire thread */
+void kvs_start_expire_thread(void) {
+    g_expire_thread_stop = 0;
+    if (pthread_create(&g_expire_thread, NULL, expire_thread_main, NULL) != 0) {
+        fprintf(stderr, "[expire] failed to create background thread\n");
+    }
+}
+
+/* Stop the background expire thread */
+void kvs_stop_expire_thread(void) {
+    g_expire_thread_stop = 1;
+    pthread_join(g_expire_thread, NULL);
+}
+
 KVItem* create_kvitem_len(const char *value, int vlen) {
     if (!value || vlen < 0) return NULL;
     KVItem *item = (KVItem*)malloc(sizeof(KVItem));
@@ -1020,6 +1113,9 @@ static dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) 
                                                          memory_order_relaxed));
         APPEND("total_commands_processed:%llu\r\n",
                (unsigned long long)atomic_load_explicit(&g_kvs_total_commands,
+                                                         memory_order_relaxed));
+        APPEND("expired_keys:%llu\r\n",
+               (unsigned long long)atomic_load_explicit(&g_expired_keys,
                                                          memory_order_relaxed));
         /* Phase 10.6 — dispatch latency histogram (16 log2-spaced buckets,
          * 1 µs .. ≥16 ms).  Emit per-bucket counts for raw consumption
@@ -1872,12 +1968,18 @@ int main(int argc, char *argv[]) {
         printf("[RDMA-REPL] rdma replication disabled by config\n");
     }
 
+    /* Start background expire thread */
+    kvs_start_expire_thread();
+
     if (kvs_config.network_model == NET_REACTOR)
         reactor_start(kvs_config.port, kvs_protocol_batch);
     else if (kvs_config.network_model == NET_PROACTOR)
         proactor_start(kvs_config.port, kvs_protocol_batch);
     else if (kvs_config.network_model == NET_NTYCO)
         ntyco_start(kvs_config.port, kvs_protocol_batch);
+
+    /* Stop background expire thread */
+    kvs_stop_expire_thread();
 
     /* Graceful incremental flush: stop replication before exit */
     if (ENABLE_AOF) aof_async_shutdown();

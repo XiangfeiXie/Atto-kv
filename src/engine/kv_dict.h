@@ -137,6 +137,7 @@ void        dict_iter_free(kv_iter_t *it);
 
 /* --- Stats --- */
 uint32_t    dict_count(kv_dict_t *d);
+kv_entry_t *dict_get_random_key(kv_dict_t *d);  /* get a random key for expire sampling */
 
 /* =====================================================================
  * Phase 4: sharded dict wrapper.

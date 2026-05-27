@@ -548,6 +548,49 @@ uint32_t dict_count(kv_dict_t *d) {
     return n;
 }
 
+/* Get a random key from the dictionary for expire sampling.
+ * Returns NULL if the dictionary is empty. */
+kv_entry_t *dict_get_random_key(kv_dict_t *d) {
+    if (d->ht[0].used == 0 && d->ht[1].used == 0) {
+        return NULL;
+    }
+
+    /* Choose a non-empty hash table */
+    int table = (d->ht[1].used > 0) ? 1 : 0;
+    kv_ht_t *ht = &d->ht[table];
+
+    if (ht->used == 0) return NULL;
+
+    /* Random bucket index */
+    uint32_t bucket_idx = (uint32_t)rand() % ht->size;
+
+    /* Find first non-empty bucket (linear probing) */
+    uint32_t max_steps = ht->size;
+    while (max_steps-- > 0) {
+        if (ht->buckets[bucket_idx] != NULL) {
+            /* Count chain length */
+            kv_entry_t *entry = ht->buckets[bucket_idx];
+            int chain_len = 0;
+            kv_entry_t *tmp = entry;
+            while (tmp) {
+                chain_len++;
+                tmp = tmp->next;
+            }
+
+            /* Random entry in chain */
+            int target = rand() % chain_len;
+            for (int i = 0; i < target; i++) {
+                entry = entry->next;
+            }
+
+            return entry;
+        }
+        bucket_idx = (bucket_idx + 1) % ht->size;
+    }
+
+    return NULL;
+}
+
 /* =====================================================================
  * Phase 4: sharded wrapper
  * ===================================================================== */

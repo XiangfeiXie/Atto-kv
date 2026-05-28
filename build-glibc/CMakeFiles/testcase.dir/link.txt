@@ -1,1 +1,0 @@
-/usr/bin/cc -O3 -DNDEBUG CMakeFiles/testcase.dir/test/testcase.c.o -o testcase 

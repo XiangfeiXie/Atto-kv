@@ -113,14 +113,6 @@ CMakeFiles/kvstore.dir/src/type/kv_type_hash.c.o: \
  /home/xxf/9.1-kvstore/src/core/server.h \
  /home/xxf/9.1-kvstore/src/core/config.h \
  /home/xxf/9.1-kvstore/src/core/protocol.h \
- /usr/include/jemalloc/jemalloc.h \
- /usr/lib/gcc/x86_64-linux-gnu/13/include/stdbool.h \
- /usr/lib/gcc/x86_64-linux-gnu/13/include/limits.h \
- /usr/lib/gcc/x86_64-linux-gnu/13/include/syslimits.h \
- /usr/include/limits.h /usr/include/x86_64-linux-gnu/bits/posix1_lim.h \
- /usr/include/x86_64-linux-gnu/bits/local_lim.h \
- /usr/include/linux/limits.h \
- /usr/include/x86_64-linux-gnu/bits/posix2_lim.h \
  /usr/lib/gcc/x86_64-linux-gnu/13/include/stdatomic.h \
  /home/xxf/9.1-kvstore/src/core/protocol.h \
  /home/xxf/9.1-kvstore/src/core/client.h /usr/include/inttypes.h \

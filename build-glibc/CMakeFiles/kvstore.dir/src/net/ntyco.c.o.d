@@ -166,6 +166,4 @@ CMakeFiles/kvstore.dir/src/net/ntyco.c.o: \
  /home/xxf/9.1-kvstore/src/core/config.h \
  /home/xxf/9.1-kvstore/src/core/protocol.h \
  /home/xxf/9.1-kvstore/src/engine/kv_dict.h \
- /usr/include/jemalloc/jemalloc.h \
- /usr/lib/gcc/x86_64-linux-gnu/13/include/stdbool.h \
  /usr/lib/gcc/x86_64-linux-gnu/13/include/stdatomic.h

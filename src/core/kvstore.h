@@ -13,13 +13,13 @@
 #include "protocol.h"
 #include "kv_dict.h"
 
+#ifdef USE_JEMALLOC
 #include <jemalloc/jemalloc.h>
+#endif
 
 #define NETWORK_REACTOR   0
 #define NETWORK_PROACTOR  1
 #define NETWORK_NTYCO     2
-
-#define ENABLE_JEMALLOC 1
 
 extern int reactor_start(unsigned short port, msg_handler handler);
 extern int proactor_start(unsigned short port, msg_handler handler);

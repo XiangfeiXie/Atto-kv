@@ -150,41 +150,43 @@ echo "timestamp,scenario,qps,avg_latency_ms,p50_ms,p95_ms,p99_ms,impact_percent"
 # 运行 redis-benchmark 并提取指标
 run_benchmark() {
     local scenario=$1
-    echo -e "${YELLOW}[INFO]${NC} Running benchmark: $scenario"
-    echo -e "${YELLOW}[INFO]${NC} Test duration: ${TEST_DURATION}s, Clients: ${CLIENTS}, Value size: ${VALUE_SIZE} bytes"
+    echo -e "${YELLOW}[INFO]${NC} Running benchmark: $scenario" >&2
+    echo -e "${YELLOW}[INFO]${NC} Test duration: ${TEST_DURATION}s, Clients: ${CLIENTS}, Value size: ${VALUE_SIZE} bytes" >&2
 
-    # 清空数据库
+    # 清空数据库（只清空本次测试 key，不影响全量同步）
     redis-cli -h "$MASTER_IP" -p "$MASTER_PORT" FLUSHALL >/dev/null 2>&1 || true
     sleep 1
 
-    # 运行 redis-benchmark
-    local output=$(redis-benchmark -h "$MASTER_IP" -p "$MASTER_PORT" \
+    # 运行 redis-benchmark (CSV 模式，仅捕获 stdout)
+    local csv_output=$(redis-benchmark -h "$MASTER_IP" -p "$MASTER_PORT" \
         -t set \
         -n "$REQUESTS" \
         -c "$CLIENTS" \
         -d "$VALUE_SIZE" \
-        --csv 2>&1)
+        --csv 2>/dev/null)
 
-    # 提取 QPS
-    local qps=$(echo "$output" | grep "SET" | grep -oP '\d+\.\d+' | head -1)
+    # 提取 QPS: CSV 格式为 "SET","17485.57"
+    local qps=$(echo "$csv_output" | grep '"SET"' | grep -oP '\d+\.\d+' | head -1)
 
-    # 运行详细延迟测试
-    local latency_output=$(redis-benchmark -h "$MASTER_IP" -p "$MASTER_PORT" \
+    # 运行延迟测试 (非 CSV 模式，仅捕获 stdout)
+    local lat_out=$(redis-benchmark -h "$MASTER_IP" -p "$MASTER_PORT" \
         -t set \
         -n 10000 \
         -c "$CLIENTS" \
         -d "$VALUE_SIZE" \
-        2>&1)
+        2>/dev/null)
 
-    # 提取延迟指标
-    local avg_latency=$(echo "$latency_output" | grep -oP 'avg_msec=\K[\d.]+' | head -1 || echo "0")
-    local p50=$(echo "$latency_output" | grep -oP 'p50=\K[\d.]+' | head -1 || echo "0")
-    local p95=$(echo "$latency_output" | grep -oP 'p95=\K[\d.]+' | head -1 || echo "0")
-    local p99=$(echo "$latency_output" | grep -oP 'p99=\K[\d.]+' | head -1 || echo "0")
+    # 提取延迟: redis-benchmark 输出格式 "avg       min       p50..."
+    # 数值行格式: "       1.623     1.000     1.500     ..."
+    local latency_line=$(echo "$lat_out" | grep -A1 "^[[:space:]]*avg" | tail -1)
+    local avg_latency=$(echo "$latency_line" | awk '{print $1}' || echo "0")
+    local p50=$(echo "$latency_line" | awk '{print $3}' || echo "0")
+    local p95=$(echo "$latency_line" | awk '{print $4}' || echo "0")
+    local p99=$(echo "$latency_line" | awk '{print $5}' || echo "0")
 
     # 如果提取失败，使用备用方法
-    if [ "$avg_latency" = "0" ]; then
-        avg_latency=$(echo "$latency_output" | grep "avg" | grep -oP '[\d.]+' | head -1 || echo "0")
+    if [ -z "$avg_latency" ] || [ "$avg_latency" = "0" ]; then
+        avg_latency=$(echo "$lat_out" | grep -oP '[\d.]+' | head -1 || echo "0")
     fi
 
     echo "$qps|$avg_latency|$p50|$p95|$p99"

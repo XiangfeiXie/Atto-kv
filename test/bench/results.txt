@@ -1,51 +1,129 @@
-# KVStore Performance Benchmark Results — 2026-05-26 06:41:29
+# KVStore Performance Benchmark Results — 2026-05-27 14:24:50
 === Pipeline 批量处理性能对比 ===
 压测参数: redis-benchmark -n 1000000 -c 50 -P <depth> -d 16
-测试时间: 2026-05-26 06:41:29
+测试时间: 2026-05-27 14:24:50
 
-Pipeline-10-SET | kvstore: 189286.39 req/s
-Pipeline-10-SET | Redis: 197005.52 req/s
-  SET 比值 (kvstore/Redis): 0.96x
-Pipeline-10-GET | kvstore: 178858.88 req/s
-Pipeline-10-GET | Redis: 195236.23 req/s
+Pipeline-1-SET | kvstore: 18042.40 req/s
+Pipeline-1-SET | Redis: 19015.02 req/s
+  SET 比值 (kvstore/Redis): 0.95x
+Pipeline-1-GET | kvstore: 18222.57 req/s
+Pipeline-1-GET | Redis: 18576.31 req/s
+  GET 比值 (kvstore/Redis): 0.98x
+
+Pipeline-1-SET-rnd | kvstore: 18245.85 req/s
+Pipeline-1-SET-rnd | Redis: 15383.67 req/s
+  SET(rnd) 比值 (kvstore/Redis): 1.19x
+Pipeline-1-GET-rnd | kvstore: 18572.52 req/s
+Pipeline-1-GET-rnd | Redis: 19064.32 req/s
+  GET(rnd) 比值 (kvstore/Redis): 0.97x
+
+Pipeline-5-SET | kvstore: 88770.52 req/s
+Pipeline-5-SET | Redis: 94464.38 req/s
+  SET 比值 (kvstore/Redis): 0.94x
+Pipeline-5-GET | kvstore: 87108.02 req/s
+Pipeline-5-GET | Redis: 94250.71 req/s
   GET 比值 (kvstore/Redis): 0.92x
 
-Pipeline-20-SET | kvstore: 329272.31 req/s
-Pipeline-20-SET | Redis: 271149.69 req/s
-  SET 比值 (kvstore/Redis): 1.21x
-Pipeline-20-GET | kvstore: 327225.12 req/s
-Pipeline-20-GET | Redis: 303122.16 req/s
-  GET 比值 (kvstore/Redis): 1.08x
+Pipeline-5-SET-rnd | kvstore: 94268.48 req/s
+Pipeline-5-SET-rnd | Redis: 85287.84 req/s
+  SET(rnd) 比值 (kvstore/Redis): 1.11x
+Pipeline-5-GET-rnd | kvstore: 84495.14 req/s
+Pipeline-5-GET-rnd | Redis: 95256.23 req/s
+  GET(rnd) 比值 (kvstore/Redis): 0.89x
 
-Pipeline-40-SET | kvstore: 615763.56 req/s
-Pipeline-40-SET | Redis: 325097.53 req/s
-  SET 比值 (kvstore/Redis): 1.89x
-Pipeline-40-GET | kvstore: 622277.56 req/s
-Pipeline-40-GET | Redis: 386100.41 req/s
-  GET 比值 (kvstore/Redis): 1.61x
+Pipeline-10-SET | kvstore: 168605.62 req/s
+Pipeline-10-SET | Redis: 189358.08 req/s
+  SET 比值 (kvstore/Redis): 0.89x
+Pipeline-10-GET | kvstore: 159489.64 req/s
+Pipeline-10-GET | Redis: 184331.80 req/s
+  GET 比值 (kvstore/Redis): 0.87x
 
-Pipeline-80-SET | kvstore: 895255.19 req/s
-Pipeline-80-SET | Redis: 376931.75 req/s
-  SET 比值 (kvstore/Redis): 2.38x
-Pipeline-80-GET | kvstore: 1109877.88 req/s
-Pipeline-80-GET | Redis: 460405.16 req/s
-  GET 比值 (kvstore/Redis): 2.41x
+Pipeline-10-SET-rnd | kvstore: 164636.16 req/s
+Pipeline-10-SET-rnd | Redis: 111594.68 req/s
+  SET(rnd) 比值 (kvstore/Redis): 1.48x
+Pipeline-10-GET-rnd | kvstore: 175100.69 req/s
+Pipeline-10-GET-rnd | Redis: 151630.03 req/s
+  GET(rnd) 比值 (kvstore/Redis): 1.15x
+
+Pipeline-20-SET | kvstore: 303951.38 req/s
+Pipeline-20-SET | Redis: 269614.44 req/s
+  SET 比值 (kvstore/Redis): 1.13x
+Pipeline-20-GET | kvstore: 303398.06 req/s
+Pipeline-20-GET | Redis: 309214.59 req/s
+  GET 比值 (kvstore/Redis): 0.98x
+
+Pipeline-20-SET-rnd | kvstore: 301023.47 req/s
+Pipeline-20-SET-rnd | Redis: 145772.59 req/s
+  SET(rnd) 比值 (kvstore/Redis): 2.07x
+Pipeline-20-GET-rnd | kvstore: 337837.84 req/s
+Pipeline-20-GET-rnd | Redis: 196155.36 req/s
+  GET(rnd) 比值 (kvstore/Redis): 1.72x
+
+Pipeline-40-SET | kvstore: 578703.69 req/s
+Pipeline-40-SET | Redis: 323519.88 req/s
+  SET 比值 (kvstore/Redis): 1.79x
+Pipeline-40-GET | kvstore: 572737.69 req/s
+Pipeline-40-GET | Redis: 385505.00 req/s
+  GET 比值 (kvstore/Redis): 1.49x
+
+Pipeline-40-SET-rnd | kvstore: 407497.97 req/s
+Pipeline-40-SET-rnd | Redis: 171644.34 req/s
+  SET(rnd) 比值 (kvstore/Redis): 2.37x
+Pipeline-40-GET-rnd | kvstore: 464684.03 req/s
+Pipeline-40-GET-rnd | Redis: 249812.66 req/s
+  GET(rnd) 比值 (kvstore/Redis): 1.86x
+
+Pipeline-80-SET | kvstore: 912408.81 req/s
+Pipeline-80-SET | Redis: 404530.75 req/s
+  SET 比值 (kvstore/Redis): 2.26x
+Pipeline-80-GET | kvstore: 1142857.12 req/s
+Pipeline-80-GET | Redis: 502765.22 req/s
+  GET 比值 (kvstore/Redis): 2.27x
+
+Pipeline-80-SET-rnd | kvstore: 436300.16 req/s
+Pipeline-80-SET-rnd | Redis: 181719.06 req/s
+  SET(rnd) 比值 (kvstore/Redis): 2.40x
+Pipeline-80-GET-rnd | kvstore: 601322.94 req/s
+Pipeline-80-GET-rnd | Redis: 285877.66 req/s
+  GET(rnd) 比值 (kvstore/Redis): 2.10x
 
 Pipeline-160-SET | kvstore: 1228501.25 req/s
-Pipeline-160-SET | Redis: 437636.75 req/s
-  SET 比值 (kvstore/Redis): 2.81x
-Pipeline-160-GET | kvstore: 1153402.50 req/s
-Pipeline-160-GET | Redis: 518941.34 req/s
-  GET 比值 (kvstore/Redis): 2.22x
+Pipeline-160-SET | Redis: 457665.91 req/s
+  SET 比值 (kvstore/Redis): 2.68x
+Pipeline-160-GET | kvstore: 1122334.50 req/s
+Pipeline-160-GET | Redis: 525210.06 req/s
+  GET 比值 (kvstore/Redis): 2.14x
+
+Pipeline-160-SET-rnd | kvstore: 484730.97 req/s
+Pipeline-160-SET-rnd | Redis: 196078.44 req/s
+  SET(rnd) 比值 (kvstore/Redis): 2.47x
+Pipeline-160-GET-rnd | kvstore: 585137.50 req/s
+Pipeline-160-GET-rnd | Redis: 290951.41 req/s
+  GET(rnd) 比值 (kvstore/Redis): 2.01x
 
 
-=== 汇总 ===
+=== 顺序Key (理想) ===
 
   P      |      kvs-SET |    redis-SET | S倍率 |      kvs-GET |    redis-GET | G倍率
   ------ | ------------ | ------------ | ------ | ------------ | ------------ | ------
-  P=10   |    189286.39 |    197005.52 |  0.96x |    178858.88 |    195236.23 |  0.92x
-  P=20   |    329272.31 |    271149.69 |  1.21x |    327225.12 |    303122.16 |  1.08x
-  P=40   |    615763.56 |    325097.53 |  1.89x |    622277.56 |    386100.41 |  1.61x
-  P=80   |    895255.19 |    376931.75 |  2.38x |   1109877.88 |    460405.16 |  2.41x
-  P=160  |   1228501.25 |    437636.75 |  2.81x |   1153402.50 |    518941.34 |  2.22x
+  P=1    |     18042.40 |     19015.02 |  0.95x |     18222.57 |     18576.31 |  0.98x
+  P=5    |     88770.52 |     94464.38 |  0.94x |     87108.02 |     94250.71 |  0.92x
+  P=10   |    168605.62 |    189358.08 |  0.89x |    159489.64 |    184331.80 |  0.87x
+  P=20   |    303951.38 |    269614.44 |  1.13x |    303398.06 |    309214.59 |  0.98x
+  P=40   |    578703.69 |    323519.88 |  1.79x |    572737.69 |    385505.00 |  1.49x
+  P=80   |    912408.81 |    404530.75 |  2.26x |   1142857.12 |    502765.22 |  2.27x
+  P=160  |   1228501.25 |    457665.91 |  2.68x |   1122334.50 |    525210.06 |  2.14x
+
+
+=== 随机Key (真实, -r 1000000) ===
+
+  P      |      kvs-SET |    redis-SET | S倍率 |      kvs-GET |    redis-GET | G倍率
+  ------ | ------------ | ------------ | ------ | ------------ | ------------ | ------
+  P=1    |     18245.85 |     15383.67 |  1.19x |     18572.52 |     19064.32 |  0.97x
+  P=5    |     94268.48 |     85287.84 |  1.11x |     84495.14 |     95256.23 |  0.89x
+  P=10   |    164636.16 |    111594.68 |  1.48x |    175100.69 |    151630.03 |  1.15x
+  P=20   |    301023.47 |    145772.59 |  2.07x |    337837.84 |    196155.36 |  1.72x
+  P=40   |    407497.97 |    171644.34 |  2.37x |    464684.03 |    249812.66 |  1.86x
+  P=80   |    436300.16 |    181719.06 |  2.40x |    601322.94 |    285877.66 |  2.10x
+  P=160  |    484730.97 |    196078.44 |  2.47x |    585137.50 |    290951.41 |  2.01x
 

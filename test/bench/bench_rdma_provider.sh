@@ -39,7 +39,8 @@ SLAVE_CONF_TEMPLATE="${PROJECT_DIR}/conf/kvstore-slave.conf"
 # 默认参数
 PAYLOAD_BYTES=0
 MASTER_IP=""
-MASTER_PORT=2100
+MASTER_RDMA_PORT=2100
+MASTER_REDIS_PORT=2000
 SLAVE_PORT=2002
 TIMEOUT=120
 PROVIDER=""  # 从配置文件读取
@@ -58,11 +59,12 @@ Required:
   --master-ip <ip>        Master IP address
 
 Options:
-  --master-port <port>    Master RDMA port (default: 2100)
-  --slave-port <port>     Slave service port (default: 2002)
-  --timeout <seconds>     Sync timeout (default: 120)
-  --output <file>         CSV output file (default: auto-generated)
-  -h, --help              Show this help
+  --master-rdma-port <port>  Master RDMA port (default: 2100)
+  --master-redis-port <port> Master Redis port (default: 2000)
+  --slave-port <port>        Slave service port (default: 2002)
+  --timeout <seconds>        Sync timeout (default: 120)
+  --output <file>            CSV output file (default: auto-generated)
+  -h, --help                 Show this help
 
 Note:
   - Master and slave must use the SAME provider (both tcp or both verbs)
@@ -72,7 +74,7 @@ Note:
 Example:
   # 1. On master: edit conf/kvstore-master.conf, set rdma_provider tcp
   # 2. On master: start kvstore and fill data
-  ./fill_data.sh 100 192.168.1.10
+  ./fill_data.sh 100 192.168.1.10 2000
 
   # 3. On slave: edit conf/kvstore-slave.conf, set rdma_provider tcp
   # 4. On slave: run test
@@ -109,8 +111,12 @@ while [ $# -gt 0 ]; do
             MASTER_IP="$2"
             shift 2
             ;;
-        --master-port)
-            MASTER_PORT="$2"
+        --master-rdma-port)
+            MASTER_RDMA_PORT="$2"
+            shift 2
+            ;;
+        --master-redis-port)
+            MASTER_REDIS_PORT="$2"
             shift 2
             ;;
         --slave-port)
@@ -176,7 +182,7 @@ PROVIDER=$(grep "^rdma_provider" "$SLAVE_CONF_TEMPLATE" | awk '{print $2}' || ec
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}  RDMA Fullsync Performance Test${NC}"
 echo -e "${BLUE}========================================${NC}"
-echo -e "Master      : ${MASTER_IP}:${MASTER_PORT}"
+echo -e "Master      : ${MASTER_IP}:${MASTER_RDMA_PORT} (RDMA), :${MASTER_REDIS_PORT} (Redis)"
 echo -e "Slave port  : ${SLAVE_PORT}"
 echo -e "Payload     : ${PAYLOAD_MB} MB (${PAYLOAD_BYTES} bytes)"
 echo -e "Provider    : ${PROVIDER}"
@@ -185,13 +191,11 @@ echo -e "Output CSV  : ${RESULTS_CSV}"
 echo -e "${BLUE}========================================${NC}"
 echo
 
-# 检查主机连通性（检查 Redis 服务端口，不是 RDMA 端口）
-echo -e "${YELLOW}[INFO]${NC} Checking master connectivity..."
-# 假设 master 使用标准端口 6379
-REDIS_PORT=6379
-resp=$(printf '*1\r\n$4\r\nPING\r\n' | nc -w 3 "$MASTER_IP" "$REDIS_PORT" 2>/dev/null | tr -d '\r\n' || true)
+# 检查主机连通性（检查 Redis 服务端口）
+echo -e "${YELLOW}[INFO]${NC} Checking master connectivity at $MASTER_IP:$MASTER_REDIS_PORT..."
+resp=$(printf '*1\r\n$4\r\nPING\r\n' | nc -w 3 "$MASTER_IP" "$MASTER_REDIS_PORT" 2>/dev/null | tr -d '\r\n' || true)
 if [ "$resp" != "+PONG" ]; then
-    echo -e "${RED}[ERROR]${NC} Master Redis service not reachable at $MASTER_IP:$REDIS_PORT" >&2
+    echo -e "${RED}[ERROR]${NC} Master Redis service not reachable at $MASTER_IP:$MASTER_REDIS_PORT" >&2
     exit 1
 fi
 echo -e "${GREEN}[OK]${NC} Master is reachable"
@@ -205,7 +209,7 @@ fi
 # 生成从机配置文件（使用原配置，只修改必要参数）
 conf_tmp="/tmp/kvstore_slave_bench_$$.conf"
 sed -e "s/^rdma_master_ip .*/rdma_master_ip ${MASTER_IP}/" \
-    -e "s/^rdma_master_port .*/rdma_master_port ${MASTER_PORT}/" \
+    -e "s/^rdma_master_port .*/rdma_master_port ${MASTER_RDMA_PORT}/" \
     -e "s/^port .*/port ${SLAVE_PORT}/" \
     "$SLAVE_CONF_TEMPLATE" > "$conf_tmp"
 

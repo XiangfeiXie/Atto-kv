@@ -80,7 +80,8 @@ stop_kvs() {
     done
     sleep 0.5
     # 确保端口释放
-    for port in $KVS_PORT $KVS_SLAVE_PORT $MASTER_RDMA_PORT 6382; do
+    local port
+    for port in $KVS_PORT $KVS_SLAVE_PORT $MASTER_RDMA_PORT; do
         if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
             fuser -k ${port}/tcp 2>/dev/null || true
         fi
@@ -234,6 +235,16 @@ run_bench() {
 
 run_bench_quiet() {
     run_bench "$@" 2>/dev/null
+}
+
+# 带随机 key 的压测（-r 参数，更接近真实场景）
+run_bench_r() {
+    local host=$1 port=$2 test=$3 n=${4:-1000000} c=${5:-50} P=${6:-20} d=${7:-3} r=${8:-1000000}
+    local csv_line
+    csv_line=$(redis-benchmark -h "$host" -p "$port" -t "$test" \
+        -n "$n" -c "$c" -P "$P" -d "$d" -r "$r" --csv 2>/dev/null | tail -1)
+    local qps=$(echo "$csv_line" | cut -d',' -f2 | tr -d '"')
+    echo "${qps:-0}"
 }
 
 # ---- 内存采样 ----

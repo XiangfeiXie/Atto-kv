@@ -1,70 +1,70 @@
-# WAL/AOF 持久化性能对比 — 2026-05-26 05:48:02
+# WAL/AOF 持久化性能对比 — 2026-05-27 13:54:35
 压测参数: redis-benchmark -n 1000000 -c 50 -P <depth> -d 16
 
-PING | kvstore AOF=N/A: 19562.96 req/s
-Pipeline-10-SET | kvstore AOF=off: 176242.52 req/s
-Pipeline-10-GET | kvstore AOF=off: 186046.52 req/s
-Pipeline-20-SET | kvstore AOF=off: 353232.06 req/s
-Pipeline-20-GET | kvstore AOF=off: 332668.00 req/s
-Pipeline-40-SET | kvstore AOF=off: 632511.06 req/s
-Pipeline-40-GET | kvstore AOF=off: 603136.31 req/s
-Pipeline-80-SET | kvstore AOF=off: 974658.88 req/s
-Pipeline-80-GET | kvstore AOF=off: 1064962.75 req/s
-Pipeline-160-SET | kvstore AOF=off: 1618123.00 req/s
-Pipeline-160-GET | kvstore AOF=off: 1169590.62 req/s
-Pipeline-10-SET | kvstore AOF=on: 167112.30 req/s
-Pipeline-10-GET | kvstore AOF=on: 169462.80 req/s
-Pipeline-20-SET | kvstore AOF=on: 317359.56 req/s
-Pipeline-20-GET | kvstore AOF=on: 318775.91 req/s
-Pipeline-40-SET | kvstore AOF=on: 617283.94 req/s
-Pipeline-40-GET | kvstore AOF=on: 588235.25 req/s
-Pipeline-80-SET | kvstore AOF=on: 764526.00 req/s
-Pipeline-80-GET | kvstore AOF=on: 1059322.00 req/s
-Pipeline-160-SET | kvstore AOF=on: 932835.81 req/s
-Pipeline-160-GET | kvstore AOF=on: 1201923.00 req/s
-PING | redis AOF=N/A: 18520.58 req/s
-Pipeline-10-SET | redis AOF=off: 189969.61 req/s
-Pipeline-10-GET | redis AOF=off: 185150.89 req/s
-Pipeline-20-SET | redis AOF=off: 266099.00 req/s
-Pipeline-20-GET | redis AOF=off: 301659.12 req/s
-Pipeline-40-SET | redis AOF=off: 336360.56 req/s
-Pipeline-40-GET | redis AOF=off: 377216.16 req/s
-Pipeline-80-SET | redis AOF=off: 384615.41 req/s
-Pipeline-80-GET | redis AOF=off: 510464.53 req/s
-Pipeline-160-SET | redis AOF=off: 441111.59 req/s
-Pipeline-160-GET | redis AOF=off: 574382.50 req/s
-Pipeline-10-SET | redis AOF=on: 121212.12 req/s
-Pipeline-10-GET | redis AOF=on: 188679.23 req/s
-Pipeline-20-SET | redis AOF=on: 161264.31 req/s
-Pipeline-20-GET | redis AOF=on: 306560.38 req/s
-Pipeline-40-SET | redis AOF=on: 189573.45 req/s
-Pipeline-40-GET | redis AOF=on: 396510.69 req/s
-Pipeline-80-SET | redis AOF=on: 193423.59 req/s
-Pipeline-80-GET | redis AOF=on: 457456.53 req/s
-Pipeline-160-SET | redis AOF=on: 211059.52 req/s
-Pipeline-160-GET | redis AOF=on: 504286.44 req/s
+PING | kvstore AOF=N/A: 16320.14 req/s
+Pipeline-10-SET | kvstore AOF=off: 152951.97 req/s
+Pipeline-10-GET | kvstore AOF=off: 167140.23 req/s
+Pipeline-20-SET | kvstore AOF=off: 303030.31 req/s
+Pipeline-20-GET | kvstore AOF=off: 305997.56 req/s
+Pipeline-40-SET | kvstore AOF=off: 539083.56 req/s
+Pipeline-40-GET | kvstore AOF=off: 643915.00 req/s
+Pipeline-80-SET | kvstore AOF=off: 873362.44 req/s
+Pipeline-80-GET | kvstore AOF=off: 1047120.44 req/s
+Pipeline-160-SET | kvstore AOF=off: 1426533.62 req/s
+Pipeline-160-GET | kvstore AOF=off: 1061571.12 req/s
+Pipeline-10-SET | kvstore AOF=on: 159769.94 req/s
+Pipeline-10-GET | kvstore AOF=on: 159515.08 req/s
+Pipeline-20-SET | kvstore AOF=on: 309789.34 req/s
+Pipeline-20-GET | kvstore AOF=on: 318674.31 req/s
+Pipeline-40-SET | kvstore AOF=on: 576036.88 req/s
+Pipeline-40-GET | kvstore AOF=on: 598444.06 req/s
+Pipeline-80-SET | kvstore AOF=on: 759301.44 req/s
+Pipeline-80-GET | kvstore AOF=on: 1090512.50 req/s
+Pipeline-160-SET | kvstore AOF=on: 852514.94 req/s
+Pipeline-160-GET | kvstore AOF=on: 1063829.75 req/s
+PING | redis AOF=N/A: 17289.97 req/s
+Pipeline-10-SET | redis AOF=off: 184195.98 req/s
+Pipeline-10-GET | redis AOF=off: 189897.47 req/s
+Pipeline-20-SET | redis AOF=off: 253807.11 req/s
+Pipeline-20-GET | redis AOF=off: 292483.19 req/s
+Pipeline-40-SET | redis AOF=off: 315059.84 req/s
+Pipeline-40-GET | redis AOF=off: 371609.06 req/s
+Pipeline-80-SET | redis AOF=off: 370507.62 req/s
+Pipeline-80-GET | redis AOF=off: 454338.94 req/s
+Pipeline-160-SET | redis AOF=off: 396196.53 req/s
+Pipeline-160-GET | redis AOF=off: 497512.44 req/s
+Pipeline-10-SET | redis AOF=on: 112981.59 req/s
+Pipeline-10-GET | redis AOF=on: 189429.83 req/s
+Pipeline-20-SET | redis AOF=on: 140252.45 req/s
+Pipeline-20-GET | redis AOF=on: 288184.44 req/s
+Pipeline-40-SET | redis AOF=on: 174825.19 req/s
+Pipeline-40-GET | redis AOF=on: 376222.72 req/s
+Pipeline-80-SET | redis AOF=on: 188359.39 req/s
+Pipeline-80-GET | redis AOF=on: 440140.84 req/s
+Pipeline-160-SET | redis AOF=on: 206058.09 req/s
+Pipeline-160-GET | redis AOF=on: 504032.28 req/s
 ── [PING (echo) 吞吐对比] ──
   系统               |     PING QPS
-  kvstore              |     19562.96
-  Redis                |     18520.58
-  比值 (kvs/redis)   |        1.06x
+  kvstore              |     16320.14
+  Redis                |     17289.97
+  比值 (kvs/redis)   |        0.94x
 
   P      |    kvs-AOF-off |     kvs-AOF-on |  AOF开销 |  redis-AOF-off |   redis-AOF-on |  AOF开销
   ------ | -------------- | -------------- | ---------- | -------------- | -------------- | ----------
-  P=10   |      176242.52 |      167112.30 |      10.0% |      189969.61 |      121212.12 |      40.0%
-  P=20   |      353232.06 |      317359.56 |      20.0% |      266099.00 |      161264.31 |      40.0%
-  P=40   |      632511.06 |      617283.94 |      10.0% |      336360.56 |      189573.45 |      50.0%
-  P=80   |      974658.88 |      764526.00 |      30.0% |      384615.41 |      193423.59 |      50.0%
-  P=160  |     1618123.00 |      932835.81 |      50.0% |      441111.59 |      211059.52 |      60.0%
+  P=10   |      152951.97 |      159769.94 |         0% |      184195.98 |      112981.59 |      40.0%
+  P=20   |      303030.31 |      309789.34 |         0% |      253807.11 |      140252.45 |      50.0%
+  P=40   |      539083.56 |      576036.88 |         0% |      315059.84 |      174825.19 |      50.0%
+  P=80   |      873362.44 |      759301.44 |      20.0% |      370507.62 |      188359.39 |      50.0%
+  P=160  |     1426533.62 |      852514.94 |      50.0% |      396196.53 |      206058.09 |      50.0%
 
   P      |    kvs-AOF-off |     kvs-AOF-on |  AOF开销 |  redis-AOF-off |   redis-AOF-on |  AOF开销
   ------ | -------------- | -------------- | ---------- | -------------- | -------------- | ----------
-  P=10   |      186046.52 |      169462.80 |      10.0% |      185150.89 |      188679.23 |         0%
-  P=20   |      332668.00 |      318775.91 |      10.0% |      301659.12 |      306560.38 |         0%
-  P=40   |      603136.31 |      588235.25 |      10.0% |      377216.16 |      396510.69 |         0%
-  P=80   |     1064962.75 |     1059322.00 |      10.0% |      510464.53 |      457456.53 |      20.0%
-  P=160  |     1169590.62 |     1201923.00 |         0% |      574382.50 |      504286.44 |      20.0%
+  P=10   |      167140.23 |      159515.08 |      10.0% |      189897.47 |      189429.83 |      10.0%
+  P=20   |      305997.56 |      318674.31 |         0% |      292483.19 |      288184.44 |      10.0%
+  P=40   |      643915.00 |      598444.06 |      10.0% |      371609.06 |      376222.72 |         0%
+  P=80   |     1047120.44 |     1090512.50 |         0% |      454338.94 |      440140.84 |      10.0%
+  P=160  |     1061571.12 |     1063829.75 |         0% |      497512.44 |      504032.28 |         0%
 
 ── [总结] ──
   压测参数: -n 1000000 -c 50 -d 16
-  PING:  kvstore=19562.96 req/s,  Redis=18520.58 req/s
+  PING:  kvstore=16320.14 req/s,  Redis=17289.97 req/s

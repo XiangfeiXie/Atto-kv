@@ -1,19 +1,30 @@
-/* repl_observe.h — shared between BPF kernel program and userspace loader */
-#ifndef REPL_OBSERVE_H
-#define REPL_OBSERVE_H
+#ifndef __REPL_OBSERVE_H__
+#define __REPL_OBSERVE_H__
 
-#include <linux/types.h>
+/* Use BPF-compatible types */
+#ifdef __BPF__
+typedef unsigned int   __u32;
+typedef unsigned char  __u8;
+#else
+#include <stdint.h>
+typedef uint32_t __u32;
+typedef uint8_t  __u8;
+#endif
 
-#define REPL_OBSERVE_MAX_DATA  512   /* reduced from 4080 to 512 for better performance */
-#define REPL_OBSERVE_MAX_SOCKS 65536
-#define REPL_OBSERVE_RINGBUF_SZ (2 * 1024 * 1024)  /* increased from 512KB to 2MB */
+/* Maximum number of sockets to track */
+#define REPL_OBSERVE_MAX_SOCKS  1024
 
-/* ring buffer event: fixed-size structure for eBPF verifier.
- * Total size: 8 + 4080 = 4088 bytes (fits in 4K page). */
+/* Ringbuf size for replication events (2MB) */
+#define REPL_OBSERVE_RINGBUF_SZ (2 * 1024 * 1024)
+
+/* Maximum data size per event (4KB) */
+#define REPL_OBSERVE_MAX_DATA   4096
+
+/* Replication event structure */
 struct repl_observe_event {
-    __u32 len;
-    __u32 padding;
-    __u8  data[REPL_OBSERVE_MAX_DATA];
+    __u32 len;       /* Length of data */
+    __u32 padding;   /* Padding for alignment */
+    __u8  data[REPL_OBSERVE_MAX_DATA];  /* Command data */
 };
 
-#endif
+#endif /* __REPL_OBSERVE_H__ */

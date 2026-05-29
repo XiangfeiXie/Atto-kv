@@ -30,28 +30,10 @@ pkg_check_modules(FABRIC   REQUIRED libfabric)
 pkg_check_modules(ZLIB     REQUIRED zlib)
 pkg_check_modules(LIBBPF  REQUIRED libbpf)
 
-# ── AF_XDP support (libxdp for zero-copy networking) ──────────────────
-option(ENABLE_AF_XDP "Enable AF_XDP zero-copy replication" ON)
-
-if(ENABLE_AF_XDP)
-    pkg_check_modules(LIBXDP libxdp)
-    if(LIBXDP_FOUND)
-        add_compile_definitions(ENABLE_AF_XDP)
-        message(STATUS "AF_XDP support enabled")
-    else()
-        message(WARNING "libxdp not found - AF_XDP support disabled")
-        message(WARNING "Install libxdp: sudo apt-get install libxdp-dev")
-        set(ENABLE_AF_XDP OFF)
-    endif()
-endif()
-
-
-# ── KCP library (third-party reliable UDP library) ────────────────────
-set(KCP_DIR ${CMAKE_SOURCE_DIR}/third_party/kcp)
-set(KCP_SRCS ${KCP_DIR}/ikcp.c)
-
-add_library(kcp STATIC ${KCP_SRCS})
-target_include_directories(kcp PUBLIC ${KCP_DIR})
+# ── AF_XDP and KCP removed (replaced by TCP replication) ──────────────
+# Phase 9.1 — Simplified replication using TCP + eBPF
+# Removed dependencies: libxdp, KCP library
+# Kept: eBPF filter for write command capture
 
 # ── NtyCo (third-party coroutine library) ─────────────────────────────
 set(NTYCO_DIR  ${CMAKE_SOURCE_DIR}/NtyCo)
@@ -117,8 +99,8 @@ set(REPL_SRCS
     src/repl/rdma_repl.c
     src/repl/repl_stream.c
     src/repl/repl_backlog.c
-    src/repl/repl_kcp_xdp.c
-    src/repl/af_xdp_socket.c
+    src/repl/repl_tcp.c
+    src/repl/repl_incr.c
 )
 
 set(BPF_SRCS
@@ -214,23 +196,7 @@ add_custom_command(
 
 add_custom_target(repl_filter_kern DEPENDS ${REPL_FILTER_KERN_OBJ})
 
-# ── Compile XDP KCP filter BPF program (AF_XDP zero-copy) ──────────────
-set(XDP_KCP_FILTER_KERN_SRC ${CMAKE_SOURCE_DIR}/src/repl/xdp_kcp_filter.bpf.c)
-set(XDP_KCP_FILTER_KERN_OBJ ${CMAKE_BINARY_DIR}/xdp_kcp_filter.bpf.o)
-
-add_custom_command(
-    OUTPUT  ${XDP_KCP_FILTER_KERN_OBJ}
-    COMMAND clang -O2 -g -target bpf
-            -I${CMAKE_SOURCE_DIR}/src/repl
-            -I/usr/include
-            -I/usr/include/x86_64-linux-gnu
-            -c ${XDP_KCP_FILTER_KERN_SRC}
-            -o ${XDP_KCP_FILTER_KERN_OBJ}
-    DEPENDS ${XDP_KCP_FILTER_KERN_SRC}
-    COMMENT "Compiling xdp_kcp_filter.bpf.c for AF_XDP"
-)
-
-add_custom_target(xdp_kcp_filter_kern DEPENDS ${XDP_KCP_FILTER_KERN_OBJ})
+# ── XDP KCP filter removed (no longer needed with TCP) ─────────────────
 
 # ── Old XDP replication removed (replaced by KCP+AF_XDP) ─────────────
 
@@ -264,7 +230,6 @@ target_link_libraries(kvstore PRIVATE
     ${FABRIC_LIBRARIES}
     ${ZLIB_LIBRARIES}
     ${LIBBPF_LIBRARIES}
-    kcp
     elf
     dl
 )
@@ -274,7 +239,7 @@ if(ENABLE_AF_XDP)
     target_include_directories(kvstore PRIVATE ${LIBXDP_INCLUDE_DIRS})
 endif()
 
-add_dependencies(kvstore ntyco xdp_kern sockmap_kern repl_filter_kern xdp_kcp_filter_kern)
+add_dependencies(kvstore ntyco xdp_kern sockmap_kern repl_filter_kern)
 
 # ── Set capabilities for eBPF (requires libcap) ───────────────────────
 # This allows kvstore to load eBPF programs without running as root

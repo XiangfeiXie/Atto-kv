@@ -48,16 +48,10 @@ typedef struct {
     char rdma_master_ip[64];
     int  rdma_master_port;
 
-    /* XDP/AF_XDP incremental replication */
-    int  xdp_repl_enabled;
-    int  xdp_driver_mode;  /* 0 = generic (SKB), 1 = driver mode */
-    char xdp_repl_ifname[32];
-    int  xdp_repl_queue;
-    int  xdp_repl_port;        /* Master: listen port; Slave: local bind port */
-    int  xdp_repl_master_port; /* Slave only: master's replication port to connect */
-    int  xdp_repl_zero_copy;   /* 0 = auto/copy fallback, 1 = require zero-copy */
-    int  xdp_repl_batch;
-    int  xdp_repl_mtu;
+    /* TCP + eBPF incremental replication (Phase 9.1) */
+    int  incr_repl_enabled;
+    int  incr_repl_port;        /* Master: TCP listen port */
+    int  incr_repl_master_port; /* Slave: master's TCP port to connect */
 
     /* sockmap stream-layer observability (Phase 2) */
     int  sockmap_enabled;

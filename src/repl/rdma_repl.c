@@ -26,7 +26,6 @@
 #include "config.h"
 #include "server.h"
 #include "repl_stream.h"
-#include "repl_kcp_xdp.h"
 #include "persistence.h"
 
 #include <stdio.h>

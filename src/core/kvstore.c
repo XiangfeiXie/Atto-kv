@@ -21,8 +21,6 @@
 #include "journal.h"
 #include "wal_persist.h"
 #include "repl_stream.h"
-#include "repl_kcp_xdp.h"
-#include "repl_frame.h"
 #include "persistence.h"
 #include "block.h"
 #include "sockmap_manager.h"
@@ -343,7 +341,7 @@ static inline void kvs_write_journal_append_kind(uint16_t kind, const char *msg,
     uint64_t seq = 0;
     uint32_t crc = 0;
     if (!msg || length <= 0) return;
-    if (!ENABLE_AOF && !kvs_config.xdp_repl_enabled) return;
+    if (!ENABLE_AOF && !kvs_config.incr_repl_enabled) return;
     if (kvs_journal_append(kind, 0, msg, (uint32_t)length, &seq, &crc) != 0)
         return;
 
@@ -353,7 +351,7 @@ static inline void kvs_write_journal_append_kind(uint16_t kind, const char *msg,
         kvs_wal_persist_append_raw(seq, kind, 0, msg, (uint32_t)length, crc);
 
     /* journal_copy + repl_stream_publish only needed when xdp/rdma repl is active */
-    if (kvs_config.xdp_repl_enabled || kvs_config.rdma_sync_enabled) {
+    if (kvs_config.incr_repl_enabled || kvs_config.rdma_sync_enabled) {
         kvs_journal_record_t rec;
         if (kvs_journal_copy(seq, &rec) == 0) {
             repl_stream_publish(&rec);
@@ -1929,7 +1927,7 @@ int main(int argc, char *argv[]) {
         kvs_wal_persist_start();
         aof_async_init();
     }
-    if (kvs_config.xdp_repl_enabled && kvs_config.rdma_role == ROLE_MASTER)
+    if (kvs_config.incr_repl_enabled && kvs_config.rdma_role == ROLE_MASTER)
         repl_stream_start_master();
     if (kvs_config.sockmap_enabled)
         sockmap_manager_init(kvs_config.port, NULL);

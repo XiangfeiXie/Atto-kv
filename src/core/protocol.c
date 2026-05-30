@@ -71,17 +71,74 @@ static inline const char *resp_find_crlf(const char *p, int n)
 #endif
 }
 
+/* Optimized integer parsing with unrolled loop and reduced branches.
+ * Handles common cases (1-4 digits) with minimal overhead. */
 static inline int resp_parse_uint_bounded(const char *p, int n,
                                           long max_value, long *out)
 {
-    if (n <= 0) return -1;
+    if (__builtin_expect(n <= 0, 0)) return -1;
+
     long v = 0;
-    for (int i = 0; i < n; i++) {
-        unsigned c = (unsigned char)p[i] - (unsigned)'0';
-        if (c > 9) return -1;
-        v = v * 10 + (long)c;
-        if (v > max_value) return -1;
+
+    /* Fast path for common small numbers (1-4 digits) */
+    if (__builtin_expect(n <= 4, 1)) {
+        switch (n) {
+        case 1: {
+            unsigned c = (unsigned char)p[0] - '0';
+            if (__builtin_expect(c > 9, 0)) return -1;
+            v = c;
+            break;
+        }
+        case 2: {
+            unsigned c0 = (unsigned char)p[0] - '0';
+            unsigned c1 = (unsigned char)p[1] - '0';
+            if (__builtin_expect((c0 | c1) > 9, 0)) return -1;
+            v = c0 * 10 + c1;
+            break;
+        }
+        case 3: {
+            unsigned c0 = (unsigned char)p[0] - '0';
+            unsigned c1 = (unsigned char)p[1] - '0';
+            unsigned c2 = (unsigned char)p[2] - '0';
+            if (__builtin_expect((c0 | c1 | c2) > 9, 0)) return -1;
+            v = c0 * 100 + c1 * 10 + c2;
+            break;
+        }
+        case 4: {
+            unsigned c0 = (unsigned char)p[0] - '0';
+            unsigned c1 = (unsigned char)p[1] - '0';
+            unsigned c2 = (unsigned char)p[2] - '0';
+            unsigned c3 = (unsigned char)p[3] - '0';
+            if (__builtin_expect((c0 | c1 | c2 | c3) > 9, 0)) return -1;
+            v = c0 * 1000 + c1 * 100 + c2 * 10 + c3;
+            break;
+        }
+        }
+        if (__builtin_expect(v > max_value, 0)) return -1;
+        *out = v;
+        return 0;
     }
+
+    /* Slow path for larger numbers - unrolled by 4 */
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        unsigned c0 = (unsigned char)p[i]   - '0';
+        unsigned c1 = (unsigned char)p[i+1] - '0';
+        unsigned c2 = (unsigned char)p[i+2] - '0';
+        unsigned c3 = (unsigned char)p[i+3] - '0';
+        if (__builtin_expect((c0 | c1 | c2 | c3) > 9, 0)) return -1;
+        v = v * 10000 + c0 * 1000 + c1 * 100 + c2 * 10 + c3;
+        if (__builtin_expect(v > max_value, 0)) return -1;
+    }
+
+    /* Handle remaining digits */
+    for (; i < n; i++) {
+        unsigned c = (unsigned char)p[i] - '0';
+        if (__builtin_expect(c > 9, 0)) return -1;
+        v = v * 10 + c;
+        if (__builtin_expect(v > max_value, 0)) return -1;
+    }
+
     *out = v;
     return 0;
 }
@@ -117,20 +174,20 @@ int resp_parse_slices(const char *buf, int buflen,
                       kvs_token_t *tokens, int max_tokens,
                       int *out_argc)
 {
-    if (buflen < 1) return 0;
+    if (__builtin_expect(buflen < 1, 0)) return 0;
 
     /* ── Inline command (telnet/debug) ── */
-    if (buf[0] != '*') {
+    if (__builtin_expect(buf[0] != '*', 0)) {
         /* Bound scanning at KVS_MAX_INLINE_LEN to avoid DoS on long garbage */
         int scan = buflen < KVS_MAX_INLINE_LEN ? buflen : KVS_MAX_INLINE_LEN;
         const char *cr = resp_find_crlf(buf, scan);
         if (!cr) {
-            if (buflen >= KVS_MAX_INLINE_LEN) return -1; /* line too long */
-            return 0; /* need more bytes */
+            if (__builtin_expect(buflen >= KVS_MAX_INLINE_LEN, 0)) return -1;
+            return 0;
         }
         int eol = (int)(cr - buf);
-        if (eol + 1 >= buflen) return 0;
-        if (buf[eol + 1] != '\n') return -1;
+        if (__builtin_expect(eol + 1 >= buflen, 0)) return 0;
+        if (__builtin_expect(buf[eol + 1] != '\n', 0)) return -1;
 
         int argc = 0;
         int pos = 0;
@@ -145,7 +202,7 @@ int resp_parse_slices(const char *buf, int buflen,
             argc++;
             pos = tok_end;
         }
-        if (argc == 0) return -1;   /* blank inline line is invalid */
+        if (__builtin_expect(argc == 0, 0)) return -1;
         *out_argc = argc;
         return eol + 2;
     }
@@ -155,61 +212,67 @@ int resp_parse_slices(const char *buf, int buflen,
 
     /* Locate first CRLF for argc */
     int hdr_scan = buflen - idx;
-    if (hdr_scan > 32) hdr_scan = 32; /* argc digits fit easily */
+    if (hdr_scan > 32) hdr_scan = 32;
     const char *cr = resp_find_crlf(buf + idx, hdr_scan);
-    if (!cr) {
-        if (buflen - idx >= 32) return -1; /* argc field too long */
+    if (__builtin_expect(!cr, 0)) {
+        if (__builtin_expect(buflen - idx >= 32, 0)) return -1;
         return 0;
     }
     int hdr_end = (int)(cr - buf);
-    if (hdr_end + 1 >= buflen) return 0;
-    if (buf[hdr_end + 1] != '\n') return -1;
-    if (hdr_end == idx) return -1; /* empty argc */
+    if (__builtin_expect(hdr_end + 1 >= buflen, 0)) return 0;
+    if (__builtin_expect(buf[hdr_end + 1] != '\n', 0)) return -1;
+    if (__builtin_expect(hdr_end == idx, 0)) return -1;
 
     /* Parse argc with overflow guard */
     long argc = 0;
-    if (resp_parse_uint_bounded(buf + idx, hdr_end - idx,
-                                (long)max_tokens, &argc) != 0) {
+    if (__builtin_expect(resp_parse_uint_bounded(buf + idx, hdr_end - idx,
+                                (long)max_tokens, &argc) != 0, 0)) {
         return -1;
     }
-    if (argc <= 0) return -1;
+    if (__builtin_expect(argc <= 0, 0)) return -1;
     idx = hdr_end + 2;
 
+    /* Prefetch next bulk string header for better cache utilization */
+    if (__builtin_expect(idx + 32 < buflen, 1))
+        __builtin_prefetch(buf + idx, 0, 3);
+
     for (long i = 0; i < argc; i++) {
-        if (idx >= buflen) return 0;
-        if (buf[idx] != '$') return -1;
+        if (__builtin_expect(idx >= buflen, 0)) return 0;
+        if (__builtin_expect(buf[idx] != '$', 0)) return -1;
         idx++;
 
         /* Bulk length header */
         int blen_scan = buflen - idx;
         if (blen_scan > 24) blen_scan = 24;
         const char *bcr = resp_find_crlf(buf + idx, blen_scan);
-        if (!bcr) {
-            if (buflen - idx >= 24) return -1; /* length field too long */
+        if (__builtin_expect(!bcr, 0)) {
+            if (__builtin_expect(buflen - idx >= 24, 0)) return -1;
             return 0;
         }
         int blen_end = (int)(bcr - buf);
-        if (blen_end + 1 >= buflen) return 0;
-        if (buf[blen_end + 1] != '\n') return -1;
-        if (blen_end == idx) return -1;
+        if (__builtin_expect(blen_end + 1 >= buflen, 0)) return 0;
+        if (__builtin_expect(buf[blen_end + 1] != '\n', 0)) return -1;
+        if (__builtin_expect(blen_end == idx, 0)) return -1;
 
         long slen = 0;
-        int neg = 0;
         int j = idx;
-        if (buf[j] == '-') { neg = 1; j++; if (j == blen_end) return -1; }
-        if (neg) return -1;   /* server-side input never has null bulk */
-        if (resp_parse_uint_bounded(buf + j, blen_end - j,
-                                    KVS_MAX_BULK_LEN, &slen) != 0) {
+        if (__builtin_expect(buf[j] == '-', 0)) return -1; /* server-side never has null bulk */
+        if (__builtin_expect(resp_parse_uint_bounded(buf + j, blen_end - j,
+                                    KVS_MAX_BULK_LEN, &slen) != 0, 0)) {
             return -1;
         }
         idx = blen_end + 2;
 
-        if ((long)idx + slen + 2 > (long)buflen) return 0;
+        if (__builtin_expect((long)idx + slen + 2 > (long)buflen, 0)) return 0;
+
+        /* Prefetch bulk data for next iteration */
+        if (__builtin_expect(i + 1 < argc && idx + slen + 32 < buflen, 1))
+            __builtin_prefetch(buf + idx + slen + 2, 0, 3);
 
         tokens[i].ptr = buf + idx;
         tokens[i].len = (int)slen;
         idx += (int)slen;
-        if (buf[idx] != '\r' || buf[idx + 1] != '\n') return -1;
+        if (__builtin_expect(buf[idx] != '\r' || buf[idx + 1] != '\n', 0)) return -1;
         idx += 2;
     }
     *out_argc = (int)argc;

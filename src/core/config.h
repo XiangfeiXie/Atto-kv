@@ -53,23 +53,8 @@ typedef struct {
     int  incr_repl_port;        /* Master: TCP listen port */
     int  incr_repl_master_port; /* Slave: master's TCP port to connect */
 
-    /* sockmap stream-layer observability (Phase 2) */
-    int  sockmap_enabled;
-
+    /* Latency histogram for performance monitoring */
     int  latency_histogram_enabled;
-
-    /* Phase 4 — multi-worker proactor (0 = auto: nproc-1, 1 = single,
-     * N = manual).  Auto/manual flag set after config_load. */
-    int  threads;
-    int  threads_auto;
-
-    /* Phase 5.1 — CPU pinning.
-     *   cpu_pin_mode: 0 = off, 1 = auto, 2 = manual list
-     *   cpu_pin_list: explicit cores when mode == 2 (e.g. {1,2,3,4})
-     *   cpu_pin_count: number of valid entries in cpu_pin_list */
-    int  cpu_pin_mode;
-    int  cpu_pin_list[64];
-    int  cpu_pin_count;
 } KvsConfig;
 
 extern KvsConfig kvs_config;

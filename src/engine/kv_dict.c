@@ -19,25 +19,11 @@
 #define DICT_INIT_SIZE  16          /* must be power of 2 */
 #define DICT_MAX_SIZE   (1U << 24)  /* ~16M buckets max */
 
-/* Phase 6.4 — incremental rehash batch size.
+/* Incremental rehash batch size.
  *
  * Each dict_add/dict_replace/dict_delete amortises the cost of moving
  * REHASH_BATCH buckets from ht[0] to ht[1].  Larger N finishes the
- * rehash window faster so dict_find returns to the single-table fast
- * path sooner; that directly speeds up the GET hot path which Phase
- * 6.2 already made rdlock-concurrent.
- *
- * Trade-off: per-write cost rises ~8x in the steady-state cost of the
- * rehash step (still O(1) amortised — each entry migrates exactly
- * once), but the total wall-clock rehash window shrinks 8x.  At 8 we
- * never observed a single-write tail latency regression in dev_quick
- * (SET p50 stayed at 2.7 ms ± 0.1).
- *
- * Range we considered:
- *   1   — original; long-lived rehash, slowest dict_find during it
- *   4   — modest gain on workloads that rehash often (LFU eviction)
- *   8   — chosen; sweet spot on 6c/12c
- *   16+ — measurable per-write tail latency spikes during rehash */
+ * rehash window faster. */
 #define REHASH_BATCH    8
 
 static uint32_t next_pow2(uint32_t v) {
@@ -141,18 +127,6 @@ void dict_clear(kv_dict_t *d) {
 /* =====================================================================
  * Progressive rehash: migrate up to 'steps' buckets from ht[0] to ht[1].
  * Called inside dict_add / dict_replace / dict_delete — amortised O(1).
- *
- * MT-safety contract (Phase 4B.5):
- *   - dict_rehash_step mutates ht[0] and ht[1] structure (bucket
- *     pointers, used counts, rehash_idx).  It MUST run with the owning
- *     shard's wrlock held.
- *   - The current dispatcher takes SHARD_WRLOCK around every keyed
- *     command, so dict_add/dict_replace/dict_delete (and the rehash
- *     step they internally invoke) are always single-writer.
- *   - dict_find is the ONLY public API that may run under a shard
- *     rdlock; it does NOT call dict_rehash_step and is safe with
- *     concurrent readers.  Phase 6.2 (read-only rdlock split) MUST
- *     keep this invariant.
  * ===================================================================== */
 
 static void dict_rehash_step(kv_dict_t *d, int steps) {
@@ -244,11 +218,6 @@ static int dict_maybe_shrink(kv_dict_t *d) {
 kv_entry_t *dict_find(kv_dict_t *d, const char *key, uint32_t key_len,
                       uint64_t hash)
 {
-    /* Phase 4: dict_find is read-only and may run under a shared shard
-     * rdlock; it MUST NOT mutate the dict.  Incremental rehash work has
-     * been hoisted to the write paths (dict_add / dict_delete /
-     * dict_resize_entry). */
-
     /* Fast return when dict is empty (no tables allocated yet) */
     if (d->ht[0].size == 0 && d->rehash_idx < 0)
         return NULL;
@@ -592,125 +561,41 @@ kv_entry_t *dict_get_random_key(kv_dict_t *d) {
 }
 
 /* =====================================================================
- * Phase 4: sharded wrapper
+ * Single global store
  * ===================================================================== */
 
-kv_shards_t g_shards;
+kv_store_t g_store;
 
-void kv_shards_init(void) {
-    for (uint32_t i = 0; i < KV_NR_SHARDS; i++) {
-        pthread_rwlock_init(&g_shards.shards[i].lock, NULL);
-        dict_init(&g_shards.shards[i].dict);
+void kv_store_init(void) {
+    dict_init(&g_store.dict);
+}
+
+void kv_store_destroy(void) {
+    dict_destroy(&g_store.dict);
+}
+
+uint32_t kv_store_count(void) {
+    return dict_count(&g_store.dict);
+}
+
+void kv_store_clear(void) {
+    dict_clear(&g_store.dict);
+}
+
+/* ---- Single store iterator ---- */
+
+void kv_store_iter_init(kv_store_iter_t *it) {
+    it->iter = dict_iter_new(&g_store.dict, 1);
+}
+
+kv_entry_t *kv_store_iter_next(kv_store_iter_t *it) {
+    if (!it->iter) return NULL;
+    return dict_iter_next(it->iter);
+}
+
+void kv_store_iter_free(kv_store_iter_t *it) {
+    if (it->iter) {
+        dict_iter_free(it->iter);
+        it->iter = NULL;
     }
-}
-
-void kv_shards_destroy(void) {
-    for (uint32_t i = 0; i < KV_NR_SHARDS; i++) {
-        pthread_rwlock_wrlock(&g_shards.shards[i].lock);
-        dict_destroy(&g_shards.shards[i].dict);
-        pthread_rwlock_unlock(&g_shards.shards[i].lock);
-        pthread_rwlock_destroy(&g_shards.shards[i].lock);
-    }
-}
-
-uint32_t kv_shards_count(void) {
-    /* Approximate: we sum without locking each shard.  In a steady-state
-     * read-mostly workload the value is exact; under concurrent writes
-     * it lags by at most "in-flight writes" which is acceptable for the
-     * DBSIZE command. */
-    uint32_t n = 0;
-    for (uint32_t i = 0; i < KV_NR_SHARDS; i++)
-        n += dict_count(&g_shards.shards[i].dict);
-    return n;
-}
-
-void kv_shards_clear(void) {
-    for (uint32_t i = 0; i < KV_NR_SHARDS; i++) {
-        pthread_rwlock_wrlock(&g_shards.shards[i].lock);
-        dict_clear(&g_shards.shards[i].dict);
-        pthread_rwlock_unlock(&g_shards.shards[i].lock);
-    }
-}
-
-/* ---- Multi-shard iterator ---- */
-
-void kv_shards_iter_init(kv_shards_iter_t *it) {
-    it->shard_idx = 0;
-    it->cur_iter  = NULL;
-    it->no_lock   = 0;
-}
-
-/* Phase 4B.4 — single-threaded iterator variant.  Skips per-shard
- * rdlock acquisition; safe only when the caller can guarantee no
- * concurrent writers (e.g. inside a fork child after the parent has
- * taken all shard wrlocks for snapshot, then forked, leaving the child
- * with a frozen COW image). */
-void kv_shards_iter_init_nolock(kv_shards_iter_t *it) {
-    it->shard_idx = 0;
-    it->cur_iter  = NULL;
-    it->no_lock   = 1;
-}
-
-static void shards_iter_advance_shard(kv_shards_iter_t *it) {
-    /* Tear down current shard iterator if any (and release its lock). */
-    if (it->cur_iter) {
-        uint32_t prev = it->shard_idx - 1;
-        dict_iter_free(it->cur_iter);
-        it->cur_iter = NULL;
-        if (!it->no_lock)
-            pthread_rwlock_unlock(&g_shards.shards[prev].lock);
-    }
-    /* Move to the next shard that holds entries. */
-    while (it->shard_idx < KV_NR_SHARDS) {
-        kv_shard_t *s = &g_shards.shards[it->shard_idx];
-        if (!it->no_lock) pthread_rwlock_rdlock(&s->lock);
-        if (dict_count(&s->dict) > 0) {
-            it->cur_iter = dict_iter_new(&s->dict, 1);
-            it->shard_idx++;
-            return;
-        }
-        if (!it->no_lock) pthread_rwlock_unlock(&s->lock);
-        it->shard_idx++;
-    }
-}
-
-kv_entry_t *kv_shards_iter_next(kv_shards_iter_t *it) {
-    for (;;) {
-        if (!it->cur_iter) {
-            shards_iter_advance_shard(it);
-            if (!it->cur_iter) return NULL;
-        }
-        kv_entry_t *e = dict_iter_next(it->cur_iter);
-        if (e) return e;
-        /* Current shard exhausted, move to next */
-        shards_iter_advance_shard(it);
-        if (!it->cur_iter) return NULL;
-    }
-}
-
-void kv_shards_iter_free(kv_shards_iter_t *it) {
-    if (it->cur_iter) {
-        uint32_t prev = it->shard_idx - 1;
-        dict_iter_free(it->cur_iter);
-        it->cur_iter = NULL;
-        if (!it->no_lock)
-            pthread_rwlock_unlock(&g_shards.shards[prev].lock);
-    }
-}
-
-/* ---- Phase 4B.4: point-in-time snapshot lock helpers ---- */
-
-void kv_shards_lock_all_for_snapshot(void) {
-    /* Acquire all shard wrlocks in shard-index order.  The dispatcher
-     * contract is to hold at most one shard wrlock at a time, so this
-     * fixed-order acquisition cannot deadlock with regular dispatch. */
-    for (uint32_t i = 0; i < KV_NR_SHARDS; i++)
-        pthread_rwlock_wrlock(&g_shards.shards[i].lock);
-}
-
-void kv_shards_unlock_all_snapshot(void) {
-    /* Release in reverse order — not required for correctness with
-     * rwlocks but keeps lock acquisition/release symmetric. */
-    for (int i = (int)KV_NR_SHARDS - 1; i >= 0; i--)
-        pthread_rwlock_unlock(&g_shards.shards[i].lock);
 }

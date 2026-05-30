@@ -1,9 +1,6 @@
 #include "kvstore.h"
 #include "kv_type_string.h"
 #include "kv_type_hash.h"
-#include "vector_store.h"
-#include "vec_engine.h"
-#include "flat_index.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +20,7 @@
 #include "repl_stream.h"
 #include "persistence.h"
 #include "block.h"
-#include "sockmap_manager.h"
+// #include "sockmap_manager.h"  /* Disabled for single-threaded build */
 
 #include <zlib.h>
 
@@ -31,71 +28,8 @@
 #define CMD4(a,b,c,d) ((uint32_t)(uint8_t)(a) | ((uint32_t)(uint8_t)(b) << 8) | \
                         ((uint32_t)(uint8_t)(c) << 16) | ((uint32_t)(uint8_t)(d) << 24))
 
-/* ──────────────────────────────────────────────────────────────────
- * Phase 6.2 — shard lock guard with read/write differentiation.
- *
- * Single-key dispatch classifies the incoming command as read/write
- * BEFORE locking, then takes rdlock for reads and wrlock for writes.
- * The cleanup attribute auto-releases on every return path.
- *
- * Why this matters: with N workers and 32 shards, an all-write workload
- * has expected wait time ≈ N/32 per request once N > 32.  Adding more
- * workers past that point only adds contention, no throughput.  For
- * read-heavy workloads (the common case: GET/HGET/LRANGE) rdlock lets
- * an arbitrary number of readers run concurrently inside one shard,
- * so the per-shard ceiling becomes "writer-bound" not "worker-bound".
- *
- * Lazy-expire upgrade: if a reader finds an expired entry under rdlock,
- * we call SHARD_UPGRADE_TO_WR() to drop rdlock + take wrlock + re-find.
- * Same hash, same shard, just stronger lock.  The "re-find" is needed
- * because between drop-rd and take-wr, another writer may have already
- * deleted the entry — so we re-check rather than blindly delete.
- *
- * Callers that need to drop the lock early (e.g. before block_wake
- * which may recursively dispatch into a different shard) call
- * SHARD_RELEASE() explicitly.
- * ────────────────────────────────────────────────────────────────── */
-typedef struct {
-    uint64_t hash;
-    int      held;
-} kvs_shard_guard_t;
-
-static inline void kvs_shard_guard_release(kvs_shard_guard_t *g) {
-    if (g->held) {
-        kv_shard_unlock_h(g->hash);
-        g->held = 0;
-    }
-}
-
-/* Take the shard lock in either rdlock (write_mode==0) or wrlock mode.
- * Declares _sg in the enclosing scope; cleanup attribute auto-releases.
- * Use exactly once per scope. */
-#define SHARD_LOCK(h, write_mode)                                            \
-    kvs_shard_guard_t _sg __attribute__((cleanup(kvs_shard_guard_release))) \
-        = { .hash = (h), .held = 1 };                                       \
-    do {                                                                     \
-        if (write_mode) kv_shard_wrlock_h(h);                                \
-        else            kv_shard_rdlock_h(h);                                \
-    } while (0)
-
-/* Back-compat: existing callers that need wrlock-only paths
- * (e.g. multi-key MGET/MSET loops in keyless handling). */
-#define SHARD_WRLOCK(h) SHARD_LOCK((h), 1)
-
-/* Upgrade an existing _sg (currently held as rdlock) to wrlock.
- * Drops the rdlock, then takes the wrlock on the same shard.
- * The guard remains armed so cleanup still fires on scope exit. */
-#define SHARD_UPGRADE_TO_WR()                                                \
-    do {                                                                     \
-        if (_sg.held) { kv_shard_unlock_h(_sg.hash); _sg.held = 0; }         \
-        kv_shard_wrlock_h(_sg.hash);                                         \
-        _sg.held = 1;                                                        \
-    } while (0)
-
-#define SHARD_RELEASE() kvs_shard_guard_release(&_sg)
-
 /* ==================== Global dict (single storage engine) ==================== */
-/* g_dict has been replaced by sharded g_shards (see kv_dict.h). */
+/* Single global dictionary */
 int g_in_reload = 0;    /* set by persistence layer during AOF/RDB reload */
 
 /* ==================== INFO counters (declared in kvstore.h) ============= */
@@ -145,9 +79,8 @@ void kvs_tsc_calibrate(void) {
     g_kvs_tsc_usable = 0;
 }
 
-/* Latency histogram (Phase 10.6).  See kvstore.h for bucket layout +
- * sharding rationale.  Sharded across KVS_LAT_SLOTS cacheline-aligned
- * slots to avoid false-sharing contention from the wire-path workers. */
+/* Latency histogram (Phase 10.6).  See kvstore.h for bucket layout.
+ * Distributed across KVS_LAT_SLOTS cacheline-aligned slots to reduce contention. */
 struct kvs_lat_slot g_kvs_lat_slots[KVS_LAT_SLOTS] = { { {0}, 0, 0, {0} } };
 
 /* Map ns to bucket index 0..15.
@@ -226,51 +159,39 @@ void update_cached_time(void) {
 /* Forward declaration */
 static void entry_cleanup_by_type(kv_entry_t *e);
 
-#define ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_SHARD 20  /* keys to sample per shard */
+#define ACTIVE_EXPIRE_CYCLE_LOOKUPS 20  /* keys to sample per cycle */
 
 static _Atomic uint64_t g_expired_keys = 0;       /* total expired keys deleted */
 static pthread_t g_expire_thread;
 static volatile int g_expire_thread_stop = 0;
 
-/* Sample random keys from all shards and delete expired ones.
- * Uses trywrlock to avoid blocking normal requests. */
+/* Sample random keys from global dict and delete expired ones. */
 static void active_expire_cycle(void) {
-    long long start_ms = get_time_now();
     int expired_total = 0;
     int sampled_total = 0;
 
-    /* Iterate all shards */
-    for (int shard_idx = 0; shard_idx < KV_NR_SHARDS; shard_idx++) {
-        kv_shard_t *shard = &g_shards.shards[shard_idx];
+    kv_dict_t *dict = kv_dict_for(0);
 
-        /* Try to acquire write lock (non-blocking) */
-        if (pthread_rwlock_trywrlock(&shard->lock) != 0) {
-            continue;  /* Lock busy, skip this shard */
+    /* Sample ACTIVE_EXPIRE_CYCLE_LOOKUPS random keys */
+    for (int i = 0; i < ACTIVE_EXPIRE_CYCLE_LOOKUPS; i++) {
+        kv_entry_t *entry = dict_get_random_key(dict);
+        if (!entry) break;
+
+        sampled_total++;
+
+        /* Check if expired */
+        if (entry->expire && get_time_now() > entry->expire) {
+            const char *key = entry_key(entry);
+            uint32_t key_len = entry->key_len;
+            uint64_t hash = entry->hash;
+
+            /* Delete expired key */
+            entry_cleanup_by_type(entry);
+            dict_delete(dict, key, key_len, hash);
+
+            expired_total++;
+            atomic_fetch_add_explicit(&g_expired_keys, 1, memory_order_relaxed);
         }
-
-        /* Sample ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_SHARD random keys */
-        for (int i = 0; i < ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_SHARD; i++) {
-            kv_entry_t *entry = dict_get_random_key(&shard->dict);
-            if (!entry) break;
-
-            sampled_total++;
-
-            /* Check if expired */
-            if (entry->expire && get_time_now() > entry->expire) {
-                const char *key = entry_key(entry);
-                uint32_t key_len = entry->key_len;
-                uint64_t hash = entry->hash;
-
-                /* Delete expired key */
-                entry_cleanup_by_type(entry);
-                dict_delete(&shard->dict, key, key_len, hash);
-
-                expired_total++;
-                atomic_fetch_add_explicit(&g_expired_keys, 1, memory_order_relaxed);
-            }
-        }
-
-        pthread_rwlock_unlock(&shard->lock);
     }
 
     /* If expire rate > 25%, recursively scan again */
@@ -342,15 +263,37 @@ static inline void kvs_write_journal_append_kind(uint16_t kind, const char *msg,
     uint32_t crc = 0;
     if (!msg || length <= 0) return;
     if (!ENABLE_AOF && !kvs_config.incr_repl_enabled) return;
+
+    /* Fast path: AOF-only mode (no replication).
+     * Bypass Journal entirely to avoid lock contention and extra memcpy.
+     * This is the common case for single-instance deployments. */
+    if (ENABLE_AOF && !kvs_config.incr_repl_enabled && !kvs_config.rdma_sync_enabled) {
+        /* Allocate sequence number atomically */
+        seq = atomic_fetch_add_explicit(&g_next_seq, 1, memory_order_acq_rel);
+
+        /* Compute CRC32C for WAL record (must match journal.c format) */
+        uint32_t len = (uint32_t)length;
+        uint16_t flags = 0;
+        crc = kvs_crc32c(0, &seq, sizeof(seq));
+        crc = kvs_crc32c(crc, &kind, sizeof(kind));
+        crc = kvs_crc32c(crc, &flags, sizeof(flags));
+        crc = kvs_crc32c(crc, &len, sizeof(len));
+        crc = kvs_crc32c(crc, msg, len);
+
+        /* Write directly to WAL, skipping Journal */
+        kvs_wal_persist_append_raw(seq, kind, 0, msg, len, crc);
+        return;
+    }
+
+    /* Slow path: replication enabled, need Journal for incremental sync */
     if (kvs_journal_append(kind, 0, msg, (uint32_t)length, &seq, &crc) != 0)
         return;
 
-    /* Fast path: append raw payload to WAL, skipping journal_copy round-trip.
-     * This avoids a redundant lock+malloc+memcpy+free per write. */
+    /* Append to WAL for AOF persistence */
     if (ENABLE_AOF)
         kvs_wal_persist_append_raw(seq, kind, 0, msg, (uint32_t)length, crc);
 
-    /* journal_copy + repl_stream_publish only needed when xdp/rdma repl is active */
+    /* Publish to replication stream for incremental sync */
     if (kvs_config.incr_repl_enabled || kvs_config.rdma_sync_enabled) {
         kvs_journal_record_t rec;
         if (kvs_journal_copy(seq, &rec) == 0) {
@@ -420,310 +363,6 @@ static int token_eq_ci(kvs_token_t t, const char *lit) {
     return 1;
 }
 
-static int token_to_float(kvs_token_t t, float *out) {
-    if (!out || t.len <= 0 || t.len >= 64) return -1;
-    char buf[64];
-    memcpy(buf, t.ptr, (size_t)t.len);
-    buf[t.len] = '\0';
-    char *end = NULL;
-    errno = 0;
-    float v = strtof(buf, &end);
-    if (errno != 0 || !end || *end != '\0') return -1;
-    *out = v;
-    return 0;
-}
-
-static int parse_metric_token(kvs_token_t t, vec_metric_t *out) {
-    if (!out) return -1;
-    char buf[16];
-    if (t.len <= 0 || t.len >= (int)sizeof(buf)) return -1;
-    for (int i = 0; i < t.len; i++) buf[i] = (char)toupper((unsigned char)t.ptr[i]);
-    buf[t.len] = '\0';
-    return vec_metric_parse(buf, (uint32_t)t.len, out);
-}
-
-static void reply_float_bulk(DynBuf *wb, float v) {
-    char buf[64];
-    int n = snprintf(buf, sizeof(buf), "%.9g", (double)v);
-    reply_bulk(wb, buf, n);
-}
-
-static int parse_vector_args(kvs_token_t *tokens, int start, int argc,
-                             float *vec, uint32_t max_dim, uint32_t *dim_out) {
-    if (!vec || !dim_out || start >= argc) return -1;
-    uint32_t dim = 0;
-    for (int i = start; i < argc; i++) {
-        if (dim >= max_dim) return -1;
-        if (token_to_float(tokens[i], &vec[dim]) != 0) return -1;
-        dim++;
-    }
-    if (dim == 0) return -1;
-    *dim_out = dim;
-    return 0;
-}
-
-static dispatch_result_t vector_cmd_minimal(kvs_token_t cmd, kvs_token_t *tokens,
-                                            int argc, DynBuf *wb) {
-    if (TOKEN_EQ(cmd, "VEC.CREATE") || TOKEN_EQ(cmd, "VECTOR.CREATE")) {
-        if (argc < 4) {
-            dynbuf_lit(wb, "-ERR wrong number of arguments for vector create\r\n");
-            return DISPATCH_ERROR;
-        }
-        uint32_t dim = 0;
-        vec_metric_t metric = VEC_METRIC_L2;
-        for (int i = 2; i < argc; i++) {
-            if (token_eq_ci(tokens[i], "DIM") && i + 1 < argc) {
-                long long v;
-                if (token_to_ll(tokens[++i], &v) < 0 || v <= 0 || v > VEC_MAX_DIM) {
-                    dynbuf_lit(wb, "-ERR invalid vector dimension\r\n");
-                    return DISPATCH_ERROR;
-                }
-                dim = (uint32_t)v;
-            } else if (token_eq_ci(tokens[i], "METRIC") && i + 1 < argc) {
-                if (parse_metric_token(tokens[++i], &metric) != 0) {
-                    dynbuf_lit(wb, "-ERR invalid vector metric\r\n");
-                    return DISPATCH_ERROR;
-                }
-            }
-        }
-        if (dim == 0) {
-            dynbuf_lit(wb, "-ERR missing vector dimension\r\n");
-            return DISPATCH_ERROR;
-        }
-        int rc = vec_engine_create_collection(tokens[1].ptr, (uint32_t)tokens[1].len,
-                                              dim, metric, VEC_INDEX_FLAT);
-        if (rc < 0) dynbuf_lit(wb, "-ERR vector create failed\r\n");
-        else dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-        return rc < 0 ? DISPATCH_ERROR : DISPATCH_OK;
-    }
-
-    if (TOKEN_EQ(cmd, "VEC.INSERT") || TOKEN_EQ(cmd, "VECTOR.INSERT")) {
-        if (argc < 5) {
-            dynbuf_lit(wb, "-ERR wrong number of arguments for vector insert\r\n");
-            return DISPATCH_ERROR;
-        }
-        float vec[VEC_MAX_DIM];
-        uint32_t dim = 0;
-        if (parse_vector_args(tokens, 3, argc, vec, VEC_MAX_DIM, &dim) != 0) {
-            dynbuf_lit(wb, "-ERR invalid vector payload\r\n");
-            return DISPATCH_ERROR;
-        }
-        int rc = vec_engine_put(tokens[1].ptr, (uint32_t)tokens[1].len,
-                                tokens[2].ptr, (uint32_t)tokens[2].len,
-                                vec, dim, VEC_METRIC_L2);
-        if (rc < 0) dynbuf_lit(wb, "-ERR vector insert failed\r\n");
-        else dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-        return rc < 0 ? DISPATCH_ERROR : DISPATCH_OK;
-    }
-
-    if (TOKEN_EQ(cmd, "VEC.DELETE") || TOKEN_EQ(cmd, "VECTOR.DELETE")) {
-        if (argc != 3) {
-            dynbuf_lit(wb, "-ERR wrong number of arguments for vector delete\r\n");
-            return DISPATCH_ERROR;
-        }
-        int rc = vec_engine_delete(tokens[1].ptr, (uint32_t)tokens[1].len,
-                                   tokens[2].ptr, (uint32_t)tokens[2].len);
-        reply_integer(wb, rc > 0 ? 1 : 0);
-        return DISPATCH_OK;
-    }
-
-    if (TOKEN_EQ(cmd, "VEC.GET") || TOKEN_EQ(cmd, "VECTOR.GET")) {
-        if (argc != 3) {
-            dynbuf_lit(wb, "-ERR wrong number of arguments for vector get\r\n");
-            return DISPATCH_ERROR;
-        }
-        float vec[VEC_MAX_DIM];
-        uint32_t dim = 0;
-        int rc = vec_engine_get(tokens[1].ptr, (uint32_t)tokens[1].len,
-                                tokens[2].ptr, (uint32_t)tokens[2].len,
-                                vec, &dim);
-        if (rc <= 0) {
-            dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
-            return DISPATCH_OK;
-        }
-        char hdr[32];
-        int n = snprintf(hdr, sizeof(hdr), "*%u\r\n", dim);
-        dynbuf_cat(wb, hdr, n);
-        for (uint32_t i = 0; i < dim; i++) reply_float_bulk(wb, vec[i]);
-        return DISPATCH_OK;
-    }
-
-    if (TOKEN_EQ(cmd, "VEC.SEARCH") || TOKEN_EQ(cmd, "VECTOR.SEARCH")) {
-        if (argc < 6 || !token_eq_ci(tokens[2], "TOPK")) {
-            dynbuf_lit(wb, "-ERR syntax: VEC.SEARCH collection TOPK k f1 f2 ...\r\n");
-            return DISPATCH_ERROR;
-        }
-        long long k;
-        if (token_to_ll(tokens[3], &k) < 0 || k <= 0 || k > VEC_MAX_TOPK) {
-            dynbuf_lit(wb, "-ERR invalid topk\r\n");
-            return DISPATCH_ERROR;
-        }
-        float query[VEC_MAX_DIM];
-        uint32_t dim = 0;
-        if (parse_vector_args(tokens, 4, argc, query, VEC_MAX_DIM, &dim) != 0) {
-            dynbuf_lit(wb, "-ERR invalid query vector\r\n");
-            return DISPATCH_ERROR;
-        }
-        vec_search_result_t r;
-        int rc = vec_engine_search(tokens[1].ptr, (uint32_t)tokens[1].len,
-                                   query, dim, (uint32_t)k, &r);
-        if (rc < 0) {
-            dynbuf_lit(wb, "-ERR vector search failed\r\n");
-            return DISPATCH_ERROR;
-        }
-        vec_result_sort(&r);
-        char hdr[32];
-        int n = snprintf(hdr, sizeof(hdr), "*%u\r\n", r.len);
-        dynbuf_cat(wb, hdr, n);
-        for (uint32_t i = 0; i < r.len; i++) {
-            dynbuf_lit(wb, "*2\r\n");
-            reply_bulk(wb, r.items[i].id, (int)r.items[i].id_len);
-            reply_float_bulk(wb, r.items[i].score);
-        }
-        vec_result_free(&r);
-        return DISPATCH_OK;
-    }
-
-    if (TOKEN_EQ(cmd, "VEC.COUNT") || TOKEN_EQ(cmd, "VECTOR.COUNT")) {
-        if (argc != 2) {
-            dynbuf_lit(wb, "-ERR wrong number of arguments for vector count\r\n");
-            return DISPATCH_ERROR;
-        }
-        reply_integer(wb, (long long)vec_engine_count_collection(tokens[1].ptr, (uint32_t)tokens[1].len));
-        return DISPATCH_OK;
-    }
-
-    dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
-    return DISPATCH_ERROR;
-}
-
-static dispatch_result_t ai_cmd_minimal(kvs_token_t cmd, kvs_token_t *tokens,
-                                        int argc, DynBuf *wb) {
-    const char *collection = "ai_cache";
-    const uint32_t collection_len = 8;
-
-    if (TOKEN_EQ(cmd, "AI.PUT")) {
-        if (argc < 5) {
-            dynbuf_lit(wb, "-ERR syntax: AI.PUT key response f1 f2 ...\r\n");
-            return DISPATCH_ERROR;
-        }
-        float vec[VEC_MAX_DIM];
-        uint32_t dim = 0;
-        if (parse_vector_args(tokens, 3, argc, vec, VEC_MAX_DIM, &dim) != 0) {
-            dynbuf_lit(wb, "-ERR invalid embedding\r\n");
-            return DISPATCH_ERROR;
-        }
-        uint64_t hash = kv_hash((const uint8_t *)tokens[1].ptr, (uint32_t)tokens[1].len);
-        SHARD_WRLOCK(hash);
-        if (string_engine_set(tokens[1].ptr, (uint32_t)tokens[1].len,
-                              tokens[2].ptr, (uint32_t)tokens[2].len, 0, 0) != 0) {
-            dynbuf_lit(wb, "-ERR AI cache write failed\r\n");
-            return DISPATCH_ERROR;
-        }
-        SHARD_RELEASE();
-        int rc = vec_engine_put(collection, collection_len,
-                                tokens[1].ptr, (uint32_t)tokens[1].len,
-                                vec, dim, VEC_METRIC_COSINE);
-        if (rc < 0) {
-            dynbuf_lit(wb, "-ERR AI vector index write failed\r\n");
-            return DISPATCH_ERROR;
-        }
-        dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-        return DISPATCH_OK;
-    }
-
-    if (TOKEN_EQ(cmd, "AI.GET")) {
-        if (argc != 2) {
-            dynbuf_lit(wb, "-ERR wrong number of arguments for AI.GET\r\n");
-            return DISPATCH_ERROR;
-        }
-        uint64_t hash = kv_hash((const uint8_t *)tokens[1].ptr, (uint32_t)tokens[1].len);
-        SHARD_LOCK(hash, 0);
-        uint32_t vlen = 0;
-        uint8_t enc = 0;
-        const char *v = string_engine_get(tokens[1].ptr, (uint32_t)tokens[1].len, &vlen, &enc);
-        if (!v) dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
-        else if (enc == KV_ENCODING_INT) {
-            char buf[32];
-            int n = snprintf(buf, sizeof(buf), "%lld", (long long)*(const int64_t *)v);
-            reply_bulk(wb, buf, n);
-        } else {
-            reply_bulk(wb, v, (int)vlen);
-        }
-        return DISPATCH_OK;
-    }
-
-    if (TOKEN_EQ(cmd, "AI.SEARCH")) {
-        if (argc < 4) {
-            dynbuf_lit(wb, "-ERR syntax: AI.SEARCH topk f1 f2 ...\r\n");
-            return DISPATCH_ERROR;
-        }
-        long long k;
-        if (token_to_ll(tokens[1], &k) < 0 || k <= 0 || k > VEC_MAX_TOPK) {
-            dynbuf_lit(wb, "-ERR invalid topk\r\n");
-            return DISPATCH_ERROR;
-        }
-        float query[VEC_MAX_DIM];
-        uint32_t dim = 0;
-        if (parse_vector_args(tokens, 2, argc, query, VEC_MAX_DIM, &dim) != 0) {
-            dynbuf_lit(wb, "-ERR invalid query embedding\r\n");
-            return DISPATCH_ERROR;
-        }
-        vec_search_result_t r;
-        int rc = vec_engine_search(collection, collection_len, query, dim, (uint32_t)k, &r);
-        if (rc < 0) {
-            dynbuf_lit(wb, "-ERR AI vector search failed\r\n");
-            return DISPATCH_ERROR;
-        }
-        vec_result_sort(&r);
-        char hdr[32];
-        int n = snprintf(hdr, sizeof(hdr), "*%u\r\n", r.len);
-        dynbuf_cat(wb, hdr, n);
-        for (uint32_t i = 0; i < r.len; i++) {
-            uint64_t hash = kv_hash((const uint8_t *)r.items[i].id, r.items[i].id_len);
-            SHARD_LOCK(hash, 0);
-            uint32_t vlen = 0;
-            uint8_t enc = 0;
-            const char *v = string_engine_get(r.items[i].id, r.items[i].id_len, &vlen, &enc);
-            dynbuf_lit(wb, "*3\r\n");
-            reply_bulk(wb, r.items[i].id, (int)r.items[i].id_len);
-            reply_float_bulk(wb, r.items[i].score);
-            if (!v) dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
-            else if (enc == KV_ENCODING_INT) {
-                char buf[32];
-                int bn = snprintf(buf, sizeof(buf), "%lld", (long long)*(const int64_t *)v);
-                reply_bulk(wb, buf, bn);
-            } else {
-                reply_bulk(wb, v, (int)vlen);
-            }
-            SHARD_RELEASE();
-        }
-        vec_result_free(&r);
-        return DISPATCH_OK;
-    }
-
-    if (TOKEN_EQ(cmd, "AI.DELETE")) {
-        if (argc != 2) {
-            dynbuf_lit(wb, "-ERR wrong number of arguments for AI.DELETE\r\n");
-            return DISPATCH_ERROR;
-        }
-        uint64_t hash = kv_hash((const uint8_t *)tokens[1].ptr, (uint32_t)tokens[1].len);
-        long long ndel = 0;
-        SHARD_WRLOCK(hash);
-        kv_entry_t *e = dict_find(kv_dict_for(hash), tokens[1].ptr, (uint32_t)tokens[1].len, hash);
-        if (e) {
-            entry_cleanup_by_type(e);
-            if (dict_delete(kv_dict_for(hash), tokens[1].ptr, (uint32_t)tokens[1].len, hash) == 0) ndel = 1;
-        }
-        SHARD_RELEASE();
-        vec_engine_delete(collection, collection_len, tokens[1].ptr, (uint32_t)tokens[1].len);
-        reply_integer(wb, ndel);
-        return DISPATCH_OK;
-    }
-
-    dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
-    return DISPATCH_ERROR;
-}
 
 /* =====================================================================
  * Phase 7.2 — CONFIG GET / SET / RESETSTAT / REWRITE
@@ -772,7 +411,7 @@ static int fmt_persistence(char *out, int cap) {
     return n;
 }
 static int fmt_threads(char *out, int cap) {
-    return snprintf(out, cap, "%d", kvs_config.threads);
+    return snprintf(out, cap, "%d", 1);
 }
 static int fmt_port(char *out, int cap) {
     return snprintf(out, cap, "%d", kvs_config.port);
@@ -792,21 +431,7 @@ static int fmt_save(char *out, int cap) {
     return n;
 }
 static int fmt_cpu_pin(char *out, int cap) {
-    if (kvs_config.cpu_pin_mode == 0) {
-        const char *s = "off"; int n = 3;
-        if (n > cap) n = cap; memcpy(out, s, n); return n;
-    }
-    if (kvs_config.cpu_pin_mode == 1) {
-        const char *s = "auto"; int n = 4;
-        if (n > cap) n = cap; memcpy(out, s, n); return n;
-    }
-    /* manual list */
-    int off = 0;
-    for (int i = 0; i < kvs_config.cpu_pin_count && off + 8 < cap; i++) {
-        off += snprintf(out + off, cap - off, "%s%d",
-                        i ? "," : "", kvs_config.cpu_pin_list[i]);
-    }
-    return off;
+    return snprintf(out, cap, "off");
 }
 
 /* SET handlers — return 0 on success, -1 with error string written via wb. */
@@ -1055,8 +680,7 @@ static dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) 
             (kvs_config.network_model == NET_REACTOR)  ? "reactor (epoll)"     :
                                                          "ntyco (coroutine)";
         APPEND("network_model:%s\r\n", netname);
-        APPEND("workers:%d\r\n", kvs_config.threads > 0 ? kvs_config.threads : 1);
-        APPEND("shards:%u\r\n", KV_NR_SHARDS);
+        APPEND("workers:%d\r\n", 1);
         APPEND("\r\n");
     }
 
@@ -1118,10 +742,9 @@ static dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) 
         /* Phase 10.6 — dispatch latency histogram (16 log2-spaced buckets,
          * 1 µs .. ≥16 ms).  Emit per-bucket counts for raw consumption
          * (Prometheus, plotting, etc.) plus derived p50/p99/p999/mean for
-         * humans reading INFO directly.  Counters are sharded across
-         * KVS_LAT_SLOTS cachelines to avoid writer contention; INFO sums
-         * them on read.  Tearing across slots/buckets is acceptable for
-         * percentile estimation at this granularity. */
+         * humans reading INFO directly.  Counters are distributed across
+         * KVS_LAT_SLOTS cachelines; INFO sums them on read.  Tearing across
+         * slots/buckets is acceptable for percentile estimation. */
         uint64_t lat_buckets[KVS_LAT_BUCKETS] = {0};
         uint64_t lat_total = 0;
         uint64_t lat_sum   = 0;
@@ -1224,7 +847,7 @@ static dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) 
     }
 
     if (want_keyspace) {
-        uint32_t nkeys = kv_shards_count();
+        uint32_t nkeys = kv_store_count();
         APPEND("# Keyspace\r\n");
         if (nkeys > 0)
             APPEND("db0:keys=%u,expires=0,avg_ttl=0\r\n", nkeys);
@@ -1391,24 +1014,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
-    if ((cmd.len >= 4 && memcmp(cmd.ptr, "VEC.", 4) == 0) ||
-        (cmd.len >= 7 && memcmp(cmd.ptr, "VECTOR.", 7) == 0)) {
-        int is_write = TOKEN_EQ(cmd, "VEC.CREATE") || TOKEN_EQ(cmd, "VECTOR.CREATE") ||
-                       TOKEN_EQ(cmd, "VEC.INSERT") || TOKEN_EQ(cmd, "VECTOR.INSERT") ||
-                       TOKEN_EQ(cmd, "VEC.DELETE") || TOKEN_EQ(cmd, "VECTOR.DELETE");
-        dispatch_result_t vr = vector_cmd_minimal(cmd, tokens, argc, wb);
-        if (vr == DISPATCH_OK && is_write && !g_in_reload)
-            kvs_write_journal_append(msg_raw, msg_len);
-        return vr;
-    }
-
-    if (cmd.len >= 3 && memcmp(cmd.ptr, "AI.", 3) == 0) {
-        int is_write = TOKEN_EQ(cmd, "AI.PUT") || TOKEN_EQ(cmd, "AI.DELETE");
-        dispatch_result_t ar = ai_cmd_minimal(cmd, tokens, argc, wb);
-        if (ar == DISPATCH_OK && is_write && !g_in_reload)
-            kvs_write_journal_append(msg_raw, msg_len);
-        return ar;
-    }
 
     /* SELECT — single-DB server: accept "SELECT 0", reject others. */
     if (TOKEN_EQ(cmd, "SELECT")) {
@@ -1423,7 +1028,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
 
     /* DBSIZE — count of keys in dict. */
     if (TOKEN_EQ(cmd, "DBSIZE")) {
-        reply_integer(wb, (long long)kv_shards_count());
+        reply_integer(wb, (long long)kv_store_count());
         return DISPATCH_OK;
     }
 
@@ -1458,13 +1063,13 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     }
 
     if (TOKEN_EQ(cmd, "FLUSHALL") || TOKEN_EQ(cmd, "FLUSHDB")) {
-        /* Walk every shard under its own rdlock, then wrlock-clear all. */
-        kv_shards_iter_t it; kv_shards_iter_init(&it);
+        /* Walk global dict and cleanup all entries */
+        kv_store_iter_t it; kv_store_iter_init(&it);
         kv_entry_t *e;
-        while ((e = kv_shards_iter_next(&it)) != NULL)
+        while ((e = kv_store_iter_next(&it)) != NULL)
             entry_cleanup_by_type(e);
-        kv_shards_iter_free(&it);
-        kv_shards_clear();
+        kv_store_iter_free(&it);
+        kv_store_clear();
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         if (!g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
@@ -1486,11 +1091,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         for (int i = 1; i < argc; i++) {
             uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                   (uint32_t)tokens[i].len);
-            /* Phase 6.2 — MGET is pure read; take rdlock to allow concurrent
-             * readers on the same shard.  string_engine_get only does dict_find
-             * (no mutation), so rdlock is safe even though it'd skip the lazy
-             * lazy-expire delete — an expired key just reads as nil here. */
-            SHARD_LOCK(kh, 0);
             uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
             const char *val = string_engine_get(tokens[i].ptr, (uint32_t)tokens[i].len,
                                                 &vlen, &enc);
@@ -1527,7 +1127,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
              * overwrite is type-safe (Redis MSET replaces any existing type). */
             uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                   (uint32_t)tokens[i].len);
-            SHARD_WRLOCK(kh);
             kv_entry_t *ke = dict_find(kv_dict_for(kh), tokens[i].ptr, (uint32_t)tokens[i].len, kh);
             if (ke && entry_type(ke) != KV_TYPE_STRING) {
                 entry_cleanup_by_type(ke);
@@ -1550,16 +1149,10 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             dynbuf_lit(wb, "-ERR wrong number of arguments for 'msetnx' command\r\n");
             return DISPATCH_ERROR;
         }
-        /* First pass: any existing (non-expired) key aborts the whole op.
-         * Note: with multiple workers, two concurrent MSETNX on overlapping
-         * key-sets may both succeed if their pre-checks interleave; this is
-         * the same as Redis's documented behaviour without WATCH. */
+        /* First pass: any existing (non-expired) key aborts the whole op. */
         for (int i = 1; i + 1 < argc; i += 2) {
             uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                   (uint32_t)tokens[i].len);
-            /* Phase 6.2 — MSETNX pre-check is read-only (only deciding
-             * whether to abort); use rdlock for concurrent inspection. */
-            SHARD_LOCK(kh, 0);
             kv_entry_t *ke = dict_find(kv_dict_for(kh), tokens[i].ptr, (uint32_t)tokens[i].len, kh);
             if (ke && (!ke->expire || get_time_now() <= ke->expire)) {
                 reply_integer(wb, 0);
@@ -1569,7 +1162,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         for (int i = 1; i + 1 < argc; i += 2) {
             uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                   (uint32_t)tokens[i].len);
-            SHARD_WRLOCK(kh);
             string_engine_set(tokens[i].ptr, (uint32_t)tokens[i].len,
                               tokens[i+1].ptr, (uint32_t)tokens[i+1].len,
                               0, 0);
@@ -1581,8 +1173,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
-    /* ── DEL / UNLINK — multi-key, type-agnostic, integer reply (Redis-compat).
-     *    Locking is per-key so concurrent DELs across shards do not block. ── */
+    /* ── DEL / UNLINK — multi-key, type-agnostic, integer reply (Redis-compat). ── */
     if (TOKEN_EQ(cmd, "DEL") || TOKEN_EQ(cmd, "UNLINK")) {
         if (argc < 2) {
             dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
@@ -1592,7 +1183,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         for (int i = 1; i < argc; i++) {
             kvs_token_t kt = tokens[i];
             uint64_t kh = kv_hash((const uint8_t *)kt.ptr, (uint32_t)kt.len);
-            SHARD_WRLOCK(kh);
             kv_entry_t *ke = dict_find(kv_dict_for(kh), kt.ptr, (uint32_t)kt.len, kh);
             if (!ke) continue;
             entry_cleanup_by_type(ke);
@@ -1606,10 +1196,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
-    /* ── EXISTS — multi-key, integer reply.  Phase 6.2: rdlock — purely
-     * read-only.  We don't even delete expired keys here (they'd need an
-     * upgrade and EXISTS is supposed to be cheap); they're just reported
-     * as absent, and lazy-deleted on the next single-key access. ── */
+    /* ── EXISTS — multi-key, integer reply. ── */
     if (TOKEN_EQ(cmd, "EXISTS") || TOKEN_EQ(cmd, "EXIST")) {
         if (argc < 2) {
             dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
@@ -1619,7 +1206,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         for (int i = 1; i < argc; i++) {
             kvs_token_t kt = tokens[i];
             uint64_t kh = kv_hash((const uint8_t *)kt.ptr, (uint32_t)kt.len);
-            SHARD_LOCK(kh, 0);
             kv_entry_t *ke = dict_find(kv_dict_for(kh), kt.ptr, (uint32_t)kt.len, kh);
             if (!ke) continue;
             if (ke->expire && get_time_now() > ke->expire) continue;
@@ -1633,30 +1219,30 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
      * For simplicity, only "*" (all keys) is supported. */
     if (TOKEN_EQ(cmd, "KEYS")) {
         /* count keys first */
-        kv_shards_iter_t it; kv_shards_iter_init(&it);
+        kv_store_iter_t it; kv_store_iter_init(&it);
         kv_entry_t *ke;
         long long nkeys = 0;
-        while ((ke = kv_shards_iter_next(&it)) != NULL) {
+        while ((ke = kv_store_iter_next(&it)) != NULL) {
             if (!(ke->expire && get_time_now() > ke->expire))
                 nkeys++;
         }
-        kv_shards_iter_free(&it);
+        kv_store_iter_free(&it);
 
         /* build response: *N\r\n, then $len\r\nkey\r\n for each */
         char hdr[32];
         int hl = snprintf(hdr, sizeof(hdr), "*%lld\r\n", nkeys);
         dynbuf_cat(wb, hdr, hl);
 
-        kv_shards_iter_init(&it);
-        while ((ke = kv_shards_iter_next(&it)) != NULL) {
+        kv_store_iter_init(&it);
+        while ((ke = kv_store_iter_next(&it)) != NULL) {
             if (ke->expire && get_time_now() > ke->expire) continue;
             reply_bulk(wb, entry_key(ke), ke->key_len);
         }
-        kv_shards_iter_free(&it);
+        kv_store_iter_free(&it);
         return DISPATCH_OK;
     }
 
-    /* ── Single-key commands (lock the relevant shard for the duration). ── */
+    /* ── Single-key commands (no locking needed in single-dict mode). ── */
 single_key:
     if (argc < 2) {
         dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
@@ -1695,27 +1281,13 @@ single_key:
         return DISPATCH_ERROR;
     }
 
-    /* Acquire the shard lock — rdlock for reads, wrlock for writes.
-     * Auto-released on every return path via the cleanup attribute on _sg.
-     * Released early before block_wake (which may recursively dispatch). */
-    SHARD_LOCK(hash, is_write);
-
     kv_entry_t *entry = dict_find(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
 
-    /* Lazy-expire: if we found an expired entry under rdlock, we must upgrade
-     * to wrlock before deleting (otherwise the dict mutation would race with
-     * other readers).  After upgrade, re-find — another writer may have
-     * already deleted the entry while we were waiting for the wrlock. */
+    /* Lazy-expire: delete expired entries */
     if (entry && entry->expire && get_time_now() > entry->expire) {
-        if (!is_write) {
-            SHARD_UPGRADE_TO_WR();
-            entry = dict_find(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
-        }
-        if (entry && entry->expire && get_time_now() > entry->expire) {
-            entry_cleanup_by_type(entry);
-            dict_delete(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
-            entry = NULL;
-        }
+        entry_cleanup_by_type(entry);
+        dict_delete(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
+        entry = NULL;
     }
 
     int pre_len = wb->len;
@@ -1822,46 +1394,31 @@ single_key:
         }
     }
 
-    /* ── After LPUSH/RPUSH, wake any client blocked on this key ──
-     *
-     *  Drop the shard lock first: the wake notify path may dispatch into
-     *  block subsystem APIs and (on the same-worker fast path) into the
-     *  woken client's saved command, which can target any shard.
-     *
-     *  Phase 9 multi-key fix: do NOT call block_retry_client here.  The
-     *  retry must run on the woken client's owner worker so that
-     *  conn->write_buf is touched by exactly one worker.  block_notify_woken
-     *  routes via proactor_block_notify(): same-worker → runs locally,
-     *  cross-worker → enqueues to owner's wake_evfd and the owner's
-     *  proactor_block_notify_local will retry block_cmd_buf. */
-    SHARD_RELEASE();
+    /* ── After LPUSH/RPUSH, wake any client blocked on this key ── */
     return DISPATCH_OK;
 }
 
 /* ==================== Engine lifecycle ==================== */
 
 int init_kvengine(void) {
-    kv_shards_init();
-    vector_store_init();
+    kv_store_init();
     block_init();
-    printf("Using string/hash + vector extension engine (%u id shards, flat vector search)\n", KV_NR_SHARDS);
+    printf("Using string/hash storage engine (single global dict)\n");
     return 0;
 }
 
 void dest_kvengine(void) {
     kvs_flush_all();
-    vector_store_destroy();
-    kv_shards_destroy();
+    kv_store_destroy();
 }
 
 void kvs_flush_all(void) {
-    kv_shards_iter_t it; kv_shards_iter_init(&it);
+    kv_store_iter_t it; kv_store_iter_init(&it);
     kv_entry_t *e;
-    while ((e = kv_shards_iter_next(&it)) != NULL)
+    while ((e = kv_store_iter_next(&it)) != NULL)
         entry_cleanup_by_type(e);
-    kv_shards_iter_free(&it);
-    kv_shards_clear();
-    vector_store_clear();
+    kv_store_iter_free(&it);
+    kv_store_clear();
 #ifdef USE_JEMALLOC
     mallctl("arenas.purge", NULL, NULL, NULL, 0);
 #endif
@@ -1929,8 +1486,8 @@ int main(int argc, char *argv[]) {
     }
     if (kvs_config.incr_repl_enabled && kvs_config.rdma_role == ROLE_MASTER)
         repl_stream_start_master();
-    if (kvs_config.sockmap_enabled)
-        sockmap_manager_init(kvs_config.port, NULL);
+    // if (kvs_config.sockmap_enabled)
+    //     sockmap_manager_init(kvs_config.port, NULL);  /* Disabled for single-threaded build */
     if (kvs_config.rdma_sync_enabled) {
         if (kvs_config.rdma_role == ROLE_MASTER) {
             rdma_repl_master_start();
@@ -1973,7 +1530,7 @@ int main(int argc, char *argv[]) {
     repl_stream_stop();
     kvs_wal_persist_stop();
     kvs_journal_shutdown();
-    if (kvs_config.sockmap_enabled) sockmap_manager_stop();
+    // if (kvs_config.sockmap_enabled) sockmap_manager_stop();  /* Disabled for single-threaded build */
     dest_kvengine();
     return 0;
 }

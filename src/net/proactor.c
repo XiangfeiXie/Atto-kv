@@ -1,4 +1,4 @@
-#define _GNU_SOURCE          /* pthread_setaffinity_np, CPU_SET, etc. */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <sched.h>
 #include <liburing.h>
@@ -22,7 +22,7 @@
 #define EVENT_ACCEPT    0
 #define EVENT_READ      1
 #define EVENT_WRITE     2
-#define EVENT_WAKE      3   /* Phase 4B.2: cross-worker wake eventfd readable */
+#define EVENT_WAKE      3
 #define ENTRIES_LENGTH  8192     /* Increased from 4096 for high-concurrency workloads */
 #define CQE_BATCH_SIZE  512      /* Increased from 256 for better batching */
 
@@ -31,60 +31,31 @@
 #define KVS_NR_BUFS        8192     /* Increased from 4096 for high-concurrency (must be power of two) */
 #define KVS_BUF_SIZE       4096
 
-/* Phase 4: per-worker proactor.
+/* Proactor using io_uring.
  *
- * Each worker owns:
- *   - its own io_uring instance (so SINGLE_ISSUER stays valid),
- *   - its own provided-buffer ring,
- *   - its own SO_REUSEPORT listen socket bound to the same port.
- *
- * The connection pool (struct conn) is *shared* across workers because
- * file descriptors are unique within the process and each conn is only
- * ever touched by the worker that accepted it.  No locking needed.
- *
- * Sharded dict locks (kv_shard_*) provide the actual cross-worker
- * mutual exclusion at the dispatch layer.
+ * Owns:
+ *   - One io_uring instance (SINGLE_ISSUER + SQPOLL),
+ *   - One provided-buffer ring,
+ *   - One listen socket.
  */
-/* Phase 4B.2 — pending cross-worker wake event.  When worker A unblocks
- * a client whose connection is owned by worker B, A pushes the client
- * onto B's pending_wake list (under wake_mu); B drains its own list at
- * the top of its event loop and runs proactor_block_notify() locally
- * (so the SQE goes onto B's own ring, preserving SINGLE_ISSUER). */
-typedef struct wake_node {
-    struct client    *client;
-    struct wake_node *next;
-} wake_node_t;
 
 typedef struct proactor_worker {
     int                       id;
     int                       listen_fd;
-    pthread_t                 tid;
     struct io_uring           ring;
     struct io_uring_buf_ring *buf_ring;
     char                     *buf_base;
     size_t                    buf_pool_bytes;
-
-    /* cross-worker wake queue (protected by wake_mu) */
-    pthread_mutex_t           wake_mu;
-    wake_node_t              *wake_head;
-    int                       wake_evfd;   /* eventfd; another worker writes to it
-                                              to nudge this worker out of
-                                              io_uring_submit_and_wait */
     int                       accept_armed;
+    int                       sqpoll_enabled;
 } proactor_worker_t;
 
 static struct conn   *conn_pool = NULL;
 static int            conn_pool_size = 0;
 static msg_handler    kvs_handler;
-static proactor_worker_t *g_workers = NULL;
-static int                g_n_workers = 0;
+static proactor_worker_t *g_worker = NULL;
 static atomic_uint         g_next_conn_gen = 1;
 static int                 g_proactor_debug = -1;
-
-/* Thread-local pointer to the currently-executing worker.  Used by
- * buf_ring_recycle() and the block-notify callback so they don't need
- * an explicit worker argument plumbed through every call site. */
-static __thread proactor_worker_t *tls_worker = NULL;
 
 static int proactor_debug_enabled(void) {
     if (g_proactor_debug < 0)
@@ -130,7 +101,7 @@ static struct io_uring_sqe *get_sqe_submit(struct io_uring *ring) {
 
 /* Hand a buffer back to the kernel ring so it can be reused. */
 static inline void buf_ring_recycle(unsigned bid) {
-    proactor_worker_t *w = tls_worker;
+    proactor_worker_t *w = g_worker;
     io_uring_buf_ring_add(w->buf_ring,
                           w->buf_base + bid * KVS_BUF_SIZE,
                           KVS_BUF_SIZE,
@@ -236,19 +207,12 @@ static int worker_arm_accept(proactor_worker_t *w) {
 
 static void conn_release(int fd);
 
-/* ── Local notify: drain pipelined input, post send SQE on **this** worker's
- *    ring.  Only safe when invoked on the conn's owner worker.  Caller in
- *    cross-worker scenarios must route through proactor_block_notify().
+/* ── Local notify: drain pipelined input, post send SQE.
  *
- *    Phase 9 (multi-key fix): this is now also the SOLE place where a
- *    BLPOP/BRPOP wake reply (either retried saved command or pending
- *    timeout) gets emitted.  The wake-side worker (LPUSH dispatcher /
- *    block_check_timeouts on worker 0) only marks the client and calls
- *    g_notify_cb; the actual write into conn->write_buf and the send SQE
- *    submission happen here, on the owner worker, so write_buf access
- *    stays single-worker. ── */
+ *    This is the place where a BLPOP/BRPOP wake reply (either retried
+ *    saved command or pending timeout) gets emitted. ── */
 static void proactor_block_notify_local(client_t *cl) {
-    if (!cl || !cl->conn || !tls_worker) return;
+    if (!cl || !cl->conn || !g_worker) return;
     struct conn *conn = cl->conn;
 
     /* (a) Timed-out BLPOP: emit the nil reply locally. */
@@ -258,10 +222,7 @@ static void proactor_block_notify_local(client_t *cl) {
     }
 
     /* (b) Awakened BLPOP via LPUSH/RPUSH: re-dispatch the saved BLPOP
-     *     command so the standard list_cmd path emits the reply.  We do
-     *     this here, NOT in the LPUSH worker, because writing to
-     *     conn->write_buf and calling kvs_dispatch (which can take other
-     *     shard locks) must be done on a thread that owns this conn. */
+     *     command so the standard list_cmd path emits the reply. */
     if (cl->block_cmd_len > 0) {
         kvs_token_t tokens2[KVS_MAX_TOKENS];
         int argc2 = 0;
@@ -283,110 +244,26 @@ static void proactor_block_notify_local(client_t *cl) {
                                      &conn->write_buf, conn);
     }
     if (conn->write_buf.len > 0) {
-        if (conn_arm_send(&tls_worker->ring, conn) != 0)
+        if (conn_arm_send(&g_worker->ring, conn) != 0)
             conn_release(conn->fd);
     } else {
-        if (conn_arm_recv(&tls_worker->ring, conn) != 0)
+        if (conn_arm_recv(&g_worker->ring, conn) != 0)
             conn_release(conn->fd);
     }
 }
 
-/* ── Notify callback: block subsystem calls this when a client is unblocked.
- *    If the conn's owner worker == current worker, dispatch directly;
- *    otherwise enqueue on the owner worker's wake_head and kick its
- *    eventfd so it leaves io_uring_submit_and_wait() and processes us. ── */
+/* ── Notify callback: block subsystem calls this when a client is unblocked. ── */
 static void proactor_block_notify(client_t *cl) {
     if (!cl || !cl->conn) return;
-    struct conn *conn = cl->conn;
-
-    /* Same-worker fast path. */
-    if (tls_worker && conn->owner_worker_id == tls_worker->id) {
-        proactor_block_notify_local(cl);
-        return;
-    }
-
-    /* Cross-worker: enqueue + eventfd kick. */
-    int oid = conn->owner_worker_id;
-    if (oid < 0 || oid >= g_n_workers) return;
-    proactor_worker_t *owner = &g_workers[oid];
-
-    wake_node_t *n = (wake_node_t *)malloc(sizeof(*n));
-    if (!n) return;
-    n->client = cl;
-    pthread_mutex_lock(&owner->wake_mu);
-    n->next = owner->wake_head;
-    owner->wake_head = n;
-    pthread_mutex_unlock(&owner->wake_mu);
-
-    if (owner->wake_evfd >= 0) {
-        uint64_t one = 1;
-        ssize_t r = write(owner->wake_evfd, &one, sizeof(one));
-        (void)r;
-    }
+    proactor_block_notify_local(cl);
 }
 
-/* Drain the local wake queue, called at the top of each loop iteration. */
-static void proactor_drain_wakes(proactor_worker_t *w) {
-    pthread_mutex_lock(&w->wake_mu);
-    wake_node_t *head = w->wake_head;
-    w->wake_head = NULL;
-    pthread_mutex_unlock(&w->wake_mu);
-    while (head) {
-        wake_node_t *next = head->next;
-        proactor_block_notify_local(head->client);
-        free(head);
-        head = next;
-    }
-}
-
-/* Public API: ask worker `id` to wake up from io_uring_submit_and_wait.
- * Used by the BLPOP register path so worker 0 re-evaluates its
- * block_nearest_timeout() right after a new blocked client lands. */
+/* Public API stub */
 void proactor_kick_worker(int id) {
-    if (id < 0 || id >= g_n_workers || !g_workers) return;
-    int fd = g_workers[id].wake_evfd;
-    if (fd < 0) return;
-    uint64_t one = 1;
-    ssize_t r = write(fd, &one, sizeof(one));
-    (void)r;
+    (void)id;
 }
 
-/* Per-worker eventfd read buffer; one slot is enough since each successful
- * read drains the counter to zero before we re-arm. */
-static __thread uint64_t tls_wake_evfd_buf;
-
-/* Arm a read on the worker's wake eventfd so that cross-worker kicks
- * unblock io_uring_submit_and_wait().  The CQE is handled as
- * EVENT_WAKE in the main loop, which re-arms it and drains the queue. */
-static int set_event_wake_read(struct io_uring *ring, int evfd) {
-    struct io_uring_sqe *sqe = get_sqe_submit(ring);
-    if (!sqe) return -1;
-    io_uring_prep_read(sqe, evfd, &tls_wake_evfd_buf,
-                       sizeof(tls_wake_evfd_buf), 0);
-    sqe->user_data = conn_info_pack(evfd, EVENT_WAKE, 0);
-    return 0;
-}
-
-/* ── Release a connection slot ──
- *
- * conn_pool[] is a SHARED global array indexed by fd.  Different workers
- * (SO_REUSEPORT) accept() different connections, but the kernel may hand
- * the same fd back to a different worker immediately after close().
- *
- * Concretely the cross-worker fd-reuse race used to be:
- *   1. Worker A: dynbuf_free(c->...)
- *   2. Worker A: close(fd)              ← kernel can reuse fd from now on
- *   3. (race) Worker B: accept() returns same fd
- *   3. (race) Worker B: dynbuf_init(c)  ← writes the slot
- *   4. Worker A: memset(c, 0, ...)      ← stomps Worker B's init
- *
- * Fix: do EVERY slot mutation before close().  After close() the slot
- * is owned by whichever worker accepts the fd next; we must not touch
- * it again.  TSAN will still flag the dynbuf_free here as racing with
- * the other worker's dynbuf_init on the same address — that race is
- * mediated by the kernel close/accept ordering which TSAN cannot see;
- * see test/bench/tsan.suppressions for the suppression entry.
- */
+/* ── Release a connection slot ── */
 static void conn_release(int fd) {
     if (fd < 0 || fd >= conn_pool_size) return;
     struct conn *c = &conn_pool[fd];
@@ -407,45 +284,39 @@ static void conn_release(int fd) {
                 fd, c->gen, c->recv_armed, c->send_armed, c->read_buf.len, c->write_buf.len);
     dynbuf_free(&c->read_buf);
     dynbuf_free(&c->write_buf);
-    memset(c, 0, sizeof(*c));   /* clear slot BEFORE releasing fd */
-    close(fd);                  /* kernel may now hand fd to another worker */
+    memset(c, 0, sizeof(*c));
+    close(fd);
 }
 
-/* Listen socket is opened in the main thread (so we surface bind errors
- * before forking off worker threads); the ring itself MUST be initialised
- * inside the issuing thread for IORING_SETUP_SINGLE_ISSUER to be valid. */
+/* Listen socket initialization */
 static int worker_listen(proactor_worker_t *w, unsigned short port, int reuseport) {
     w->listen_fd = p_init_listen(port, reuseport);
     if (w->listen_fd < 0) return -1;
-    /* Cross-worker wake eventfd.  Do NOT set EFD_NONBLOCK — we want the
-     * io_uring IORING_OP_READ to park in async context until another
-     * worker actually writes to the fd; non-blocking would short-cut
-     * with -EAGAIN every iteration and burn CPU. */
-    w->wake_evfd = eventfd(0, EFD_CLOEXEC);
-    if (w->wake_evfd < 0) {
-        perror("[proactor] eventfd");
-        close(w->listen_fd); w->listen_fd = -1;
-        return -1;
-    }
-    pthread_mutex_init(&w->wake_mu, NULL);
-    w->wake_head = NULL;
     return 0;
 }
 
 static int worker_setup_ring(proactor_worker_t *w)
 {
-    /* Request SINGLE_ISSUER + DEFER_TASKRUN + COOP_TASKRUN for maximum
-     * batching.  DEFER_TASKRUN defers work execution until the next
-     * submit_and_wait, reducing context-switch overhead.  COOP_TASKRUN
-     * signals the kernel that only this task will wait on the ring,
-     * allowing further batching optimisations.  Falls back gracefully on
-     * older kernels that lack these flags. */
+    /* SQPOLL and DEFER_TASKRUN are mutually exclusive:
+     * - SQPOLL: kernel thread polls SQ, best for high throughput
+     * - DEFER_TASKRUN: userspace polling, best for low latency
+     * Try SQPOLL first, then fall back to DEFER_TASKRUN path. */
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
-    params.flags = IORING_SETUP_SINGLE_ISSUER
-                 | IORING_SETUP_DEFER_TASKRUN
-                 | IORING_SETUP_COOP_TASKRUN;
+
+    /* Try SQPOLL + SINGLE_ISSUER (high throughput path) */
+    params.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SINGLE_ISSUER;
+    params.sq_thread_idle = 1000;  /* SQPOLL thread sleeps after 1s idle */
     int qret = io_uring_queue_init_params(ENTRIES_LENGTH, &w->ring, &params);
+
+    if (qret == -EINVAL) {
+        /* SQPOLL failed, try DEFER_TASKRUN path (low latency) */
+        memset(&params, 0, sizeof(params));
+        params.flags = IORING_SETUP_SINGLE_ISSUER
+                     | IORING_SETUP_DEFER_TASKRUN
+                     | IORING_SETUP_COOP_TASKRUN;
+        qret = io_uring_queue_init_params(ENTRIES_LENGTH, &w->ring, &params);
+    }
     if (qret == -EINVAL) {
         /* Retry without COOP_TASKRUN (kernel < 6.1) */
         memset(&params, 0, sizeof(params));
@@ -470,6 +341,8 @@ static int worker_setup_ring(proactor_worker_t *w)
                 w->id, strerror(-qret));
         return -1;
     }
+
+    w->sqpoll_enabled = (params.flags & IORING_SETUP_SQPOLL) ? 1 : 0;
 
     /* Phase 3.2 buffer ring */
     w->buf_pool_bytes = (size_t)KVS_NR_BUFS * KVS_BUF_SIZE;
@@ -499,17 +372,12 @@ static int worker_setup_ring(proactor_worker_t *w)
     }
     io_uring_buf_ring_advance(w->buf_ring, KVS_NR_BUFS);
 
-    /* Arm the cross-worker wake eventfd so other workers can kick
-     * this worker out of io_uring_submit_and_wait(). */
-    if (set_event_wake_read(&w->ring, w->wake_evfd) != 0) {
-        fprintf(stderr, "[proactor#%d] failed to arm wake eventfd\n",
-                w->id);
-        return -1;
-    }
+    /* Single-threaded: no wake eventfd needed */
 
     if (w->id == 0) {
-        printf("[proactor] io_uring flags: 0x%x (single_issuer/defer_taskrun/coop)\n",
-               params.flags);
+        printf("[proactor] io_uring flags: 0x%x%s\n",
+               params.flags,
+               w->sqpoll_enabled ? " (SQPOLL enabled - reduced syscalls)" : "");
         printf("[proactor] buf ring: %d x %d B = %zu MB per worker\n",
                KVS_NR_BUFS, KVS_BUF_SIZE, w->buf_pool_bytes / (1024 * 1024));
     }
@@ -517,13 +385,7 @@ static int worker_setup_ring(proactor_worker_t *w)
 }
 
 static void worker_teardown(proactor_worker_t *w) {
-    /* drain any straggler wake nodes */
-    pthread_mutex_lock(&w->wake_mu);
-    wake_node_t *n = w->wake_head; w->wake_head = NULL;
-    pthread_mutex_unlock(&w->wake_mu);
-    while (n) { wake_node_t *next = n->next; free(n); n = next; }
-    pthread_mutex_destroy(&w->wake_mu);
-    if (w->wake_evfd >= 0) { close(w->wake_evfd); w->wake_evfd = -1; }
+    /* Single-threaded: no wake nodes to drain */
 
     if (w->buf_ring) {
         io_uring_free_buf_ring(&w->ring, w->buf_ring, KVS_NR_BUFS, KVS_BUF_RING_BGID);
@@ -537,41 +399,15 @@ static void worker_teardown(proactor_worker_t *w) {
     if (w->listen_fd >= 0) close(w->listen_fd);
 }
 
-/* Phase 5.1 — choose a core for worker `id` according to the cpu_pin
- * config, then bind the current thread to it.  Returns the chosen core,
- * or -1 if pinning is disabled / not applicable. */
+/* Single-threaded: no CPU pinning needed */
 static int worker_pin_self(int id) {
-    if (kvs_config.cpu_pin_mode == 0) return -1;            /* off */
-
-    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
-    if (nproc < 1) return -1;
-
-    int core;
-    if (kvs_config.cpu_pin_mode == 2 && kvs_config.cpu_pin_count > 0) {
-        /* Manual list: worker i -> cpu_pin_list[i % count]. */
-        core = kvs_config.cpu_pin_list[id % kvs_config.cpu_pin_count];
-    } else {
-        /* Auto: leave core 0 for softirq + bench client.  Worker i lands
-         * on core ((i + 1) mod nproc).  With threads=nproc-1 this packs
-         * workers onto cores 1..nproc-1 exactly. */
-        core = (int)((id + 1) % nproc);
-    }
-
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(core, &set);
-    int rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
-    if (rc != 0) {
-        fprintf(stderr, "[proactor] worker %d: pthread_setaffinity_np(core=%d) failed: %s\n",
-                id, core, strerror(rc));
-        return -1;
-    }
-    return core;
+    (void)id;
+    return -1;  /* pinning disabled */
 }
 
 static void *worker_loop(void *arg) {
     proactor_worker_t *w = (proactor_worker_t *)arg;
-    tls_worker = w;
+    g_worker = w;
 
     /* Bind to a CPU core BEFORE setting up the io_uring ring so the ring
      * is associated with this core's NUMA / cache domain from creation. */
@@ -733,14 +569,28 @@ static void *worker_loop(void *arg) {
 
                     size_t need = c->r_off + rb->len + (size_t)res;
                     if (need > rb->cap) {
-                        /* Optimized growth strategy: for large jumps (pipeline bursts),
-                         * allocate 1.25x the needed size to reduce realloc calls.
-                         * For smaller growth, use 2x doubling. */
+                        /* Optimized growth: for large jumps (pipeline bursts),
+                         * allocate 1.5x to reduce realloc frequency while limiting waste.
+                         * For normal growth, use 2x doubling. Cap at 16MB to prevent DoS. */
                         size_t new_cap = rb->cap;
-                        if (need > rb->cap * 2)
-                            new_cap = need + (need >> 2);  /* need * 1.25 */
-                        else
+                        const size_t MAX_BUF_CAP = 16 * 1024 * 1024;  /* 16MB limit */
+
+                        if (need > MAX_BUF_CAP) {
+                            buf_ring_recycle(bid);
+                            conn_release(fd);
+                            goto event_read_done;
+                        }
+
+                        if (need > rb->cap * 2) {
+                            /* Large jump: use 1.5x growth */
+                            new_cap = need + (need >> 1);
+                        } else {
+                            /* Normal growth: 2x doubling */
+                            new_cap = rb->cap * 2;
                             while (new_cap < need) new_cap *= 2;
+                        }
+
+                        if (new_cap > MAX_BUF_CAP) new_cap = MAX_BUF_CAP;
 
                         char *new_buf = realloc(rb->buf, new_cap);
                         if (!new_buf) {
@@ -817,14 +667,7 @@ static void *worker_loop(void *arg) {
                 }
 event_read_done: ;
             }
-            else if (result.event == EVENT_WAKE) {
-                /* eventfd became readable: another worker enqueued a wake
-                 * (or someone kicked worker 0 to recompute timeouts).
-                 * Re-arm the read first, then drain the queue.  This
-                 * keeps the per-iteration hot path lock-free. */
-                proactor_drain_wakes(w);
-                set_event_wake_read(ring, w->wake_evfd);
-            }
+            /* Single-threaded: no EVENT_WAKE handling needed */
             else if (result.event == EVENT_WRITE) {
                 if (fd < 0 || fd >= conn_pool_size) continue;
                 struct conn *c = &conn_pool[fd];
@@ -907,47 +750,28 @@ int proactor_start(unsigned short port, msg_handler handler) {
            conn_pool_size,
            (sizeof(struct conn) * (size_t)conn_pool_size) / (1024 * 1024));
 
-    g_n_workers = kvs_config.threads > 0 ? kvs_config.threads : 1;
-    g_workers = (proactor_worker_t *)calloc((size_t)g_n_workers,
-                                            sizeof(proactor_worker_t));
-    if (!g_workers) { free(conn_pool); return -1; }
+    /* Single-threaded mode: only one worker */
+    g_worker = (proactor_worker_t *)calloc(1, sizeof(proactor_worker_t));
+    if (!g_worker) { free(conn_pool); return -1; }
 
-    int reuseport = (g_n_workers > 1);
-    for (int i = 0; i < g_n_workers; i++) {
-        g_workers[i].id = i;
-        g_workers[i].listen_fd = -1;
-        if (worker_listen(&g_workers[i], port, reuseport) < 0) {
-            for (int j = 0; j < i; j++)
-                if (g_workers[j].listen_fd >= 0) close(g_workers[j].listen_fd);
-            free(g_workers); free(conn_pool);
-            return -1;
-        }
+    g_worker->id = 0;
+    g_worker->listen_fd = -1;
+    if (worker_listen(g_worker, port, 0) < 0) {
+        free(g_worker); free(conn_pool);
+        return -1;
     }
-    if (g_n_workers > 1)
-        printf("[proactor] %d workers, SO_REUSEPORT, sharded dict (32 shards)\n",
-               g_n_workers);
 
-    /* Phase 4B.2: block subsystem is now MT-safe; arm the notify_cb
-     * unconditionally.  Cross-worker wakeups route through the per-
-     * worker wake queue + eventfd inside proactor_block_notify(). */
+    printf("[proactor] single-threaded mode, single global dict\n");
+
+    /* Single-threaded: simplified notify callback */
     block_set_notify_cb(proactor_block_notify);
 
-    /* Worker 0 runs on main thread; spawn pthreads for the rest. */
-    for (int i = 1; i < g_n_workers; i++) {
-        if (pthread_create(&g_workers[i].tid, NULL, worker_loop, &g_workers[i])) {
-            perror("[proactor] pthread_create");
-            g_kvs_stop = 1;
-            break;
-        }
-    }
-    worker_loop(&g_workers[0]);
+    /* Run single worker on main thread */
+    worker_loop(g_worker);
 
     /* Tear down */
-    for (int i = 1; i < g_n_workers; i++) {
-        pthread_join(g_workers[i].tid, NULL);
-    }
-    for (int i = 0; i < g_n_workers; i++) worker_teardown(&g_workers[i]);
-    free(g_workers); g_workers = NULL;
+    worker_teardown(g_worker);
+    free(g_worker); g_worker = NULL;
     free(conn_pool); conn_pool = NULL;
     return 0;
 }

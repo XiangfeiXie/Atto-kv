@@ -413,7 +413,7 @@ static void child_serialize_loop(shm_ring_t *shm,
      * [magic:4][version:4][db_num:4][key_count:4][base_seq:8] = 24 bytes */
     {
         int magic = 0x524442, version = 2, db_num = 0;
-        int key_count = (int)kv_shards_count();
+        int key_count = (int)kv_store_count();
         char *p = s->data;
         memcpy(p, &magic,     4); p += 4;
         memcpy(p, &version,   4); p += 4;
@@ -425,10 +425,10 @@ static void child_serialize_loop(shm_ring_t *shm,
     /* Write pointer: entries start after the 24-byte header */
     char *wp = s->data + 24;
 
-    kv_shards_iter_t it_s; kv_shards_iter_init_nolock(&it_s);
+    kv_store_iter_t it_s; kv_store_iter_init(&it_s);
 
     kv_entry_t *e;
-    while ((e = kv_shards_iter_next(&it_s)) != NULL) {
+    while ((e = kv_store_iter_next(&it_s)) != NULL) {
         /* Try to serialize into remaining slot space */
         size_t room = (size_t)(s->data + CHUNK_DATA_SIZE - wp);
         int n = serialize_entry_inline(wp, room, e);
@@ -471,7 +471,7 @@ static void child_serialize_loop(shm_ring_t *shm,
         eventfd_write(child_evt_fd, 1);
     }
 
-    kv_shards_iter_free(&it_s);
+    kv_store_iter_free(&it_s);
 
 send_eof:
     {
@@ -739,15 +739,15 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
 
     /* 7) fork() */
     fullsync_sigchld_install();
-    kv_shards_lock_all_for_snapshot();
+    kv_store_lock_for_snapshot();
     child_pid = fork();
 
     if (child_pid < 0) {
         fprintf(stderr, "[RDMA-REPL] fork() failed: %s\n", strerror(errno));
-        kv_shards_unlock_all_snapshot();
+        kv_store_unlock_snapshot();
         close(child_evt_fd);
         close(parent_evt_fd);
-        
+
         goto fail;
     }
 
@@ -766,7 +766,7 @@ static int rdma_master_serve_one(struct fid_fabric *fabric,
         close(parent_evt_fd);
         _exit(0);
     }
-    kv_shards_unlock_all_snapshot();
+    kv_store_unlock_snapshot();
 
     /* ============================================================
      * PARENT: spawn worker thread to handle RDMA send pipeline

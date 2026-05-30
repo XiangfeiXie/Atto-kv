@@ -304,7 +304,7 @@ static int parse_int64(const char *p, int len, int64_t *out) {
  * Engine access
  * ===================================================================== */
 
-/* g_dict replaced by sharded g_shards (kv_dict.h) */
+/* Hash type implementation */
 extern long long get_time_now(void);
 
 static int check_expiry(kv_entry_t *e, const char *key, uint32_t key_len, uint64_t hash) {

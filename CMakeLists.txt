@@ -59,21 +59,6 @@ set(CORE_SRCS
     src/core/block.c
 )
 
-set(VECTOR_SRCS
-    src/vector/vector_store.c
-    src/vector/vector_math.c
-)
-
-set(STORAGE_SRCS
-    src/storage/vec_engine.c
-    src/storage/vec_collection.c
-    src/storage/vec_segment.c
-)
-
-set(INDEX_SRCS
-    src/index/flat_index.c
-)
-
 set(ENGINE_SRCS
     src/engine/kv_dict.c
 )
@@ -103,18 +88,16 @@ set(REPL_SRCS
     src/repl/repl_incr.c
 )
 
+# BPF sources disabled for single-threaded build
 set(BPF_SRCS
-    src/bpf/xdp_manager.c
-    src/bpf/sockmap_manager.c
-    src/bpf/bpf_pin.c
+    # src/bpf/xdp_manager.c
+    # src/bpf/sockmap_manager.c
+    # src/bpf/bpf_pin.c
 )
 
 set(KVSTORE_SRCS
     ${UTIL_SRCS}
     ${CORE_SRCS}
-    ${VECTOR_SRCS}
-    ${STORAGE_SRCS}
-    ${INDEX_SRCS}
     ${ENGINE_SRCS}
     ${TYPE_SRCS}
     ${NET_SRCS}
@@ -139,25 +122,9 @@ add_custom_command(
     COMMENT "Compiling XDP BPF kernel program"
 )
 
-add_custom_target(xdp_kern DEPENDS ${XDP_KERN_OBJ})
-
-# ── Compile sockmap kernel BPF program ────────────────────────────────
-set(SOCKMAP_KERN_SRC  ${CMAKE_SOURCE_DIR}/src/bpf/sockmap_kvs.kern.c)
-set(SOCKMAP_KERN_OBJ  ${CMAKE_BINARY_DIR}/sockmap_kvs.kern.o)
-
-add_custom_command(
-    OUTPUT  ${SOCKMAP_KERN_OBJ}
-    COMMAND clang -O2 -g -target bpf
-            -I${CMAKE_SOURCE_DIR}/src/bpf
-            -I/usr/include
-            -I/usr/include/x86_64-linux-gnu
-            -c ${SOCKMAP_KERN_SRC}
-            -o ${SOCKMAP_KERN_OBJ}
-    DEPENDS ${SOCKMAP_KERN_SRC} ${CMAKE_SOURCE_DIR}/src/bpf/sockmap_kvs.h
-    COMMENT "Compiling sockmap BPF kernel program"
-)
-
-add_custom_target(sockmap_kern DEPENDS ${SOCKMAP_KERN_OBJ})
+# ── BPF kernel programs disabled for single-threaded build ────────────
+# add_custom_target(xdp_kern DEPENDS ${XDP_KERN_OBJ})
+# add_custom_target(sockmap_kern DEPENDS ${SOCKMAP_KERN_OBJ})
 
 # ── Compile repl-agent BPF programs ───────────────────────────────────
 # repl_observe.bpf.o — socket-layer observation for replication
@@ -208,9 +175,6 @@ target_include_directories(kvstore PRIVATE
     src/core
     src/engine
     src/type
-    src/vector
-    src/storage
-    src/index
     src/net
     src/persist
     src/repl
@@ -239,7 +203,7 @@ if(ENABLE_AF_XDP)
     target_include_directories(kvstore PRIVATE ${LIBXDP_INCLUDE_DIRS})
 endif()
 
-add_dependencies(kvstore ntyco xdp_kern sockmap_kern repl_filter_kern)
+add_dependencies(kvstore ntyco repl_filter_kern)
 
 # ── Set capabilities for eBPF (requires libcap) ───────────────────────
 # This allows kvstore to load eBPF programs without running as root

@@ -109,14 +109,11 @@ KVItem* create_kvitem(char *value_str, char *expire_str);
 /* =============================================================================
  * Part 1. AOF — unified with WAL replication
  *
- * The legacy AOF async writer (ring buffer + io_uring worker) has been
- * retired.  Every write command flows through the current replication
- * journal path, which fans out to XDP/AF_XDP via repl_stream.
- * feeds the unified journal ring.  The consumer thread serialises records
- * to wal/incr.wal (binary WAL + CRC32) for crash recovery.
+ * Write commands flow through the journal path and are persisted to
+ * build/incr.wal (binary WAL + CRC32) for crash recovery.
  *
- * aof_async_append  →  current journal path      (journal the command)
- * aof_reload_mmap   →  reads wal/incr.wal        (crash recovery)
+ * aof_async_append  →  journal path (no-op, handled by wal_persist)
+ * aof_reload_mmap   →  reads incr.wal for crash recovery
  * ============================================================================= */
 
 int aof_async_init(void) {
@@ -265,35 +262,24 @@ static void rdb_serialize_cb_dynbuf(kv_entry_t *e, void *priv) {
     serialize_entry_to_buf((DynBuf *)priv, e);
 }
 
-/* Set to 1 inside the BGSAVE fork child so shards_scan() switches to
- * the no-lock iterator.  Crucial for MT mode: at fork time some worker
- * may have held a shard wrlock; the child inherits the locked state
- * with no thread to release it, so the regular rdlock-walking iterator
- * would deadlock. */
+/* Set to 1 inside the BGSAVE fork child (currently unused in single-dict mode) */
 static int g_rdb_in_fork_child = 0;
 
-/* Iterate every entry across all shards.  In the BGSAVE fork child the
- * caller has already serialised access via kv_shards_lock_all_for_snapshot
- * before fork; the child sees a frozen COW image and walks it without
- * touching any rwlocks.  In the parent (sync save / replication
- * full-sync) the iterator takes a per-shard rdlock as it goes. */
-static void shards_scan(void (*cb)(kv_entry_t *e, void *priv), void *priv) {
-    kv_shards_iter_t it;
-    if (g_rdb_in_fork_child)
-        kv_shards_iter_init_nolock(&it);
-    else
-        kv_shards_iter_init(&it);
+/* Iterate every entry in the global dict. */
+static void store_scan(void (*cb)(kv_entry_t *e, void *priv), void *priv) {
+    kv_store_iter_t it;
+    kv_store_iter_init(&it);
     kv_entry_t *e;
-    while ((e = kv_shards_iter_next(&it)) != NULL)
+    while ((e = kv_store_iter_next(&it)) != NULL)
         cb(e, priv);
-    kv_shards_iter_free(&it);
+    kv_store_iter_free(&it);
 }
 
 void rdb_serialize_to_buf(DynBuf *out) {
     int magic = 0x524442;
     int version = 2;
     int db_num = 0;
-    int key_count = (int)kv_shards_count();
+    int key_count = (int)kv_store_count();
 
     /* Reserve: header (16) + per-entry estimate (key + value + overhead ~= 256) */
     dynbuf_reserve(out, 16 + key_count * 256);
@@ -303,7 +289,7 @@ void rdb_serialize_to_buf(DynBuf *out) {
     dynbuf_append(out, (const char *)&db_num,    sizeof(int));
     dynbuf_append(out, (const char *)&key_count, sizeof(int));
 
-    shards_scan(rdb_serialize_cb_dynbuf, out);
+    store_scan(rdb_serialize_cb_dynbuf, out);
 }
 
 /* 子进程：使用 io_uring 将整个 buffer 分块写入，最后 fsync */
@@ -422,7 +408,7 @@ void rdb_save_sync(void) {
     int magic = 0x524442;
     int version = 2;
     int db_num = 0;
-    int key_count = (int)kv_shards_count();
+    int key_count = (int)kv_store_count();
 
     /* 预分配：header (16 bytes) + 每个 key 平均 256 bytes */
     rdb_buf_reserve(&b, 16 + (size_t)key_count * 256);
@@ -432,7 +418,7 @@ void rdb_save_sync(void) {
     rdb_buf_put(&b, &db_num, sizeof(int));
     rdb_buf_put(&b, &key_count, sizeof(int));
 
-    shards_scan(rdb_save_callback_buf, &b);
+    store_scan(rdb_save_callback_buf, &b);
 
     /* 2) 写临时文件 + rename，保证原子性 */
     /* persist_path() 返回同一 static buffer，必须先拷贝再调用第二次，
@@ -592,107 +578,36 @@ void rdb_save_async_uring(void) {
         return;
     }
 
-    /* Phase 4B.4: take all shard wrlocks before fork so the child
-     * inherits a point-in-time consistent snapshot.  Workers stall
-     * here for the duration of: 32 wrlock acquisitions + fork() +
-     * 32 wrlock releases (a few hundred microseconds typically). */
+    /* Take snapshot lock before fork (no-op in single-dict mode) */
     long long t_lock = get_time_now_real();
-    kv_shards_lock_all_for_snapshot();
+    kv_store_lock_for_snapshot();
     long long t_locked = get_time_now_real();
 
     pid_t pid = fork();
     if (pid < 0) {
         fprintf(stderr, "[RDB] fork failed (%s), falling back to sync save\n",
                 strerror(errno));
-        kv_shards_unlock_all_snapshot();
-        /* Fallback runs in the parent without the snapshot guarantee;
-         * acceptable because fork-fail is rare and we still produce a
-         * per-shard-consistent dump. */
+        kv_store_unlock_snapshot();
+        /* Fallback runs in the parent; acceptable because fork-fail is rare. */
         rdb_save_sync();
         return;
     }
     if (pid == 0) {
-        /* Child: locks are "held" in our COW memory image, but no
-         * thread will ever release them.  Switch shards_scan to the
-         * no-lock iterator and serialise. */
+        /* Child: serialize and write */
         g_rdb_in_fork_child = 1;
         rdb_save_sync();
         fflush(stdout);
         fflush(stderr);
         _exit(0);
     }
-    /* Parent: release the snapshot locks immediately so workers resume.
-     * The child continues against its frozen COW image. */
-    kv_shards_unlock_all_snapshot();
+    /* Parent: release the snapshot lock immediately. */
+    kv_store_unlock_snapshot();
     long long t_done = get_time_now_real();
     g_rdb_child_pid = pid;
     printf("[RDB] BGSAVE started, child pid=%d (snapshot stall: %lld ms acquire, %lld ms total)\n",
            (int)pid, t_locked - t_lock, t_done - t_lock);
 }
 
-/* =============================================================================
- * Part 2b. AOF rewrite — Phase 7.1.0 stub.
- *
- * Status: NOT YET IMPLEMENTED.  The BGREWRITEAOF command currently
- * returns -ERR, and aof_rewrite_bg() returns -1.  AOF on this dev
- * box never grows beyond ~10 MB during normal smoke / dev_quick
- * runs, so rewrite is a no-op feature for current workloads.  When
- * a real workload pushes AOF past ~100 MB the implementation
- * outlined below should be slotted in — every piece of infrastructure
- * already exists in this file, so the wiring is mostly mechanical.
- *
- * ─── Design when we DO implement it (V2 plan) ───
- *
- * 1. Trigger:
- *    aof_rewrite_bg() is called by BGREWRITEAOF or by an
- *    auto-trigger (e.g. AOF doubled in size since last rewrite).
- *    Reject if g_aof_rewrite_pid != 0 (already running, like the
- *    existing g_rdb_child_pid guard does for BGSAVE).
- *
- * 2. Snapshot:
- *    Mirror rdb_save_async_uring exactly:
- *      kv_shards_lock_all_for_snapshot();   (Phase 4B.4)
- *      pid_t pid = fork();                  (parent unlocks immediately)
- *    Child gets a frozen COW image just like RDB; safe to walk
- *    via kv_shards_iter_init_nolock + g_rdb_in_fork_child=1.  We
- *    can reuse the same fork-child flag because BGSAVE and
- *    BGREWRITEAOF will refuse to overlap (one child slot).
- *
- * 3. Child output:
- *    For each entry, emit ONE canonical RESP command that recreates
- *    it (SET / HSET / RPUSH / SADD / ZADD plus EXPIREAT if TTL set).
- *    Use io_uring just like rdb_save_async_uring does:
- *    chunk-write to build/appendonly.aof.tmp, then fsync, then exit.
- *
- * 4. The rewrite buffer (the actually hard part):
- *    Between the fork and the child's exit, the parent keeps
- *    serving writes that mutate the live dict.  Those writes
- *    are NOT in the child's snapshot.  We tee them into an
- *    in-memory "rewrite buffer" (DynBuf protected by an existing
- *    producer mu, cf. wal_repl.c's g_journal_producer_mu).  Hook:
- *    aof_async_append() checks g_aof_rewrite_in_progress and, if
- *    set, also pushes a copy into the rewrite buffer.
- *
- * 5. Finalize (on SIGCHLD for the rewrite child):
- *    SIGCHLD handler is NOT a safe place for fsync/rename.  Set a
- *    flag g_aof_rewrite_done, polled by the proactor worker 0 tick:
- *      a) open appendonly.aof.tmp O_APPEND
- *      b) write out the rewrite buffer (under producer mu)
- *      c) fsync, close
- *      d) atomic rename appendonly.aof.tmp → appendonly.aof
- *      e) clear g_aof_rewrite_in_progress, free rewrite buffer
- *
- * 6. Failure modes:
- *    - fork fails: free buffer, fall through, return -1.
- *    - child crashes: SIGCHLD reaper sees nonzero exit, drops
- *      buffer, leaves old AOF in place.
- *    - rename fails (disk full): same — old AOF preserved.
- *
- * The whole thing is ~200 lines mirroring rdb_save_async_uring's
- * shape.  Do NOT inline the rewrite buffer copy on the dispatcher
- * hot path; aof_async_append already holds the producer mu, so the
- * extra dynbuf_cat is essentially free there.
- * ============================================================================= */
 
 int aof_rewrite_bg(void) {
     static int installed = 0;
@@ -729,12 +644,12 @@ int aof_rewrite_bg(void) {
     pthread_mutex_unlock(&g_aof_rewrite_mu);
 
     /* Take snapshot locks before fork */
-    kv_shards_lock_all_for_snapshot();
+    kv_store_lock_for_snapshot();
 
     pid_t pid = fork();
     if (pid < 0) {
         fprintf(stderr, "[AOF] fork failed (%s)\n", strerror(errno));
-        kv_shards_unlock_all_snapshot();
+        kv_store_unlock_snapshot();
         pthread_mutex_lock(&g_aof_rewrite_mu);
         g_aof_rewrite_in_progress = 0;
         pthread_mutex_unlock(&g_aof_rewrite_mu);
@@ -747,7 +662,7 @@ int aof_rewrite_bg(void) {
 
         /* Serialize all entries to RESP commands */
         rdb_buf_t b = {0};
-        shards_scan(aof_rewrite_entry, &b);
+        store_scan(aof_rewrite_entry, &b);
 
         /* Write to temp file using io_uring */
         const char *tmp_path = persist_path("build/appendonly.aof.tmp");
@@ -769,7 +684,7 @@ int aof_rewrite_bg(void) {
     }
 
     /* Parent: release locks immediately */
-    kv_shards_unlock_all_snapshot();
+    kv_store_unlock_snapshot();
     g_aof_rewrite_child_pid = pid;
     printf("[AOF] BGREWRITEAOF started, child pid=%d\n", (int)pid);
 
@@ -911,12 +826,12 @@ int rdb_load_stream_append(const char *buf, size_t len) {
 }
 
 void rdb_rebuild_all_encodings(void) {
-    kv_shards_iter_t it;
-    kv_shards_iter_init(&it);
+    kv_store_iter_t it;
+    kv_store_iter_init(&it);
     kv_entry_t *e;
-    while ((e = kv_shards_iter_next(&it)) != NULL)
+    while ((e = kv_store_iter_next(&it)) != NULL)
         hash_rebuild_encoding(e);
-    kv_shards_iter_free(&it);
+    kv_store_iter_free(&it);
 }
 
 /* In-memory RDB loader: parses the same binary format as rdb_load_mmap()
@@ -930,7 +845,7 @@ int rdb_load_from_buf(const char *buf, size_t len) {
     if (key_count < 0) return -1;
 
     int loaded = rdb_load_stream_append(buf + 16, len - 16);
-    if (loaded < 0) { kv_shards_clear(); return -1; }
+    if (loaded < 0) { kv_store_clear(); return -1; }
 
     rdb_rebuild_all_encodings();
 

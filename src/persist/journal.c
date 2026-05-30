@@ -16,7 +16,7 @@ typedef struct {
 
 static journal_backlog_slot_t g_backlog[KVS_JOURNAL_BACKLOG_CAP];
 static pthread_mutex_t g_journal_mu = PTHREAD_MUTEX_INITIALIZER;
-static _Atomic uint64_t g_next_seq = 0;
+_Atomic uint64_t g_next_seq = 0;  /* Exposed for fast-path in kvstore.c */
 static int g_journal_ready = 0;
 
 int kvs_journal_init(void)

@@ -15,7 +15,7 @@
 
 /* ── WAL batch writer configuration ── */
 #define WAL_BATCH_SIZE 8192         /* max records per buffer */
-#define WAL_FLUSH_INTERVAL_MS 10    /* flush every 10ms if not full */
+#define WAL_FLUSH_INTERVAL_MS 1     /* flush every 1ms (reduced from 10ms) */
 #define WAL_INLINE_PAYLOAD 128      /* payloads <= this are stored inline */
 #define WAL_URING_DEPTH 256         /* io_uring queue depth */
 #define WAL_URING_CHUNK_SIZE (1024 * 1024)  /* 1MB per SQE */
@@ -116,7 +116,14 @@ static void wal_fsync_if_needed(int force)
     }
 }
 
-/* io_uring-based flush: batch submit write SQEs, then reap CQEs */
+/* io_uring-based flush: batch submit write SQEs, then reap CQEs
+ *
+ * Fix: Use a temporary buffer to flatten iovec arrays before writing.
+ * This avoids the "Invalid argument" error that occurs when using
+ * io_uring writev with offset=-1 (O_APPEND mode) and large iovec arrays.
+ * The kernel has limits on iovec count (typically UIO_MAXIOV=1024), and
+ * combining writev with O_APPEND via io_uring can trigger edge cases.
+ */
 static int wal_flush_records(wal_pending_t *records, int count)
 {
     if (count == 0) return 0;
@@ -146,7 +153,13 @@ static int wal_flush_records(wal_pending_t *records, int count)
         iov_idx++;
     }
 
-    /* Step 2: Submit write operations via io_uring in chunks */
+    /* Step 2: Flatten iovecs into a contiguous buffer and submit via io_uring.
+     * This avoids kernel limitations with writev + O_APPEND + io_uring.
+     * We allocate a temporary buffer, copy all iovec data into it, then
+     * submit a single write operation per chunk. */
+    static __thread char *write_buf = NULL;
+    static __thread size_t write_buf_cap = 0;
+
     int inflight = 0;
     int iov_pos = 0;
 
@@ -171,8 +184,27 @@ static int wal_flush_records(wal_pending_t *records, int count)
                 chunk_bytes = g_wal_iovs[iov_pos].iov_len;
             }
 
-            /* Use offset -1 for append mode (O_APPEND) */
-            io_uring_prep_writev(sqe, g_wal_fd, &g_wal_iovs[iov_pos], chunk_iovs, -1);
+            /* Ensure write buffer is large enough */
+            if (chunk_bytes > write_buf_cap) {
+                size_t new_cap = chunk_bytes + (chunk_bytes >> 2);  /* +25% headroom */
+                char *new_buf = (char *)realloc(write_buf, new_cap);
+                if (!new_buf) {
+                    fprintf(stderr, "[WAL-PERSIST] failed to allocate write buffer (%zu bytes)\n", new_cap);
+                    return -1;
+                }
+                write_buf = new_buf;
+                write_buf_cap = new_cap;
+            }
+
+            /* Flatten iovecs into contiguous buffer */
+            char *p = write_buf;
+            for (int j = 0; j < chunk_iovs; j++) {
+                memcpy(p, g_wal_iovs[iov_pos + j].iov_base, g_wal_iovs[iov_pos + j].iov_len);
+                p += g_wal_iovs[iov_pos + j].iov_len;
+            }
+
+            /* Submit single write operation with flattened buffer */
+            io_uring_prep_write(sqe, g_wal_fd, write_buf, chunk_bytes, -1);
             sqe->user_data = chunk_bytes;  /* Store bytes for verification */
 
             iov_pos += chunk_iovs;

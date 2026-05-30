@@ -44,6 +44,9 @@ typedef struct {
     char *payload;
 } kvs_journal_record_t;
 
+/* Expose g_next_seq for fast-path optimization in kvstore.c */
+extern _Atomic uint64_t g_next_seq;
+
 int      kvs_journal_init(void);
 void     kvs_journal_shutdown(void);
 int      kvs_journal_append(uint16_t kind, uint16_t flags,

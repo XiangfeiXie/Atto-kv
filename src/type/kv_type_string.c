@@ -29,7 +29,6 @@ S(REP_WRONGTYPE, "-WRONGTYPE Operation against a key holding the wrong kind of v
  * Key is passed as (ptr, len), no null-termination required.
  * ===================================================================== */
 
-/* g_dict replaced by sharded g_shards (kv_dict.h) */
 extern long long get_time_now(void);
 
 /* =====================================================================
@@ -63,10 +62,10 @@ static int try_parse_int64(const char *p, int len, int64_t *out) {
 
 /* Phase 6.1 — engine_set with pre-found entry + pre-computed hash.
  *
- * The dispatcher (kvs_dispatch) already takes the shard wrlock, computes
- * the key hash, calls dict_find once, and clears expired entries.  When
- * string_cmd calls this, `existing` is either NULL or a definitely-non-
- * expired STRING entry (other types are rejected upstream by WRONGTYPE).
+ * The dispatcher (kvs_dispatch) handles locking, computes the key hash,
+ * calls dict_find once, and clears expired entries.  When string_cmd calls
+ * this, `existing` is either NULL or a definitely-non-expired STRING entry
+ * (other types are rejected upstream by WRONGTYPE).
  *
  * Saves: 1 × kv_hash, 1 × dict_find, 1 × expire check per SET-family cmd.
  *

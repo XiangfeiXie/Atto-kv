@@ -58,7 +58,6 @@ KVItem* create_kvitem_len(const char *value, int vlen);
 void    free_kvitem(KVItem *item);
 
 /* ── Global dict ── */
-/* g_dict replaced by sharded g_shards (kv_dict.h) */
 extern int g_in_reload;   /* 1 during AOF/RDB reload — suppress AOF append + eBPF */
 
 /* ── INFO command counters ──
@@ -87,18 +86,15 @@ extern long long        g_kvs_start_time_ms;        /* set in main(); never muta
  * (AOF/WAL reload) deliberately bypass the histogram to avoid skew.
  * INFO Stats exposes per-bucket counts plus derived p50/p99/p999.
  *
- * SHARDED to eliminate false sharing: each writer hashes its tid into
- * KVS_LAT_SLOTS independent cacheline-aligned slots.  An earlier single-
- * shared design caused catastrophic cacheline ping-pong (LOCK XADD on
- * ~2 cachelines from N workers → ~1 µs/op of pure contention overhead,
- * collapsing throughput).  With sharding each worker writes its own
- * cacheline; the only writer-writer conflict is the rare hash collision.
+ * Latency counters are distributed across KVS_LAT_SLOTS cacheline-aligned
+ * slots to reduce contention. Each slot is independently updated and the
+ * INFO command aggregates across all slots.
  *
  * Cost: 2× clock_gettime(CLOCK_MONOTONIC) on the wire path = ~30 ns/op
  * (vDSO) + 3 uncontended atomic_fetch_add ≈ 10 ns.  At 491 k QPS that's
  * ≤2 % CPU.  Reader (INFO Stats) sums all slots — slow but rare. */
 #define KVS_LAT_BUCKETS 16
-#define KVS_LAT_SLOTS   8         /* >= max worker count for this project */
+#define KVS_LAT_SLOTS   8
 
 struct kvs_lat_slot {
     _Atomic uint64_t hist[KVS_LAT_BUCKETS];     /* 128 B */

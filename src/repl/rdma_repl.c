@@ -113,8 +113,15 @@ static struct fi_info *rdma_build_hints(void) {
 
 static int rdma_wait_cq(struct fid_cq *cq) {
     struct fi_cq_data_entry ce;
+    extern volatile sig_atomic_t g_kvs_stop;
     for (;;) {
-        ssize_t r = fi_cq_sread(cq, &ce, 1, NULL, -1);
+        /* Check for shutdown signal */
+        if (g_kvs_stop) {
+            fprintf(stderr, "[RDMA-REPL] CQ wait interrupted by signal\n");
+            return -1;
+        }
+        /* Use 1 second timeout instead of infinite wait */
+        ssize_t r = fi_cq_sread(cq, &ce, 1, NULL, 1000);
         if (r == 1) return 0;
         if (r == -FI_EAGAIN) continue;
         if (r == -FI_EAVAIL) {
@@ -124,22 +131,32 @@ static int rdma_wait_cq(struct fid_cq *cq) {
                     fi_cq_strerror(cq, ee.prov_errno, ee.err_data, NULL, 0));
             return -1;
         }
-        fprintf(stderr, "[RDMA-REPL] fi_cq_sread: %s\n", fi_strerror(-r));
-        return -1;
+        if (r != -FI_EAGAIN) {
+            fprintf(stderr, "[RDMA-REPL] fi_cq_sread: %s\n", fi_strerror(-r));
+            return -1;
+        }
     }
 }
 
 static int rdma_wait_eq(struct fid_eq *eq, uint32_t *event,
                         struct fi_eq_cm_entry *entry, size_t entry_size) {
-    ssize_t r = fi_eq_sread(eq, event, entry, entry_size, -1, 0);
-    if (r < 0) {
+    extern volatile sig_atomic_t g_kvs_stop;
+    for (;;) {
+        /* Check for shutdown signal */
+        if (g_kvs_stop) {
+            fprintf(stderr, "[RDMA-REPL] EQ wait interrupted by signal\n");
+            return -1;
+        }
+        /* Use 1 second timeout instead of infinite wait */
+        ssize_t r = fi_eq_sread(eq, event, entry, entry_size, 1000, 0);
+        if (r >= 0) return 0;
+        if (r == -FI_EAGAIN) continue;
         struct fi_eq_err_entry ee; memset(&ee, 0, sizeof(ee));
         fi_eq_readerr(eq, &ee, 0);
         fprintf(stderr, "[RDMA-REPL] EQ error: %s\n",
                 fi_eq_strerror(eq, ee.prov_errno, ee.err_data, NULL, 0));
         return -1;
     }
-    return 0;
 }
 
 /* ========================================================== */
@@ -877,12 +894,20 @@ static void *rdma_master_thread(void *arg) {
     printf("[RDMA-REPL] master: listening for slaves\n");
 
     /* Main accept loop */
+    extern volatile sig_atomic_t g_kvs_stop;
     for (;;) {
+        /* Check for shutdown signal */
+        if (g_kvs_stop) {
+            printf("[RDMA-REPL] master: shutting down\n");
+            break;
+        }
         uint8_t buf[sizeof(struct fi_eq_cm_entry) + 256];
         struct fi_eq_cm_entry *entry = (struct fi_eq_cm_entry *)buf;
         uint32_t event;
-        ssize_t r = fi_eq_sread(eq, &event, entry, sizeof(buf), -1, 0);
+        /* Use 1 second timeout instead of infinite wait */
+        ssize_t r = fi_eq_sread(eq, &event, entry, sizeof(buf), 1000, 0);
         if (r < 0) {
+            if (r == -FI_EAGAIN) continue;
             if (r == -FI_EAVAIL) {
                 struct fi_eq_err_entry ee; memset(&ee, 0, sizeof(ee));
                 fi_eq_readerr(eq, &ee, 0);
@@ -1056,10 +1081,18 @@ int rdma_repl_slave_run(void) {
     fflush(stdout);
 
     /* Streaming recv loop */
+    extern volatile sig_atomic_t g_kvs_stop;
     while (!eof_received && pending > 0) {
+        /* Check for shutdown signal */
+        if (g_kvs_stop) {
+            printf("[RDMA-REPL] slave: interrupted by signal\n");
+            break;
+        }
         struct fi_cq_data_entry ce;
-        ssize_t r = fi_cq_sread(cq, &ce, 1, NULL, -1);
+        /* Use 1 second timeout instead of infinite wait */
+        ssize_t r = fi_cq_sread(cq, &ce, 1, NULL, 1000);
         if (r < 0) {
+            if (r == -FI_EAGAIN) continue;
             if (r == -FI_EAVAIL) {
                 struct fi_cq_err_entry ee; memset(&ee, 0, sizeof(ee));
                 fi_cq_readerr(cq, &ee, 0);

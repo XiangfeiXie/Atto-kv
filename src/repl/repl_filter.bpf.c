@@ -197,6 +197,7 @@ int repl_filter_verdict(struct __sk_buff *skb) {
     if (!e)
         return SK_PASS;
 
+    e->sock_cookie = bpf_get_socket_cookie(skb);
     e->len = len;
     e->padding = 0;
 

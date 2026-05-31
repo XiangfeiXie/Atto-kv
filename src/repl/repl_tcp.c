@@ -1,15 +1,22 @@
-/* repl_tcp.c — TCP-based replication transport layer
+/* repl_tcp.c — TCP-based replication transport layer with RESP reassembly
  *
  * Master flow:
  *   1. Load eBPF filter (repl_filter.bpf.o) → captures write commands
- *   2. Poll ringbuf → send via TCP with length framing
- *   3. Accept slave connections on repl_port
+ *   2. Poll ringbuf → reassemble RESP commands in userspace
+ *   3. Send complete commands via TCP with length framing
+ *   4. Accept slave connections on repl_port
  *
  * Slave flow:
  *   1. Connect to master via TCP
- *   2. Receive length-framed commands
+ *   2. Receive length-framed commands (already complete)
  *   3. Write commands to local kvstore socket
  *   4. Auto-reconnect on disconnect
+ *
+ * RESP Reassembly:
+ *   - eBPF captures TCP segments (may be incomplete RESP commands)
+ *   - Userspace maintains per-connection reassembly buffers
+ *   - Only complete RESP commands are replicated
+ *   - Stale connections are cleaned up every 10 seconds
  */
 #define _GNU_SOURCE
 #include "repl_tcp.h"
@@ -31,11 +38,12 @@
 
 /* ── eBPF event structure (from repl_observe.h) ─────────────────────── */
 
-#define REPL_OBSERVE_MAX_DATA  512
+#define REPL_OBSERVE_MAX_DATA  4096
 #define REPL_OBSERVE_MAX_SOCKS 65536
 #define REPL_OBSERVE_RINGBUF_SZ (2 * 1024 * 1024)
 
 struct repl_observe_event {
+    uint64_t sock_cookie;
     uint32_t len;
     uint32_t padding;
     uint8_t  data[REPL_OBSERVE_MAX_DATA];
@@ -46,6 +54,27 @@ struct repl_observe_event {
 #define REPL_FRAME_HEADER   4
 #define REPL_MAX_FRAME_SIZE (64 * 1024)  /* 64KB max frame */
 #define RECONNECT_INTERVAL  3            /* seconds */
+
+/* ── RESP Protocol Reassembly ───────────────────────────────────────── */
+
+#define REASSEMBLY_BUF_SIZE  16384       /* 16KB reassembly buffer per connection */
+#define REASSEMBLY_TIMEOUT   30          /* 30 seconds timeout for stale connections */
+#define MAX_CONNECTIONS      1024        /* Max tracked connections */
+
+/* Reassembly context for each connection */
+struct reassembly_ctx {
+    uint64_t sock_cookie;
+    uint8_t  buf[REASSEMBLY_BUF_SIZE];
+    size_t   buf_len;
+    time_t   last_active;
+    struct reassembly_ctx *next;  /* For hash table chaining */
+};
+
+/* Hash table for connection tracking */
+static struct {
+    struct reassembly_ctx *table[MAX_CONNECTIONS];
+    pthread_mutex_t lock;
+} g_reassembly = {0};
 
 /* ── Global state ───────────────────────────────────────────────────── */
 
@@ -191,6 +220,137 @@ static int tcp_recv_exact(int fd, void *buf, size_t len)
     return 0;
 }
 
+/* ── RESP Protocol Parser ───────────────────────────────────────────── */
+
+/* Find complete RESP command in buffer
+ * Returns: length of complete command, or -1 if incomplete
+ */
+static int find_complete_resp_command(const uint8_t *data, size_t len)
+{
+    if (len < 4 || data[0] != '*')
+        return -1;
+
+    /* Parse array count: *N\r\n */
+    size_t i = 1;
+    int argc = 0;
+    while (i < len && data[i] >= '0' && data[i] <= '9') {
+        argc = argc * 10 + (data[i] - '0');
+        i++;
+    }
+    if (i + 1 >= len || data[i] != '\r' || data[i+1] != '\n')
+        return -1;
+    i += 2;
+
+    /* Parse each argument: $L\r\n<data>\r\n */
+    for (int arg = 0; arg < argc; arg++) {
+        if (i >= len || data[i] != '$')
+            return -1;
+        i++;
+
+        /* Parse argument length */
+        int arg_len = 0;
+        while (i < len && data[i] >= '0' && data[i] <= '9') {
+            arg_len = arg_len * 10 + (data[i] - '0');
+            i++;
+        }
+        if (i + 1 >= len || data[i] != '\r' || data[i+1] != '\n')
+            return -1;
+        i += 2;
+
+        /* Skip argument data + \r\n */
+        i += arg_len + 2;
+        if (i > len)
+            return -1;  /* Incomplete data */
+    }
+
+    return (int)i;  /* Complete command length */
+}
+
+/* ── Reassembly Context Management ──────────────────────────────────── */
+
+static inline uint32_t hash_cookie(uint64_t cookie)
+{
+    return (uint32_t)(cookie % MAX_CONNECTIONS);
+}
+
+static struct reassembly_ctx *get_or_create_ctx(uint64_t cookie)
+{
+    uint32_t hash = hash_cookie(cookie);
+
+    pthread_mutex_lock(&g_reassembly.lock);
+
+    /* Search for existing context */
+    struct reassembly_ctx *ctx = g_reassembly.table[hash];
+    while (ctx) {
+        if (ctx->sock_cookie == cookie) {
+            pthread_mutex_unlock(&g_reassembly.lock);
+            return ctx;
+        }
+        ctx = ctx->next;
+    }
+
+    /* Create new context */
+    ctx = (struct reassembly_ctx *)calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        pthread_mutex_unlock(&g_reassembly.lock);
+        return NULL;
+    }
+
+    ctx->sock_cookie = cookie;
+    ctx->buf_len = 0;
+    ctx->last_active = time(NULL);
+
+    /* Insert at head of chain */
+    ctx->next = g_reassembly.table[hash];
+    g_reassembly.table[hash] = ctx;
+
+    pthread_mutex_unlock(&g_reassembly.lock);
+    return ctx;
+}
+
+static void cleanup_stale_contexts(void)
+{
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&g_reassembly.lock);
+
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        struct reassembly_ctx **prev = &g_reassembly.table[i];
+        struct reassembly_ctx *ctx = *prev;
+
+        while (ctx) {
+            if (now - ctx->last_active > REASSEMBLY_TIMEOUT) {
+                /* Remove stale context */
+                *prev = ctx->next;
+                free(ctx);
+                ctx = *prev;
+            } else {
+                prev = &ctx->next;
+                ctx = ctx->next;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&g_reassembly.lock);
+}
+
+static void cleanup_all_contexts(void)
+{
+    pthread_mutex_lock(&g_reassembly.lock);
+
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        struct reassembly_ctx *ctx = g_reassembly.table[i];
+        while (ctx) {
+            struct reassembly_ctx *next = ctx->next;
+            free(ctx);
+            ctx = next;
+        }
+        g_reassembly.table[i] = NULL;
+    }
+
+    pthread_mutex_unlock(&g_reassembly.lock);
+}
+
 /* ── eBPF ringbuf callback (master only) ────────────────────────────── */
 
 static int master_on_data(void *ctx, void *data, size_t len)
@@ -201,26 +361,55 @@ static int master_on_data(void *ctx, void *data, size_t len)
     if (e->len == 0 || e->len > REPL_OBSERVE_MAX_DATA)
         return 0;
 
-    /* Append to backlog for incremental recovery */
-    repl_incr_append((const char *)e->data, e->len);
+    /* Get or create reassembly context for this connection */
+    struct reassembly_ctx *rctx = get_or_create_ctx(e->sock_cookie);
+    if (!rctx) {
+        fprintf(stderr, "[REPL-TCP] Failed to get reassembly context\n");
+        return 0;
+    }
 
-    if (g_repl.peer_fd < 0)
-        return 0;  /* No slave connected */
+    /* Check buffer overflow */
+    if (rctx->buf_len + e->len > REASSEMBLY_BUF_SIZE) {
+        fprintf(stderr, "[REPL-TCP] Reassembly buffer overflow, resetting (cookie=%lu)\n",
+                e->sock_cookie);
+        rctx->buf_len = 0;
+    }
 
-    /* Send frame to slave */
-    if (tcp_send_frame(g_repl.peer_fd, e->data, e->len) == 0) {
-        pthread_mutex_lock(&g_repl.stats_lock);
-        g_repl.stats.bytes_sent += e->len + REPL_FRAME_HEADER;
-        g_repl.stats.frames_sent++;
-        pthread_mutex_unlock(&g_repl.stats_lock);
-    } else {
-        /* Connection lost */
-        close(g_repl.peer_fd);
-        g_repl.peer_fd = -1;
-        pthread_mutex_lock(&g_repl.stats_lock);
-        g_repl.stats.connected = 0;
-        pthread_mutex_unlock(&g_repl.stats_lock);
-        printf("[REPL-TCP] Slave disconnected\n");
+    /* Append data to reassembly buffer */
+    memcpy(rctx->buf + rctx->buf_len, e->data, e->len);
+    rctx->buf_len += e->len;
+    rctx->last_active = time(NULL);
+
+    /* Try to extract complete RESP commands */
+    while (rctx->buf_len > 0) {
+        int cmd_len = find_complete_resp_command(rctx->buf, rctx->buf_len);
+        if (cmd_len <= 0)
+            break;  /* Incomplete command, wait for more data */
+
+        /* Append complete command to backlog for incremental recovery */
+        repl_incr_append((const char *)rctx->buf, cmd_len);
+
+        /* Send complete command to slave if connected */
+        if (g_repl.peer_fd >= 0) {
+            if (tcp_send_frame(g_repl.peer_fd, rctx->buf, cmd_len) == 0) {
+                pthread_mutex_lock(&g_repl.stats_lock);
+                g_repl.stats.bytes_sent += cmd_len + REPL_FRAME_HEADER;
+                g_repl.stats.frames_sent++;
+                pthread_mutex_unlock(&g_repl.stats_lock);
+            } else {
+                /* Connection lost */
+                close(g_repl.peer_fd);
+                g_repl.peer_fd = -1;
+                pthread_mutex_lock(&g_repl.stats_lock);
+                g_repl.stats.connected = 0;
+                pthread_mutex_unlock(&g_repl.stats_lock);
+                printf("[REPL-TCP] Slave disconnected\n");
+            }
+        }
+
+        /* Remove processed command from buffer */
+        memmove(rctx->buf, rctx->buf + cmd_len, rctx->buf_len - cmd_len);
+        rctx->buf_len -= cmd_len;
     }
 
     return 0;
@@ -355,6 +544,8 @@ static void *master_thread_func(void *arg)
     int flags = fcntl(g_repl.listen_fd, F_GETFL, 0);
     fcntl(g_repl.listen_fd, F_SETFL, flags | O_NONBLOCK);
 
+    int cleanup_counter = 0;
+
     while (g_repl.running) {
         /* Poll eBPF ringbuf for write commands */
         if (g_repl.ringbuf) {
@@ -378,6 +569,12 @@ static void *master_thread_func(void *arg)
                 printf("[REPL-TCP] Slave connected from %s:%u\n",
                        inet_ntoa(slave_addr.sin_addr), ntohs(slave_addr.sin_port));
             }
+        }
+
+        /* Cleanup stale reassembly contexts every 10 seconds */
+        if (++cleanup_counter >= 10000) {  /* 10000 * 1ms = 10s */
+            cleanup_stale_contexts();
+            cleanup_counter = 0;
         }
 
         usleep(1000);  /* 1ms sleep */
@@ -496,6 +693,10 @@ int repl_tcp_init(const struct repl_tcp_config *cfg)
     pthread_mutex_init(&g_repl.stats_lock, NULL);
 
     if (cfg->role == REPL_ROLE_MASTER) {
+        /* Initialize reassembly hash table */
+        pthread_mutex_init(&g_reassembly.lock, NULL);
+        memset(g_reassembly.table, 0, sizeof(g_reassembly.table));
+
         /* Master: setup listen socket */
         g_repl.listen_fd = tcp_listen(cfg->repl_port);
         if (g_repl.listen_fd < 0) {
@@ -540,6 +741,10 @@ void repl_tcp_shutdown(void)
 
     g_repl.running = 0;
     pthread_join(g_repl.thread, NULL);
+
+    /* Cleanup reassembly contexts */
+    cleanup_all_contexts();
+    pthread_mutex_destroy(&g_reassembly.lock);
 
     if (g_repl.ringbuf)
         ring_buffer__free(g_repl.ringbuf);

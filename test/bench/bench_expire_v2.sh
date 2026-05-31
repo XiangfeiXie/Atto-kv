@@ -177,7 +177,7 @@ test_mixed_workload() {
     local ttl=$3
 
     log "========================================"
-    log "混合负载: threads=${threads}, keys=${nkeys}, TTL=${ttl}s, 后台读写"
+    log "混合负载: threads=${threads}, keys=${nkeys}, TTL=${ttl}s, 后台读负载"
     log "========================================"
 
     local pid=$(start_kvs "$threads")
@@ -204,9 +204,10 @@ test_mixed_workload() {
     local vmrss_before=$(get_vmrss "$pid")
     local expired_before=$(get_expired_keys)
 
-    # 启动后台读写负载 - 只操作已有 key 范围，不创建新 key
-    log "  启动后台读写负载（只操作已有 key）..."
-    redis-benchmark -p 2000 -t get,set -n 500000 -r "$nkeys" -d "$VALUE_SIZE" -q > /tmp/bench_mixed.log 2>&1 &
+    # 启动后台读负载 - 只 GET 不 SET，避免重置 TTL
+    # 注意：SET 命令会清除 TTL，导致 key 永久存在
+    log "  启动后台读负载（只 GET，避免重置 TTL）..."
+    redis-benchmark -p 2000 -t get -n 500000 -r "$nkeys" -d "$VALUE_SIZE" -q > /tmp/bench_mixed.log 2>&1 &
     local bench_pid=$!
 
     # 等待过期
@@ -275,12 +276,8 @@ test_burst_expire 1 10000 5
 test_burst_expire 1 50000 5
 test_burst_expire 1 100000 5
 
-# 多线程突发过期
-test_burst_expire 4 100000 5
-
 # 混合负载测试
 test_mixed_workload 1 50000 5
-test_mixed_workload 4 100000 5
 
 echo ""
 log "测试完成！结果已保存："

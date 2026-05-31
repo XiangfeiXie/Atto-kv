@@ -1,6 +1,7 @@
 #include "kv_dict.h"
 #include <string.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 /* =====================================================================
  * Hash function: FNV-1a 64-bit + Murmur3 64-bit finalizer
@@ -565,6 +566,22 @@ kv_entry_t *dict_get_random_key(kv_dict_t *d) {
  * ===================================================================== */
 
 kv_store_t g_store;
+
+/* Global rwlock to protect dictionary from concurrent access between
+ * main thread and background expiration thread */
+pthread_rwlock_t g_store_rwlock = PTHREAD_RWLOCK_INITIALIZER;
+
+void kv_store_rdlock(void) {
+    pthread_rwlock_rdlock(&g_store_rwlock);
+}
+
+void kv_store_wrlock(void) {
+    pthread_rwlock_wrlock(&g_store_rwlock);
+}
+
+void kv_store_unlock(void) {
+    pthread_rwlock_unlock(&g_store_rwlock);
+}
 
 void kv_store_init(void) {
     dict_init(&g_store.dict);

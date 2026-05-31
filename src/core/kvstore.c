@@ -154,50 +154,164 @@ void update_cached_time(void) {
 /* =====================================================================
  * Active expire cycle — background thread periodically samples keys
  * and deletes expired ones to prevent memory leaks.
+ *
+ * Phase 9.2 — Lazy deletion queue optimization:
+ * Instead of deleting expired keys immediately in read path (which requires
+ * upgrading read lock to write lock), we enqueue them in a thread-local queue
+ * and batch-delete during write operations (when we already hold write lock).
+ * This eliminates lock contention between expire thread and normal requests.
  * ===================================================================== */
 
 /* Forward declaration */
 static void entry_cleanup_by_type(kv_entry_t *e);
 
 #define ACTIVE_EXPIRE_CYCLE_LOOKUPS 20  /* keys to sample per cycle */
+#define EXPIRE_QUEUE_SIZE 256           /* max expired keys per thread queue */
+
+/* Adaptive sampling: increase sample size when expire rate is high */
+#define ACTIVE_EXPIRE_CYCLE_LOOKUPS_MIN 20
+#define ACTIVE_EXPIRE_CYCLE_LOOKUPS_MAX 200
 
 static _Atomic uint64_t g_expired_keys = 0;       /* total expired keys deleted */
 static pthread_t g_expire_thread;
 static volatile int g_expire_thread_stop = 0;
 
-/* Sample random keys from global dict and delete expired ones. */
-static void active_expire_cycle(void) {
-    int expired_total = 0;
-    int sampled_total = 0;
+/* Thread-local expire queue — each worker thread maintains its own queue
+ * of expired keys discovered during read operations. These are batch-deleted
+ * during write operations to avoid lock contention. */
+typedef struct {
+    char *keys[EXPIRE_QUEUE_SIZE];
+    uint32_t key_lens[EXPIRE_QUEUE_SIZE];
+    uint64_t hashes[EXPIRE_QUEUE_SIZE];
+    int count;
+} expire_queue_t;
 
-    kv_dict_t *dict = kv_dict_for(0);
+static __thread expire_queue_t g_expire_queue = {0};
 
-    /* Sample ACTIVE_EXPIRE_CYCLE_LOOKUPS random keys */
-    for (int i = 0; i < ACTIVE_EXPIRE_CYCLE_LOOKUPS; i++) {
-        kv_entry_t *entry = dict_get_random_key(dict);
-        if (!entry) break;
+/* Enqueue an expired key for later batch deletion.
+ * Called during read operations when we discover an expired key but only
+ * hold read lock. Returns 1 if enqueued, 0 if queue is full. */
+static inline int enqueue_expired_key(const char *key, uint32_t key_len, uint64_t hash) {
+    if (g_expire_queue.count >= EXPIRE_QUEUE_SIZE) {
+        return 0;  /* Queue full, caller should handle */
+    }
 
-        sampled_total++;
+    /* Duplicate key string (will be freed in flush_expire_queue) */
+    char *key_copy = (char*)malloc(key_len);
+    if (!key_copy) return 0;
+    memcpy(key_copy, key, key_len);
 
-        /* Check if expired */
-        if (entry->expire && get_time_now() > entry->expire) {
-            const char *key = entry_key(entry);
-            uint32_t key_len = entry->key_len;
-            uint64_t hash = entry->hash;
+    g_expire_queue.keys[g_expire_queue.count] = key_copy;
+    g_expire_queue.key_lens[g_expire_queue.count] = key_len;
+    g_expire_queue.hashes[g_expire_queue.count] = hash;
+    g_expire_queue.count++;
 
-            /* Delete expired key */
+    return 1;
+}
+
+/* Batch delete all expired keys in the thread-local queue.
+ * MUST be called while holding write lock (kv_store_wrlock).
+ * This is called at the end of write operations to piggyback on the
+ * existing write lock, avoiding extra lock acquisitions. */
+static inline void flush_expire_queue(void) {
+    if (g_expire_queue.count == 0) return;
+
+    long long now = get_time_now();
+
+    for (int i = 0; i < g_expire_queue.count; i++) {
+        kv_dict_t *dict = kv_dict_for(g_expire_queue.hashes[i]);
+        kv_entry_t *entry = dict_find(dict,
+                                       g_expire_queue.keys[i],
+                                       g_expire_queue.key_lens[i],
+                                       g_expire_queue.hashes[i]);
+
+        /* Double-check expiration (key might have been updated) */
+        if (entry && entry->expire && now > entry->expire) {
             entry_cleanup_by_type(entry);
-            dict_delete(dict, key, key_len, hash);
-
-            expired_total++;
+            dict_delete(dict,
+                       g_expire_queue.keys[i],
+                       g_expire_queue.key_lens[i],
+                       g_expire_queue.hashes[i]);
             atomic_fetch_add_explicit(&g_expired_keys, 1, memory_order_relaxed);
         }
+
+        free(g_expire_queue.keys[i]);
     }
 
-    /* If expire rate > 25%, recursively scan again */
-    if (sampled_total > 0 && expired_total * 4 > sampled_total) {
-        active_expire_cycle();
-    }
+    g_expire_queue.count = 0;
+}
+
+/* Sample random keys from global dict and delete expired ones.
+ * Phase 9.2: Adaptive sampling - increase sample size when expire rate is high. */
+static void active_expire_cycle(void) {
+    kv_dict_t *dict = kv_dict_for(0);
+    int sample_size = ACTIVE_EXPIRE_CYCLE_LOOKUPS_MIN;
+    int consecutive_high_expire = 0;
+
+    /* Loop until expire rate drops below 25% */
+    do {
+        int expired_total = 0;
+        int sampled_total = 0;
+
+        /* Try to acquire write lock - if busy, skip this cycle to avoid blocking */
+        if (pthread_rwlock_trywrlock(&g_store_rwlock) != 0) {
+            /* Lock is busy, skip this cycle */
+            return;
+        }
+
+        /* Sample keys with adaptive sample size */
+        for (int i = 0; i < sample_size; i++) {
+            kv_entry_t *entry = dict_get_random_key(dict);
+            if (!entry) break;
+
+            sampled_total++;
+
+            /* Check if expired */
+            if (entry->expire && get_time_now() > entry->expire) {
+                const char *key = entry_key(entry);
+                uint32_t key_len = entry->key_len;
+                uint64_t hash = entry->hash;
+
+                /* Delete expired key */
+                entry_cleanup_by_type(entry);
+                dict_delete(dict, key, key_len, hash);
+
+                expired_total++;
+                atomic_fetch_add_explicit(&g_expired_keys, 1, memory_order_relaxed);
+            }
+        }
+
+        pthread_rwlock_unlock(&g_store_rwlock);
+
+        /* Adaptive sampling: adjust sample size based on expire rate */
+        double expire_rate = sampled_total > 0 ? (double)expired_total / sampled_total : 0;
+
+        if (expire_rate > 0.5) {
+            /* High expire rate: double sample size (up to max) */
+            sample_size = sample_size * 2;
+            if (sample_size > ACTIVE_EXPIRE_CYCLE_LOOKUPS_MAX) {
+                sample_size = ACTIVE_EXPIRE_CYCLE_LOOKUPS_MAX;
+            }
+            consecutive_high_expire++;
+        } else if (expire_rate < 0.1) {
+            /* Low expire rate: halve sample size (down to min) */
+            sample_size = sample_size / 2;
+            if (sample_size < ACTIVE_EXPIRE_CYCLE_LOOKUPS_MIN) {
+                sample_size = ACTIVE_EXPIRE_CYCLE_LOOKUPS_MIN;
+            }
+            consecutive_high_expire = 0;
+        }
+
+        /* Prevent infinite loop: stop after 10 consecutive high-expire cycles */
+        if (consecutive_high_expire > 10) {
+            break;
+        }
+
+        /* If expire rate <= 25%, stop scanning */
+        if (sampled_total == 0 || expired_total * 4 <= sampled_total) {
+            break;
+        }
+    } while (1);
 }
 
 /* Background thread main loop */
@@ -205,10 +319,13 @@ static void *expire_thread_main(void *arg) {
     (void)arg;
 
     while (!g_expire_thread_stop) {
-        /* Sleep 100ms */
+        /* Phase 9.2: Reduced frequency from 100ms to 1s.
+         * With lazy deletion queue optimization, most expired keys are
+         * cleaned up during normal write operations, so background thread
+         * only needs to handle pure-read workloads at lower frequency. */
         struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = 100 * 1000000;  /* 100ms */
+        ts.tv_sec = 1;
+        ts.tv_nsec = 0;  /* 1 second */
         nanosleep(&ts, NULL);
 
         /* Run expire cycle */
@@ -1028,7 +1145,10 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
 
     /* DBSIZE — count of keys in dict. */
     if (TOKEN_EQ(cmd, "DBSIZE")) {
-        reply_integer(wb, (long long)kv_store_count());
+        kv_store_rdlock();
+        long long count = (long long)kv_store_count();
+        kv_store_unlock();
+        reply_integer(wb, count);
         return DISPATCH_OK;
     }
 
@@ -1063,6 +1183,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     }
 
     if (TOKEN_EQ(cmd, "FLUSHALL") || TOKEN_EQ(cmd, "FLUSHDB")) {
+        kv_store_wrlock();
         /* Walk global dict and cleanup all entries */
         kv_store_iter_t it; kv_store_iter_init(&it);
         kv_entry_t *e;
@@ -1074,6 +1195,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (!g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
         }
+        kv_store_unlock();
         return DISPATCH_OK;
     }
 
@@ -1085,6 +1207,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
             return DISPATCH_ERROR;
         }
+        kv_store_rdlock();
         char hdr[32];
         int hl = snprintf(hdr, sizeof(hdr), "*%d\r\n", argc - 1);
         dynbuf_cat(wb, hdr, hl);
@@ -1113,6 +1236,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                 dynbuf_lit(wb, "\r\n");
             }
         }
+        kv_store_unlock();
         return DISPATCH_OK;
     }
 
@@ -1122,6 +1246,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             dynbuf_lit(wb, "-ERR wrong number of arguments for 'mset' command\r\n");
             return DISPATCH_ERROR;
         }
+        kv_store_wrlock();
         for (int i = 1; i + 1 < argc; i += 2) {
             /* If a non-string entry exists at this key, drop it first so the
              * overwrite is type-safe (Redis MSET replaces any existing type). */
@@ -1140,6 +1265,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (!g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
         }
+        kv_store_unlock();
         return DISPATCH_OK;
     }
 
@@ -1149,6 +1275,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             dynbuf_lit(wb, "-ERR wrong number of arguments for 'msetnx' command\r\n");
             return DISPATCH_ERROR;
         }
+        kv_store_wrlock();
         /* First pass: any existing (non-expired) key aborts the whole op. */
         for (int i = 1; i + 1 < argc; i += 2) {
             uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
@@ -1156,6 +1283,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             kv_entry_t *ke = dict_find(kv_dict_for(kh), tokens[i].ptr, (uint32_t)tokens[i].len, kh);
             if (ke && (!ke->expire || get_time_now() <= ke->expire)) {
                 reply_integer(wb, 0);
+                kv_store_unlock();
                 return DISPATCH_OK;
             }
         }
@@ -1170,6 +1298,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (!g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
         }
+        kv_store_unlock();
         return DISPATCH_OK;
     }
 
@@ -1179,6 +1308,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
             return DISPATCH_ERROR;
         }
+        kv_store_wrlock();
         long long ndel = 0;
         for (int i = 1; i < argc; i++) {
             kvs_token_t kt = tokens[i];
@@ -1193,6 +1323,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (ndel > 0 && !g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
         }
+        kv_store_unlock();
         return DISPATCH_OK;
     }
 
@@ -1202,6 +1333,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
             return DISPATCH_ERROR;
         }
+        kv_store_rdlock();
         long long nfound = 0;
         for (int i = 1; i < argc; i++) {
             kvs_token_t kt = tokens[i];
@@ -1212,12 +1344,14 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             nfound++;
         }
         reply_integer(wb, nfound);
+        kv_store_unlock();
         return DISPATCH_OK;
     }
 
     /* KEYS pattern — return all matching keys as a RESP array.
      * For simplicity, only "*" (all keys) is supported. */
     if (TOKEN_EQ(cmd, "KEYS")) {
+        kv_store_rdlock();
         /* count keys first */
         kv_store_iter_t it; kv_store_iter_init(&it);
         kv_entry_t *ke;
@@ -1239,10 +1373,11 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             reply_bulk(wb, entry_key(ke), ke->key_len);
         }
         kv_store_iter_free(&it);
+        kv_store_unlock();
         return DISPATCH_OK;
     }
 
-    /* ── Single-key commands (no locking needed in single-dict mode). ── */
+    /* ── Single-key commands ── */
 single_key:
     if (argc < 2) {
         dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
@@ -1281,12 +1416,30 @@ single_key:
         return DISPATCH_ERROR;
     }
 
+    /* Acquire appropriate lock based on operation type */
+    if (is_write) {
+        kv_store_wrlock();
+    } else {
+        kv_store_rdlock();
+    }
+
     kv_entry_t *entry = dict_find(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
 
-    /* Lazy-expire: delete expired entries */
+    /* Lazy-expire: enqueue expired entries for batch deletion.
+     * Phase 9.2 optimization: instead of deleting immediately (which would
+     * require upgrading read lock to write lock), we enqueue the key and
+     * delete it later during a write operation when we already hold write lock.
+     * This eliminates lock contention. */
     if (entry && entry->expire && get_time_now() > entry->expire) {
-        entry_cleanup_by_type(entry);
-        dict_delete(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
+        if (is_write) {
+            /* Already have write lock, delete immediately */
+            entry_cleanup_by_type(entry);
+            dict_delete(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
+            atomic_fetch_add_explicit(&g_expired_keys, 1, memory_order_relaxed);
+        } else {
+            /* Only have read lock, enqueue for later deletion */
+            enqueue_expired_key(key_tok.ptr, (uint32_t)key_tok.len, hash);
+        }
         entry = NULL;
     }
 
@@ -1306,6 +1459,7 @@ single_key:
             }
         }
         dynbuf_cat(wb, r, rlen);
+        kv_store_unlock();
         return DISPATCH_OK;
     }
 
@@ -1313,15 +1467,18 @@ single_key:
     if (TOKEN_EQ(cmd, "EXPIRE")) {
         if (argc < 3) {
             dynbuf_lit(wb, "-ERR wrong number of arguments for 'expire' command\r\n");
+            kv_store_unlock();
             return DISPATCH_ERROR;
         }
         long long secs;
         if (token_to_ll(tokens[2], &secs) < 0) {
             dynbuf_lit(wb, "-ERR value is not an integer or out of range\r\n");
+            kv_store_unlock();
             return DISPATCH_ERROR;
         }
         if (!entry) {
             reply_integer(wb, 0);
+            kv_store_unlock();
             return DISPATCH_OK;
         }
         entry->expire = get_time_now() + secs * 1000;
@@ -1329,29 +1486,32 @@ single_key:
         if (!g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
         }
+        kv_store_unlock();
         return DISPATCH_OK;
     }
 
     /* TTL / PTTL: Redis returns -2 if key missing, -1 if no TTL set,
        else remaining seconds (TTL) or milliseconds (PTTL). */
     if (TOKEN_EQ(cmd, "TTL") || TOKEN_EQ(cmd, "PTTL")) {
-        if (!entry) { reply_integer(wb, -2); return DISPATCH_OK; }
-        if (!entry->expire) { reply_integer(wb, -1); return DISPATCH_OK; }
+        if (!entry) { reply_integer(wb, -2); kv_store_unlock(); return DISPATCH_OK; }
+        if (!entry->expire) { reply_integer(wb, -1); kv_store_unlock(); return DISPATCH_OK; }
         long long rem_ms = entry->expire - get_time_now();
-        if (rem_ms < 0) { reply_integer(wb, -2); return DISPATCH_OK; }
+        if (rem_ms < 0) { reply_integer(wb, -2); kv_store_unlock(); return DISPATCH_OK; }
         if (TOKEN_EQ(cmd, "TTL")) reply_integer(wb, (rem_ms + 500) / 1000);
         else                       reply_integer(wb, rem_ms);
+        kv_store_unlock();
         return DISPATCH_OK;
     }
 
     /* PERSIST — clear TTL. */
     if (TOKEN_EQ(cmd, "PERSIST")) {
-        if (!entry || !entry->expire) { reply_integer(wb, 0); return DISPATCH_OK; }
+        if (!entry || !entry->expire) { reply_integer(wb, 0); kv_store_unlock(); return DISPATCH_OK; }
         entry->expire = 0;
         reply_integer(wb, 1);
         if (!g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
         }
+        kv_store_unlock();
         return DISPATCH_OK;
     }
 
@@ -1362,6 +1522,7 @@ single_key:
     /* WRONGTYPE if key exists but with a different type */
     if (entry && (int)entry_type(entry) != cmd_type) {
         dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
+        kv_store_unlock();
         return DISPATCH_ERROR;
     }
 
@@ -1380,8 +1541,10 @@ single_key:
         break;
     }
 
-    if (r == DISPATCH_BLOCKED)
+    if (r == DISPATCH_BLOCKED) {
+        kv_store_unlock();
         return DISPATCH_BLOCKED;
+    }
 
     /* ── Write-command post-processing (AOF + WAL repl + XDP cache) ── */
     if (is_write) {
@@ -1392,7 +1555,15 @@ single_key:
         if (ok && !g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
         }
+
+        /* Phase 9.2: Flush expire queue during write operations.
+         * Since we already hold write lock, batch-delete any expired keys
+         * discovered during recent read operations. This piggybacks on the
+         * existing lock acquisition, eliminating lock contention. */
+        flush_expire_queue();
     }
+
+    kv_store_unlock();
 
     /* ── After LPUSH/RPUSH, wake any client blocked on this key ── */
     return DISPATCH_OK;

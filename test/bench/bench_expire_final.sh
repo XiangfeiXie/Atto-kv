@@ -14,7 +14,9 @@ sleep 1
 
 # 启动kvstore
 echo "[1] 启动 kvstore..."
-./build/kvstore conf/kvstore-none.conf > /tmp/kvstore_expire_test.log 2>&1 &
+# 使用当前用户的临时目录，避免权限问题
+LOG_FILE="${HOME}/.kvstore_expire_test.log"
+./build/kvstore conf/kvstore-none.conf > "$LOG_FILE" 2>&1 &
 sleep 3
 
 if ! redis-cli -p 2000 PING >/dev/null 2>&1; then

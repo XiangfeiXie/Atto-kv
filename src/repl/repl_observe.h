@@ -22,8 +22,9 @@ typedef uint8_t  __u8;
 
 /* Replication event structure */
 struct repl_observe_event {
-    __u32 len;       /* Length of data */
-    __u32 padding;   /* Padding for alignment */
+    __u64 sock_cookie;  /* Socket cookie for connection tracking */
+    __u32 len;          /* Length of data */
+    __u32 padding;      /* Padding for alignment */
     __u8  data[REPL_OBSERVE_MAX_DATA];  /* Command data */
 };
 

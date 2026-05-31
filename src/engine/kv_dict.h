@@ -174,6 +174,12 @@ void        kv_store_iter_init(kv_store_iter_t *it);
 kv_entry_t *kv_store_iter_next(kv_store_iter_t *it);
 void        kv_store_iter_free(kv_store_iter_t *it);
 
+/* Locking helpers for concurrent access protection */
+extern pthread_rwlock_t g_store_rwlock;  /* Global rwlock for dict access */
+void kv_store_rdlock(void);    /* Acquire read lock (shared) */
+void kv_store_wrlock(void);    /* Acquire write lock (exclusive) */
+void kv_store_unlock(void);    /* Release lock */
+
 /* Snapshot helpers (no-op in single-dict mode) */
 static inline void kv_store_lock_for_snapshot(void) { }
 static inline void kv_store_unlock_snapshot(void) { }

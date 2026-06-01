@@ -55,6 +55,25 @@ struct repl_observe_event {
 #define REPL_MAX_FRAME_SIZE (64 * 1024)  /* 64KB max frame */
 #define RECONNECT_INTERVAL  3            /* seconds */
 
+/* ── Sync Protocol ──────────────────────────────────────────────────── */
+
+#define SYNC_MAGIC          0x53594E43   /* "SYNC" */
+#define SYNC_STATUS_OK      0
+#define SYNC_STATUS_FULLSYNC_REQUIRED 1
+
+/* Sync request from slave to master */
+struct sync_request {
+    uint32_t magic;          /* SYNC_MAGIC */
+    uint64_t last_offset;    /* Last received offset */
+} __attribute__((packed));
+
+/* Sync response from master to slave */
+struct sync_response {
+    uint32_t status;         /* SYNC_STATUS_OK or SYNC_STATUS_FULLSYNC_REQUIRED */
+    uint64_t start_offset;   /* Starting offset for catch-up data */
+    uint64_t data_len;       /* Length of catch-up data to follow */
+} __attribute__((packed));
+
 /* ── RESP Protocol Reassembly ───────────────────────────────────────── */
 
 #define REASSEMBLY_BUF_SIZE  16384       /* 16KB reassembly buffer per connection */
@@ -534,6 +553,85 @@ static int slave_apply_command(const uint8_t *data, uint32_t len)
 
 /* ── Master thread ──────────────────────────────────────────────────── */
 
+static int master_handle_sync_request(int fd)
+{
+    struct sync_request req;
+    struct sync_response resp;
+
+    /* Receive sync request */
+    if (tcp_recv_exact(fd, &req, sizeof(req)) != 0) {
+        fprintf(stderr, "[REPL-TCP] Failed to receive sync request\n");
+        return -1;
+    }
+
+    /* Validate magic */
+    if (ntohl(req.magic) != SYNC_MAGIC) {
+        fprintf(stderr, "[REPL-TCP] Invalid sync magic: 0x%x\n", ntohl(req.magic));
+        return -1;
+    }
+
+    uint64_t last_offset = be64toh(req.last_offset);
+    printf("[REPL-TCP] Slave requests sync from offset %lu\n", last_offset);
+
+    /* Check if offset is available in backlog */
+    if (repl_incr_has_offset(last_offset)) {
+        /* Partial resync - send missing data */
+        resp.status = htonl(SYNC_STATUS_OK);
+        resp.start_offset = htobe64(last_offset);
+
+        /* Get missing data from backlog */
+        char *catchup_buf = malloc(REPL_MAX_FRAME_SIZE);
+        if (!catchup_buf) {
+            fprintf(stderr, "[REPL-TCP] malloc failed for catchup buffer\n");
+            return -1;
+        }
+
+        size_t catchup_len = 0;
+        if (repl_incr_get_range(last_offset, catchup_buf, REPL_MAX_FRAME_SIZE, &catchup_len) == 0) {
+            resp.data_len = htobe64(catchup_len);
+
+            /* Send response header */
+            if (send(fd, &resp, sizeof(resp), MSG_NOSIGNAL) != sizeof(resp)) {
+                free(catchup_buf);
+                return -1;
+            }
+
+            /* Send catchup data if any */
+            if (catchup_len > 0) {
+                if (send(fd, catchup_buf, catchup_len, MSG_NOSIGNAL) != (ssize_t)catchup_len) {
+                    free(catchup_buf);
+                    return -1;
+                }
+                printf("[REPL-TCP] Sent %zu bytes of catchup data\n", catchup_len);
+            } else {
+                printf("[REPL-TCP] Slave is up-to-date\n");
+            }
+        } else {
+            /* Failed to get range, require full sync */
+            resp.status = htonl(SYNC_STATUS_FULLSYNC_REQUIRED);
+            resp.start_offset = 0;
+            resp.data_len = 0;
+            send(fd, &resp, sizeof(resp), MSG_NOSIGNAL);
+            printf("[REPL-TCP] Offset available but get_range failed, requiring full sync\n");
+        }
+
+        free(catchup_buf);
+    } else {
+        /* Offset too old - require full sync */
+        resp.status = htonl(SYNC_STATUS_FULLSYNC_REQUIRED);
+        resp.start_offset = 0;
+        resp.data_len = 0;
+
+        if (send(fd, &resp, sizeof(resp), MSG_NOSIGNAL) != sizeof(resp)) {
+            return -1;
+        }
+
+        printf("[REPL-TCP] Offset %lu too old, requiring full sync\n", last_offset);
+    }
+
+    return 0;
+}
+
 static void *master_thread_func(void *arg)
 {
     (void)arg;
@@ -560,14 +658,21 @@ static void *master_thread_func(void *arg)
 
             if (fd >= 0) {
                 tcp_set_options(fd);
-                g_repl.peer_fd = fd;
 
-                pthread_mutex_lock(&g_repl.stats_lock);
-                g_repl.stats.connected = 1;
-                pthread_mutex_unlock(&g_repl.stats_lock);
+                /* Handle sync request from slave */
+                if (master_handle_sync_request(fd) == 0) {
+                    g_repl.peer_fd = fd;
 
-                printf("[REPL-TCP] Slave connected from %s:%u\n",
-                       inet_ntoa(slave_addr.sin_addr), ntohs(slave_addr.sin_port));
+                    pthread_mutex_lock(&g_repl.stats_lock);
+                    g_repl.stats.connected = 1;
+                    pthread_mutex_unlock(&g_repl.stats_lock);
+
+                    printf("[REPL-TCP] Slave connected from %s:%u\n",
+                           inet_ntoa(slave_addr.sin_addr), ntohs(slave_addr.sin_port));
+                } else {
+                    fprintf(stderr, "[REPL-TCP] Sync handshake failed, closing connection\n");
+                    close(fd);
+                }
             }
         }
 
@@ -586,6 +691,84 @@ static void *master_thread_func(void *arg)
 
 /* ── Slave thread ───────────────────────────────────────────────────── */
 
+static int slave_send_sync_request(int fd, uint64_t last_offset)
+{
+    struct sync_request req;
+    struct sync_response resp;
+
+    /* Send sync request */
+    req.magic = htonl(SYNC_MAGIC);
+    req.last_offset = htobe64(last_offset);
+
+    if (send(fd, &req, sizeof(req), MSG_NOSIGNAL) != sizeof(req)) {
+        fprintf(stderr, "[REPL-TCP] Failed to send sync request\n");
+        return -1;
+    }
+
+    /* Receive sync response */
+    if (tcp_recv_exact(fd, &resp, sizeof(resp)) != 0) {
+        fprintf(stderr, "[REPL-TCP] Failed to receive sync response\n");
+        return -1;
+    }
+
+    uint32_t status = ntohl(resp.status);
+    uint64_t data_len = be64toh(resp.data_len);
+
+    if (status == SYNC_STATUS_FULLSYNC_REQUIRED) {
+        fprintf(stderr, "[REPL-TCP] Master requires full sync (offset too old)\n");
+        return -2;  /* Special code for full sync required */
+    }
+
+    if (status != SYNC_STATUS_OK) {
+        fprintf(stderr, "[REPL-TCP] Unknown sync status: %u\n", status);
+        return -1;
+    }
+
+    /* Receive catchup data if any */
+    if (data_len > 0) {
+        char *catchup_buf = malloc(data_len);
+        if (!catchup_buf) {
+            fprintf(stderr, "[REPL-TCP] malloc failed for catchup buffer\n");
+            return -1;
+        }
+
+        if (tcp_recv_exact(fd, catchup_buf, data_len) != 0) {
+            fprintf(stderr, "[REPL-TCP] Failed to receive catchup data\n");
+            free(catchup_buf);
+            return -1;
+        }
+
+        printf("[REPL-TCP] Received %lu bytes of catchup data, applying...\n", data_len);
+
+        /* Apply catchup data frame by frame */
+        size_t pos = 0;
+        while (pos < data_len) {
+            if (pos + 4 > data_len) break;
+
+            uint32_t frame_len;
+            memcpy(&frame_len, catchup_buf + pos, 4);
+            frame_len = ntohl(frame_len);
+            pos += 4;
+
+            if (pos + frame_len > data_len) break;
+
+            slave_apply_command((uint8_t *)(catchup_buf + pos), frame_len);
+            pos += frame_len;
+
+            pthread_mutex_lock(&g_repl.stats_lock);
+            g_repl.stats.slave_offset += frame_len;
+            pthread_mutex_unlock(&g_repl.stats_lock);
+        }
+
+        free(catchup_buf);
+        printf("[REPL-TCP] Catchup complete, now in sync\n");
+    } else {
+        printf("[REPL-TCP] Already in sync with master\n");
+    }
+
+    return 0;
+}
+
 static void *slave_thread_func(void *arg)
 {
     (void)arg;
@@ -593,6 +776,7 @@ static void *slave_thread_func(void *arg)
     printf("[REPL-TCP] Slave thread started\n");
 
     uint8_t frame_buf[REPL_MAX_FRAME_SIZE];
+    uint64_t last_saved_offset = repl_incr_load_offset();
 
     while (g_repl.running) {
         /* Connect to master if not connected */
@@ -603,10 +787,32 @@ static void *slave_thread_func(void *arg)
             g_repl.peer_fd = tcp_connect(g_repl.cfg.master_ip, g_repl.cfg.repl_port);
 
             if (g_repl.peer_fd >= 0) {
+                /* Send sync request with last known offset */
+                int sync_result = slave_send_sync_request(g_repl.peer_fd, last_saved_offset);
+
+                if (sync_result == -2) {
+                    /* Full sync required */
+                    close(g_repl.peer_fd);
+                    g_repl.peer_fd = -1;
+                    fprintf(stderr, "[REPL-TCP] Full sync required but not implemented in TCP layer\n");
+                    fprintf(stderr, "[REPL-TCP] Please restart slave to trigger RDMA full sync\n");
+                    sleep(10);
+                    continue;
+                } else if (sync_result != 0) {
+                    /* Sync failed */
+                    close(g_repl.peer_fd);
+                    g_repl.peer_fd = -1;
+                    sleep(RECONNECT_INTERVAL);
+                    continue;
+                }
+
                 pthread_mutex_lock(&g_repl.stats_lock);
                 g_repl.stats.connected = 1;
                 g_repl.stats.reconnect_count++;
+                g_repl.stats.partial_resync = (sync_result == 0 && last_saved_offset > 0) ? 1 : 0;
                 pthread_mutex_unlock(&g_repl.stats_lock);
+
+                printf("[REPL-TCP] Connected and synced with master\n");
             } else {
                 sleep(RECONNECT_INTERVAL);
                 continue;
@@ -660,6 +866,12 @@ static void *slave_thread_func(void *arg)
         /* Acknowledge offset to master every 100 frames */
         if (g_repl.stats.frames_recv % 100 == 0) {
             repl_incr_ack_offset(g_repl.stats.slave_offset);
+        }
+
+        /* Save offset to disk every 1000 frames */
+        if (g_repl.stats.frames_recv % 1000 == 0) {
+            last_saved_offset = g_repl.stats.slave_offset;
+            repl_incr_save_offset(last_saved_offset);
         }
     }
 

@@ -105,7 +105,7 @@ void exec_x_command(int connfd,char*key,const char*filename){
 	fseek(fp,0,SEEK_SET);
 
 	char*data = malloc(data_len);
-	fread(data,1,data_len,fp);
+	//fread(data,1,data_len,fp);
 	fclose(fp);
 
 	//组装RESP长文本SET
@@ -153,7 +153,7 @@ void txt_testcase_01(int connfd,const char road){
 	fseek(fp,0,SEEK_SET);
 
 	char *content = malloc(len+ 1);
-	fread(content,1,len,fp);
+	//fread(content,1,len,fp);
 	content[len] = 0;
 	fclose(fp);
 

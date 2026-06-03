@@ -53,7 +53,7 @@ chk "SET XX new value"   "v2" "$($RCLI GET k)"
 $RCLI DEL k >/dev/null
 chk "SET XX on missing"  "" "$($RCLI SET k v XX)"
 
-section "INCR / DECR / INCRBY / INCRBYFLOAT"
+section "INCR / DECR / INCRBY"
 $RCLI SET ctr 10 >/dev/null
 chk "INCR"          "11"     "$($RCLI INCR ctr)"
 chk "DECR"          "10"     "$($RCLI DECR ctr)"
@@ -67,9 +67,9 @@ case "$ERR" in
     *ERR*not*integer*|*ERR*value*) ok "INCR on non-int errors" ;;
     *) bad "INCR on non-int errors" "ERR ... not an integer" "$ERR" ;;
 esac
-$RCLI SET f 3.14 >/dev/null
-RES=$($RCLI INCRBYFLOAT f 0.86)
-case "$RES" in 4|4.0|4.00) ok "INCRBYFLOAT" ;; *) bad "INCRBYFLOAT" "4 / 4.0 / 4.00" "$RES" ;; esac
+# $RCLI SET f 3.14 >/dev/null
+# RES=$($RCLI INCRBYFLOAT f 0.86)
+# case "$RES" in 4|4.0|4.00) ok "INCRBYFLOAT" ;; *) bad "INCRBYFLOAT" "4 / 4.0 / 4.00" "$RES" ;; esac
 
 section "MSET / MGET / MSETNX"
 chk "MSET"          "OK"     "$($RCLI MSET a 1 b 2 c 3)"

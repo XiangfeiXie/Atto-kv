@@ -260,9 +260,9 @@ void common_testcase_04(int connfd){
 
 		testcase(connfd, resp_pack_request(cmd), "+OK\r\n", cmd);
 
-		if ((i + 1) % 1000 == 0) {
-			printf("  inserted %d keys...\n", i + 1);
-		}
+		// if ((i + 1) % 1000 == 0) {
+		// 	printf("  inserted %d keys...\n", i + 1);
+		// }
 	}
 
 	struct timeval tv_end;
@@ -295,9 +295,9 @@ void common_testcase_05(int connfd){
 
 		testcase(connfd, resp_pack_request(cmd), expected, cmd);
 
-		if ((i + 1) % 1000 == 0) {
-			printf("  verified %d keys...\n", i + 1);
-		}
+		// if ((i + 1) % 1000 == 0) {
+		// 	printf("  verified %d keys...\n", i + 1);
+		// }
 	}
 
 	struct timeval tv_end;
@@ -311,7 +311,7 @@ void common_testcase_05(int connfd){
 void common_testcase_06(int connfd){
 	int i;
 
-	int count = 5000;
+	int count = 50000;
 
 	struct timeval tv_begin;
 	gettimeofday(&tv_begin, NULL);
@@ -329,9 +329,9 @@ void common_testcase_06(int connfd){
 
 		testcase(connfd, resp_pack_request(cmd), "+OK\r\n", cmd);
 
-		if ((i + 1) % 1000 == 0) {
-			printf("  inserted %d keys (batch 2)...\n", i + 1);
-		}
+		// if ((i + 1) % 1000 == 0) {
+		// 	printf("  inserted %d keys (batch 2)...\n", i + 1);
+		// }
 	}
 
 	struct timeval tv_end;
@@ -344,7 +344,7 @@ void common_testcase_06(int connfd){
 void common_testcase_07(int connfd){
 	int i;
 
-	int count = 5000;
+	int count = 50000;
 
 	struct timeval tv_begin;
 	gettimeofday(&tv_begin, NULL);
@@ -365,9 +365,9 @@ void common_testcase_07(int connfd){
 
 		testcase(connfd, resp_pack_request(cmd), expected, cmd);
 
-		if ((i + 1) % 1000 == 0) {
-			printf("  verified %d keys (batch 2)...\n", i + 1);
-		}
+		// if ((i + 1) % 1000 == 0) {
+		// 	printf("  verified %d keys (batch 2)...\n", i + 1);
+		// }
 	}
 
 	struct timeval tv_end;

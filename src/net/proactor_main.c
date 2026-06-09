@@ -12,6 +12,7 @@
 #include "kvstore.h"
 #include "block.h"
 #include "protocol.h"
+#include "shared.h"
 
 /* Global variables */
 struct conn *conn_pool = NULL;
@@ -157,6 +158,9 @@ static void *worker_loop(void *arg) {
 /* Start proactor */
 int proactor_start(unsigned short port, msg_handler handler) {
     (void)handler;
+
+    /* Initialize shared response objects */
+    init_shared_responses();
 
     if (conn_pool_init(kvs_config.maxclients) < 0) {
         fprintf(stderr, "[proactor] failed to init conn pool\n");

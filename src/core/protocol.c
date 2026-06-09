@@ -149,6 +149,8 @@ int resp_parse_uint_bounded(const char *p, int n,
 
 /* ==================== RESP static fragments ==================== */
 
+#include "shared.h"
+
 #define S(id, str) \
     const char id[] = str; \
     const int  id##_LEN = (int)(sizeof(str) - 1)
@@ -311,6 +313,12 @@ int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn 
     kvs_token_t tokens[KVS_MAX_TOKENS];
 
     while (remaining > 0) {
+        /* Prefetch next command location to improve cache hit rate in pipeline scenarios.
+         * Only prefetch when buffer has enough data to avoid unnecessary cache pollution. */
+        if (__builtin_expect(remaining > 128, 1)) {
+            __builtin_prefetch(rb->buf + off + 64, 0, 1);
+        }
+
         /* Tolerate inter-command CRLF only (Redis strict-parses; keep mild tolerance) */
         while (remaining > 0 && (rb->buf[off] == '\r' || rb->buf[off] == '\n')) {
             off++; remaining--;

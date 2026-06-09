@@ -58,6 +58,7 @@ set(CORE_SRCS
     src/core/config.c
     src/core/protocol.c
     src/core/block.c
+    src/core/shared.c
 )
 
 set(ENGINE_SRCS

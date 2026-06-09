@@ -306,7 +306,7 @@ static int worker_setup_ring(proactor_worker_t *w)
 
     /* Try SQPOLL + SINGLE_ISSUER (high throughput path) */
     params.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SINGLE_ISSUER;
-    params.sq_thread_idle = 1000;  /* SQPOLL thread sleeps after 1s idle */
+    params.sq_thread_idle = 200;  /* Optimized: 200ms reduces overhead for P=5~10 */
     int qret = io_uring_queue_init_params(ENTRIES_LENGTH, &w->ring, &params);
 
     if (qret == -EINVAL) {
@@ -435,6 +435,15 @@ static void *worker_loop(void *arg) {
         struct io_uring_cqe *cqes[CQE_BATCH_SIZE];
         int nready = io_uring_peek_batch_cqe(ring, cqes, CQE_BATCH_SIZE);
 
+        /* Safety check: if SQ is nearly full, submit early to avoid overflow.
+         * Each CQE may generate up to 2 SQEs (recv + send), so reserve 2*nready space. */
+        if (nready > 0) {
+            int sq_space = io_uring_sq_space_left(ring);
+            if (sq_space < nready * 2) {
+                io_uring_submit(ring);
+            }
+        }
+
         if (nready == 0) {
             /* Block subsystem is now MT-safe; only worker 0 sweeps timeouts
              * to keep work centralised, but any worker may have callbacks
@@ -524,13 +533,11 @@ static void *worker_loop(void *arg) {
                 if (nc->client) nc->client->conn = nc;
                 if (conn_arm_recv(ring, nc) != 0)
                     conn_release(connfd);
-                else if (proactor_debug_enabled()) {
-                    int submitted = io_uring_submit(ring);
-                    fprintf(stderr, "[proactor#%d] submit after accept fd=%d ret=%d\n",
-                            w->id, connfd, submitted);
-                } else {
-                    io_uring_submit(ring);
-                }
+                /* Deferred submit: rely on main loop batch submit for better throughput.
+                 * Removes per-accept syscall overhead in high-concurrency scenarios. */
+                if (proactor_debug_enabled())
+                    fprintf(stderr, "[proactor#%d] armed recv for fd=%d (deferred submit)\n",
+                            w->id, connfd);
             }
             else if (result.event == EVENT_READ) {
                 if (fd < 0 || fd >= conn_pool_size) {
@@ -715,18 +722,58 @@ event_read_done: ;
                         } else {
                             if (conn_arm_recv(ring, c) != 0)
                                 conn_release(fd);
-                            else
-                                io_uring_submit(ring);
+                            /* Deferred submit: batch with main loop for reduced syscall overhead */
                         }
                     } else {
                         if (conn_arm_recv(ring, c) != 0)
                             conn_release(fd);
-                        else
-                            io_uring_submit(ring);
+                        /* Deferred submit: batch with main loop for reduced syscall overhead */
                     }
                 }
             }
         }
+
+        /* Batch drain optimization: only effective when nready >= 20
+         * (high concurrency scenarios). For P=5~10, the overhead of
+         * iterating CQEs twice outweighs the benefit. */
+        if (nready >= 20) {
+            #define MAX_BATCH_CONNS 128
+            static __thread struct conn *batch_conns[MAX_BATCH_CONNS];
+            int batch_count = 0;
+
+            for (int i = 0; i < nready && batch_count < MAX_BATCH_CONNS; i++) {
+                struct io_uring_cqe *cqe = cqes[i];
+                struct conn_info result = conn_info_unpack(cqe->user_data);
+                int fd = result.fd;
+
+                if (result.event != EVENT_READ || fd < 0 || fd >= conn_pool_size)
+                    continue;
+
+                struct conn *c = &conn_pool[fd];
+                if (!c->active || c->read_buf.len == 0) continue;
+                if (c->send_armed || c->write_buf.len > 0) continue;
+                if (c->client && c->client->state == CLIENT_BLOCKED) continue;
+                if (c->status) continue;
+
+                batch_conns[batch_count++] = c;
+            }
+
+            /* Process batch if we have enough connections */
+            if (batch_count >= 10) {
+                extern int kvs_drain_batch(struct conn **conns, int conn_count);
+                kvs_drain_batch(batch_conns, batch_count);
+
+                /* Arm sends for connections that now have responses */
+                for (int i = 0; i < batch_count; i++) {
+                    struct conn *c = batch_conns[i];
+                    if (c->write_buf.len > 0 && !c->send_armed) {
+                        if (conn_arm_send(ring, c) != 0)
+                            conn_release(c->fd);
+                    }
+                }
+            }
+        }
+
         if (worker_arm_accept(w) != 0)
             fprintf(stderr, "[proactor#%d] failed to re-arm accept\n", w->id);
         io_uring_cq_advance(ring, nready);

@@ -71,7 +71,10 @@ set(TYPE_SRCS
 
 set(NET_SRCS
     src/net/reactor.c
-    src/net/proactor.c
+    src/net/proactor_ring.c
+    src/net/proactor_conn.c
+    src/net/proactor_event.c
+    src/net/proactor_main.c
     src/net/ntyco.c
 )
 

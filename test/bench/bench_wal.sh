@@ -27,7 +27,7 @@ require_tools
 BENCH_N=1000000
 BENCH_C=50
 WARMUP_N=200000
-PIPELINES=(10 20 40 80 160)
+PIPELINES=(1 10 20 40 80 160)
 
 # ---- 输出文件 ----
 RESULT_TXT="${PROJECT_DIR}/test/bench/results_wal.txt"

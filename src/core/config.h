@@ -53,6 +53,9 @@ typedef struct {
     int  incr_repl_port;        /* Master: TCP listen port */
     int  incr_repl_master_port; /* Slave: master's TCP port to connect */
 
+    int  fullsync_timeout;      /* Fullsync timeout (ms) */
+    int  fullsync_max_retries;  /* Max retry count */
+
     /* Latency histogram for performance monitoring */
     int  latency_histogram_enabled;
 } KvsConfig;

@@ -40,6 +40,9 @@ static void config_default(void) {
     kvs_config.incr_repl_port = 6483;  /* Default TCP port for replication */
     kvs_config.incr_repl_master_port = 6483;  /* Slave: master's port to connect */
 
+    kvs_config.fullsync_timeout = 3600000;  /* 1 hour */
+    kvs_config.fullsync_max_retries = 3;
+
     kvs_config.latency_histogram_enabled = 0;
 }
 
@@ -202,6 +205,12 @@ int config_load(const char *path) {
 
         } else if (strcasecmp(key, "incr_repl_master_port") == 0) {
             parse_int(val, lineno, "incr_repl_master_port", 1, 65535, &kvs_config.incr_repl_master_port);
+
+        } else if (strcasecmp(key, "fullsync_timeout") == 0) {
+            parse_int(val, lineno, "fullsync_timeout", 1000, 7200000, &kvs_config.fullsync_timeout);
+
+        } else if (strcasecmp(key, "fullsync_max_retries") == 0) {
+            parse_int(val, lineno, "fullsync_max_retries", 0, 10, &kvs_config.fullsync_max_retries);
 
         } else if (strcasecmp(key, "latency_histogram") == 0) {
             int v = parse_bool(val, lineno, "latency_histogram");

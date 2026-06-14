@@ -91,6 +91,9 @@ set(REPL_SRCS
     src/repl/repl_backlog.c
     src/repl/repl_tcp.c
     src/repl/repl_incr.c
+    src/repl/rdma_ctrl_protocol.c
+    src/repl/rdma_repl_master.c
+    src/repl/rdma_repl_slave.c
 )
 
 # BPF sources disabled for single-threaded build

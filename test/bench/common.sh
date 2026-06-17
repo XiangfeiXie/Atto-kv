@@ -212,8 +212,8 @@ populate() {
         local batch=$batch_size
         [ $batch -gt $remaining ] && batch=$remaining
         for i in $(seq $((sent+1)) $((sent+batch))); do
-            printf '*3\r\n$3\r\nSET\r\n$9\r\nkey%06d\r\n$16\r\nbenchmark_value_\r\n' $i
-        done | timeout 300 nc -w 5 "$host" "$port" > /dev/null 2>&1
+            printf 'SET key%06d benchmark_value_\r\n' $i
+        done | timeout 300 redis-cli -h "$host" -p "$port" --pipe > /dev/null 2>&1
         sent=$((sent + batch))
         remaining=$((remaining - batch))
         echo -n "."

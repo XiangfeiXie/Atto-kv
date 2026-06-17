@@ -81,6 +81,8 @@ set(NET_SRCS
 
 set(PERSIST_SRCS
     src/persist/persistence.c
+    src/persist/persist_rdb.c
+    src/persist/persist_aof.c
     src/persist/journal.c
     src/persist/wal_persist.c
 )

@@ -411,7 +411,7 @@ int reactor_start(unsigned short port, msg_handler handler) {
 
         int nready = epoll_wait(epfd, events, 1024, timeout_ms);
         if (nready < 0) {
-            if (errno == EINTR) break;  /* Signal received */
+            if (errno == EINTR) continue;  /* Signal received — rely on g_kvs_stop to exit */
             fprintf(stderr, "[reactor] epoll_wait error: %s\n", strerror(errno));
             continue;
         }

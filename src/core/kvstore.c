@@ -1625,6 +1625,7 @@ single_key:
 int init_kvengine(void) {
     kv_store_init();
     block_init();
+    init_shared_responses();
     printf("Using string/hash storage engine (single global dict)\n");
     return 0;
 }

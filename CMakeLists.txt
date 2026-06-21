@@ -93,6 +93,8 @@ set(REPL_SRCS
     src/repl/repl_stream.c
     src/repl/repl_backlog.c
     src/repl/repl_tcp.c
+    src/repl/repl_tcp_master.c
+    src/repl/repl_tcp_slave.c
     src/repl/repl_incr.c
     src/repl/rdma_ctrl_protocol.c
     src/repl/rdma_repl_master.c

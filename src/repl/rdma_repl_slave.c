@@ -1,9 +1,17 @@
-/* Slave fullsync: FI_EP_MSG batch receiver */
+/* rdma_repl_slave.c — Slave fullsync receiver (simplified single connection)
+ *
+ * New Architecture:
+ *   - Direct connect to child RDMA port (2101)
+ *   - Pure data streaming: no control messages
+ *   - Connection shutdown = EOF
+ *   - Parse header + entries
+ */
 
 #include "rdma_repl.h"
-#include "rdma_ctrl_protocol.h"
 #include "kvstore.h"
 #include "kv_dict.h"
+#include "repl_incr.h"
+#include "persistence.h"
 
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
@@ -16,91 +24,265 @@
 #include <string.h>
 #include <arpa/inet.h>
 
-/* Wait for a single CQ completion */
-static int wait_cq(struct fid_cq *cq) {
-    struct fi_cq_data_entry e;
+/* Number of receive buffers for streaming */
+#define NUM_RECV_BUFS  4
+
+/* Size of each receive buffer (must be >= master's batch size) */
+#define RECV_BUF_SIZE  (1024 * 1024 * 1024)  /* 1GB */
+
+/* ── Helper: Wait for CQ completion ────────────────────────────────── */
+
+static int wait_cq_with_shutdown_detect(struct fid_cq *cq, struct fi_cq_data_entry *entry, int *shutdown) {
+    *shutdown = 0;
+
     for (;;) {
-        ssize_t r = fi_cq_read(cq, &e, 1);
-        if (r > 0) return 0;
-        if (r < 0 && r != -FI_EAGAIN) return -1;
+        ssize_t r = fi_cq_read(cq, entry, 1);
+        if (r > 0) return (int)entry->len;
+        if (r == -FI_EAGAIN) {
+            usleep(100);
+            continue;
+        }
+        /* r < 0: error completion */
+        struct fi_cq_err_entry err;
+        fi_cq_readerr(cq, &err, 0);
+
+        /* FI_ECANCELED: recv canceled by remote shutdown */
+        /* FI_ESHUTDOWN / FI_ENOTCONN: connection closed */
+        if (err.err == FI_ECANCELED || err.err == FI_ESHUTDOWN || err.err == FI_ENOTCONN) {
+            *shutdown = 1;
+            return 0;
+        }
+
+        fprintf(stderr, "[SLAVE] CQ error: %s (err=%d, prov_errno=%d)\n",
+                fi_strerror(err.err), err.err, err.prov_errno);
+        return -1;
     }
 }
 
-/* Parse one KV entry from buffer and load into store */
+/* ── Helper: Parse one entry from buffer ───────────────────────────── */
+
 static int parse_entry(const char **p, const char *end) {
     const char *ptr = *p;
     if (ptr + 4 > end) return -1;
+
     uint32_t klen = ntohl(*(uint32_t *)ptr); ptr += 4;
     if (ptr + klen > end) return -1;
     const char *key = ptr; ptr += klen;
+
     if (ptr + 4 > end) return -1;
     uint32_t vlen = ntohl(*(uint32_t *)ptr); ptr += 4;
     if (ptr + vlen > end) return -1;
     const char *val = ptr; ptr += vlen;
+
     if (ptr + 8 > end) return -1;
     uint64_t expire = be64toh(*(uint64_t *)ptr); ptr += 8;
 
+    /* Add to local dictionary */
     uint64_t hash = kv_hash((const uint8_t *)key, klen);
     kv_entry_t *e = dict_add(kv_dict_for(hash), key, klen, val, vlen, hash);
-    if (e) e->expire = expire;
+    if (e) e->expire = (long long)expire;
+
     *p = ptr;
     return 0;
 }
 
-int slave_receive_fullsync_batched(struct fid_domain *domain,
-                                   struct fid_ep *ep, struct fid_cq *cq) {
-    printf("[Slave] Fullsync receive start\n");
-    (void)domain;
+/* ── Main entry point ──────────────────────────────────────────────── */
 
-    /* Allocate receive buffer */
-    char *recv_buf = malloc(REMOTE_BUF_SIZE);
-    if (!recv_buf) return -1;
+int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
+    printf("[SLAVE] Starting fullsync to %s:%u\n", master_ip, rdma_port);
 
-    /* Send HANDSHAKE */
-    ctrl_msg_t hs = { .type = CTRL_MSG_HANDSHAKE };
-    if (ctrl_msg_send(ep, &hs) < 0) { free(recv_buf); return -1; }
-    if (wait_cq(cq) < 0) { free(recv_buf); return -1; }
-    printf("[Slave] HANDSHAKE sent\n");
+    /* Step 1: Create libfabric resources */
+    struct fi_info *hints = fi_allocinfo();
+    if (!hints) return -1;
+    hints->caps = FI_MSG;
+    hints->ep_attr->type = FI_EP_MSG;
+    hints->mode = 0;
+    hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED;
 
-    /* Receive loop */
-    int batches = 0, total_entries = 0;
-    while (1) {
-        /* Receive header */
-        ctrl_msg_t msg;
-        if (ctrl_msg_recv(ep, cq, &msg) < 0) break;
+    struct fi_info *info = NULL;
+    char service[16];
+    snprintf(service, sizeof(service), "%d", rdma_port);
 
-        if (msg.type == CTRL_MSG_EOF) {
-            printf("[Slave] EOF, fullsync complete\n");
-            break;
-        }
-        if (msg.type != CTRL_MSG_BATCH_ACK) break;
-
-        /* Receive data */
-        size_t dlen = msg.batch_size;
-        if (dlen > REMOTE_BUF_SIZE) break;
-        if (fi_recv(ep, recv_buf, dlen, NULL, 0, NULL) < 0) break;
-        if (wait_cq(cq) < 0) break;
-
-        /* Verify CRC */
-        if (calc_crc32(recv_buf, dlen) != msg.crc32) {
-            fprintf(stderr, "[Slave] CRC mismatch\n"); break;
-        }
-
-        /* Parse entries */
-        const char *p = recv_buf, *end = recv_buf + dlen;
-        int n = 0;
-        while (p < end) { if (parse_entry(&p, end) < 0) break; n++; }
-        total_entries += n;
-        batches++;
-        printf("[Slave] Batch %u: %d entries, %zu bytes\n", msg.batch_id, n, dlen);
-
-        /* Send ACK */
-        ctrl_msg_t ack = { .type = CTRL_MSG_BATCH_ACK, .batch_id = msg.batch_id };
-        if (ctrl_msg_send(ep, &ack) < 0) break;
-        if (wait_cq(cq) < 0) break;
+    int rc = fi_getinfo(FI_VERSION(1, 17), master_ip, service, 0, hints, &info);
+    fi_freeinfo(hints);
+    if (rc) {
+        fprintf(stderr, "[SLAVE] fi_getinfo: %s\n", fi_strerror(-rc));
+        return -1;
     }
 
-    printf("[Slave] Total: %d batches, %d entries\n", batches, total_entries);
-    free(recv_buf);
-    return 0;
+    struct fid_fabric *fabric = NULL;
+    struct fid_eq *eq = NULL;
+    struct fid_domain *domain = NULL;
+    struct fid_cq *cq = NULL;
+    struct fid_ep *ep = NULL;
+
+    if (fi_fabric(info->fabric_attr, &fabric, NULL) ||
+        fi_eq_open(fabric, &(struct fi_eq_attr){.wait_obj = FI_WAIT_UNSPEC}, &eq, NULL) ||
+        fi_domain(fabric, info, &domain, NULL) ||
+        fi_cq_open(domain, &(struct fi_cq_attr){
+            .format = FI_CQ_FORMAT_DATA, .wait_obj = FI_WAIT_UNSPEC
+        }, &cq, NULL) ||
+        fi_endpoint(domain, info, &ep, NULL) ||
+        fi_ep_bind(ep, &eq->fid, 0) ||
+        fi_ep_bind(ep, &cq->fid, FI_SEND | FI_RECV) ||
+        fi_enable(ep) ||
+        fi_connect(ep, info->dest_addr, NULL, 0)) {
+        fprintf(stderr, "[SLAVE] Setup failed\n");
+        rc = -1;
+        goto cleanup;
+    }
+
+    /* Wait for connection */
+    struct fi_eq_cm_entry entry;
+    uint32_t event;
+    ssize_t r = fi_eq_sread(eq, &event, &entry, sizeof(entry), 60000, 0);
+    if (r < 0 || event != FI_CONNECTED) {
+        fprintf(stderr, "[SLAVE] Connect failed\n");
+        rc = -1;
+        goto cleanup;
+    }
+
+    printf("[SLAVE] Connected to master child process\n");
+
+    /* Step 2: Allocate receive buffers */
+    char *recv_bufs[NUM_RECV_BUFS];
+    for (int i = 0; i < NUM_RECV_BUFS; i++) {
+        recv_bufs[i] = (char *)malloc(RECV_BUF_SIZE);
+        if (!recv_bufs[i]) {
+            fprintf(stderr, "[SLAVE] malloc failed\n");
+            rc = -1;
+            goto cleanup;
+        }
+    }
+
+    /* Pre-post all receive buffers */
+    for (int i = 0; i < NUM_RECV_BUFS; i++) {
+        if (fi_recv(ep, recv_bufs[i], RECV_BUF_SIZE, NULL, 0, recv_bufs[i]) < 0) {
+            fprintf(stderr, "[SLAVE] fi_recv failed\n");
+            rc = -1;
+            goto cleanup_bufs;
+        }
+    }
+
+    printf("[SLAVE] Pre-posted %d receive buffers\n", NUM_RECV_BUFS);
+
+    /* Step 3: Receive loop */
+    int batches = 0;
+    int total_entries = 0;
+    uint32_t expected_entries = 0;
+    uint64_t base_seq = 0;
+    int header_parsed = 0;
+
+    while (1) {
+        /* Wait for data completion */
+        int shutdown = 0;
+        struct fi_cq_data_entry ce;
+        int dlen = wait_cq_with_shutdown_detect(cq, &ce, &shutdown);
+
+        if (shutdown) {
+            printf("[SLAVE] Connection closed, fullsync done\n");
+            break;
+        }
+
+        if (dlen < 0) {
+            fprintf(stderr, "[SLAVE] CQ error\n");
+            rc = -1;
+            goto cleanup_bufs;
+        }
+
+        if (dlen == 0) {
+            continue;  /* Spurious wakeup */
+        }
+
+        /* Get buffer from completion entry */
+        char *recv_buf = (char *)ce.op_context;
+        size_t received = ce.len;
+
+        /* Parse data */
+        const char *p = recv_buf;
+        const char *end = recv_buf + received;
+        int n = 0;
+
+        if (!header_parsed) {
+            /* First batch contains header */
+            if (received < 24) {
+                fprintf(stderr, "[SLAVE] Header too short\n");
+                rc = -1;
+                goto cleanup_bufs;
+            }
+
+            uint32_t magic = ntohl(*(uint32_t *)(p + 0));
+            expected_entries = ntohl(*(uint32_t *)(p + 12));
+            base_seq = be64toh(*(uint64_t *)(p + 16));
+
+            if (magic != 0x52444232) {
+                fprintf(stderr, "[SLAVE] Invalid magic: 0x%x\n", magic);
+                rc = -1;
+                goto cleanup_bufs;
+            }
+
+            printf("[SLAVE] Header: key_count=%u, base_seq=%lu\n",
+                   expected_entries, (unsigned long)base_seq);
+
+            /* Clear existing data */
+            kvs_flush_all();
+
+            p += 24;
+            header_parsed = 1;
+        }
+
+        /* Parse entries in this batch */
+        while (p < end) {
+            if (parse_entry(&p, end) < 0) {
+                fprintf(stderr, "[SLAVE] Parse error\n");
+                rc = -1;
+                goto cleanup_bufs;
+            }
+            n++;
+        }
+
+        total_entries += n;
+        batches++;
+        printf("[SLAVE] Batch %d: %d entries, %zu bytes (total=%d/%u)\n",
+               batches, n, received, total_entries, expected_entries);
+
+        /* Check if all entries received */
+        if (expected_entries > 0 && (uint32_t)total_entries >= expected_entries) {
+            printf("[SLAVE] All entries received, fullsync done\n");
+            break;
+        }
+
+        /* Re-post receive buffer */
+        if (fi_recv(ep, recv_buf, RECV_BUF_SIZE, NULL, 0, recv_buf) < 0) {
+            fprintf(stderr, "[SLAVE] fi_recv re-post failed\n");
+            rc = -1;
+            goto cleanup_bufs;
+        }
+    }
+
+    printf("[SLAVE] Total: %d batches, %d entries\n", batches, total_entries);
+
+    /* Step 4: Rebuild encodings */
+    extern void rdb_rebuild_all_encodings(void);
+    rdb_rebuild_all_encodings();
+
+    /* Step 5: Save base_seq for incremental sync */
+    repl_incr_save_offset(base_seq);
+
+    rc = 0;
+
+cleanup_bufs:
+    for (int i = 0; i < NUM_RECV_BUFS; i++) {
+        free(recv_bufs[i]);
+    }
+
+cleanup:
+    if (ep) fi_close(&ep->fid);
+    if (cq) fi_close(&cq->fid);
+    if (domain) fi_close(&domain->fid);
+    if (eq) fi_close(&eq->fid);
+    if (fabric) fi_close(&fabric->fid);
+    fi_freeinfo(info);
+
+    return rc;
 }

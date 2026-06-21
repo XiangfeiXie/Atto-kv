@@ -5,6 +5,7 @@
 #include <rdma/fi_cm.h>
 #include <rdma/fi_errno.h>
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -64,9 +65,13 @@ int ctrl_msg_send(struct fid_ep *ep, const ctrl_msg_t *msg) {
     wire_msg.batch_id = htonl(msg->batch_id);
     wire_msg.crc32 = htonl(msg->crc32);
 
+    printf("[CTRL] Sending message type=%u, batch_id=%u, size=%zu\n",
+           msg->type, msg->batch_id, msg->batch_size);
+
     /* Send via FI_MSG */
     ssize_t ret = fi_send(ep, &wire_msg, sizeof(wire_msg), NULL, 0, NULL);
     if (ret < 0) {
+        fprintf(stderr, "[CTRL] fi_send failed: %s\n", fi_strerror((int)-ret));
         return -1;
     }
 
@@ -108,6 +113,9 @@ int ctrl_msg_recv(struct fid_ep *ep, struct fid_cq *cq, ctrl_msg_t *msg) {
     msg->batch_size = be64toh(wire_msg->batch_size);
     msg->batch_id = ntohl(wire_msg->batch_id);
     msg->crc32 = ntohl(wire_msg->crc32);
+
+    printf("[CTRL] Received message type=%u, batch_id=%u, size=%zu\n",
+           msg->type, msg->batch_id, msg->batch_size);
 
     free(wire_msg);
     return 0;

@@ -186,6 +186,16 @@ uint64_t repl_incr_get_master_offset(void) {
     return offset;
 }
 
+uint64_t repl_incr_get_backlog_start(void) {
+    pthread_mutex_lock(&g_backlog.mutex);
+    uint64_t oldest = 0;
+    if (g_backlog.master_offset > g_backlog.size) {
+        oldest = g_backlog.master_offset - g_backlog.size;
+    }
+    pthread_mutex_unlock(&g_backlog.mutex);
+    return oldest;
+}
+
 void repl_incr_ack_offset(uint64_t offset) {
     pthread_mutex_lock(&g_backlog.mutex);
     if (offset > g_backlog.slave_offset) {

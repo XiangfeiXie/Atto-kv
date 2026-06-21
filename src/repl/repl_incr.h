@@ -30,6 +30,9 @@ int repl_incr_has_offset(uint64_t offset);
 /* Get current master offset */
 uint64_t repl_incr_get_master_offset(void);
 
+/* Get backlog's oldest available offset */
+uint64_t repl_incr_get_backlog_start(void);
+
 /* Update slave acknowledged offset */
 void repl_incr_ack_offset(uint64_t offset);
 

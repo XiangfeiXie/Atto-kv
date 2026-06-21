@@ -1707,30 +1707,23 @@ int main(int argc, char *argv[]) {
         kvs_wal_persist_start();
         aof_async_init();
     }
-    if (kvs_config.incr_repl_enabled && kvs_config.rdma_role == ROLE_MASTER)
-        repl_stream_start_master();
+    if (kvs_config.incr_repl_enabled) {
+        if (kvs_config.rdma_role == ROLE_MASTER) {
+            repl_stream_start_master();
+        } else if (kvs_config.rdma_role == ROLE_SLAVE) {
+            extern uint64_t repl_incr_load_offset(void);
+            uint64_t start_seq = repl_incr_load_offset();
+            repl_stream_start_slave(start_seq);
+        }
+    }
     // if (kvs_config.sockmap_enabled)
     //     sockmap_manager_init(kvs_config.port, NULL);  /* Disabled for single-threaded build */
     if (kvs_config.rdma_sync_enabled) {
         if (kvs_config.rdma_role == ROLE_MASTER) {
             rdma_repl_master_start();
-        } else {
-            /* Slave: fullsync + incr loop.
-             * If incr reconnection fails and master requests a fresh
-             * fullsync, re-run the fullsync cycle. */
-            for (int fullsync_attempt = 0; fullsync_attempt < 5; fullsync_attempt++) {
-                if (rdma_repl_slave_run() != 0) {
-                    fprintf(stderr, "[RDMA-REPL] slave full-sync failed; "
-                                    "continuing with local state\n");
-                    break;
-                }
-                if (!rdma_repl_slave_need_fullresync())
-                    break;
-                printf("[RDMA-REPL] slave: fullresync requested, "
-                       "re-running fullsync (attempt %d)\n",
-                       fullsync_attempt + 2);
-            }
         }
+        /* Note: Slave fullsync is now handled automatically by repl_tcp.c
+         * when it detects offset is too old during sync request */
     } else {
         printf("[RDMA-REPL] rdma replication disabled by config\n");
     }

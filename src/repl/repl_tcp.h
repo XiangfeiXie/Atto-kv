@@ -2,11 +2,14 @@
  *
  * Architecture:
  *   eBPF filter → ringbuf → backlog → TCP socket → network
+ *   TCP (6483): Control plane + incremental sync
+ *   RDMA (2101): Data plane (fullsync child process only)
  *
  * Features:
  *   - Smart filtering: only write commands captured (60-80% reduction)
  *   - TCP reliability: built-in ordering, retransmission, flow control
  *   - Incremental recovery: backlog buffer for partial resync on reconnect
+ *   - RDMA fullsync: fork child process for zero-copy data transfer
  *   - Simple deployment: no special kernel features required
  *   - Integrated into kvstore main process (no separate daemon)
  *
@@ -16,6 +19,9 @@
 #define REPL_TCP_H
 
 #include <stdint.h>
+
+/* RDMA fullsync port (child process) */
+#define RDMA_FULLSYNC_PORT  2101
 
 /* Replication role */
 typedef enum {

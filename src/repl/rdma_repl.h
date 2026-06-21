@@ -2,29 +2,32 @@
 #define __RDMA_REPL_H__
 
 #include <stdint.h>
+#include <sys/types.h>
 #include "journal.h"
 
 /* ===================================================================
- * RDMA batch fullsync over libfabric (FI_EP_MSG)
+ * RDMA replication - Simplified architecture
  *
  * Architecture:
- *   - Full sync: FI_EP_MSG batch protocol (header + data via fi_send/fi_recv)
- *   - Incremental sync: XDP/AF_XDP via repl_stream
+ *   - TCP (6483): All control (sync request, heartbeat, coordination)
+ *   - RDMA (2101): Data only (fullsync streaming)
+ *   - Master: rdma_repl_master_start() only manages child sessions
+ *   - Slave: rdma_repl_slave_run() called by repl_tcp when fullsync needed
  * =================================================================== */
 
-struct fid_domain;
-struct fid_ep;
-struct fid_cq;
-
+/* Master: Initialize session management (SIGCHLD handler) */
 int rdma_repl_master_start(void);
-int rdma_repl_slave_run(void);
-int rdma_repl_slave_need_fullresync(void);
-int rdma_repl_capture_write(const kvs_journal_record_t *rec);
 
-/* Fullsync entry points */
-int master_fullsync_planB(struct fid_domain *domain, struct fid_ep *ep,
-                          struct fid_cq *cq);
-int slave_receive_fullsync_batched(struct fid_domain *domain,
-                                   struct fid_ep *ep, struct fid_cq *cq);
+/* Slave: Perform full sync via RDMA (called by repl_tcp.c) */
+int rdma_repl_slave_run(void);
+
+/* Session management: Add child process PID for tracking */
+void session_add(pid_t pid);
+
+/* Master child process: Pure RDMA data streaming (called after fork) */
+int master_fullsync_child(uint64_t base_seq);
+
+/* Slave: Direct RDMA fullsync connection (called by repl_tcp.c) */
+int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port);
 
 #endif /* __RDMA_REPL_H__ */

@@ -17,9 +17,6 @@
 
 struct repl_tcp_global g_repl = {0};
 
-/* Reassembly hash table (used by master for eBPF stream reassembly) */
-struct reassembly_table g_reassembly = {0};
-
 /* ── TCP helpers ────────────────────────────────────────────────────── */
 
 int tcp_set_options(int fd)
@@ -213,9 +210,6 @@ int repl_tcp_init(const struct repl_tcp_config *cfg)
     g_repl.last_heartbeat = time(NULL);
 
     if (cfg->role == REPL_ROLE_MASTER) {
-        pthread_mutex_init(&g_reassembly.lock, NULL);
-        memset(g_reassembly.table, 0, sizeof(g_reassembly.table));
-
         g_repl.listen_fd = tcp_listen(cfg->repl_port);
         if (g_repl.listen_fd < 0) {
             fprintf(stderr, "[REPL-TCP] Failed to create listen socket\n");
@@ -266,9 +260,6 @@ void repl_tcp_shutdown(void)
 
     if (g_repl.cfg.role == REPL_ROLE_MASTER)
         pthread_join(g_repl.heartbeat_thread, NULL);
-
-    cleanup_all_contexts();
-    pthread_mutex_destroy(&g_reassembly.lock);
 
     if (g_repl.ringbuf)       ring_buffer__free(g_repl.ringbuf);
     if (g_repl.bpf_obj)       bpf_object__close(g_repl.bpf_obj);

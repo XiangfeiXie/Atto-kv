@@ -41,74 +41,12 @@ int find_complete_resp_command(const uint8_t *data, size_t len)
     return (int)i;
 }
 
-/* ── Reassembly Context Management ──────────────────────────────────── */
-
-static inline uint32_t hash_cookie(uint64_t cookie)
-{
-    return (uint32_t)(cookie % MAX_CONNECTIONS);
-}
-
-struct reassembly_ctx *get_or_create_ctx(uint64_t cookie)
-{
-    uint32_t hash = hash_cookie(cookie);
-    pthread_mutex_lock(&g_reassembly.lock);
-
-    struct reassembly_ctx *ctx = g_reassembly.table[hash];
-    while (ctx) {
-        if (ctx->sock_cookie == cookie) {
-            pthread_mutex_unlock(&g_reassembly.lock);
-            return ctx;
-        }
-        ctx = ctx->next;
-    }
-
-    ctx = (struct reassembly_ctx *)calloc(1, sizeof(*ctx));
-    if (!ctx) { pthread_mutex_unlock(&g_reassembly.lock); return NULL; }
-
-    ctx->sock_cookie = cookie;
-    ctx->buf_len = 0;
-    ctx->last_active = time(NULL);
-
-    ctx->next = g_reassembly.table[hash];
-    g_reassembly.table[hash] = ctx;
-    pthread_mutex_unlock(&g_reassembly.lock);
-    return ctx;
-}
-
-void cleanup_stale_contexts(void)
-{
-    time_t now = time(NULL);
-    pthread_mutex_lock(&g_reassembly.lock);
-
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        struct reassembly_ctx **prev = &g_reassembly.table[i];
-        struct reassembly_ctx *ctx = *prev;
-        while (ctx) {
-            if (now - ctx->last_active > REASSEMBLY_TIMEOUT) {
-                *prev = ctx->next; free(ctx); ctx = *prev;
-            } else {
-                prev = &ctx->next; ctx = ctx->next;
-            }
-        }
-    }
-    pthread_mutex_unlock(&g_reassembly.lock);
-}
-
-void cleanup_all_contexts(void)
-{
-    pthread_mutex_lock(&g_reassembly.lock);
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        struct reassembly_ctx *ctx = g_reassembly.table[i];
-        while (ctx) {
-            struct reassembly_ctx *next = ctx->next;
-            free(ctx); ctx = next;
-        }
-        g_reassembly.table[i] = NULL;
-    }
-    pthread_mutex_unlock(&g_reassembly.lock);
-}
-
-/* ── eBPF ringbuf callback ──────────────────────────────────────────── */
+/* ── eBPF ringbuf callback (single-skb, no reassembly) ────────────────
+ *
+ * Each event carries up to REPL_OBSERVE_MAX_DATA (4096) bytes of data
+ * from a single TCP segment.  If a RESP command spans multiple segments,
+ * it is dropped — the slave will catch up via partial resync or fullsync.
+ */
 
 int master_on_data(void *ctx, void *data, size_t len)
 {
@@ -116,46 +54,26 @@ int master_on_data(void *ctx, void *data, size_t len)
     struct repl_observe_event *e = (struct repl_observe_event *)data;
     if (e->len == 0 || e->len > REPL_OBSERVE_MAX_DATA) return 0;
 
-    struct reassembly_ctx *rctx = get_or_create_ctx(e->sock_cookie);
-    if (!rctx) {
-        fprintf(stderr, "[REPL-TCP] Failed to get reassembly context\n");
-        return 0;
-    }
+    /* Try to extract a complete RESP command from this segment */
+    int cmd_len = find_complete_resp_command(e->data, e->len);
+    if (cmd_len <= 0) return 0;  /* Spans segments — dropped, recovery path covers it */
 
-    if (rctx->buf_len + e->len > REASSEMBLY_BUF_SIZE) {
-        fprintf(stderr, "[REPL-TCP] Reassembly buffer overflow, resetting (cookie=%lu)\n",
-                e->sock_cookie);
-        rctx->buf_len = 0;
-    }
+    repl_incr_append((const char *)e->data, cmd_len);
 
-    memcpy(rctx->buf + rctx->buf_len, e->data, e->len);
-    rctx->buf_len += e->len;
-    rctx->last_active = time(NULL);
-
-    while (rctx->buf_len > 0) {
-        int cmd_len = find_complete_resp_command(rctx->buf, rctx->buf_len);
-        if (cmd_len <= 0) break;
-
-        repl_incr_append((const char *)rctx->buf, cmd_len);
-
-        if (g_repl.peer_fd >= 0) {
-            if (tcp_send_data_frame(g_repl.peer_fd, rctx->buf, cmd_len) == 0) {
-                pthread_mutex_lock(&g_repl.stats_lock);
-                g_repl.stats.bytes_sent += cmd_len + REPL_FRAME_HEADER;
-                g_repl.stats.frames_sent++;
-                pthread_mutex_unlock(&g_repl.stats_lock);
-            } else {
-                close(g_repl.peer_fd);
-                g_repl.peer_fd = -1;
-                pthread_mutex_lock(&g_repl.stats_lock);
-                g_repl.stats.connected = 0;
-                pthread_mutex_unlock(&g_repl.stats_lock);
-                printf("[REPL-TCP] Slave disconnected\n");
-            }
+    if (g_repl.peer_fd >= 0) {
+        if (tcp_send_data_frame(g_repl.peer_fd, e->data, cmd_len) == 0) {
+            pthread_mutex_lock(&g_repl.stats_lock);
+            g_repl.stats.bytes_sent += cmd_len + REPL_FRAME_HEADER;
+            g_repl.stats.frames_sent++;
+            pthread_mutex_unlock(&g_repl.stats_lock);
+        } else {
+            close(g_repl.peer_fd);
+            g_repl.peer_fd = -1;
+            pthread_mutex_lock(&g_repl.stats_lock);
+            g_repl.stats.connected = 0;
+            pthread_mutex_unlock(&g_repl.stats_lock);
+            printf("[REPL-TCP] Slave disconnected\n");
         }
-
-        memmove(rctx->buf, rctx->buf + cmd_len, rctx->buf_len - cmd_len);
-        rctx->buf_len -= cmd_len;
     }
     return 0;
 }
@@ -312,7 +230,7 @@ static int master_handle_sync_request(int fd)
         }
         free(catchup_buf);
     } else {
-fullsync:
+fullsync:;
         uint64_t base_seq = repl_incr_get_master_offset();
         printf("[REPL-TCP] Triggering full sync (base_seq=%lu)\n", base_seq);
 
@@ -394,8 +312,6 @@ void *master_thread_func(void *arg)
     int flags = fcntl(g_repl.listen_fd, F_GETFL, 0);
     fcntl(g_repl.listen_fd, F_SETFL, flags | O_NONBLOCK);
 
-    int cleanup_counter = 0;
-
     while (g_repl.running) {
         if (g_repl.ringbuf)
             ring_buffer__poll(g_repl.ringbuf, 1);
@@ -420,10 +336,6 @@ void *master_thread_func(void *arg)
             }
         }
 
-        if (++cleanup_counter >= 10000) {
-            cleanup_stale_contexts();
-            cleanup_counter = 0;
-        }
         usleep(1000);
     }
 

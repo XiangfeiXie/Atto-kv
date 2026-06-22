@@ -86,19 +86,6 @@ struct heartbeat_msg {
     uint64_t master_offset;
 } __attribute__((packed));
 
-/* ── RESP Reassembly ────────────────────────────────────────────────── */
-#define REASSEMBLY_BUF_SIZE  16384
-#define REASSEMBLY_TIMEOUT   30
-#define MAX_CONNECTIONS      1024
-
-struct reassembly_ctx {
-    uint64_t sock_cookie;
-    uint8_t  buf[REASSEMBLY_BUF_SIZE];
-    size_t   buf_len;
-    time_t   last_active;
-    struct reassembly_ctx *next;
-};
-
 /* ── Global state ───────────────────────────────────────────────────── */
 struct repl_tcp_global {
     struct repl_tcp_config cfg;
@@ -127,13 +114,6 @@ struct repl_tcp_global {
 
 extern struct repl_tcp_global g_repl;
 
-/* Reassembly hash table */
-struct reassembly_table {
-    struct reassembly_ctx *table[MAX_CONNECTIONS];
-    pthread_mutex_t lock;
-};
-extern struct reassembly_table g_reassembly;
-
 /* ── TCP helpers ────────────────────────────────────────────────────── */
 int  tcp_set_options(int fd);
 int  tcp_listen(uint16_t port);
@@ -144,11 +124,6 @@ int  tcp_recv_exact(int fd, void *buf, size_t len);
 
 /* ── RESP parser ────────────────────────────────────────────────────── */
 int find_complete_resp_command(const uint8_t *data, size_t len);
-
-/* ── Reassembly ─────────────────────────────────────────────────────── */
-struct reassembly_ctx *get_or_create_ctx(uint64_t cookie);
-void cleanup_stale_contexts(void);
-void cleanup_all_contexts(void);
 
 /* ── Heartbeat ──────────────────────────────────────────────────────── */
 int  send_heartbeat_ping(int fd);

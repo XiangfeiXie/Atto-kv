@@ -1,14 +1,26 @@
-/* repl_tcp_master.c — Master-side replication logic
+/* repl_tcp_master.c — Master-side replication logic with stream reassembly
  *
- *   - RESP command reassembly from eBPF ringbuf events
+ *   - RESP command reassembly from eBPF ringbuf events (multi-segment support)
+ *   - Per-socket buffer management with GC
  *   - eBPF program loading (sockops + sockmap + ringbuf)
  *   - Sync request handling (partial resync / fullsync + fork)
  *   - Master thread (poll ringbuf + accept slaves)
  */
 #define _GNU_SOURCE
 #include "repl_tcp_internal.h"
+#include "repl_observe.h"
 
-/* ── RESP Protocol Parser ───────────────────────────────────────────── */
+/* Event flags (ensure they match repl_observe.h) */
+#define REPL_FLAG_FIRST  0x01
+#define REPL_FLAG_LAST   0x02
+
+/* ── Global stream reassembly state ─────────────────────────────────────── */
+
+static struct {
+    struct sock_stream slots[MAX_STREAM_BUFFERS];
+} g_streams = {0};
+
+/* ── RESP Protocol Parser ───────────────────────────────────────────────── */
 
 int find_complete_resp_command(const uint8_t *data, size_t len)
 {
@@ -41,44 +53,160 @@ int find_complete_resp_command(const uint8_t *data, size_t len)
     return (int)i;
 }
 
-/* ── eBPF ringbuf callback (single-skb, no reassembly) ────────────────
- *
- * Each event carries up to REPL_OBSERVE_MAX_DATA (4096) bytes of data
- * from a single TCP segment.  If a RESP command spans multiple segments,
- * it is dropped — the slave will catch up via partial resync or fullsync.
- */
+/* ── Stream management helpers ──────────────────────────────────────────── */
 
-int master_on_data(void *ctx, void *data, size_t len)
+static struct sock_stream *stream_get(uint64_t cookie)
 {
-    (void)ctx; (void)len;
-    struct repl_observe_event *e = (struct repl_observe_event *)data;
-    if (e->len == 0 || e->len > REPL_OBSERVE_MAX_DATA) return 0;
+    for (int i = 0; i < MAX_STREAM_BUFFERS; i++) {
+        if (g_streams.slots[i].sock_cookie == cookie)
+            return &g_streams.slots[i];
+    }
+    return NULL;
+}
 
-    /* Try to extract a complete RESP command from this segment */
-    int cmd_len = find_complete_resp_command(e->data, e->len);
-    if (cmd_len <= 0) return 0;  /* Spans segments — dropped, recovery path covers it */
+static struct sock_stream *stream_get_or_create(uint64_t cookie)
+{
+    struct sock_stream *s = stream_get(cookie);
+    if (s) return s;
 
-    repl_incr_append((const char *)e->data, cmd_len);
-
-    if (g_repl.peer_fd >= 0) {
-        if (tcp_send_data_frame(g_repl.peer_fd, e->data, cmd_len) == 0) {
-            pthread_mutex_lock(&g_repl.stats_lock);
-            g_repl.stats.bytes_sent += cmd_len + REPL_FRAME_HEADER;
-            g_repl.stats.frames_sent++;
-            pthread_mutex_unlock(&g_repl.stats_lock);
-        } else {
-            close(g_repl.peer_fd);
-            g_repl.peer_fd = -1;
-            pthread_mutex_lock(&g_repl.stats_lock);
-            g_repl.stats.connected = 0;
-            pthread_mutex_unlock(&g_repl.stats_lock);
-            printf("[REPL-TCP] Slave disconnected\n");
+    /* Find free slot */
+    for (int i = 0; i < MAX_STREAM_BUFFERS; i++) {
+        if (g_streams.slots[i].sock_cookie == 0) {
+            s = &g_streams.slots[i];
+            memset(s, 0, sizeof(*s));
+            s->sock_cookie = cookie;
+            return s;
         }
     }
+
+    /* All slots occupied - recycle oldest timeout buffer */
+    time_t now = time(NULL);
+    struct sock_stream *oldest = NULL;
+    for (int i = 0; i < MAX_STREAM_BUFFERS; i++) {
+        if (now - g_streams.slots[i].last_active > STREAM_GC_TIMEOUT) {
+            if (g_streams.slots[i].buffer) {
+                free(g_streams.slots[i].buffer);
+            }
+            memset(&g_streams.slots[i], 0, sizeof(struct sock_stream));
+            s = &g_streams.slots[i];
+            s->sock_cookie = cookie;
+            return s;
+        }
+        if (!oldest || g_streams.slots[i].last_active < oldest->last_active)
+            oldest = &g_streams.slots[i];
+    }
+
+    /* Force recycle oldest if all active */
+    fprintf(stderr, "[REPL-TCP] Stream buffer exhausted, dropping oldest (cookie=%lu)\n",
+            (unsigned long)oldest->sock_cookie);
+    if (oldest->buffer) free(oldest->buffer);
+    memset(oldest, 0, sizeof(*oldest));
+    oldest->sock_cookie = cookie;
+    return oldest;
+}
+
+static int stream_ensure_capacity(struct sock_stream *s, uint32_t needed)
+{
+    if (needed <= s->capacity)
+        return 0;
+    uint32_t new_cap = s->capacity ? s->capacity * 2 : 4096;
+    while (new_cap < needed)
+        new_cap *= 2;
+    uint8_t *p = realloc(s->buffer, new_cap);
+    if (!p) {
+        fprintf(stderr, "[REPL-TCP] Failed to allocate %u bytes\n", new_cap);
+        return -1;
+    }
+    s->buffer = p;
+    s->capacity = new_cap;
     return 0;
 }
 
-/* ── eBPF loader ────────────────────────────────────────────────────── */
+static void stream_cleanup_stale(void)
+{
+    time_t now = time(NULL);
+    for (int i = 0; i < MAX_STREAM_BUFFERS; i++) {
+        struct sock_stream *s = &g_streams.slots[i];
+        if (s->sock_cookie != 0 && now - s->last_active > STREAM_GC_TIMEOUT) {
+            fprintf(stderr, "[REPL-TCP] GC stale stream cookie=%lu written=%u\n",
+                    (unsigned long)s->sock_cookie, s->written);
+            if (s->buffer) free(s->buffer);
+            memset(s, 0, sizeof(*s));
+        }
+    }
+}
+
+/* ── eBPF ringbuf callback (with stream reassembly) ──────────────────────── */
+
+int master_on_data(void *ctx, void *data, size_t data_sz)
+{
+    (void)ctx; (void)data_sz;
+    struct repl_observe_event *e = (struct repl_observe_event *)data;
+
+    if (e->len == 0 || e->len > REPL_OBSERVE_MAX_DATA)
+        return 0;
+
+    struct sock_stream *s = stream_get_or_create(e->sock_cookie);
+    if (!s) return 0;
+
+    /* FIRST: Check for residual data from previous command boundary */
+    if (e->flags & REPL_FLAG_FIRST) {
+        /* If written > 0, previous LAST had residual data */
+        /* Simplification: if residual exists but new command is multi-segment, reset */
+        if (s->written > 0 && !(e->flags & REPL_FLAG_LAST)) {
+            s->written = 0;
+        }
+        /* Single-segment command (FIRST+LAST) is unaffected */
+    }
+
+    if (stream_ensure_capacity(s, s->written + e->len) != 0)
+        return 0;
+
+    /* Append data: BPF offset is relative, actual position is written + offset */
+    memcpy(s->buffer + s->written, e->data, e->len);
+    s->written += e->len;
+    s->last_active = time(NULL);
+
+    /* LAST: Command complete, submit */
+    if (e->flags & REPL_FLAG_LAST) {
+        int cmd_len = find_complete_resp_command(s->buffer, s->written);
+        if (cmd_len > 0) {
+            repl_incr_append((const char *)s->buffer, cmd_len);
+
+            if (g_repl.peer_fd >= 0) {
+                if (tcp_send_data_frame(g_repl.peer_fd, s->buffer, cmd_len) == 0) {
+                    pthread_mutex_lock(&g_repl.stats_lock);
+                    g_repl.stats.bytes_sent += cmd_len + REPL_FRAME_HEADER;
+                    g_repl.stats.frames_sent++;
+                    pthread_mutex_unlock(&g_repl.stats_lock);
+                } else {
+                    close(g_repl.peer_fd);
+                    g_repl.peer_fd = -1;
+                    pthread_mutex_lock(&g_repl.stats_lock);
+                    g_repl.stats.connected = 0;
+                    pthread_mutex_unlock(&g_repl.stats_lock);
+                    printf("[REPL-TCP] Slave disconnected\n");
+                }
+            }
+
+            /* Key fix: Preserve residual data after command boundary */
+            if (cmd_len < (int)s->written) {
+                size_t remain = s->written - cmd_len;
+                memmove(s->buffer, s->buffer + cmd_len, remain);
+                s->written = remain;
+            } else {
+                s->written = 0;
+            }
+        } else {
+            /* Parse failed - reset buffer */
+            s->written = 0;
+        }
+    }
+
+    return 0;
+}
+
+/* ── eBPF loader ────────────────────────────────────────────────────────── */
 
 int master_load_bpf(void)
 {
@@ -165,11 +293,12 @@ int master_load_bpf(void)
         return -1;
     }
 
-    printf("[REPL-TCP] eBPF filter loaded, monitoring port %u\n", g_repl.cfg.kv_port);
+    printf("[REPL-TCP] eBPF filter loaded with stream reassembly, monitoring port %u\n",
+           g_repl.cfg.kv_port);
     return 0;
 }
 
-/* ── Master sync request handler ────────────────────────────────────── */
+/* ── Master sync request handler ────────────────────────────────────────── */
 
 static int master_handle_sync_request(int fd)
 {
@@ -302,7 +431,7 @@ fullsync:;
     return 0;
 }
 
-/* ── Master thread ──────────────────────────────────────────────────── */
+/* ── Master thread (with integrated GC) ─────────────────────────────────── */
 
 void *master_thread_func(void *arg)
 {
@@ -312,9 +441,18 @@ void *master_thread_func(void *arg)
     int flags = fcntl(g_repl.listen_fd, F_GETFL, 0);
     fcntl(g_repl.listen_fd, F_SETFL, flags | O_NONBLOCK);
 
+    time_t last_gc = time(NULL);
+
     while (g_repl.running) {
         if (g_repl.ringbuf)
             ring_buffer__poll(g_repl.ringbuf, 1);
+
+        /* GC stale stream buffers every STREAM_GC_INTERVAL seconds */
+        time_t now = time(NULL);
+        if (now - last_gc >= STREAM_GC_INTERVAL) {
+            stream_cleanup_stale();
+            last_gc = now;
+        }
 
         if (g_repl.peer_fd < 0) {
             struct sockaddr_in slave_addr;
@@ -337,6 +475,13 @@ void *master_thread_func(void *arg)
         }
 
         usleep(1000);
+    }
+
+    /* Cleanup all stream buffers on exit */
+    for (int i = 0; i < MAX_STREAM_BUFFERS; i++) {
+        if (g_streams.slots[i].buffer) {
+            free(g_streams.slots[i].buffer);
+        }
     }
 
     printf("[REPL-TCP] Master thread stopped\n");

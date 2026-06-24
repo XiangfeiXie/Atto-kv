@@ -1,12 +1,14 @@
-/* repl_filter.bpf.c — Smart eBPF filter for replication
+/* repl_filter.bpf.c — Smart eBPF filter for replication with stream reassembly
  *
  * This eBPF program filters Redis commands at the socket layer:
  * - Only intercepts WRITE commands (SET, DEL, LPUSH, etc.)
  * - Ignores READ commands (GET, KEYS, INFO, etc.)
+ * - Handles multi-segment commands via per-socket state tracking
  * - Copies write commands to ringbuf for replication
  * - Always returns SK_PASS (transparent to application)
  *
- * Reduces ringbuf pressure by 60-80% compared to capturing all traffic.
+ * Key improvement: Solves the multi-segment command loss problem by tracking
+ * command boundaries using RESP protocol length parsing.
  */
 
 #include <linux/bpf.h>
@@ -14,7 +16,7 @@
 #include <bpf/bpf_endian.h>
 #include "repl_observe.h"
 
-/* ── BPF Maps ────────────────────────────────────────────────────── */
+/* ── BPF Maps ────────────────────────────────────────────────────────── */
 
 struct {
     __uint(type,        BPF_MAP_TYPE_SOCKHASH);
@@ -43,7 +45,106 @@ struct {
     __type(value,       __u8[REPL_OBSERVE_MAX_DATA]);
 } repl_temp_buf SEC(".maps");
 
-/* ── Helper: Check if command is a write command ──────────────────── */
+/* Per-socket state for command tracking */
+struct repl_sock_state {
+    __u32 expected;   /* Total bytes expected for current write command, 0 = not in command */
+    __u32 seen;       /* Bytes captured so far */
+};
+
+struct {
+    __uint(type,        BPF_MAP_TYPE_SK_STORAGE);
+    __uint(map_flags,   BPF_F_NO_PREALLOC);
+    __type(key,         int);
+    __type(value,       struct repl_sock_state);
+} repl_sock_state_map SEC(".maps");
+
+/* ── Helper: Parse RESP total length ──────────────────────────────────── */
+
+/*
+ * Parse RESP command total length from protocol header.
+ * Only needs first 256 bytes (all $L prefixes are in the header).
+ * Returns 0 on parse failure or if command exceeds REPL_OBSERVE_MAX_CMD.
+ * Supports up to 16 arguments (sufficient for KV commands).
+ */
+static __always_inline __u32 parse_resp_total_len(const __u8 *data, __u32 data_len)
+{
+    if (data_len < 4 || data[0] != '*')
+        return 0;
+
+    __u32 cursor = 1, N = 0;
+
+    /* Parse *N\r\n - array count (max 6 digits) */
+    #pragma unroll
+    for (int j = 0; j < 6; j++) {
+        if (cursor >= data_len) break;
+        __u8 c = data[cursor];
+        if (c >= '0' && c <= '9') {
+            if (N > 100) return 0;  /* Overflow protection */
+            N = N * 10 + (c - '0');
+            cursor++;
+        } else {
+            break;
+        }
+    }
+    if (N == 0 || N > 16)
+        return 0;
+    if (cursor + 1 >= data_len || data[cursor] != '\r' || data[cursor + 1] != '\n')
+        return 0;
+    cursor += 2;
+
+    /* Initialize total bytes with *N\r\n header length */
+    __u32 total = cursor;
+
+    /* Parse each argument's length */
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        if (i >= (int)N) break;
+
+        __u32 arg_start = cursor;
+
+        if (cursor >= data_len || data[cursor] != '$')
+            return 0;
+        cursor++;
+
+        __u32 L = 0;
+        /* Parse argument length (max 10 digits = 9GB limit) */
+        #pragma unroll
+        for (int j = 0; j < 10; j++) {
+            if (cursor >= data_len) break;
+            __u8 c = data[cursor];
+            if (c >= '0' && c <= '9') {
+                /* Overflow protection: max 1GB per argument */
+                if (L > 100000000) return 0;
+                L = L * 10 + (c - '0');
+                cursor++;
+            } else {
+                break;
+            }
+        }
+        if (cursor + 1 >= data_len)
+            return 0;
+        if (data[cursor] != '\r' || data[cursor + 1] != '\n')
+            return 0;
+        cursor += 2;
+
+        /* Accumulate: $L\r\n prefix + L data bytes + trailing \r\n */
+        __u32 segment_len = (cursor - arg_start) + L + 2;
+
+        /* Prevent addition overflow */
+        if (total > 0xFFFFFFFF - segment_len)
+            return 0;
+
+        total += segment_len;
+    }
+
+    /* Final check: don't exceed REPL_OBSERVE_MAX_CMD (4MB) */
+    if (total > REPL_OBSERVE_MAX_CMD)
+        return 0;
+
+    return total;
+}
+
+/* ── Helper: Check if command is a write command ──────────────────────── */
 
 static __always_inline int is_write_command(const char *data, __u32 len) {
     /* RESP protocol format: *N\r\n$L\r\nCOMMAND\r\n...
@@ -133,7 +234,7 @@ static __always_inline int is_write_command(const char *data, __u32 len) {
     return 0;
 }
 
-/* ── sockops: Auto-insert passive-established sockets ──────────────── */
+/* ── sockops: Auto-insert passive-established sockets ──────────────────── */
 
 SEC("sockops")
 int repl_filter_sockops(struct bpf_sock_ops *skops) {
@@ -154,61 +255,95 @@ int repl_filter_sockops(struct bpf_sock_ops *skops) {
     return 0;
 }
 
-/* ── stream_parser: Simple passthrough parser ──────────────────────── */
+/* ── stream_parser: Simple passthrough parser ──────────────────────────── */
 
 SEC("sk_skb/stream_parser")
 int repl_filter_parser(struct __sk_buff *skb) {
     return skb->len;
 }
 
-/* ── stream_verdict: Smart filtering + copy to ringbuf ─────────────── */
+/* ── stream_verdict: Smart filtering + stream reassembly ───────────────── */
 
 SEC("sk_skb/stream_verdict")
 int repl_filter_verdict(struct __sk_buff *skb) {
-    __u32 len = skb->len;
-    if (len == 0 || len > REPL_OBSERVE_MAX_DATA)
+    __u32 skb_len = skb->len;
+    if (skb_len == 0)
         return SK_PASS;
 
-    /* Quick filter check: only process if starts with '*' (RESP array) */
-    __u8 first_byte = 0;
-    if (bpf_skb_load_bytes(skb, 0, &first_byte, 1) != 0)
-        return SK_PASS;
-    if (first_byte != '*')
-        return SK_PASS;
-
-    /* Get per-CPU temporary buffer for command parsing */
-    __u32 key = 0;
-    __u8 *data = bpf_map_lookup_elem(&repl_temp_buf, &key);
-    if (!data)
+    /* Get per-socket state (create if not exists) */
+    __u64 cookie = bpf_get_socket_cookie(skb);
+    struct repl_sock_state *st =
+        bpf_sk_storage_get(&repl_sock_state_map, skb, 0,
+                           BPF_SK_STORAGE_GET_F_CREATE);
+    if (!st)
         return SK_PASS;
 
-    /* Load minimal data for command detection (first 64 bytes is enough) */
-    __u32 parse_len = len < 64 ? len : 64;
-    if (bpf_skb_load_bytes(skb, 0, data, parse_len) != 0)
-        return SK_PASS;
+    /* Check if we're in the middle of a write command */
+    if (st->expected == 0) {
+        /* Not in a command - check if this starts a new write command */
+        __u8 first_byte = 0;
+        if (bpf_skb_load_bytes(skb, 0, &first_byte, 1) != 0)
+            return SK_PASS;
+        if (first_byte != '*')
+            return SK_PASS;
 
-    /* Filter: only intercept write commands */
-    if (!is_write_command((const char *)data, parse_len))
-        return SK_PASS;
+        /* Get temporary buffer for parsing */
+        __u32 key = 0;
+        __u8 *data = bpf_map_lookup_elem(&repl_temp_buf, &key);
+        if (!data)
+            return SK_PASS;
 
-    /* Allocate ringbuf entry */
+        /* Load header for parsing (256 bytes is enough for all $L prefixes) */
+        __u32 parse_len = skb_len < 256 ? skb_len : 256;
+        if (bpf_skb_load_bytes(skb, 0, data, parse_len) != 0)
+            return SK_PASS;
+
+        /* Parse RESP header to get total command length */
+        __u32 total = parse_resp_total_len(data, parse_len);
+        if (total == 0 || total > REPL_OBSERVE_MAX_CMD)
+            return SK_PASS;
+
+        /* Check if this is a write command */
+        if (!is_write_command((const char *)data, parse_len))
+            return SK_PASS;
+
+        /* Enter capture state */
+        st->expected = total;
+        st->seen = 0;
+    }
+
+    /* Allocate ringbuf event */
     struct repl_observe_event *e =
         bpf_ringbuf_reserve(&repl_ringbuf, sizeof(*e), 0);
     if (!e)
-        return SK_PASS;
+        return SK_PASS;  /* ringbuf full, drop (slave will catch up via resync) */
 
-    e->sock_cookie = bpf_get_socket_cookie(skb);
-    e->len = len;
-    e->padding = 0;
-
-    /* Copy full command data directly from skb to ringbuf */
-    __u32 copy_len = len;
+    __u32 copy_len = skb_len;
     if (copy_len > REPL_OBSERVE_MAX_DATA)
         copy_len = REPL_OBSERVE_MAX_DATA;
 
     if (bpf_skb_load_bytes(skb, 0, e->data, copy_len) != 0) {
         bpf_ringbuf_discard(e, 0);
         return SK_PASS;
+    }
+
+    e->sock_cookie = cookie;
+    e->len = copy_len;
+    e->offset = st->seen;
+    e->flags = 0;
+    e->padding[0] = 0;
+    e->padding[1] = 0;
+    e->padding[2] = 0;
+
+    /* Set flags */
+    if (st->seen == 0)
+        e->flags |= REPL_FLAG_FIRST;
+
+    st->seen += skb_len;
+    if (st->seen >= st->expected) {
+        e->flags |= REPL_FLAG_LAST;
+        st->expected = 0;
+        st->seen = 0;
     }
 
     bpf_ringbuf_submit(e, 0);

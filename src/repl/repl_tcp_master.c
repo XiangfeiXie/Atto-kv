@@ -4,11 +4,12 @@
  *   - Per-socket buffer management with GC
  *   - eBPF program loading (sockops + sockmap + ringbuf)
  *   - Sync request handling (partial resync / fullsync + fork)
- *   - Master thread (poll ringbuf + accept slaves)
+ *   - Master thread (poll ringbuf + accept slaves + process notify queue)
  */
 #define _GNU_SOURCE
 #include "repl_tcp_internal.h"
 #include "repl_observe.h"
+#include "repl_notify.h"
 
 /* Event flags (ensure they match repl_observe.h) */
 #define REPL_FLAG_FIRST  0x01
@@ -446,6 +447,10 @@ void *master_thread_func(void *arg)
     while (g_repl.running) {
         if (g_repl.ringbuf)
             ring_buffer__poll(g_repl.ringbuf, 1);
+
+        /* Process long command notifications from main process
+         * Commands >4KB are not captured by eBPF, main process pushes them to queue */
+        repl_notify_flush();
 
         /* GC stale stream buffers every STREAM_GC_INTERVAL seconds */
         time_t now = time(NULL);

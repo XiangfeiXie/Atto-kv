@@ -307,10 +307,27 @@ int repl_filter_verdict(struct __sk_buff *skb) {
         if (!is_write_command((const char *)data, parse_len))
             return SK_PASS;
 
-        /* Enter capture state */
+        /* KEY CHANGE: Long commands (>4KB) are passed through to main process
+         * Only short commands (≤4KB) are captured by eBPF
+         * Main process will handle long commands via repl_notify after execution
+         */
+        if (total > 4096) {
+            /* Don't set expected - all subsequent skbs will pass through
+             * Main process will recv the complete command via normal TCP stack
+             */
+            return SK_PASS;
+        }
+
+        /* Enter capture state (only for commands ≤4KB) */
         st->expected = total;
         st->seen = 0;
     }
+
+    /* If expected==0, this is either a long command's subsequent segment
+     * or a read command - pass through without capturing
+     */
+    if (st->expected == 0)
+        return SK_PASS;
 
     /* Allocate ringbuf event */
     struct repl_observe_event *e =

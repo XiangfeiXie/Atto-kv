@@ -60,6 +60,7 @@ struct repl_tcp_stats {
     uint64_t reconnect_count;
     uint64_t master_offset;      /* Master current write offset */
     uint64_t slave_offset;       /* Slave acknowledged offset */
+    uint64_t large_commands;     /* Long commands (>4KB) via notify path */
     int      connected;
     int      partial_resync;     /* 1 if last reconnect used partial resync */
 };

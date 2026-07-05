@@ -7,6 +7,8 @@
 #include <sys/resource.h>
 #include <sys/utsname.h>
 
+#include "persistence.h"
+
 static int section_match(kvs_token_t t, const char *name) {
     size_t n = strlen(name);
     if ((size_t)t.len != n) return 0;

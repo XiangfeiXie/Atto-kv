@@ -22,16 +22,31 @@
 #include <time.h>
 #include <unistd.h>
 
-/* eBPF ringbuf event (shared with BPF program via repl_observe.h)
- * Each event holds one complete RESP command — no multi-segment reassembly. */
+/* eBPF ringbuf event (shared with BPF program via repl_observe.h) */
 #define REPL_OBSERVE_MAX_DATA  4096
 #define REPL_OBSERVE_RINGBUF_SZ (8 * 1024 * 1024)
 
 struct repl_observe_event {
     uint64_t sock_cookie;
     uint32_t len;
-    uint32_t pad;
+    uint32_t offset;
+    uint8_t  flags;
+    uint8_t  padding[3];
     uint8_t  data[REPL_OBSERVE_MAX_DATA];
+};
+
+/* Stream reassembly support */
+#define MAX_STREAM_BUFFERS  32   /* Enough for one-master-one-slave scenario */
+#define STREAM_GC_TIMEOUT   10   /* 10 seconds timeout */
+#define STREAM_GC_INTERVAL  5    /* GC every 5 seconds */
+
+/* Per-socket command reassembly buffer */
+struct sock_stream {
+    uint64_t  sock_cookie;
+    uint8_t  *buffer;        /* Dynamically allocated */
+    uint32_t  capacity;      /* Buffer capacity */
+    uint32_t  written;       /* Bytes written */
+    time_t    last_active;   /* Last activity time (for GC) */
 };
 
 /* ── Constants ──────────────────────────────────────────────────────── */

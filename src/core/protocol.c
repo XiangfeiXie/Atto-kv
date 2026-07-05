@@ -3,7 +3,6 @@
 #include "client.h"
 #include "config.h"
 #include "kvstore.h"           /* kvs_lat_record_ns, KVS_LAT_BUCKETS */
-#include "../repl/repl_notify.h"  /* Long command replication notification */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -288,32 +287,6 @@ int resp_parse_slices(const char *buf, int buflen,
 
 /* ==================== Batch drain loop ==================== */
 
-/* Fast check if command is a write command (for replication notification)
- * Only checks first character for performance */
-static inline int is_write_command_fast(kvs_token_t cmd) {
-    if (cmd.len == 0) return 0;
-
-    char c0 = cmd.ptr[0];
-    if (c0 >= 'a' && c0 <= 'z') c0 -= 32;  /* toupper */
-
-    /* Write commands: SET, DEL, HSET, LPUSH, RPUSH, SADD, ZADD, INCR, DECR, APPEND, MSET */
-    switch (c0) {
-        case 'S':  /* SET, SETEX, SETNX, SADD, SREM */
-        case 'D':  /* DEL, DECR, DECRBY */
-        case 'H':  /* HSET, HMSET, HDEL */
-        case 'L':  /* LPUSH, LPOP */
-        case 'R':  /* RPUSH, RPOP */
-        case 'Z':  /* ZADD, ZREM */
-        case 'I':  /* INCR, INCRBY */
-        case 'A':  /* APPEND */
-        case 'M':  /* MSET, MSETNX */
-        case 'F':  /* FLUSHALL, FLUSHDB */
-            return 1;
-        default:
-            return 0;
-    }
-}
-
 int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn *c);
 
 /* Batch drain optimization: process multiple connections in one call
@@ -356,11 +329,6 @@ int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn 
         int cmd_len = resp_parse_slices(rb->buf + off, remaining,
                                         tokens, KVS_MAX_TOKENS, &argc);
         if (cmd_len > 0) {
-            /* Check if this is a long write command that needs replication notification
-             * >4KB commands are not captured by eBPF, so main process notifies replication */
-            int need_repl_notify = (cmd_len > 4096) && (argc > 0) && is_write_command_fast(tokens[0]);
-            const char *cmd_start = rb->buf + off;
-
             /* Phase 10.8 — wire-path latency sample using rdtsc-backed
              * fast clock (Phase 10.7).  Sampled 1-in-(LAT_SAMPLE_MASK+1)=64 to keep
              * hot-path overhead at ~0.2% even at 500k+ QPS: an A/B with
@@ -380,12 +348,6 @@ int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn 
             if (sample) {
                 uint64_t _t1 = kvs_now_ns_fast();
                 kvs_lat_record_ns(_t1 - _t0);
-            }
-
-            /* Long write command: notify replication module after successful execution
-             * Queue push is lock-free (~10ns), master replication thread will handle send */
-            if (need_repl_notify && r == DISPATCH_OK) {
-                repl_notify_push(cmd_start, (size_t)cmd_len);
             }
 
             off += cmd_len;

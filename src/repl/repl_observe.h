@@ -13,19 +13,21 @@
 /* Maximum command length (4MB, covers 99.9% cases) */
 #define REPL_OBSERVE_MAX_CMD    (4 * 1024 * 1024)
 
+/* Event flags */
+#define REPL_FLAG_FIRST  0x01   /* First skb of a command */
+#define REPL_FLAG_LAST   0x02   /* Last skb of a command */
+
 /* BPF programs use kernel types directly, userspace uses stdint.h */
 #ifdef __BPF__
 
-/* Replication event structure (BPF side)
- *
- * Each event holds one complete RESP command (no multi-segment reassembly).
- * Commands that don't fit in a single skb (>4KB or split across segments)
- * are handled by the main-process repl_notify path instead. */
+/* Replication event structure (BPF side) */
 struct repl_observe_event {
     __u64 sock_cookie;  /* Socket cookie for connection tracking */
-    __u32 len;          /* Length of complete command data */
-    __u32 pad;          /* Padding for 8-byte alignment */
-    __u8  data[REPL_OBSERVE_MAX_DATA];  /* Complete command data */
+    __u32 len;          /* Length of data in this segment */
+    __u32 offset;       /* Offset in complete command */
+    __u8  flags;        /* REPL_FLAG_FIRST | REPL_FLAG_LAST */
+    __u8  padding[3];   /* Padding for alignment */
+    __u8  data[REPL_OBSERVE_MAX_DATA];  /* Command data */
 };
 
 #endif /* __BPF__ */

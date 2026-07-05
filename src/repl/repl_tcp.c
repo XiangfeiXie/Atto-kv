@@ -12,7 +12,6 @@
  */
 #define _GNU_SOURCE
 #include "repl_tcp_internal.h"
-#include "repl_notify.h"
 
 /* ── Global state ───────────────────────────────────────────────────── */
 
@@ -216,9 +215,6 @@ int repl_tcp_init(const struct repl_tcp_config *cfg)
             fprintf(stderr, "[REPL-TCP] Failed to create listen socket\n");
             return -1;
         }
-
-        /* Initialize long command notification queue */
-        repl_notify_init();
 
         if (master_load_bpf() != 0)
             fprintf(stderr, "[REPL-TCP] Warning: eBPF filter failed, using fallback mode\n");

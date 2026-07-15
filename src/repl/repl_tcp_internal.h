@@ -22,31 +22,30 @@
 #include <time.h>
 #include <unistd.h>
 
-/* eBPF ringbuf event (shared with BPF program via repl_observe.h) */
+/* eBPF ringbuf event (userspace copy, must match repl_observe.h) */
 #define REPL_OBSERVE_MAX_DATA  4096
 #define REPL_OBSERVE_RINGBUF_SZ (8 * 1024 * 1024)
 
 struct repl_observe_event {
     uint64_t sock_cookie;
     uint32_t len;
-    uint32_t offset;
-    uint8_t  flags;
-    uint8_t  padding[3];
+    uint32_t pad;
     uint8_t  data[REPL_OBSERVE_MAX_DATA];
 };
 
-/* Stream reassembly support */
-#define MAX_STREAM_BUFFERS  32   /* Enough for one-master-one-slave scenario */
-#define STREAM_GC_TIMEOUT   10   /* 10 seconds timeout */
-#define STREAM_GC_INTERVAL  5    /* GC every 5 seconds */
+/* Stream reassembly: linear per-socket buffer.
+ * strparser guarantees ordered delivery (no OOO), so a single
+ * linear buffer is sufficient — no rb_tree / sequence tracking needed. */
+#define MAX_STREAM_BUFFERS  32
+#define STREAM_GC_TIMEOUT   10
+#define STREAM_GC_INTERVAL  5
 
-/* Per-socket command reassembly buffer */
 struct sock_stream {
     uint64_t  sock_cookie;
-    uint8_t  *buffer;        /* Dynamically allocated */
-    uint32_t  capacity;      /* Buffer capacity */
-    uint32_t  written;       /* Bytes written */
-    time_t    last_active;   /* Last activity time (for GC) */
+    uint8_t  *buf;           /* Linear reassembly buffer (realloc'd as needed) */
+    uint32_t  len;           /* Valid bytes in buf */
+    uint32_t  cap;           /* Total capacity */
+    time_t    last_active;
 };
 
 /* ── Constants ──────────────────────────────────────────────────────── */
@@ -140,6 +139,9 @@ int  tcp_recv_exact(int fd, void *buf, size_t len);
 
 /* ── RESP parser ────────────────────────────────────────────────────── */
 int find_complete_resp_command(const uint8_t *data, size_t len);
+
+/* ── Write-command filter ───────────────────────────────────────────── */
+int is_write_command(const uint8_t *data, size_t len);
 
 /* ── Heartbeat ──────────────────────────────────────────────────────── */
 int  send_heartbeat_ping(int fd);

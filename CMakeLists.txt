@@ -32,11 +32,6 @@ pkg_check_modules(FABRIC   REQUIRED libfabric)
 pkg_check_modules(ZLIB     REQUIRED zlib)
 pkg_check_modules(LIBBPF  REQUIRED libbpf)
 
-# ── AF_XDP and KCP removed (replaced by TCP replication) ──────────────
-# Phase 9.1 — Simplified replication using TCP + eBPF
-# Removed dependencies: libxdp, KCP library
-# Kept: eBPF filter for write command capture
-
 # ── NtyCo (third-party coroutine library) ─────────────────────────────
 set(NTYCO_DIR  ${CMAKE_SOURCE_DIR}/NtyCo)
 set(NTYCO_LIB  ${NTYCO_DIR}/libntyco.a)
@@ -100,17 +95,13 @@ set(REPL_SRCS
     src/repl/repl_tcp_master.c
     src/repl/repl_tcp_slave.c
     src/repl/repl_incr.c
+    src/repl/repl_xdp_reasm.c
     src/repl/rdma_ctrl_protocol.c
     src/repl/rdma_repl_master.c
     src/repl/rdma_repl_slave.c
 )
 
-# BPF sources disabled for single-threaded build
-set(BPF_SRCS
-    # src/bpf/xdp_manager.c
-    # src/bpf/sockmap_manager.c
-    # src/bpf/bpf_pin.c
-)
+# BPF sources (currently empty — XDP uses repl_xdp_reasm.c)
 
 set(KVSTORE_SRCS
     ${UTIL_SRCS}
@@ -120,69 +111,25 @@ set(KVSTORE_SRCS
     ${NET_SRCS}
     ${PERSIST_SRCS}
     ${REPL_SRCS}
-    ${BPF_SRCS}
 )
 
-# ── Compile XDP kernel BPF program ────────────────────────────────────
-set(XDP_KERN_SRC  ${CMAKE_SOURCE_DIR}/src/bpf/xdp_kvs.kern.c)
-set(XDP_KERN_OBJ  ${CMAKE_BINARY_DIR}/xdp_kvs.kern.o)
+# ── Compile repl_filter_xdp BPF program (XDP packet mirror) ───────────
+set(REPL_FILTER_XDP_KERN_SRC ${CMAKE_SOURCE_DIR}/src/repl/repl_filter_xdp.bpf.c)
+set(REPL_FILTER_XDP_KERN_OBJ ${CMAKE_BINARY_DIR}/repl_filter_xdp.bpf.o)
 
 add_custom_command(
-    OUTPUT  ${XDP_KERN_OBJ}
-    COMMAND clang -O2 -g -target bpf
-            -I${CMAKE_SOURCE_DIR}/src/bpf
-            -I/usr/include
-            -I/usr/include/x86_64-linux-gnu
-            -c ${XDP_KERN_SRC}
-            -o ${XDP_KERN_OBJ}
-    DEPENDS ${XDP_KERN_SRC} ${CMAKE_SOURCE_DIR}/src/bpf/xdp_kvs.h
-    COMMENT "Compiling XDP BPF kernel program"
-)
-
-# ── BPF kernel programs disabled for single-threaded build ────────────
-# add_custom_target(xdp_kern DEPENDS ${XDP_KERN_OBJ})
-# add_custom_target(sockmap_kern DEPENDS ${SOCKMAP_KERN_OBJ})
-
-# ── Compile repl-agent BPF programs ───────────────────────────────────
-# repl_observe.bpf.o — socket-layer observation for replication
-set(REPL_OBSERVE_KERN_SRC ${CMAKE_SOURCE_DIR}/src/repl/repl_observe.bpf.c)
-set(REPL_OBSERVE_KERN_OBJ ${CMAKE_BINARY_DIR}/repl_observe.bpf.o)
-
-add_custom_command(
-    OUTPUT  ${REPL_OBSERVE_KERN_OBJ}
+    OUTPUT  ${REPL_FILTER_XDP_KERN_OBJ}
     COMMAND clang -O2 -g -target bpf
             -I${CMAKE_SOURCE_DIR}/src/repl
             -I/usr/include
             -I/usr/include/x86_64-linux-gnu
-            -c ${REPL_OBSERVE_KERN_SRC}
-            -o ${REPL_OBSERVE_KERN_OBJ}
-    DEPENDS ${REPL_OBSERVE_KERN_SRC} ${CMAKE_SOURCE_DIR}/src/repl/repl_observe.h
-    COMMENT "Compiling repl_observe BPF program"
+            -c ${REPL_FILTER_XDP_KERN_SRC}
+            -o ${REPL_FILTER_XDP_KERN_OBJ}
+    DEPENDS ${REPL_FILTER_XDP_KERN_SRC}
+    COMMENT "Compiling repl_filter_xdp.bpf.c (XDP)"
 )
 
-add_custom_target(repl_observe_kern DEPENDS ${REPL_OBSERVE_KERN_OBJ})
-
-# ── Compile repl_filter BPF program (smart filtering) ──────────────────
-set(REPL_FILTER_KERN_SRC ${CMAKE_SOURCE_DIR}/src/repl/repl_filter.bpf.c)
-set(REPL_FILTER_KERN_OBJ ${CMAKE_BINARY_DIR}/repl_filter.bpf.o)
-
-add_custom_command(
-    OUTPUT  ${REPL_FILTER_KERN_OBJ}
-    COMMAND clang -O2 -g -target bpf
-            -I${CMAKE_SOURCE_DIR}/src/repl
-            -I/usr/include
-            -I/usr/include/x86_64-linux-gnu
-            -c ${REPL_FILTER_KERN_SRC}
-            -o ${REPL_FILTER_KERN_OBJ}
-    DEPENDS ${REPL_FILTER_KERN_SRC}
-    COMMENT "Compiling repl_filter.bpf.c"
-)
-
-add_custom_target(repl_filter_kern DEPENDS ${REPL_FILTER_KERN_OBJ})
-
-# ── XDP KCP filter removed (no longer needed with TCP) ─────────────────
-
-# ── Old XDP replication removed (replaced by KCP+AF_XDP) ─────────────
+add_custom_target(repl_filter_xdp_kern DEPENDS ${REPL_FILTER_XDP_KERN_OBJ})
 
 # ── kvstore target ────────────────────────────────────────────────────
 add_executable(kvstore ${KVSTORE_SRCS})
@@ -195,7 +142,6 @@ target_include_directories(kvstore PRIVATE
     src/net
     src/persist
     src/repl
-    src/bpf
     ${NTYCO_DIR}/core
     ${URING_INCLUDE_DIRS}
     ${JEMALLOC_INCLUDE_DIRS}
@@ -215,12 +161,7 @@ target_link_libraries(kvstore PRIVATE
     dl
 )
 
-if(ENABLE_AF_XDP)
-    target_link_libraries(kvstore PRIVATE ${LIBXDP_LIBRARIES})
-    target_include_directories(kvstore PRIVATE ${LIBXDP_INCLUDE_DIRS})
-endif()
-
-add_dependencies(kvstore ntyco repl_filter_kern)
+add_dependencies(kvstore ntyco repl_filter_xdp_kern)
 
 # ── Set capabilities for eBPF (requires libcap) ───────────────────────
 # This allows kvstore to load eBPF programs without running as root
@@ -246,28 +187,6 @@ add_custom_target(set-caps
     COMMENT "Setting eBPF capabilities on kvstore binary"
     VERBATIM
 )
-
-# ── repl-agent target (deprecated - replaced by KCP+XDP) ──────────────
-# Commented out: old independent replication agent
-# set(REPL_AGENT_SRCS
-#     src/repl/repl_agent.c
-# )
-#
-# add_executable(repl-agent ${REPL_AGENT_SRCS})
-#
-# target_include_directories(repl-agent PRIVATE
-#     src/repl
-#     ${LIBBPF_INCLUDE_DIRS}
-# )
-#
-# target_link_libraries(repl-agent PRIVATE
-#     Threads::Threads
-#     ${LIBBPF_LIBRARIES}
-#     elf
-#     dl
-# )
-#
-# add_dependencies(repl-agent repl_observe_kern)
 
 # ── testcase target ───────────────────────────────────────────────────
 add_executable(testcase test/testcase.c)

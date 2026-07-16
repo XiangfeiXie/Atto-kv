@@ -1,35 +1,35 @@
-/* repl_tcp_master.c — Master-side replication with linear stream reassembly
+/* repl_tcp_master.c — Master-side replication (XDP path)
  *
- *   - eBPF ringbuf → linear per-socket buffer (ordered delivery, no OOO)
- *   - RESP command extraction + write-command filter
- *   - Backlog append + slave forwarding
- *   - eBPF loader + sync request handler + master thread
+ * Pipeline:
+ *   XDP BPF → ringbuf → xdp_reasm_on_event()  (repl_xdp_reasm.c)
+ *            → seq dedup + ordering + linear buffer
+ *            → find_complete_resp_command()    (this file)
+ *            → is_write_command()              (this file)
+ *            → forward_to_slave()              (this file)
  *
- * Key design (vs old FIRST/LAST/offset approach):
- *   - eBPF does zero protocol parsing — just copies raw skb bytes
- *   - User-space appends each event to a linear buffer, then loops:
- *       extract complete RESP cmd → if write → backlog + forward
- *     Pipelines naturally handled: multiple cmds per segment work too.
- *   - Read commands are consumed and discarded (no forwarding).
+ * This file contains:
+ *   - RESP protocol parser
+ *   - Write-command filter
+ *   - Forward to slave (TCP data frame + backlog append)
+ *   - Sync request handler
+ *   - Master thread (accept + ringbuf poll + GC)
  */
 
 #define _GNU_SOURCE
 #include "repl_tcp_internal.h"
-#include "repl_observe.h"
 
 #include <stdlib.h>
 
-/* ── Global stream reassembly state ─────────────────────────────────── */
+/* Max RESP command length (sanity cap) */
+#define MAX_RESP_CMD_LEN  (4 * 1024 * 1024)
 
-static struct {
-    struct sock_stream slots[MAX_STREAM_BUFFERS];
-} g_streams;
+/* GC interval for XDP connection table (seconds) */
+#define XDP_GC_INTERVAL    5
 
 /* ── Write-command filter ─────────────────────────────────────────────
  *
  * Checks the first 3 chars of the command name (after RESP header).
- * False positives (e.g. SUBSTR matching 'S') are harmless — they just
- * result in an extra backlog append that the slave replays harmlessly.
+ * False positives are harmless — extra backlog append, slave replays idempotently.
  * False negatives would be catastrophic, so we err on the inclusive side. */
 
 int is_write_command(const uint8_t *data, size_t len)
@@ -109,7 +109,7 @@ int find_complete_resp_command(const uint8_t *data, size_t len)
         int arg_len = 0;
         while (i < len && data[i] >= '0' && data[i] <= '9') {
             arg_len = arg_len * 10 + (data[i] - '0');
-            if (arg_len > REPL_OBSERVE_MAX_CMD) return -1;
+            if (arg_len > MAX_RESP_CMD_LEN) return -1;
             i++;
         }
         if (i + 1 >= len) return 0;
@@ -124,88 +124,9 @@ int find_complete_resp_command(const uint8_t *data, size_t len)
     return (int)i;
 }
 
-/* ── Stream management ──────────────────────────────────────────────── */
-
-static struct sock_stream *stream_get(uint64_t cookie)
-{
-    for (int i = 0; i < MAX_STREAM_BUFFERS; i++)
-        if (g_streams.slots[i].sock_cookie == cookie)
-            return &g_streams.slots[i];
-    return NULL;
-}
-
-static struct sock_stream *stream_get_or_create(uint64_t cookie)
-{
-    struct sock_stream *s = stream_get(cookie);
-    if (s) return s;
-
-    /* Find free slot */
-    for (int i = 0; i < MAX_STREAM_BUFFERS; i++) {
-        if (g_streams.slots[i].sock_cookie == 0) {
-            s = &g_streams.slots[i];
-            memset(s, 0, sizeof(*s));
-            s->sock_cookie = cookie;
-            return s;
-        }
-    }
-
-    /* Recycle stale */
-    time_t now = time(NULL);
-    for (int i = 0; i < MAX_STREAM_BUFFERS; i++) {
-        struct sock_stream *c = &g_streams.slots[i];
-        if (now - c->last_active > STREAM_GC_TIMEOUT) {
-            free(c->buf);
-            memset(c, 0, sizeof(*c));
-            c->sock_cookie = cookie;
-            return c;
-        }
-    }
-
-    /* Force-recycle oldest */
-    struct sock_stream *oldest = &g_streams.slots[0];
-    for (int i = 1; i < MAX_STREAM_BUFFERS; i++)
-        if (g_streams.slots[i].last_active < oldest->last_active)
-            oldest = &g_streams.slots[i];
-
-    fprintf(stderr, "[REPL-TCP] Stream slots exhausted, evicting cookie=%lu\n",
-            (unsigned long)oldest->sock_cookie);
-    free(oldest->buf);
-    memset(oldest, 0, sizeof(*oldest));
-    oldest->sock_cookie = cookie;
-    return oldest;
-}
-
-static int stream_ensure_capacity(struct sock_stream *s, uint32_t needed)
-{
-    if (needed <= s->cap) return 0;
-
-    uint32_t new_cap = s->cap ? s->cap : 4096;
-    while (new_cap < needed) {
-        if (new_cap > REPL_OBSERVE_MAX_CMD) return -1;
-        new_cap *= 2;
-    }
-    uint8_t *p = realloc(s->buf, new_cap);
-    if (!p) return -1;
-    s->buf = p;
-    s->cap = new_cap;
-    return 0;
-}
-
-static void stream_cleanup_stale(void)
-{
-    time_t now = time(NULL);
-    for (int i = 0; i < MAX_STREAM_BUFFERS; i++) {
-        struct sock_stream *s = &g_streams.slots[i];
-        if (s->sock_cookie && now - s->last_active > STREAM_GC_TIMEOUT) {
-            free(s->buf);
-            memset(s, 0, sizeof(*s));
-        }
-    }
-}
-
 /* ── Forward a verified write command to slave ──────────────────────── */
 
-static void forward_to_slave(const uint8_t *cmd, uint32_t cmd_len)
+void forward_to_slave(const uint8_t *cmd, uint32_t cmd_len)
 {
     repl_incr_append((const char *)cmd, (size_t)cmd_len);
 
@@ -224,181 +145,6 @@ static void forward_to_slave(const uint8_t *cmd, uint32_t cmd_len)
         pthread_mutex_unlock(&g_repl.stats_lock);
         printf("[REPL-TCP] Slave disconnected\n");
     }
-}
-
-/* ── eBPF ringbuf callback ────────────────────────────────────────────
- *
- * Linear reassembly + command extraction + write filter + forward.
- *
- * For each event:
- *   1. Append raw bytes to per-socket linear buffer
- *   2. Loop: extract complete RESP commands from buffer head
- *      - Write command → backlog + forward to slave
- *      - Read command  → skip (consumed, not forwarded)
- *   3. Compact remaining partial data to buffer head
- *
- * Pipelined commands (multiple cmds in one TCP segment) are naturally
- * handled by the extraction loop. */
-
-int master_on_data(void *ctx, void *data, size_t data_sz)
-{
-    (void)ctx; (void)data_sz;
-    struct repl_observe_event *e = (struct repl_observe_event *)data;
-
-    if (e->len == 0 || e->len > REPL_OBSERVE_MAX_DATA)
-        return 0;
-
-    struct sock_stream *s = stream_get_or_create(e->sock_cookie);
-    if (!s) return 0;
-
-    /* Grow if needed (cap exponential growth) */
-    if (stream_ensure_capacity(s, s->len + e->len) != 0) {
-        /* Buffer too large — likely garbage, reset */
-        s->len = 0;
-        return 0;
-    }
-
-    /* Append to linear buffer */
-    memcpy(s->buf + s->len, e->data, e->len);
-    s->len += e->len;
-    s->last_active = time(NULL);
-
-    /* Extract all complete commands from the head of the buffer.
-     * Typical case: 1 command.  Pipeline case: N commands. */
-    int extracted = 0;
-    while (1) {
-        int cmd_len = find_complete_resp_command(s->buf, s->len);
-        if (cmd_len <= 0) {
-            /* 0 = incomplete (wait for more data)
-             * -1 = parse error (garbage — discard accumulated data) */
-            if (cmd_len < 0 && s->len > REPL_OBSERVE_MAX_CMD) {
-                /* Stale/garbage data accumulated, reset */
-                s->len = 0;
-            }
-            break;
-        }
-
-        /* Check if write command — if so, replicate */
-        if (is_write_command(s->buf, (size_t)cmd_len))
-            forward_to_slave(s->buf, (uint32_t)cmd_len);
-
-        extracted++;
-
-        /* Consume this command from the buffer */
-        s->len -= (uint32_t)cmd_len;
-        if (s->len > 0)
-            memmove(s->buf, s->buf + cmd_len, s->len);
-    }
-
-    /* Keep small buffers (<64KB) to avoid constant realloc.
-     * Free larger ones to bound memory. */
-    if (s->len == 0 && s->cap > 65536) {
-        free(s->buf);
-        s->buf = NULL;
-        s->cap = 0;
-    }
-
-    return 0;
-}
-
-/* ── eBPF loader ────────────────────────────────────────────────────── */
-
-int master_load_bpf(void)
-{
-    char obj_path[512];
-    const char *build_dir = getenv("BUILD_DIR");
-    if (!build_dir) {
-        char self[256];
-        ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
-        if (n > 0) {
-            self[n] = '\0';
-            char *slash = strrchr(self, '/');
-            if (slash) *slash = '\0';
-            snprintf(obj_path, sizeof(obj_path), "%s/repl_filter.bpf.o", self);
-            if (access(obj_path, R_OK) != 0)
-                snprintf(obj_path, sizeof(obj_path), "build/repl_filter.bpf.o");
-        } else {
-            snprintf(obj_path, sizeof(obj_path), "build/repl_filter.bpf.o");
-        }
-    } else {
-        snprintf(obj_path, sizeof(obj_path), "%s/repl_filter.bpf.o", build_dir);
-    }
-
-    if (access(obj_path, R_OK) != 0) {
-        fprintf(stderr, "[REPL-TCP] BPF object not found: %s\n", obj_path);
-        return -1;
-    }
-
-    g_repl.bpf_obj = bpf_object__open_file(obj_path, NULL);
-    if (!g_repl.bpf_obj) {
-        fprintf(stderr, "[REPL-TCP] bpf_object__open_file: %s\n", strerror(errno));
-        return -1;
-    }
-    if (bpf_object__load(g_repl.bpf_obj)) {
-        fprintf(stderr, "[REPL-TCP] bpf_object__load failed\n");
-        bpf_object__close(g_repl.bpf_obj);
-        g_repl.bpf_obj = NULL;
-        return -1;
-    }
-
-    struct bpf_map *cfg_map = bpf_object__find_map_by_name(g_repl.bpf_obj, "repl_config");
-    if (cfg_map) {
-        uint32_t key = 0, val = g_repl.cfg.kv_port;
-        bpf_map__update_elem(cfg_map, &key, sizeof(key), &val, sizeof(val), BPF_ANY);
-    }
-
-    g_repl.cgroup_fd = open("/sys/fs/cgroup", O_RDONLY | O_DIRECTORY);
-    if (g_repl.cgroup_fd < 0) {
-        fprintf(stderr, "[REPL-TCP] open cgroup: %s\n", strerror(errno));
-        bpf_object__close(g_repl.bpf_obj);
-        g_repl.bpf_obj = NULL;
-        return -1;
-    }
-
-    struct bpf_program *sockops =
-        bpf_object__find_program_by_name(g_repl.bpf_obj, "repl_filter_sockops");
-    if (sockops)
-        bpf_prog_attach(bpf_program__fd(sockops), g_repl.cgroup_fd,
-                        BPF_CGROUP_SOCK_OPS, 0);
-
-    struct bpf_map *sockmap =
-        bpf_object__find_map_by_name(g_repl.bpf_obj, "repl_sockmap");
-    if (sockmap) {
-        int map_fd = bpf_map__fd(sockmap);
-        struct bpf_program *parser =
-            bpf_object__find_program_by_name(g_repl.bpf_obj, "repl_filter_parser");
-        if (parser)
-            bpf_prog_attach(bpf_program__fd(parser), map_fd,
-                            BPF_SK_SKB_STREAM_PARSER, 0);
-        struct bpf_program *verdict =
-            bpf_object__find_program_by_name(g_repl.bpf_obj, "repl_filter_verdict");
-        if (verdict)
-            bpf_prog_attach(bpf_program__fd(verdict), map_fd,
-                            BPF_SK_SKB_STREAM_VERDICT, 0);
-    }
-
-    struct bpf_map *rb_map =
-        bpf_object__find_map_by_name(g_repl.bpf_obj, "repl_ringbuf");
-    if (!rb_map) {
-        fprintf(stderr, "[REPL-TCP] ringbuf map not found\n");
-        close(g_repl.cgroup_fd);
-        bpf_object__close(g_repl.bpf_obj);
-        g_repl.bpf_obj = NULL;
-        return -1;
-    }
-
-    g_repl.ringbuf = ring_buffer__new(bpf_map__fd(rb_map), master_on_data, NULL, NULL);
-    if (!g_repl.ringbuf) {
-        fprintf(stderr, "[REPL-TCP] ring_buffer__new failed\n");
-        close(g_repl.cgroup_fd);
-        bpf_object__close(g_repl.bpf_obj);
-        g_repl.bpf_obj = NULL;
-        return -1;
-    }
-
-    printf("[REPL-TCP] eBPF filter loaded, monitoring port %u\n",
-           g_repl.cfg.kv_port);
-    return 0;
 }
 
 /* ── Master sync request handler ────────────────────────────────────── */
@@ -542,7 +288,7 @@ fullsync:;
 void *master_thread_func(void *arg)
 {
     (void)arg;
-    printf("[REPL-TCP] Master thread started\n");
+    printf("[REPL-TCP] Master thread started (XDP mode)\n");
 
     int flags = fcntl(g_repl.listen_fd, F_GETFL, 0);
     fcntl(g_repl.listen_fd, F_SETFL, flags | O_NONBLOCK);
@@ -554,8 +300,8 @@ void *master_thread_func(void *arg)
             ring_buffer__poll(g_repl.ringbuf, 1);
 
         time_t now = time(NULL);
-        if (now - last_gc >= STREAM_GC_INTERVAL) {
-            stream_cleanup_stale();
+        if (now - last_gc >= XDP_GC_INTERVAL) {
+            xdp_reasm_gc();
             last_gc = now;
         }
 
@@ -583,9 +329,6 @@ void *master_thread_func(void *arg)
 
         usleep(1000);
     }
-
-    for (int i = 0; i < MAX_STREAM_BUFFERS; i++)
-        free(g_streams.slots[i].buf);
 
     printf("[REPL-TCP] Master thread stopped\n");
     return NULL;

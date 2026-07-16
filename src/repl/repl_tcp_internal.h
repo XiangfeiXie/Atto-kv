@@ -1,10 +1,15 @@
-/* repl_tcp_internal.h — Internal types and declarations shared across repl_tcp_*.c */
+/* repl_tcp_internal.h — Internal types and declarations shared across repl_tcp_*.c
+ *
+ * XDP path (only):
+ *   XDP BPF → ringbuf → xdp_reasm_on_event() → RESP extract → forward_to_slave()
+ */
 
 #ifndef REPL_TCP_INTERNAL_H
 #define REPL_TCP_INTERNAL_H
 
 #include "repl_tcp.h"
 #include "repl_incr.h"
+#include "repl_xdp_reasm.h"
 
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
@@ -21,32 +26,6 @@
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
-
-/* eBPF ringbuf event (userspace copy, must match repl_observe.h) */
-#define REPL_OBSERVE_MAX_DATA  4096
-#define REPL_OBSERVE_RINGBUF_SZ (8 * 1024 * 1024)
-
-struct repl_observe_event {
-    uint64_t sock_cookie;
-    uint32_t len;
-    uint32_t pad;
-    uint8_t  data[REPL_OBSERVE_MAX_DATA];
-};
-
-/* Stream reassembly: linear per-socket buffer.
- * strparser guarantees ordered delivery (no OOO), so a single
- * linear buffer is sufficient — no rb_tree / sequence tracking needed. */
-#define MAX_STREAM_BUFFERS  32
-#define STREAM_GC_TIMEOUT   10
-#define STREAM_GC_INTERVAL  5
-
-struct sock_stream {
-    uint64_t  sock_cookie;
-    uint8_t  *buf;           /* Linear reassembly buffer (realloc'd as needed) */
-    uint32_t  len;           /* Valid bytes in buf */
-    uint32_t  cap;           /* Total capacity */
-    time_t    last_active;
-};
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 #define REPL_FRAME_HEADER   4
@@ -108,10 +87,10 @@ struct repl_tcp_global {
     pthread_t              heartbeat_thread;
     volatile int           running;
 
-    /* eBPF state (master only) */
+    /* XDP eBPF state (master only) */
     struct bpf_object     *bpf_obj;
     struct ring_buffer    *ringbuf;
-    int                    cgroup_fd;
+    xdp_attach_t           xdp_att;
 
     /* TCP state */
     int                    listen_fd;
@@ -137,10 +116,8 @@ int  tcp_send_frame(int fd, const void *data, uint32_t len);
 int  tcp_send_data_frame(int fd, const void *data, uint32_t len);
 int  tcp_recv_exact(int fd, void *buf, size_t len);
 
-/* ── RESP parser ────────────────────────────────────────────────────── */
+/* ── RESP parser + write-command filter (used by xdp_reasm) ─────────── */
 int find_complete_resp_command(const uint8_t *data, size_t len);
-
-/* ── Write-command filter ───────────────────────────────────────────── */
 int is_write_command(const uint8_t *data, size_t len);
 
 /* ── Heartbeat ──────────────────────────────────────────────────────── */
@@ -150,9 +127,8 @@ int  check_heartbeat_timeout(void);
 void *heartbeat_thread_func(void *arg);
 
 /* ── Master ─────────────────────────────────────────────────────────── */
-int  master_load_bpf(void);
-int  master_on_data(void *ctx, void *data, size_t len);
 void *master_thread_func(void *arg);
+void  forward_to_slave(const uint8_t *cmd, uint32_t cmd_len);
 
 /* ── Slave ──────────────────────────────────────────────────────────── */
 int  slave_apply_command(const uint8_t *data, uint32_t len);

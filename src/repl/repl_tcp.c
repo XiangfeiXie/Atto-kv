@@ -1,15 +1,15 @@
 /* repl_tcp.c — TCP transport + heartbeat + public API
  *
- * This file contains:
- *   1. Global state (g_repl, g_reassembly)
- *   2. TCP helpers (set_options, listen, connect, send_frame, recv_exact)
- *   3. Heartbeat (ping, timeout, thread)
- *   4. Public API (init, shutdown, get_stats)
+ * Architecture (XDP only):
+ *   XDP BPF (iface) → ringbuf → xdp_reasm_on_event()
+ *       → seq dedup + ordering + RESP extract
+ *       → is_write_command() → forward_to_slave()
+ *       → TCP data frame → slave
  *
- * Protocol types: see repl_tcp_internal.h
- * Master logic:  see repl_tcp_master.c
- * Slave logic:   see repl_tcp_slave.c
+ * TCP (6483): Control plane + incremental sync
+ * RDMA (2101): Data plane (fullsync child process)
  */
+
 #define _GNU_SOURCE
 #include "repl_tcp_internal.h"
 
@@ -216,14 +216,28 @@ int repl_tcp_init(const struct repl_tcp_config *cfg)
             return -1;
         }
 
-        if (master_load_bpf() != 0)
-            fprintf(stderr, "[REPL-TCP] Warning: eBPF filter failed, using fallback mode\n");
+        /* XDP: init reassembly, load BPF, attach to interface */
+        if (xdp_reasm_init(forward_to_slave) != 0) {
+            fprintf(stderr, "[REPL-TCP] XDP reasm init failed\n");
+            close(g_repl.listen_fd);
+            return -1;
+        }
+
+        if (xdp_load_bpf(cfg->kv_port, NULL, xdp_reasm_on_event,
+                         &g_repl.bpf_obj, &g_repl.ringbuf,
+                         &g_repl.xdp_att) != 0) {
+            fprintf(stderr, "[REPL-TCP] XDP load failed\n");
+            xdp_reasm_shutdown();
+            close(g_repl.listen_fd);
+            return -1;
+        }
 
         if (pthread_create(&g_repl.thread, NULL, master_thread_func, NULL) != 0) {
             fprintf(stderr, "[REPL-TCP] pthread_create failed\n");
+            xdp_reasm_shutdown();
             if (g_repl.ringbuf) ring_buffer__free(g_repl.ringbuf);
             if (g_repl.bpf_obj) bpf_object__close(g_repl.bpf_obj);
-            if (g_repl.cgroup_fd >= 0) close(g_repl.cgroup_fd);
+            xdp_detach(&g_repl.xdp_att);
             close(g_repl.listen_fd);
             return -1;
         }
@@ -232,14 +246,15 @@ int repl_tcp_init(const struct repl_tcp_config *cfg)
             fprintf(stderr, "[REPL-TCP] Failed to create heartbeat thread\n");
             g_repl.running = 0;
             pthread_join(g_repl.thread, NULL);
+            xdp_reasm_shutdown();
             if (g_repl.ringbuf) ring_buffer__free(g_repl.ringbuf);
             if (g_repl.bpf_obj) bpf_object__close(g_repl.bpf_obj);
-            if (g_repl.cgroup_fd >= 0) close(g_repl.cgroup_fd);
+            xdp_detach(&g_repl.xdp_att);
             close(g_repl.listen_fd);
             return -1;
         }
 
-        printf("[REPL-TCP] Master initialized on port %u\n", cfg->repl_port);
+        printf("[REPL-TCP] Master initialized (XDP mode) on port %u\n", cfg->repl_port);
     } else {
         if (pthread_create(&g_repl.thread, NULL, slave_thread_func, NULL) != 0) {
             fprintf(stderr, "[REPL-TCP] pthread_create failed\n");
@@ -261,9 +276,12 @@ void repl_tcp_shutdown(void)
     if (g_repl.cfg.role == REPL_ROLE_MASTER)
         pthread_join(g_repl.heartbeat_thread, NULL);
 
-    if (g_repl.ringbuf)       ring_buffer__free(g_repl.ringbuf);
-    if (g_repl.bpf_obj)       bpf_object__close(g_repl.bpf_obj);
-    if (g_repl.cgroup_fd >= 0) close(g_repl.cgroup_fd);
+    xdp_reasm_shutdown();
+
+    if (g_repl.ringbuf)   ring_buffer__free(g_repl.ringbuf);
+    if (g_repl.bpf_obj)   bpf_object__close(g_repl.bpf_obj);
+    xdp_detach(&g_repl.xdp_att);
+
     if (g_repl.listen_fd >= 0) close(g_repl.listen_fd);
     if (g_repl.peer_fd >= 0)   close(g_repl.peer_fd);
     if (g_repl.kv_fd >= 0)     close(g_repl.kv_fd);

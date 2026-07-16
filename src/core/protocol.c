@@ -8,6 +8,17 @@
 #include <stdlib.h>
 #include <time.h>
 
+/* ── Debug instrumentation for RESP parser ────
+ * Enable via: KVS_DEBUG_RESP=1 ./kvstore ...
+ * Levels: 1=parse errors only, 2=all parse decisions, 3=trace */
+#define KVS_DEBUG_RESP_ENABLED() (getenv("KVS_DEBUG_RESP") != NULL)
+#define KVS_DEBUG_RESP_LEVEL() \
+    (KVS_DEBUG_RESP_ENABLED() ? atoi(getenv("KVS_DEBUG_RESP")) : 0)
+#define DEBUG_RESP(level, fmt, ...) \
+    do { if (KVS_DEBUG_RESP_LEVEL() >= (level)) \
+        fprintf(stderr, "[RESP] " fmt "\n", ##__VA_ARGS__); \
+    } while (0)
+
 #if defined(__AVX2__)
 #include <immintrin.h>
 #elif defined(__SSE2__)
@@ -96,7 +107,7 @@ int resp_parse_uint_bounded(const char *p, int n,
         case 2: {
             unsigned c0 = (unsigned char)p[0] - '0';
             unsigned c1 = (unsigned char)p[1] - '0';
-            if (__builtin_expect((c0 | c1) > 9, 0)) return -1;
+            if (__builtin_expect(c0 > 9 || c1 > 9, 0)) return -1;
             v = c0 * 10 + c1;
             break;
         }
@@ -104,7 +115,7 @@ int resp_parse_uint_bounded(const char *p, int n,
             unsigned c0 = (unsigned char)p[0] - '0';
             unsigned c1 = (unsigned char)p[1] - '0';
             unsigned c2 = (unsigned char)p[2] - '0';
-            if (__builtin_expect((c0 | c1 | c2) > 9, 0)) return -1;
+            if (__builtin_expect(c0 > 9 || c1 > 9 || c2 > 9, 0)) return -1;
             v = c0 * 100 + c1 * 10 + c2;
             break;
         }
@@ -113,7 +124,7 @@ int resp_parse_uint_bounded(const char *p, int n,
             unsigned c1 = (unsigned char)p[1] - '0';
             unsigned c2 = (unsigned char)p[2] - '0';
             unsigned c3 = (unsigned char)p[3] - '0';
-            if (__builtin_expect((c0 | c1 | c2 | c3) > 9, 0)) return -1;
+            if (__builtin_expect(c0 > 9 || c1 > 9 || c2 > 9 || c3 > 9, 0)) return -1;
             v = c0 * 1000 + c1 * 100 + c2 * 10 + c3;
             break;
         }
@@ -130,7 +141,7 @@ int resp_parse_uint_bounded(const char *p, int n,
         unsigned c1 = (unsigned char)p[i+1] - '0';
         unsigned c2 = (unsigned char)p[i+2] - '0';
         unsigned c3 = (unsigned char)p[i+3] - '0';
-        if (__builtin_expect((c0 | c1 | c2 | c3) > 9, 0)) return -1;
+        if (__builtin_expect(c0 > 9 || c1 > 9 || c2 > 9 || c3 > 9, 0)) return -1;
         v = v * 10000 + c0 * 1000 + c1 * 100 + c2 * 10 + c3;
         if (__builtin_expect(v > max_value, 0)) return -1;
     }

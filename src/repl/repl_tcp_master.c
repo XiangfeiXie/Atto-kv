@@ -217,18 +217,36 @@ fullsync:;
         uint64_t base_seq = repl_incr_get_master_offset();
         printf("[REPL-TCP] Triggering full sync (base_seq=%lu)\n", base_seq);
 
-        extern int master_fullsync_child(uint64_t base_seq);
+        extern int master_fullsync_child(uint64_t base_seq, int ready_fd);
         extern void session_add(pid_t pid);
 
+        /* Pipe for child to signal readiness before parent responds */
+        int pipefd[2];
+        if (pipe(pipefd) < 0) { perror("[REPL-TCP] pipe"); return -1; }
+
         pid_t child_pid = fork();
-        if (child_pid < 0) { perror("[REPL-TCP] fork"); return -1; }
+        if (child_pid < 0) { perror("[REPL-TCP] fork"); close(pipefd[0]); close(pipefd[1]); return -1; }
 
         if (child_pid == 0) {
+            close(pipefd[0]);   /* child only writes */
             close(fd);
             if (g_repl.listen_fd >= 0) close(g_repl.listen_fd);
             if (g_repl.kv_fd >= 0) close(g_repl.kv_fd);
-            int rc = master_fullsync_child(base_seq);
+            int rc = master_fullsync_child(base_seq, pipefd[1]);
             _exit(rc == 0 ? 0 : 1);
+        }
+
+        close(pipefd[1]);  /* parent only reads */
+
+        /* Wait for child to fi_listen() before responding to slave */
+        {
+            char ready = 0;
+            ssize_t n = read(pipefd[0], &ready, 1);
+            close(pipefd[0]);
+            if (n != 1 || ready != 1) {
+                fprintf(stderr, "[REPL-TCP] Child failed to become ready\n");
+                return -1;
+            }
         }
 
         session_add(child_pid);

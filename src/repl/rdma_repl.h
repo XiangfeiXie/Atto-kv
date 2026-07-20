@@ -24,8 +24,9 @@ int rdma_repl_slave_run(void);
 /* Session management: Add child process PID for tracking */
 void session_add(pid_t pid);
 
-/* Master child process: Pure RDMA data streaming (called after fork) */
-int master_fullsync_child(uint64_t base_seq);
+/* Master child process: Pure RDMA data streaming (called after fork).
+ * ready_fd >= 0: write a byte after fi_listen() so parent knows we're ready. */
+int master_fullsync_child(uint64_t base_seq, int ready_fd);
 
 /* Slave: Direct RDMA fullsync connection (called by repl_tcp.c) */
 int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port);

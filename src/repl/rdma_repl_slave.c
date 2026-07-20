@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <arpa/inet.h>
 
 /* Number of receive buffers for streaming */
@@ -171,9 +172,11 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
     /* Step 3: Receive loop */
     int batches = 0;
     int total_entries = 0;
+    uint64_t total_bytes = 0;
     uint32_t expected_entries = 0;
     uint64_t base_seq = 0;
     int header_parsed = 0;
+    struct timespec t_start, t_end;
 
     while (1) {
         /* Wait for data completion */
@@ -231,6 +234,7 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
 
             p += 24;
             header_parsed = 1;
+            clock_gettime(CLOCK_MONOTONIC, &t_start);
         }
 
         /* Parse entries in this batch */
@@ -244,6 +248,7 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
         }
 
         total_entries += n;
+        total_bytes += received;
         batches++;
         printf("[SLAVE] Batch %d: %d entries, %zu bytes (total=%d/%u)\n",
                batches, n, received, total_entries, expected_entries);
@@ -268,8 +273,20 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
     extern void rdb_rebuild_all_encodings(void);
     rdb_rebuild_all_encodings();
 
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+
     /* Step 5: Save base_seq for incremental sync */
     repl_incr_save_offset(base_seq);
+
+    /* Print receive-side throughput */
+    {
+        double ms = (t_end.tv_sec - t_start.tv_sec) * 1000.0
+                  + (t_end.tv_nsec - t_start.tv_nsec) / 1e6;
+        double mbps = (ms > 0) ? (total_bytes / (ms / 1000.0) / (1024.0 * 1024.0)) : 0;
+        double eps  = (ms > 0) ? (total_entries / (ms / 1000.0)) : 0;
+        printf("[SLAVE] Recv throughput: %lu bytes, %d entries, %.1f ms, %.2f MB/s, %.0f entries/s\n",
+               (unsigned long)total_bytes, total_entries, ms, mbps, eps);
+    }
 
     rc = 0;
 

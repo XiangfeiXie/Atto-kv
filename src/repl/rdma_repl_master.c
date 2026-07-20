@@ -70,7 +70,7 @@ static int serialize_entry(char *buf, size_t room, kv_entry_t *e) {
 
 /* ── Child Process: Fullsync Main ──────────────────────────────────── */
 
-int master_fullsync_child(uint64_t base_seq) {
+int master_fullsync_child(uint64_t base_seq, int ready_fd) {
     printf("[CHILD] Fullsync process started (pid=%d, base_seq=%lu)\n",
            getpid(), (unsigned long)base_seq);
 
@@ -111,6 +111,17 @@ int master_fullsync_child(uint64_t base_seq) {
     }
 
     printf("[CHILD] Listening on port %d\n", CHILD_RDMA_PORT);
+
+    /* Signal parent that we are ready to accept connections */
+    if (ready_fd >= 0) {
+        char ready = 1;
+        ssize_t n = write(ready_fd, &ready, 1);
+        close(ready_fd);
+        if (n != 1) {
+            fprintf(stderr, "[CHILD] Failed to signal parent\n");
+            return -1;
+        }
+    }
 
     /* Step 2: Wait for slave connection */
     struct fi_eq_cm_entry entry;

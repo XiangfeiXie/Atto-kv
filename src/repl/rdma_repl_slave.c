@@ -12,6 +12,7 @@
 #include "kv_dict.h"
 #include "repl_incr.h"
 #include "persistence.h"
+#include "config.h"
 
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
@@ -98,6 +99,7 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
     hints->ep_attr->type = FI_EP_MSG;
     hints->mode = 0;
     hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_ALLOCATED;
+    hints->fabric_attr->prov_name = strdup(kvs_config.rdma_provider);
 
     struct fi_info *info = NULL;
     char service[16];

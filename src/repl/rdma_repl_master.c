@@ -51,23 +51,6 @@ static int wait_cq(struct fid_cq *cq) {
     }
 }
 
-/* ── Helper: Serialize one entry ───────────────────────────────────── */
-
-static int serialize_entry(char *buf, size_t room, kv_entry_t *e) {
-    /* Format: [klen:4][key][dlen:4][data][expire:8] */
-    size_t need = 4 + e->key_len + 4 + e->val_len + 8;
-    if (need > room) return -1;
-
-    char *p = buf;
-    *(uint32_t *)p = htonl(e->key_len); p += 4;
-    memcpy(p, entry_key(e), e->key_len); p += e->key_len;
-    *(uint32_t *)p = htonl(e->val_len); p += 4;
-    memcpy(p, e->data, e->val_len); p += e->val_len;
-    *(uint64_t *)p = htobe64((uint64_t)e->expire);
-
-    return (int)need;
-}
-
 /* ── Child Process: Fullsync Main ──────────────────────────────────── */
 
 int master_fullsync_child(uint64_t base_seq, int ready_fd) {
@@ -192,12 +175,15 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
     kv_store_iter_init(&it);
     kv_entry_t *e;
 
-    while ((e = kv_store_iter_next(&it)) != NULL) {
-        int n = serialize_entry(batch_buf + batch_offset,
-                                STREAM_BATCH_SIZE - batch_offset, e);
+    /* ── Inline entry serialization ────────────────────────────────────
+     * Format: [klen:4][key][dlen:4][data][expire:8]
+     * Inlined to eliminate per-entry function call overhead. */
 
-        if (n < 0) {
-            /* Batch full, send it */
+    while ((e = kv_store_iter_next(&it)) != NULL) {
+        size_t need = 4 + e->key_len + 4 + e->val_len + 8;
+
+        if (batch_offset + need > STREAM_BATCH_SIZE) {
+            /* Send full batch */
             if (fi_send(ep, batch_buf, batch_offset, NULL, 0, NULL) < 0) {
                 fprintf(stderr, "[CHILD] fi_send failed\n");
                 free(batch_buf);
@@ -207,21 +193,20 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
                 free(batch_buf);
                 return -1;
             }
-
             total_bytes += batch_offset;
             batch_offset = 0;
-
-            /* Retry serialization */
-            n = serialize_entry(batch_buf + batch_offset,
-                               STREAM_BATCH_SIZE - batch_offset, e);
-            if (n < 0) {
-                fprintf(stderr, "[CHILD] Entry too large\n");
-                free(batch_buf);
-                return -1;
-            }
         }
 
-        batch_offset += n;
+        {
+            char *p = batch_buf + batch_offset;
+            *(uint32_t *)p = htonl(e->key_len); p += 4;
+            memcpy(p, entry_key(e), e->key_len); p += e->key_len;
+            *(uint32_t *)p = htonl(e->val_len); p += 4;
+            memcpy(p, e->data, e->val_len); p += e->val_len;
+            *(uint64_t *)p = htobe64((uint64_t)e->expire);
+        }
+
+        batch_offset += need;
         total_entries++;
     }
     kv_store_iter_free(&it);

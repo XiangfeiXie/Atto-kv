@@ -103,6 +103,7 @@ static inline uint64_t kv_hash(const uint8_t *key, uint32_t len) {
 void     dict_init(kv_dict_t *d);
 void     dict_destroy(kv_dict_t *d);
 void     dict_clear(kv_dict_t *d);
+void     dict_reserve(kv_dict_t *d, uint32_t count); /* pre-alloc for bulk load */
 
 /* --- Core operations --- */
 kv_entry_t *dict_find(kv_dict_t *d, const char *key, uint32_t key_len, uint64_t hash);
@@ -164,6 +165,7 @@ void     kv_store_init(void);
 void     kv_store_destroy(void);
 uint32_t kv_store_count(void);
 void     kv_store_clear(void);
+void     kv_store_reserve(uint32_t count);
 
 /* Single dict iteration helper */
 typedef struct {

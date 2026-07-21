@@ -61,37 +61,17 @@ static int wait_cq_with_shutdown_detect(struct fid_cq *cq, struct fi_cq_data_ent
     }
 }
 
-/* ── Helper: Parse one entry from buffer ───────────────────────────── */
-
-static int parse_entry(const char **p, const char *end) {
-    const char *ptr = *p;
-    if (ptr + 4 > end) return -1;
-
-    uint32_t klen = ntohl(*(uint32_t *)ptr); ptr += 4;
-    if (ptr + klen > end) return -1;
-    const char *key = ptr; ptr += klen;
-
-    if (ptr + 4 > end) return -1;
-    uint32_t vlen = ntohl(*(uint32_t *)ptr); ptr += 4;
-    if (ptr + vlen > end) return -1;
-    const char *val = ptr; ptr += vlen;
-
-    if (ptr + 8 > end) return -1;
-    uint64_t expire = be64toh(*(uint64_t *)ptr); ptr += 8;
-
-    /* Add to local dictionary */
-    uint64_t hash = kv_hash((const uint8_t *)key, klen);
-    kv_entry_t *e = dict_add(kv_dict_for(hash), key, klen, val, vlen, hash);
-    if (e) e->expire = (long long)expire;
-
-    *p = ptr;
-    return 0;
-}
+/* ── Inline entry parsing ─────────────────────────────────────────────
+ * Entries are parsed directly in the receive loop below.
+ * Format: [klen:4][key][dlen:4][data][expire:8] */
 
 /* ── Main entry point ──────────────────────────────────────────────── */
 
 int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
     printf("[SLAVE] Starting fullsync to %s:%u\n", master_ip, rdma_port);
+
+    struct timespec t_e2e_start;
+    clock_gettime(CLOCK_MONOTONIC, &t_e2e_start);
 
     /* Step 1: Create libfabric resources */
     struct fi_info *hints = fi_allocinfo();
@@ -229,23 +209,36 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
             printf("[SLAVE] Header: key_count=%u, base_seq=%lu\n",
                    expected_entries, (unsigned long)base_seq);
 
-            /* Clear existing data */
+            /* Clear existing data and pre-size hashtable */
             kvs_flush_all();
+            kv_store_reserve(expected_entries);
 
             p += 24;
             header_parsed = 1;
             clock_gettime(CLOCK_MONOTONIC, &t_start);
         }
 
-        /* Parse entries in this batch */
-        while (p < end) {
-            if (parse_entry(&p, end) < 0) {
-                fprintf(stderr, "[SLAVE] Parse error\n");
-                rc = -1;
-                goto cleanup_bufs;
-            }
+        /* Parse entries inline — avoids per-entry function call overhead.
+         * Format: [klen:4][key][dlen:4][data][expire:8] */
+        while (p + 16 <= end) {
+            uint32_t klen = ntohl(*(uint32_t *)p); p += 4;
+            if (p + klen > end) goto parse_done;
+
+            const char *key = p; p += klen;
+            if (p + 4 > end) goto parse_done;
+
+            uint32_t vlen = ntohl(*(uint32_t *)p); p += 4;
+            if (p + vlen + 8 > end) goto parse_done;
+
+            const char *val = p; p += vlen;
+            uint64_t expire = be64toh(*(uint64_t *)p); p += 8;
+
+            uint64_t hash = kv_hash((const uint8_t *)key, klen);
+            kv_entry_t *e = dict_add(kv_dict_for(hash), key, klen, val, vlen, hash);
+            if (e) e->expire = (long long)expire;
             n++;
         }
+    parse_done:
 
         total_entries += n;
         total_bytes += received;
@@ -278,7 +271,7 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
     /* Step 5: Save base_seq for incremental sync */
     repl_incr_save_offset(base_seq);
 
-    /* Print receive-side throughput */
+    /* Print receive-side throughput (pure data path) */
     {
         double ms = (t_end.tv_sec - t_start.tv_sec) * 1000.0
                   + (t_end.tv_nsec - t_start.tv_nsec) / 1e6;
@@ -286,6 +279,17 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
         double eps  = (ms > 0) ? (total_entries / (ms / 1000.0)) : 0;
         printf("[SLAVE] Recv throughput: %lu bytes, %d entries, %.1f ms, %.2f MB/s, %.0f entries/s\n",
                (unsigned long)total_bytes, total_entries, ms, mbps, eps);
+    }
+
+    /* Print end-to-end throughput (connect + transfer + parse + rebuild) */
+    {
+        struct timespec t_e2e_end;
+        clock_gettime(CLOCK_MONOTONIC, &t_e2e_end);
+        double ms = (t_e2e_end.tv_sec - t_e2e_start.tv_sec) * 1000.0
+                  + (t_e2e_end.tv_nsec - t_e2e_start.tv_nsec) / 1e6;
+        double mbps = (ms > 0) ? (total_bytes / (ms / 1000.0) / (1024.0 * 1024.0)) : 0;
+        printf("[SLAVE] End-to-end: %lu bytes, %d entries, %.1f ms, %.2f MB/s (incl connect+rebuild)\n",
+               (unsigned long)total_bytes, total_entries, ms, mbps);
     }
 
     rc = 0;

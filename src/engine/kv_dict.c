@@ -125,6 +125,20 @@ void dict_clear(kv_dict_t *d) {
     d->rehash_idx = -1;
 }
 
+/* Pre-allocate hashtable for bulk load. Must be called on an empty dict
+ * (after dict_clear). Eliminates progressive rehash overhead during
+ * large batch inserts like fullsync. */
+void dict_reserve(kv_dict_t *d, uint32_t count) {
+    if (d->ht[0].buckets || d->ht[1].buckets || d->rehash_idx >= 0) {
+        /* Not empty — caller should have cleared first */
+        dict_clear(d);
+    }
+    uint32_t size = next_pow2(count);
+    if (size < DICT_INIT_SIZE) size = DICT_INIT_SIZE;
+    if (size > DICT_MAX_SIZE) size = DICT_MAX_SIZE;
+    ht_alloc(&d->ht[0], size);
+}
+
 /* =====================================================================
  * Progressive rehash: migrate up to 'steps' buckets from ht[0] to ht[1].
  * Called inside dict_add / dict_replace / dict_delete — amortised O(1).
@@ -597,6 +611,10 @@ uint32_t kv_store_count(void) {
 
 void kv_store_clear(void) {
     dict_clear(&g_store.dict);
+}
+
+void kv_store_reserve(uint32_t count) {
+    dict_reserve(&g_store.dict, count);
 }
 
 /* ---- Single store iterator ---- */

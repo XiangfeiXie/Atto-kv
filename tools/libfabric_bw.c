@@ -53,14 +53,33 @@ static long long now_us(void) {
     return (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
-static int wait_cq(struct fid_cq *cq) {
+static int is_verbs(void) { return strcmp(g_provider, "verbs") == 0; }
+
+static int wait_cq_or_die(struct fid_cq *cq) {
     for (;;) {
         struct fi_cq_data_entry e;
         ssize_t r = fi_cq_read(cq, &e, 1);
         if (r > 0) return (int)e.len;
-        if (r < 0 && r != -FI_EAGAIN) { errno = (int)(-r); return -1; }
+        if (r < 0 && r != -FI_EAGAIN) {
+            struct fi_cq_err_entry err;
+            fi_cq_readerr(cq, &err, 0);
+            fprintf(stderr, "CQ error: %s (%d)\n", fi_strerror((int)(-r)), (int)(-r));
+            return -1;
+        }
         usleep(100);
     }
+}
+
+static void *reg_mr_if_needed(struct fid_domain *dom, void *buf, size_t len,
+                              uint64_t access, struct fid_mr **out_mr) {
+    *out_mr = NULL;
+    if (!is_verbs()) return NULL;  /* tcp: no MR needed */
+    int ret = fi_mr_reg(dom, buf, len, access, 0, 0, 0, out_mr, NULL);
+    if (ret) {
+        fprintf(stderr, "fi_mr_reg: %s\n", fi_strerror(-ret));
+        exit(1);
+    }
+    return fi_mr_desc(*out_mr);
 }
 
 /* ── server ────────────────────────────────────────────────────────── */
@@ -81,12 +100,13 @@ static int run_server(void) {
     struct fid_fabric *fabric = NULL;
     struct fid_eq      *eq     = NULL;
     struct fid_pep     *pep    = NULL;
-    if (fi_fabric(info->fabric_attr, &fabric, NULL) ||
-        fi_eq_open(fabric, &(struct fi_eq_attr){.wait_obj = FI_WAIT_UNSPEC}, &eq, NULL) ||
-        fi_passive_ep(fabric, info, &pep, NULL) ||
-        fi_pep_bind(pep, &eq->fid, 0) ||
-        fi_listen(pep))
-        die("passive EP setup");
+    int ret;
+    if ((ret = fi_fabric(info->fabric_attr, &fabric, NULL)))   die("fi_fabric");
+    if ((ret = fi_eq_open(fabric, &(struct fi_eq_attr){
+            .wait_obj = FI_WAIT_UNSPEC}, &eq, NULL)))           die("fi_eq_open");
+    if ((ret = fi_passive_ep(fabric, info, &pep, NULL)))        die("fi_passive_ep");
+    if ((ret = fi_pep_bind(pep, &eq->fid, 0)))                  die("fi_pep_bind");
+    if ((ret = fi_listen(pep)))                                  die("fi_listen");
 
     printf("[server] listening on 0.0.0.0:%s  (provider=%s)\n", g_port, g_provider);
 
@@ -99,27 +119,28 @@ static int run_server(void) {
     struct fid_domain *dom = NULL;
     struct fid_ep     *ep  = NULL;
     struct fid_cq     *cq  = NULL;
-    if (fi_domain(fabric, entry.info, &dom, NULL) ||
-        fi_cq_open(dom, &(struct fi_cq_attr){
+    if ((ret = fi_domain(fabric, entry.info, &dom, NULL)))        die("fi_domain");
+    if ((ret = fi_cq_open(dom, &(struct fi_cq_attr){
             .format = FI_CQ_FORMAT_DATA, .wait_obj = FI_WAIT_UNSPEC
-        }, &cq, NULL) ||
-        fi_endpoint(dom, entry.info, &ep, NULL) ||
-        fi_ep_bind(ep, &eq->fid, 0) ||
-        fi_ep_bind(ep, &cq->fid, FI_SEND | FI_RECV) ||
-        fi_accept(ep, NULL, 0) ||
-        fi_enable(ep))
-        die("accept");
+        }, &cq, NULL)))                                            die("fi_cq_open");
+    if ((ret = fi_endpoint(dom, entry.info, &ep, NULL)))          die("fi_endpoint");
+    if ((ret = fi_ep_bind(ep, &eq->fid, 0)))                      die("fi_ep_bind(eq)");
+    if ((ret = fi_ep_bind(ep, &cq->fid, FI_SEND|FI_RECV)))        die("fi_ep_bind(cq)");
+    if ((ret = fi_enable(ep)))                                     die("fi_enable");
+    if ((ret = fi_accept(ep, NULL, 0)))                            die("fi_accept");
 
     if (fi_eq_sread(eq, &event, &entry, sizeof(entry), 10000, 0) < 0 ||
         event != FI_CONNECTED) die("FI_CONNECTED");
 
     printf("[server] client connected\n");
 
-    /* prep recv buffers */
+    /* prep recv buffers with MR (verbs) or plain (tcp) */
     char *bufs[NRECV_BUFS];
+    struct fid_mr *recv_mr[NRECV_BUFS];
     for (int i = 0; i < NRECV_BUFS; i++) {
         bufs[i] = malloc(g_batch);
-        if (fi_recv(ep, bufs[i], g_batch, NULL, 0, bufs[i]) < 0)
+        void *desc = reg_mr_if_needed(dom, bufs[i], g_batch, FI_RECV, &recv_mr[i]);
+        if ((ret = fi_recv(ep, bufs[i], g_batch, desc, 0, bufs[i])))
             die("fi_recv post");
     }
 
@@ -133,7 +154,14 @@ static int run_server(void) {
         if (r > 0) {
             if (!total) t0 = now_us();
             total += (size_t)ce.len;
-            fi_recv(ep, ce.op_context, g_batch, NULL, 0, ce.op_context);
+            /* find matching MR descriptor (verbs) or NULL (tcp) */
+            void *desc = NULL;
+            if (is_verbs()) {
+                for (int i = 0; i < NRECV_BUFS; i++) {
+                    if (bufs[i] == ce.op_context) { desc = fi_mr_desc(recv_mr[i]); break; }
+                }
+            }
+            fi_recv(ep, ce.op_context, g_batch, desc, 0, ce.op_context);
         } else if (r == -FI_EAGAIN) {
             usleep(100);
         } else {
@@ -186,19 +214,20 @@ static int run_client(void) {
     struct fid_domain  *dom    = NULL;
     struct fid_ep      *ep     = NULL;
     struct fid_cq      *cq     = NULL;
+    int ret;
 
-    if (fi_fabric(info->fabric_attr, &fabric, NULL) ||
-        fi_eq_open(fabric, &(struct fi_eq_attr){.wait_obj = FI_WAIT_UNSPEC}, &eq, NULL) ||
-        fi_domain(fabric, info, &dom, NULL) ||
-        fi_cq_open(dom, &(struct fi_cq_attr){
+    if ((ret = fi_fabric(info->fabric_attr, &fabric, NULL)))   die("fi_fabric");
+    if ((ret = fi_eq_open(fabric, &(struct fi_eq_attr){
+            .wait_obj = FI_WAIT_UNSPEC}, &eq, NULL)))           die("fi_eq_open");
+    if ((ret = fi_domain(fabric, info, &dom, NULL)))            die("fi_domain");
+    if ((ret = fi_cq_open(dom, &(struct fi_cq_attr){
             .format = FI_CQ_FORMAT_DATA, .wait_obj = FI_WAIT_UNSPEC
-        }, &cq, NULL) ||
-        fi_endpoint(dom, info, &ep, NULL) ||
-        fi_ep_bind(ep, &eq->fid, 0) ||
-        fi_ep_bind(ep, &cq->fid, FI_SEND | FI_RECV) ||
-        fi_enable(ep) ||
-        fi_connect(ep, info->dest_addr, NULL, 0))
-        die("connect setup");
+        }, &cq, NULL)))                                          die("fi_cq_open");
+    if ((ret = fi_endpoint(dom, info, &ep, NULL)))              die("fi_endpoint");
+    if ((ret = fi_ep_bind(ep, &eq->fid, 0)))                    die("fi_ep_bind(eq)");
+    if ((ret = fi_ep_bind(ep, &cq->fid, FI_SEND|FI_RECV)))      die("fi_ep_bind(cq)");
+    if ((ret = fi_enable(ep)))                                   die("fi_enable");
+    if ((ret = fi_connect(ep, info->dest_addr, NULL, 0)))       die("fi_connect");
 
     uint32_t event;
     struct fi_eq_cm_entry entry;
@@ -207,9 +236,12 @@ static int run_client(void) {
 
     printf("[client] connected, sending %zu MB...\n", g_total / (1024*1024));
 
-    /* send data in batches */
+    /* send data — register buffer for verbs, plain for tcp */
     char *buf = malloc(g_batch);
     memset(buf, 'A', g_batch);
+
+    struct fid_mr *send_mr = NULL;
+    void *send_desc = reg_mr_if_needed(dom, buf, g_batch, FI_SEND, &send_mr);
 
     size_t sent = 0;
     long long t0 = now_us();
@@ -217,8 +249,9 @@ static int run_client(void) {
     while (sent < g_total) {
         size_t chunk = g_batch;
         if (sent + chunk > g_total) chunk = g_total - sent;
-        if (fi_send(ep, buf, chunk, NULL, 0, NULL) < 0) die("fi_send");
-        if (wait_cq(cq) < 0) die("send CQ");
+        if ((ret = fi_send(ep, buf, chunk, send_desc, 0, NULL)))
+            die("fi_send");
+        if (wait_cq_or_die(cq) < 0) die("send CQ");
         sent += chunk;
     }
 

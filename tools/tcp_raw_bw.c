@@ -1,17 +1,16 @@
 /*
  * tcp_raw_bw.c — 原生 TCP socket 单向传输带宽基准
  *
- * 对比对象: libfabric_bw.c（纯 libfabric 传输）+ kvstore 全量同步
- * 目的:     同样的数据量，原生 TCP vs libfabric tcp vs kvstore 全量同步，
- *           逐层剥离开销来源。
- *
- * 用法:
- *   ./tcp_raw_bw --server --port 2101
- *   ./tcp_raw_bw --client 127.0.0.1 --port 2101 --size 100M
- *
- * 与 libfabric_bw.c 完全相同的收发逻辑，仅传输层不同:
+ * 与 libfabric_bw.c 功能对等、接口一致，仅传输层用原生 socket:
  *   libfabric_bw:  fi_passive_ep / fi_send / fi_recv
  *   tcp_raw_bw:    socket/bind/listen / send / recv
+ *
+ * 跨 VM 用法 (与 libfabric_bw 完全相同):
+ *   主机: ./tcp_raw_bw --server --port 2101 --size 100M
+ *   从机: ./tcp_raw_bw --client 192.168.30.135 --port 2101 --size 100M
+ *
+ * 本地: ./tcp_raw_bw --server --port 2101 &
+ *       ./tcp_raw_bw --client 127.0.0.1 --port 2101 --size 100M
  */
 
 #define _GNU_SOURCE
@@ -78,7 +77,7 @@ static size_t recv_full(int fd, void *buf, size_t len) {
 
 static int run_server(void) {
     int lfd = tcp_listen(g_port);
-    printf("[server] listening on %s:%d\n", g_node, g_port);
+    printf("[server] listening on 0.0.0.0:%d\n", g_port);
 
     int cfd = accept(lfd, NULL, NULL);
     if (cfd < 0) die("accept");
@@ -160,19 +159,21 @@ int main(int argc, char **argv) {
         {"server", no_argument,       NULL, 's'},
         {"client", required_argument, NULL, 'c'},
         {"port",   required_argument, NULL, 'P'},
-        {"size",   required_argument, NULL, 'z'},
+        {"size",   required_argument, NULL, 'S'},
+        {"batch",  required_argument, NULL, 'B'},
         {"help",   no_argument,       NULL, 'h'},
         {0,0,0,0}
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "sc:P:z:h", opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "sc:P:S:B:h", opts, NULL)) != -1) {
         switch (opt) {
         case 's': g_server = 1; break;
         case 'c': g_node = optarg; g_server = 0; break;
         case 'P': g_port = atoi(optarg); break;
-        case 'z': g_total = parse_size(optarg); break;
+        case 'S': g_total = parse_size(optarg); break;
+        case 'B': g_batch = parse_size(optarg); break;
         case 'h':
-            printf("Usage: tcp_raw_bw --server|--client IP --port P --size N[M|G]\n");
+            printf("Usage: tcp_raw_bw --server|--client IP --port P --size N[M|G] [--batch N[K|M]]\n");
             return 0;
         default:  break;
         }

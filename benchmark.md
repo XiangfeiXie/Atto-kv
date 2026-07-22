@@ -469,28 +469,78 @@ export MALLOC_CONF=dirty_decay_ms:1000,muzzy_decay_ms:1000,background_thread:tru
 | **原生 TCP socket** | 180–200 MB/s | 44–52 MB/s |
 | **libfabric tcp** | 175–190 MB/s | 34–54 MB/s |
 | **libfabric verbs (RXE)** | 不可用 (accept 超时) | ~7.4 MB/s |
-| **kvstore 全量同步** | ~20 MB/s* | 待测 |
+| **kvstore 全量同步 (优化前)** | ~20 MB/s* | — |
 
-> \*kvstore 全量同步速率来自本地测试（tcp provider, 63k entries × 512B value），瓶颈在逐条序列化+解析+dict_add，与传输层无关。
+> \*优化前数据（tcp provider, 63k entries × 512B value），瓶颈在逐条序列化+解析+dict_add，与传输层无关。
 
-### 5d. 完整性能金字塔
+### 5d. kvstore 全量同步实测 — 优化后
+
+**测试时间:** 2026-07-22 | **工具:** `tools/fullsync_bench.sh`
+**Provider:** tcp | **数据:** 200K keys × 512B value, ~103 MB wire data
+**优化项:** 预计算 hash (v2 wire format) + entry arena + 发送双缓冲 + Phase 1/2 分离
+
+#### 本地 localhost
+
+| 指标 | 数值 |
+|---|---|
+| End-to-end | 10.32 MB/s (10,143 ms) |
+| Recv 吞吐 | **32.54 MB/s** (62,154 entries/s) |
+| 数据完整性 | 200,000 / 200,000 ✓ |
+
+> Recv 吞吐从优化前 ~20 MB/s 提升到 32.54 MB/s (+63%)，端到端受 connect + `rdb_rebuild_all_encodings` 拖累（~9s 固定开销）。
+
+#### 跨 VM (192.168.30.135 ↔ 192.168.30.136)
+
+| 轮次 | End-to-end | Recv 吞吐 | Entries/s |
+|:---:|---:|---:|---:|
+| 1 | 13.38 MB/s (7,762 ms) | 56.99 MB/s | 109,756 |
+| 2 | **16.43 MB/s** (6,320 ms) | **180.21 MB/s** | 347,037 |
+| 3 | 15.77 MB/s (6,585 ms) | 159.96 MB/s | 308,049 |
+| **平均** | **15.19 MB/s** | **132.39 MB/s** | 254,947 |
+
+> Recv 吞吐波动较大（57–180 MB/s），受跨 VM 网络抖动影响。端到端稳定在 13–16 MB/s，瓶颈为 `rdb_rebuild_all_encodings`（遍历全部 entry 重建编码）约 4–5s。
+
+### 5e. Redis 全量同步对比
+
+**测试时间:** 2026-07-22 | **环境:** 本地 localhost, Redis 7.0.15
+**数据:** 2M keys × 512B value, 内存占用 1,358 MB
+
+| 指标 | 数值 |
+|---|---|
+| RDB 文件大小 | 50,900,100 bytes (**48.5 MB**) |
+| 压缩比 | 1,358 MB → 48.5 MB (**28:1**) |
+| 同步耗时 (2 轮) | 3,785 ms / 5,065 ms |
+| 同步吞吐 | **12.82 MB/s** / 9.58 MB/s (基于 RDB 大小) |
+| 有效吞吐 | ~359 MB/s (基于原始内存数据 1,358 MB / 3.785s) |
+
+> Redis RDB 使用紧凑二进制编码（整数压缩、ziplist、LZF）+ fork COW 快照。RDB 文件仅 48.5 MB，远小于 kvstore 线格式 103 MB（200K entries）。但 Redis 将 1,358 MB 原始内存数据压缩到 48.5 MB 后传输，等效有效吞吐 ~359 MB/s。
+
+### 5f. 完整性能金字塔
 
 ```
-                    Localhost               Cross-VM (1GB)
-                    ─────────               ─────────────
-原生 TCP            196 MB/s   ████████      52 MB/s    ████████
-libfabric tcp       186 MB/s   ████████      54 MB/s    ████████
-libfabric verbs        —                      7 MB/s     ██
-kvstore 全量同步      20 MB/s   ███             ?         ?
+                    场景                  吞吐
+                    ────────              ──────
+原生 TCP (localhost)                       196 MB/s   ████████████████████
+libfabric tcp (localhost)                  186 MB/s   ███████████████████
+kvstore recv (localhost, 优化后)            32 MB/s   ███
+Redis diskless (localhost, 有效吞吐)       359 MB/s   ████████████████████████████████████
+Redis diskless (localhost, RDB 大小算)      12 MB/s   █
+
+原生 TCP (cross-VM, 1GB)                   52 MB/s   █████
+libfabric tcp (cross-VM, 1GB)              54 MB/s   █████
+kvstore recv (cross-VM, 200K×512B)        132 MB/s   █████████████
+kvstore e2e  (cross-VM, 200K×512B)         15 MB/s   █
+libfabric verbs RXE (cross-VM)              7 MB/s   █
 ```
 
-### 5e. 结论
+### 5g. 结论
 
 1. **传输层选 tcp 即可。** libfabric tcp 与原生 socket 吞吐基本持平（大块差距 < 5%，跨 VM 1GB 时甚至略高），不存在传输层瓶颈
 2. **软件 verbs (RXE) 是负优化。** 速率仅为 tcp 的 1/7（7.4 vs 54 MB/s），原因：CQ 轮询空转 + 软件模拟层数据拷贝，CPU 占用 100%
 3. **跨 VM 瓶颈在虚拟网络。** 原生 socket 物理上限 ~54 MB/s，VMware 虚拟网卡限制
-4. **主要优化方向在 kvstore 数据面。** 本地裸传输 190+ MB/s，kvstore 全量同步仅 20 MB/s（9.5x 差距），瓶颈完全在序列化/解析/dict_add 的 CPU 开销
-5. **真实 RDMA 硬件 (InfiniBand/RoCE) 场景下 verbs 才有优势**，软件模拟环境无使用价值
+4. **kvstore 优化效果显著。** Recv 吞吐从 ~20 → 32.5 MB/s localhost (+63%)，跨 VM 可达 180 MB/s（端到端 15 MB/s 受 rebuild_encodings 拖累）
+5. **kvstore vs Redis：差距在数据模型。** Redis RDB 将 1,358 MB 压缩到 48.5 MB 后传输（28:1 压缩比），等效 359 MB/s 有效吞吐。kvstore 传输原始 103 MB，缺少紧凑编码和压缩
+6. **真实 RDMA 硬件 (InfiniBand/RoCE) 场景下 verbs 才有优势**，软件模拟环境无使用价值
 
 ---
 

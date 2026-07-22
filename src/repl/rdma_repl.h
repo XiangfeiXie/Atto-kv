@@ -24,6 +24,9 @@ int rdma_repl_slave_run(void);
 /* Session management: Add child process PID for tracking */
 void session_add(pid_t pid);
 
+/* Kill all tracked child processes (clean up before re-fork). */
+void session_kill_all(void);
+
 /* Master child process: Pure RDMA data streaming (called after fork).
  * ready_fd >= 0: write a byte after fi_listen() so parent knows we're ready. */
 int master_fullsync_child(uint64_t base_seq, int ready_fd);

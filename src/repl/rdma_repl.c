@@ -66,6 +66,29 @@ void session_add(pid_t pid) {
     pthread_mutex_unlock(&g_sessions.lock);
 }
 
+/* Kill all tracked child processes before forking a new one.
+ * Prevents fi_getinfo failure caused by a previous child still
+ * holding the RDMA_CM listener on the fullsync port. */
+void session_kill_all(void) {
+    pthread_mutex_lock(&g_sessions.lock);
+    for (int i = 0; i < g_sessions.count; i++) {
+        pid_t pid = g_sessions.pids[i];
+        if (pid > 0) {
+            printf("[RDMA-REPL] Killing old child pid=%d\n", pid);
+            kill(pid, SIGTERM);
+            /* Give it a moment to exit and release the port */
+            usleep(50000);
+            /* Force kill if still alive */
+            if (kill(pid, 0) == 0) {
+                kill(pid, SIGKILL);
+                usleep(50000);
+            }
+        }
+    }
+    g_sessions.count = 0;
+    pthread_mutex_unlock(&g_sessions.lock);
+}
+
 static void session_init(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));

@@ -17,6 +17,7 @@
 
 #define _GNU_SOURCE
 #include "repl_tcp_internal.h"
+#include "rdma_repl.h"
 
 #include <stdlib.h>
 
@@ -217,8 +218,11 @@ fullsync:;
         uint64_t base_seq = repl_incr_get_master_offset();
         printf("[REPL-TCP] Triggering full sync (base_seq=%lu)\n", base_seq);
 
+        /* Kill previous fullsync child to free RDMA_CM port 2101.
+         * Otherwise fi_getinfo fails for the new child ("No data available"). */
+        session_kill_all();
+
         extern int master_fullsync_child(uint64_t base_seq, int ready_fd);
-        extern void session_add(pid_t pid);
 
         /* Pipe for child to signal readiness before parent responds */
         int pipefd[2];

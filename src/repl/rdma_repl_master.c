@@ -76,10 +76,20 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
     char service[16];
     snprintf(service, sizeof(service), "%d", CHILD_RDMA_PORT);
 
-    int rc = fi_getinfo(FI_VERSION(1, 17), "0.0.0.0", service, FI_SOURCE, hints, &info);
+    /* NULL node: let libfabric auto-select the best local address.
+     * "0.0.0.0" breaks verbs/RXE — RDMA_CM can't map wildcard to a GID. */
+    /* Use the configured listen IP.  For tcp provider "0.0.0.0" is fine;
+     * for verbs/RXE the IP must match the RDMA interface (e.g. 192.168.x.x)
+     * because RDMA_CM needs a real GID — wildcard won't resolve. */
+    const char *node = kvs_config.rdma_listen_ip;
+    if (node[0] == '0' && node[1] == '.' && strcmp(node, "0.0.0.0") == 0)
+        node = NULL;  /* let libfabric auto-select for tcp compatibility */
+
+    int rc = fi_getinfo(FI_VERSION(1, 17), node, service, FI_SOURCE, hints, &info);
     fi_freeinfo(hints);
     if (rc) {
-        fprintf(stderr, "[CHILD] fi_getinfo: %s\n", fi_strerror(-rc));
+        fprintf(stderr, "[CHILD] fi_getinfo(node=%s): %s\n",
+                node ? node : "(null)", fi_strerror(-rc));
         return -1;
     }
 

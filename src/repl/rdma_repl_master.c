@@ -88,17 +88,23 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
     int rc = fi_getinfo(FI_VERSION(1, 17), node, service, FI_SOURCE, hints, &info);
     fi_freeinfo(hints);
     if (rc) {
-        fprintf(stderr, "[CHILD] fi_getinfo(node=%s): %s\n",
-                node ? node : "(null)", fi_strerror(-rc));
+        fprintf(stderr, "[CHILD] fi_getinfo(node=%s svc=%s): %s\n",
+                node ? node : "(null)", service, fi_strerror(-rc));
         return -1;
     }
 
+    /* Debug: show resolved domain/fabric so we can trace the address mismatch */
+    printf("[CHILD] fi_getinfo: node=%s svc=%s → domain=%s fabric=%s\n",
+           node ? node : "(null)", service,
+           info->domain_attr->name, info->fabric_attr->name);
+
     struct fid_fabric *fabric = NULL;
-    struct fid_eq *eq = NULL;
-    struct fid_pep *pep = NULL;
+    struct fid_eq      *eq     = NULL;
+    struct fid_pep     *pep    = NULL;
 
     if (fi_fabric(info->fabric_attr, &fabric, NULL) ||
-        fi_eq_open(fabric, &(struct fi_eq_attr){.wait_obj = FI_WAIT_UNSPEC}, &eq, NULL) ||
+        fi_eq_open(fabric, &(struct fi_eq_attr){.wait_obj = FI_WAIT_UNSPEC},
+                   &eq, NULL) ||
         fi_passive_ep(fabric, info, &pep, NULL) ||
         fi_pep_bind(pep, &eq->fid, 0) ||
         fi_listen(pep)) {
@@ -106,7 +112,8 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
         return -1;
     }
 
-    printf("[CHILD] Listening on port %d\n", CHILD_RDMA_PORT);
+    printf("[CHILD] Listening OK (node=%s, svc=%s)\n",
+           node ? node : "(null)", service);
 
     /* Signal parent that we are ready to accept connections */
     if (ready_fd >= 0) {
@@ -120,13 +127,25 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
     }
 
     /* Step 2: Wait for slave connection */
+    printf("[CHILD] Waiting for CONNREQ on svc=%s (timeout 60s)...\n", service);
+    {
+        char addr_str[64] = {0};
+        struct sockaddr *sa = (struct sockaddr *)info->src_addr;
+        if (sa && sa->sa_family == AF_INET)
+            inet_ntop(AF_INET, &((struct sockaddr_in *)sa)->sin_addr,
+                      addr_str, sizeof(addr_str));
+        printf("[CHILD] src_addr hint: %s\n",
+               addr_str[0] ? addr_str : "(none)");
+    }
     struct fi_eq_cm_entry entry;
     uint32_t event;
     ssize_t r = fi_eq_sread(eq, &event, &entry, sizeof(entry), 60000, 0);
     if (r < 0 || event != FI_CONNREQ) {
-        fprintf(stderr, "[CHILD] No connection received\n");
+        fprintf(stderr, "[CHILD] fi_eq_sread: r=%zd event=%u (expected FI_CONNREQ=%d) errno=%d\n",
+                r, event, FI_CONNREQ, (int)(r < 0 ? (int)(-r) : 0));
         return -1;
     }
+    printf("[CHILD] Got CONNREQ from slave\n");
 
     struct fid_domain *domain = NULL;
     struct fid_ep *ep = NULL;
@@ -139,11 +158,13 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
         fi_endpoint(domain, entry.info, &ep, NULL) ||
         fi_ep_bind(ep, &eq->fid, 0) ||
         fi_ep_bind(ep, &cq->fid, FI_SEND | FI_RECV) ||
-        fi_accept(ep, NULL, 0) ||
-        fi_enable(ep)) {
+        fi_enable(ep) ||
+        fi_accept(ep, NULL, 0)) {
         fprintf(stderr, "[CHILD] Failed to accept connection\n");
         return -1;
     }
+
+    printf("[CHILD] Slave connected\n");
 
     r = fi_eq_sread(eq, &event, &entry, sizeof(entry), 10000, 0);
     if (r < 0 || event != FI_CONNECTED) {
@@ -170,6 +191,21 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
     if (!BUF(0)) {
         fprintf(stderr, "[CHILD] malloc(buf[0]) failed\n");
         return -1;
+    }
+
+    /* MR descriptors for send buffers (verbs/RXE needs explicit registration) */
+    struct fid_mr *send_mr[2] = {NULL, NULL};
+    void          *send_desc[2] = {NULL, NULL};
+    {
+        int r = fi_mr_reg(domain, BUF(0), STREAM_BATCH_SIZE,
+                          FI_SEND, 0, 0, 0, &send_mr[0], NULL);
+        if (r) {
+            fprintf(stderr, "[CHILD] fi_mr_reg(buf[0]) r=%d: %s\n",
+                    r, fi_strerror(-r));
+            /* continue with NULL desc — tcp provider tolerates this */
+        }
+        if (send_mr[0])
+            send_desc[0] = fi_mr_desc(send_mr[0]);
     }
 
     uint32_t total_entries = 0;
@@ -212,7 +248,7 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
 
         /* Current buffer full → flush it and switch */
         if (OFF(cur) + need > STREAM_BATCH_SIZE) {
-            if (fi_send(ep, BUF(cur), OFF(cur), NULL, 0, BUF(cur)) < 0) {
+            if (fi_send(ep, BUF(cur), OFF(cur), send_desc[cur], 0, BUF(cur)) < 0) {
                 fprintf(stderr, "[CHILD] fi_send failed\n");
                 goto cleanup_bufs;
             }
@@ -227,6 +263,14 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
                     goto cleanup_bufs;
                 }
                 OFF(next) = 0;
+                /* Register newly allocated buffer for verbs */
+                int r = fi_mr_reg(domain, BUF(next), STREAM_BATCH_SIZE,
+                                  FI_SEND, 0, 0, 0, &send_mr[next], NULL);
+                if (r)
+                    fprintf(stderr, "[CHILD] fi_mr_reg(buf[1]) r=%d: %s\n",
+                            r, fi_strerror(-r));
+                if (send_mr[next])
+                    send_desc[next] = fi_mr_desc(send_mr[next]);
             }
 
             /* Wait for previous inflight to free the buffer we're switching to */
@@ -264,7 +308,7 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
             total_bytes += OFF(inflight);
             OFF(inflight) = 0;
         }
-        if (fi_send(ep, BUF(cur), OFF(cur), NULL, 0, BUF(cur)) < 0) {
+        if (fi_send(ep, BUF(cur), OFF(cur), send_desc[cur], 0, BUF(cur)) < 0) {
             fprintf(stderr, "[CHILD] fi_send (last) failed\n");
             goto cleanup_bufs;
         }
@@ -290,6 +334,8 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
 
     /* Step 8: Cleanup */
  cleanup_bufs:
+    if (send_mr[0]) fi_close(&send_mr[0]->fid);
+    if (send_mr[1]) fi_close(&send_mr[1]->fid);
     free(BUF(0));
     free(BUF(1));  /* NULL-safe */
     fi_close(&ep->fid);

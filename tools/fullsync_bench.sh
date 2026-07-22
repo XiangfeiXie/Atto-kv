@@ -123,17 +123,24 @@ incr_repl_master_port 6483
 EOF
 }
 
-# ── 生成 RESP 测试数据 ──────────────────────────────────────────────────────
-gen_data() {
-    local out="$1"
-    python3 -c "
+# ── 填充数据（分块 pipe，避免 redis-cli --pipe 30s 超时）──────────────────
+populate() {
+    local chunk=50000
+    local done=0
+    while [[ $done -lt $NKEYS ]]; do
+        local end=$((done + chunk))
+        [[ $end -gt $NKEYS ]] && end=$NKEYS
+        printf "  chunk %d/%d ... " $((done/chunk + 1)) $(( (NKEYS+chunk-1)/chunk ))
+        python3 -c "
 import sys
 v = 'x' * $VSIZE
-kl = len(f'k{$NKEYS:05d}')   # key length: e.g. 'k50000' = 6
-for i in range(1, $NKEYS + 1):
-    k = f'k{i:05d}'
+for i in range($done, $end):
+    k = f'key:{i:07d}'
     sys.stdout.write(f'*3\r\n\$3\r\nSET\r\n\${len(k)}\r\n{k}\r\n\${len(v)}\r\n{v}\r\n')
-" > "$out"
+" | redis-cli -p "$MASTER_PORT" --pipe 2>&1 | grep -oP 'replies: \K\d+' | tr '\n' ' '
+        echo "ok"
+        done=$end
+    done
 }
 
 # ── Master 模式 ─────────────────────────────────────────────────────────────
@@ -177,16 +184,14 @@ run_master() {
     fi
     echo "  Master OK (pid=$!)"
 
-    # Populate
+    # Populate（分块 pipe，不会超时）
     echo ""
-    echo "── Populating $NKEYS keys ──"
-    gen_data /tmp/fs_resp.txt
+    echo "── Populating $NKEYS keys in chunks ──"
     T0=$(date +%s%3N)
-    cat /tmp/fs_resp.txt | redis-cli -p "$MASTER_PORT" --pipe 2>/dev/null
+    populate
     T1=$(date +%s%3N)
     MC=$(redis-cli -p "$MASTER_PORT" DBSIZE | tr -d '\r')
     echo "  $MC keys  (pipe in $(( T1 - T0 )) ms)"
-    rm -f /tmp/fs_resp.txt
 
     # Done
     bar
@@ -303,13 +308,7 @@ run_slave() {
     # Cleanup slave process gracefully
     kill ${SLAVE_PID:-0} 2>/dev/null || true
     wait ${SLAVE_PID:-0} 2>/dev/null || true
-    echo ""
-    echo "  Reference (benchmark.md):"
-    echo "    Raw TCP localhost:     ~196 MB/s"
-    echo "    libfabric tcp local:   ~186 MB/s"
-    echo "    libfabric verbs(RXE):  ~7.4 MB/s (cross-VM)"
-    echo "    kvstore fullsync:      ~20 MB/s (pre-optimization, 63k x 512B)"
-    echo ""
+
 }
 
 # ── Main ────────────────────────────────────────────────────────────────────

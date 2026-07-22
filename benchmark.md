@@ -489,7 +489,7 @@ export MALLOC_CONF=dirty_decay_ms:1000,muzzy_decay_ms:1000,background_thread:tru
 
 > Recv 吞吐从优化前 ~20 MB/s 提升到 32.54 MB/s (+63%)，端到端受 connect + `rdb_rebuild_all_encodings` 拖累（~9s 固定开销）。
 
-#### 跨 VM (192.168.30.135 ↔ 192.168.30.136)
+#### 跨 VM — tcp provider (192.168.30.135 ↔ 192.168.30.136)
 
 | 轮次 | End-to-end | Recv 吞吐 | Entries/s |
 |:---:|---:|---:|---:|
@@ -499,6 +499,19 @@ export MALLOC_CONF=dirty_decay_ms:1000,muzzy_decay_ms:1000,background_thread:tru
 | **平均** | **15.19 MB/s** | **132.39 MB/s** | 254,947 |
 
 > Recv 吞吐波动较大（57–180 MB/s），受跨 VM 网络抖动影响。端到端稳定在 13–16 MB/s，瓶颈为 `rdb_rebuild_all_encodings`（遍历全部 entry 重建编码）约 4–5s。
+
+#### 跨 VM — verbs provider (RXE, 192.168.30.135 ↔ 192.168.30.136)
+
+**测试时间:** 2026-07-23 | **Provider:** verbs (RXE SoftRoCE) | **优化项:** 同上 + 显式 MR 注册 + recv 预 post
+
+| Keys | 轮次 | End-to-end | Recv 吞吐 | Entries/s | Arena |
+|:---:|:---:|---:|---:|---:|---:|
+| 200K | 1 | 4.56 MB/s (22,960 ms) | **215.98 MB/s** | 412,516 | 116.9 MB |
+| 400K | 1 | 5.24 MB/s (39,949 ms) | 204.82 MB/s | 391,209 | 233.7 MB |
+| 400K | 2 | 5.84 MB/s (35,834 ms) | **254.49 MB/s** | 486,074 | 233.7 MB |
+| 400K | 3 | 5.87 MB/s (35,678 ms) | 206.15 MB/s | 393,738 | 233.7 MB |
+
+> **Recv 吞吐 200–255 MB/s，是 tcp provider 的 4–5 倍，远超 VM 网卡物理上限 54 MB/s。** verbs 通过内核旁路 + RDMA 语义消除了 TCP 协议栈拷贝开销。端到端 4–6 MB/s 受 `rdb_rebuild_all_encodings` 固定开销拖累（35–40s 端到端中 rebuild 占 ~30s），数据路径本身仅 1–2s。
 
 ### 5e. Redis 全量同步对比
 
@@ -528,19 +541,21 @@ Redis diskless (localhost, RDB 大小算)      12 MB/s   █
 
 原生 TCP (cross-VM, 1GB)                   52 MB/s   █████
 libfabric tcp (cross-VM, 1GB)              54 MB/s   █████
-kvstore recv (cross-VM, 200K×512B)        132 MB/s   █████████████
-kvstore e2e  (cross-VM, 200K×512B)         15 MB/s   █
-libfabric verbs RXE (cross-VM)              7 MB/s   █
+kvstore recv verbs (cross-VM, 400K×512B)  255 MB/s   █████████████████████████
+kvstore recv tcp   (cross-VM, 200K×512B)  132 MB/s   █████████████
+kvstore e2e  verbs (cross-VM, 400K×512B)    6 MB/s   █
+kvstore e2e  tcp   (cross-VM, 200K×512B)   15 MB/s   █
+libfabric raw verbs RXE (cross-VM)           7 MB/s   █
 ```
 
 ### 5g. 结论
 
-1. **传输层选 tcp 即可。** libfabric tcp 与原生 socket 吞吐基本持平（大块差距 < 5%，跨 VM 1GB 时甚至略高），不存在传输层瓶颈
-2. **软件 verbs (RXE) 是负优化。** 速率仅为 tcp 的 1/7（7.4 vs 54 MB/s），原因：CQ 轮询空转 + 软件模拟层数据拷贝，CPU 占用 100%
-3. **跨 VM 瓶颈在虚拟网络。** 原生 socket 物理上限 ~54 MB/s，VMware 虚拟网卡限制
-4. **kvstore 优化效果显著。** Recv 吞吐从 ~20 → 32.5 MB/s localhost (+63%)，跨 VM 可达 180 MB/s（端到端 15 MB/s 受 rebuild_encodings 拖累）
-5. **kvstore vs Redis：差距在数据模型。** Redis RDB 将 1,358 MB 压缩到 48.5 MB 后传输（28:1 压缩比），等效 359 MB/s 有效吞吐。kvstore 传输原始 103 MB，缺少紧凑编码和压缩
-6. **真实 RDMA 硬件 (InfiniBand/RoCE) 场景下 verbs 才有优势**，软件模拟环境无使用价值
+1. **传输层：tcp 稳定，verbs 极致。** tcp provider 与原生 socket 持平（54 vs 52 MB/s），零学习成本。verbs provider 在软件 RXE 下 recv 可达 255 MB/s（4–5× tcp），但需要显式 MR 管理 + recv 预 post + RDMA_CM 地址配置
+2. **verbs 瓶颈已从传输转移到 CPU。** recv 255 MB/s 远超 VM 网卡上限 54 MB/s，传输不再是瓶颈。当前瓶颈为 `rdb_rebuild_all_encodings`（遍历全部 entry 重建编码，200K→~10s，400K→~30s）
+3. **kvstore 优化效果显著。** Recv 吞吐从 ~20 → 32.5 MB/s (tcp localhost), 132→255 MB/s (verbs cross-VM)。端到端受 rebuild_encodings 拖累严重
+4. **kvstore vs Redis：差距在数据模型。** Redis RDB 将 1,358 MB 压缩到 48.5 MB 后传输（28:1 压缩比），等效 359 MB/s 有效吞吐。kvstore 传输原始 109–219 MB，缺少紧凑编码和压缩
+5. **下一优化方向：消除 `rdb_rebuild_all_encodings`**。该函数在 fullsync 场景下是冗余的——wire format 加载的 entry 编码已经是最优的。去掉后端到端可提升至接近 recv 吞吐
+6. **软件 RXE 下 verbs 有实际价值**，与之前结论不同——修复 MR + recv 时序后，软件模拟 RDMA 性能远超 tcp
 
 ---
 

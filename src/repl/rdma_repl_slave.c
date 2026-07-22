@@ -27,10 +27,14 @@
 #include <arpa/inet.h>
 
 /* Number of receive buffers for streaming */
-#define NUM_RECV_BUFS  4
+#define NUM_RECV_BUFS  2
 
-/* Size of each receive buffer (must be >= master's batch size) */
-#define RECV_BUF_SIZE  (1024 * 1024 * 1024)  /* 1GB */
+/* Size of each receive buffer — MUST be >= master's STREAM_BATCH_SIZE (512MB).
+ * verbs RC (Reliable Connection) does not fragment messages: the entire send
+ * must fit into a single posted recv buffer.  Undersized → buffer overflow
+ * → memory corruption → SIGSEGV.  2 × 512MB = 1GB MR total (half the original
+ * 2GB that triggered OOM). */
+#define RECV_BUF_SIZE  (512 * 1024 * 1024)  /* 512MB, matches STREAM_BATCH_SIZE */
 
 /* ── Helper: Wait for CQ completion ────────────────────────────────── */
 
@@ -92,6 +96,9 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
         fprintf(stderr, "[SLAVE] fi_getinfo: %s\n", fi_strerror(-rc));
         return -1;
     }
+    printf("[SLAVE] fi_getinfo: node=%s svc=%s → domain=%s fabric=%s\n",
+           master_ip, service, info->domain_attr->name,
+           info->fabric_attr->name);
 
     struct fid_fabric *fabric = NULL;
     struct fid_eq *eq = NULL;
@@ -108,11 +115,46 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
         fi_endpoint(domain, info, &ep, NULL) ||
         fi_ep_bind(ep, &eq->fid, 0) ||
         fi_ep_bind(ep, &cq->fid, FI_SEND | FI_RECV) ||
-        fi_enable(ep) ||
-        fi_connect(ep, info->dest_addr, NULL, 0)) {
+        fi_enable(ep)) {
         fprintf(stderr, "[SLAVE] Setup failed\n");
         rc = -1;
         goto cleanup;
+    }
+
+    /* ── Allocate + register + pre-post recv buffers BEFORE fi_connect.
+     * verbs has no kernel socket buffer: master starts sending immediately
+     * after accept, so recvs must be posted before the connection is up. ── */
+    char *recv_bufs[NUM_RECV_BUFS];
+    struct fid_mr *recv_mr[NUM_RECV_BUFS] = {NULL};
+    void          *recv_desc[NUM_RECV_BUFS] = {NULL};
+
+    for (int i = 0; i < NUM_RECV_BUFS; i++) {
+        recv_bufs[i] = (char *)malloc(RECV_BUF_SIZE);
+        if (!recv_bufs[i]) {
+            fprintf(stderr, "[SLAVE] malloc failed\n");
+            rc = -1;
+            goto cleanup_meta;
+        }
+        int r = fi_mr_reg(domain, recv_bufs[i], RECV_BUF_SIZE,
+                          FI_RECV, 0, 0, 0, &recv_mr[i], NULL);
+        if (r == 0 && recv_mr[i])
+            recv_desc[i] = fi_mr_desc(recv_mr[i]);
+
+        if (fi_recv(ep, recv_bufs[i], RECV_BUF_SIZE,
+                    recv_desc[i], 0, recv_bufs[i]) < 0) {
+            fprintf(stderr, "[SLAVE] fi_recv failed (buf %d)\n", i);
+            rc = -1;
+            goto cleanup_meta;
+        }
+    }
+    printf("[SLAVE] Pre-posted %d x %dMB recv buffers\n",
+           NUM_RECV_BUFS, (int)(RECV_BUF_SIZE / (1024 * 1024)));
+
+    /* Now connect — recvs are already posted, ready for incoming data */
+    if (fi_connect(ep, info->dest_addr, NULL, 0)) {
+        fprintf(stderr, "[SLAVE] fi_connect failed\n");
+        rc = -1;
+        goto cleanup_meta;
     }
 
     /* Wait for connection */
@@ -120,34 +162,13 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
     uint32_t event;
     ssize_t r = fi_eq_sread(eq, &event, &entry, sizeof(entry), 60000, 0);
     if (r < 0 || event != FI_CONNECTED) {
-        fprintf(stderr, "[SLAVE] Connect failed\n");
+        fprintf(stderr, "[SLAVE] fi_eq_sread(FI_CONNECTED): r=%zd event=%u errno=%d\n",
+                r, event, (int)(r < 0 ? (int)(-r) : 0));
         rc = -1;
-        goto cleanup;
+        goto cleanup_meta;
     }
 
     printf("[SLAVE] Connected to master child process\n");
-
-    /* Step 2: Allocate receive buffers */
-    char *recv_bufs[NUM_RECV_BUFS];
-    for (int i = 0; i < NUM_RECV_BUFS; i++) {
-        recv_bufs[i] = (char *)malloc(RECV_BUF_SIZE);
-        if (!recv_bufs[i]) {
-            fprintf(stderr, "[SLAVE] malloc failed\n");
-            rc = -1;
-            goto cleanup;
-        }
-    }
-
-    /* Pre-post all receive buffers */
-    for (int i = 0; i < NUM_RECV_BUFS; i++) {
-        if (fi_recv(ep, recv_bufs[i], RECV_BUF_SIZE, NULL, 0, recv_bufs[i]) < 0) {
-            fprintf(stderr, "[SLAVE] fi_recv failed\n");
-            rc = -1;
-            goto cleanup_meta;
-        }
-    }
-
-    printf("[SLAVE] Pre-posted %d receive buffers\n", NUM_RECV_BUFS);
 
     /* Step 3: Receive loop with two-phase processing.
      * Phase 1: parse wire buffer → compact metadata array (sequential scan).
@@ -308,11 +329,16 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
             break;
         }
 
-        /* Re-post receive buffer */
-        if (fi_recv(ep, recv_buf, RECV_BUF_SIZE, NULL, 0, recv_buf) < 0) {
-            fprintf(stderr, "[SLAVE] fi_recv re-post failed\n");
-            rc = -1;
-            goto cleanup_meta;
+        /* Re-post receive buffer with matching MR desc */
+        {
+            void *desc = NULL;
+            for (int i = 0; i < NUM_RECV_BUFS; i++)
+                if (recv_bufs[i] == recv_buf) { desc = recv_desc[i]; break; }
+            if (fi_recv(ep, recv_buf, RECV_BUF_SIZE, desc, 0, recv_buf) < 0) {
+                fprintf(stderr, "[SLAVE] fi_recv re-post failed\n");
+                rc = -1;
+                goto cleanup_meta;
+            }
         }
     }
 
@@ -352,8 +378,8 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
 
 cleanup_meta:
     free(meta);
-
     for (int i = 0; i < NUM_RECV_BUFS; i++) {
+        if (recv_mr[i]) fi_close(&recv_mr[i]->fid);
         free(recv_bufs[i]);
     }
 

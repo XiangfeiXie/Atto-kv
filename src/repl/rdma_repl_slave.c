@@ -143,13 +143,32 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
         if (fi_recv(ep, recv_bufs[i], RECV_BUF_SIZE, NULL, 0, recv_bufs[i]) < 0) {
             fprintf(stderr, "[SLAVE] fi_recv failed\n");
             rc = -1;
-            goto cleanup_bufs;
+            goto cleanup_meta;
         }
     }
 
     printf("[SLAVE] Pre-posted %d receive buffers\n", NUM_RECV_BUFS);
 
-    /* Step 3: Receive loop */
+    /* Step 3: Receive loop with two-phase processing.
+     * Phase 1: parse wire buffer → compact metadata array (sequential scan).
+     * Phase 2: insert from metadata → hash table (random-access dict).
+     * Separation eliminates cache ping-pong between wire buffer and dict. */
+
+    /* ── Per-entry metadata (40 bytes, cache-line friendly) ────────── */
+    struct entry_meta {
+        uint64_t hash;
+        uint64_t expire;
+        const char *key;
+        const char *val;
+        uint32_t klen;
+        uint32_t vlen;
+    };
+
+    struct entry_meta *meta = NULL;   /* allocated after header parsed */
+    int meta_cap     = 0;    /* capacity (== expected_entries) */
+    int meta_count   = 0;    /* total entries parsed so far */
+    int arena_ready  = 0;
+
     int batches = 0;
     int total_entries = 0;
     uint64_t total_bytes = 0;
@@ -172,7 +191,7 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
         if (dlen < 0) {
             fprintf(stderr, "[SLAVE] CQ error\n");
             rc = -1;
-            goto cleanup_bufs;
+            goto cleanup_meta;
         }
 
         if (dlen == 0) {
@@ -182,69 +201,106 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
         /* Get buffer from completion entry */
         char *recv_buf = (char *)ce.op_context;
         size_t received = ce.len;
-
-        /* Parse data */
-        const char *p = recv_buf;
+        const char *p   = recv_buf;
         const char *end = recv_buf + received;
-        int n = 0;
+        int batch_start = meta_count;  /* first slot for this batch */
 
+        /* ── Header (first batch only) ─────────────────────────────── */
         if (!header_parsed) {
-            /* First batch contains header */
             if (received < 24) {
                 fprintf(stderr, "[SLAVE] Header too short\n");
                 rc = -1;
-                goto cleanup_bufs;
+                goto cleanup_meta;
             }
 
-            uint32_t magic = ntohl(*(uint32_t *)(p + 0));
+            uint32_t magic   = ntohl(*(uint32_t *)(p + 0));
+            uint32_t version = ntohl(*(uint32_t *)(p + 4));
             expected_entries = ntohl(*(uint32_t *)(p + 12));
             base_seq = be64toh(*(uint64_t *)(p + 16));
 
             if (magic != 0x52444232) {
                 fprintf(stderr, "[SLAVE] Invalid magic: 0x%x\n", magic);
                 rc = -1;
-                goto cleanup_bufs;
+                goto cleanup_meta;
             }
 
-            printf("[SLAVE] Header: key_count=%u, base_seq=%lu\n",
-                   expected_entries, (unsigned long)base_seq);
+            printf("[SLAVE] Header: version=%u, key_count=%u, base_seq=%lu\n",
+                   version, expected_entries, (unsigned long)base_seq);
 
             /* Clear existing data and pre-size hashtable */
             kvs_flush_all();
             kv_store_reserve(expected_entries);
+
+            /* Allocate metadata array for the entire fullsync */
+            meta_cap = (int)expected_entries;
+            meta = (struct entry_meta *)malloc(
+                (size_t)meta_cap * sizeof(*meta));
+            if (!meta) {
+                fprintf(stderr, "[SLAVE] meta malloc(%u) failed\n",
+                        expected_entries);
+                rc = -1;
+                goto cleanup_meta;
+            }
 
             p += 24;
             header_parsed = 1;
             clock_gettime(CLOCK_MONOTONIC, &t_start);
         }
 
-        /* Parse entries inline — avoids per-entry function call overhead.
-         * Format: [klen:4][key][dlen:4][data][expire:8] */
-        while (p + 16 <= end) {
-            uint32_t klen = ntohl(*(uint32_t *)p); p += 4;
-            if (p + klen > end) goto parse_done;
-
-            const char *key = p; p += klen;
-            if (p + 4 > end) goto parse_done;
-
-            uint32_t vlen = ntohl(*(uint32_t *)p); p += 4;
-            if (p + vlen + 8 > end) goto parse_done;
-
-            const char *val = p; p += vlen;
-            uint64_t expire = be64toh(*(uint64_t *)p); p += 8;
-
-            uint64_t hash = kv_hash((const uint8_t *)key, klen);
-            kv_entry_t *e = dict_add(kv_dict_for(hash), key, klen, val, vlen, hash);
-            if (e) e->expire = (long long)expire;
-            n++;
+        /* ── Phase 1: Parse entries into metadata array ──────────────
+         * Pure sequential scan — no hash-table access, cache-friendly. */
+        while (p + 24 <= end && meta_count < meta_cap) {
+            struct entry_meta *m = &meta[meta_count];
+            m->hash   = be64toh(*(const uint64_t *)p); p += 8;
+            m->klen   = ntohl(*(const uint32_t *)p);   p += 4;
+            if (p + m->klen > end) break;
+            m->key    = p;                              p += m->klen;
+            if (p + 4 > end) break;
+            m->vlen   = ntohl(*(const uint32_t *)p);   p += 4;
+            if (p + m->vlen + 8 > end) break;
+            m->val    = p;                              p += m->vlen;
+            m->expire = be64toh(*(const uint64_t *)p);  p += 8;
+            meta_count++;
         }
-    parse_done:
 
-        total_entries += n;
+        int n = meta_count - batch_start;
         total_bytes += received;
+
+        /* ── Arena: allocate after first batch (exact heap sizing) ─── */
+        if (!arena_ready && n > 0 && meta_count > 0) {
+            kv_dict_t *dict = kv_dict_global();
+            if (!dict->arena) {
+                /* Sum exact heap bytes from the parsed metadata */
+                size_t heap_sample = 0;
+                for (int i = 0; i < meta_count; i++)
+                    heap_sample += sizeof(kv_entry_t)
+                                 + meta[i].klen + meta[i].vlen;
+                size_t est_total = (heap_sample * expected_entries)
+                                 / (size_t)meta_count;
+                size_t arena_sz  = est_total + est_total / 10; /* +10% */
+                if (arena_sz > 64 * 1024 * 1024) {
+                    dict_arena_init(dict, arena_sz);
+                    if (dict->arena)
+                        printf("[SLAVE] Arena: %.1f MB (exact est., %u samples)\n",
+                               (double)arena_sz / (1024 * 1024),
+                               meta_count);
+                }
+                arena_ready = 1;
+            }
+        }
+
+        /* ── Phase 2: Insert from metadata into hash table ───────────
+         * All keys/values still live in recv_buf (valid until re-post). */
+        for (int i = batch_start; i < meta_count; i++) {
+            struct entry_meta *m = &meta[i];
+            kv_entry_t *e = dict_add(kv_dict_for(m->hash),
+                                      m->key, m->klen,
+                                      m->val, m->vlen, m->hash);
+            if (e) e->expire = (long long)m->expire;
+        }
+
+        total_entries = meta_count;
         batches++;
-        printf("[SLAVE] Batch %d: %d entries, %zu bytes (total=%d/%u)\n",
-               batches, n, received, total_entries, expected_entries);
 
         /* Check if all entries received */
         if (expected_entries > 0 && (uint32_t)total_entries >= expected_entries) {
@@ -256,7 +312,7 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
         if (fi_recv(ep, recv_buf, RECV_BUF_SIZE, NULL, 0, recv_buf) < 0) {
             fprintf(stderr, "[SLAVE] fi_recv re-post failed\n");
             rc = -1;
-            goto cleanup_bufs;
+            goto cleanup_meta;
         }
     }
 
@@ -294,7 +350,9 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
 
     rc = 0;
 
-cleanup_bufs:
+cleanup_meta:
+    free(meta);
+
     for (int i = 0; i < NUM_RECV_BUFS; i++) {
         free(recv_bufs[i]);
     }

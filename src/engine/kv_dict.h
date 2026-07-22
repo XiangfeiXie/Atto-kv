@@ -63,6 +63,10 @@ typedef struct {
     kv_ht_t   ht[2];        /* ht[0] current, ht[1] rehash target */
     int64_t   rehash_idx;   /* -1 = not rehashing, >=0 = next bucket */
     uint32_t  iterators;    /* safe iterator count (pauses rehash)   */
+    /* Arena allocator for bulk insert (fullsync slave) */
+    char     *arena;        /* pre-allocated arena base */
+    size_t    arena_cap;    /* arena total capacity */
+    size_t    arena_used;   /* arena bump pointer offset */
 } kv_dict_t;
 
 /* --- Iterator (for RDB save, FLUSHALL, future SCAN) --- */
@@ -104,6 +108,8 @@ void     dict_init(kv_dict_t *d);
 void     dict_destroy(kv_dict_t *d);
 void     dict_clear(kv_dict_t *d);
 void     dict_reserve(kv_dict_t *d, uint32_t count); /* pre-alloc for bulk load */
+void     dict_arena_init(kv_dict_t *d, size_t size); /* bulk alloc arena */
+size_t   dict_arena_avail(kv_dict_t *d);             /* remaining arena bytes */
 
 /* --- Core operations --- */
 kv_entry_t *dict_find(kv_dict_t *d, const char *key, uint32_t key_len, uint64_t hash);

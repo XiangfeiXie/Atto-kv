@@ -37,14 +37,20 @@ static uint32_t next_pow2(uint32_t v) {
 }
 
 /* Allocate a new entry with key appended after data[].
-   Layout in memory: [kv_entry_t header][data[...type+encoding+payload]][key bytes] */
-static kv_entry_t *entry_alloc(const char *key, uint32_t key_len,
+   Layout in memory: [kv_entry_t header][data[...type+encoding+payload]][key bytes]
+   When dict has an arena, allocates from arena (bump pointer); falls back to malloc. */
+static kv_entry_t *entry_alloc(kv_dict_t *d, const char *key, uint32_t key_len,
                                 const char *data, uint32_t data_len,
                                 uint64_t hash)
 {
-    /* total = header + data (type+encoding+payload) + key */
     uint32_t total = (uint32_t)sizeof(kv_entry_t) + data_len + key_len;
-    kv_entry_t *e = (kv_entry_t *)malloc((size_t)total);
+    kv_entry_t *e;
+    if (d->arena && d->arena_used + total <= d->arena_cap) {
+        e = (kv_entry_t *)(d->arena + d->arena_used);
+        d->arena_used += total;
+    } else {
+        e = (kv_entry_t *)malloc((size_t)total);
+    }
     if (!e) return NULL;
 
     e->next    = NULL;
@@ -96,6 +102,9 @@ void dict_init(kv_dict_t *d) {
     ht_init(&d->ht[1]);
     d->rehash_idx = -1;
     d->iterators  = 0;
+    d->arena      = NULL;
+    d->arena_cap  = 0;
+    d->arena_used = 0;
     /* Start with a small table so the first adds trigger the lazy-init
        path inside dict_add rather than pre-allocating here. */
 }
@@ -109,6 +118,9 @@ void dict_destroy(kv_dict_t *d) {
 }
 
 void dict_clear(kv_dict_t *d) {
+    int has_arena = (d->arena != NULL);
+    const char *arena_end = d->arena + d->arena_cap;
+
     for (int t = 0; t < 2; t++) {
         kv_ht_t *ht = &d->ht[t];
         if (!ht->buckets) continue;
@@ -116,13 +128,24 @@ void dict_clear(kv_dict_t *d) {
             kv_entry_t *e = ht->buckets[i];
             while (e) {
                 kv_entry_t *next = e->next;
-                free(e);
+                /* Only free if NOT in arena (arena entries live in bulk block) */
+                if (!has_arena ||
+                    (char *)e < d->arena || (char *)e >= arena_end) {
+                    free(e);
+                }
                 e = next;
             }
         }
         ht_init(ht);
     }
     d->rehash_idx = -1;
+
+    if (has_arena) {
+        free(d->arena);
+        d->arena = NULL;
+        d->arena_cap = 0;
+        d->arena_used = 0;
+    }
 }
 
 /* Pre-allocate hashtable for bulk load. Must be called on an empty dict
@@ -137,6 +160,27 @@ void dict_reserve(kv_dict_t *d, uint32_t count) {
     if (size < DICT_INIT_SIZE) size = DICT_INIT_SIZE;
     if (size > DICT_MAX_SIZE) size = DICT_MAX_SIZE;
     ht_alloc(&d->ht[0], size);
+}
+
+/* Pre-allocate entry arena for bulk insert (fullsync slave).
+ * All entries inserted after this will be carved from the arena
+ * instead of individual malloc() calls.  Arena persists until
+ * the next dict_clear(), which frees the entire block at once.
+ *
+ * Call after dict_clear() + dict_reserve() on the empty dict.
+ * Safe to call even if no arena is needed (size=0 is a no-op). */
+void dict_arena_init(kv_dict_t *d, size_t size) {
+    if (size == 0) return;
+    d->arena = (char *)malloc(size);
+    if (d->arena) {
+        d->arena_cap  = size;
+        d->arena_used = 0;
+    }
+}
+
+size_t dict_arena_avail(kv_dict_t *d) {
+    if (!d->arena) return 0;
+    return d->arena_cap - d->arena_used;
 }
 
 /* =====================================================================
@@ -320,7 +364,7 @@ use_ht0:
         ht = &d->ht[0];
     }
 
-    kv_entry_t *e = entry_alloc(key, key_len, data, data_len, hash);
+    kv_entry_t *e = entry_alloc(d, key, key_len, data, data_len, hash);
     if (!e) return NULL;
 
     /* Prepend to bucket chain */
@@ -355,7 +399,7 @@ use_ht0:
 
     /* Build entry directly: [type:1][enc:1][payload][key] — one malloc */
     uint32_t data_len = (uint32_t)(2 + payload_len);
-    kv_entry_t *e = entry_alloc(key, key_len, NULL, data_len, hash);
+    kv_entry_t *e = entry_alloc(d, key, key_len, NULL, data_len, hash);
     if (!e) return NULL;
 
     e->data[0] = (char)type;

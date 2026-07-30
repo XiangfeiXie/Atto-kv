@@ -177,10 +177,6 @@ void dict_arena_init(kv_dict_t *d, size_t size) {
     }
 }
 
-size_t dict_arena_avail(kv_dict_t *d) {
-    if (!d->arena) return 0;
-    return d->arena_cap - d->arena_used;
-}
 
 /* =====================================================================
  * Progressive rehash: migrate up to 'steps' buckets from ht[0] to ht[1].
@@ -307,35 +303,6 @@ kv_entry_t *dict_find(kv_dict_t *d, const char *key, uint32_t key_len,
     return NULL;
 }
 
-kv_entry_t *dict_find_extkey(kv_dict_t *d, const char *key,
-                              uint32_t key_len, uint64_t hash)
-{
-    if (d->ht[0].size == 0 && d->rehash_idx < 0)
-        return NULL;
-
-    for (int t = 0; t < 2; t++) {
-        kv_ht_t *ht = &d->ht[t];
-        if (ht->size == 0) continue;
-
-        uint32_t idx = (uint32_t)(hash & ht->size_mask);
-        kv_entry_t *e = ht->buckets[idx];
-        while (e) {
-            /* e->key_len == sizeof(void*), entry_key(e) points to a
-             * pointer whose value is the actual key address.
-             * Real key length is stored in e->data[2..6] (payload prefix). */
-            uint32_t real_klen;
-            memcpy(&real_klen, e->data + 2, sizeof(uint32_t));
-            const char *real_key = *(const char **)entry_key(e);
-
-            if (e->hash == hash && real_klen == key_len &&
-                memcmp(real_key, key, key_len) == 0)
-                return e;
-            e = e->next;
-        }
-    }
-
-    return NULL;
-}
 
 kv_entry_t *dict_add(kv_dict_t *d, const char *key, uint32_t key_len,
                      const char *data, uint32_t data_len, uint64_t hash)
@@ -555,9 +522,6 @@ done:
     return result;
 }
 
-kv_entry_t *dict_iter_peek(kv_iter_t *it) {
-    return it->next;
-}
 
 void dict_iter_free(kv_iter_t *it) {
     if (!it) return;

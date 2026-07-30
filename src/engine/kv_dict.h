@@ -109,20 +109,10 @@ void     dict_destroy(kv_dict_t *d);
 void     dict_clear(kv_dict_t *d);
 void     dict_reserve(kv_dict_t *d, uint32_t count); /* pre-alloc for bulk load */
 void     dict_arena_init(kv_dict_t *d, size_t size); /* bulk alloc arena */
-size_t   dict_arena_avail(kv_dict_t *d);             /* remaining arena bytes */
 
 /* --- Core operations --- */
 kv_entry_t *dict_find(kv_dict_t *d, const char *key, uint32_t key_len, uint64_t hash);
 
-/* dict_find variant: entry key area stores a pointer to the actual key
- * (not the key bytes themselves). Used by ZSET skiplist encoding where
- * member strings are owned by skiplist nodes.
- *   entry data[]: [type][encoding][real_key_len:4][score:8]
- *   entry key area: [ptr:8] -> external key string
- *   entry->key_len = 8 (sizeof(void*))
- * Comparison dereferences the stored pointer before memcmp. */
-kv_entry_t *dict_find_extkey(kv_dict_t *d, const char *key,
-                              uint32_t key_len, uint64_t hash);
 kv_entry_t *dict_add(kv_dict_t *d, const char *key, uint32_t key_len,
                      const char *data, uint32_t data_len, uint64_t hash);
 /* Direct add: builds entry from raw components (no intermediate data buffer) */
@@ -138,7 +128,6 @@ kv_entry_t *dict_resize_entry(kv_dict_t *d, kv_entry_t *e, uint32_t new_data_len
 /* --- Iteration --- */
 kv_iter_t  *dict_iter_new(kv_dict_t *d, int safe);
 kv_entry_t *dict_iter_next(kv_iter_t *it);
-kv_entry_t *dict_iter_peek(kv_iter_t *it);
 void        dict_iter_free(kv_iter_t *it);
 
 /* --- Stats --- */

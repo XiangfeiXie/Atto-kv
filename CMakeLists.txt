@@ -48,15 +48,20 @@ set(UTIL_SRCS
     src/util/dynbuf.c
 )
 
+set(CONFIG_SRCS
+    src/config/config.c
+)
+
+set(PROTOCOL_SRCS
+    src/protocol/protocol.c
+)
+
 set(CORE_SRCS
     src/core/kvstore.c
     src/core/kvstore_expire.c
     src/core/kvstore_config.c
     src/core/kvstore_info.c
     src/core/kvstore_dispatch.c
-    src/core/config.c
-    src/core/protocol.c
-    src/core/shared.c
 )
 
 set(ENGINE_SRCS
@@ -70,10 +75,8 @@ set(TYPE_SRCS
 
 set(NET_SRCS
     src/net/reactor.c
-    src/net/proactor_ring.c
-    src/net/proactor_conn.c
+    src/net/proactor.c
     src/net/proactor_event.c
-    src/net/proactor_main.c
     src/net/ntyco.c
 )
 
@@ -93,6 +96,8 @@ set(REPL_SRCS
 set(KVSTORE_SRCS
     ${UTIL_SRCS}
     ${CORE_SRCS}
+    ${CONFIG_SRCS}
+    ${PROTOCOL_SRCS}
     ${ENGINE_SRCS}
     ${TYPE_SRCS}
     ${NET_SRCS}
@@ -106,6 +111,8 @@ add_executable(kvstore ${KVSTORE_SRCS})
 target_include_directories(kvstore PRIVATE
     src/util
     src/core
+    src/config
+    src/protocol
     src/engine
     src/type
     src/net

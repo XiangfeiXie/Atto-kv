@@ -4,10 +4,8 @@
 #define KVSTORE_INTERNAL_H
 
 #include "kvstore.h"
-#include "kvstore_macros.h"
 #include "kv_type_string.h"
 #include "kv_type_hash.h"
-#include "shared.h"
 #include "config.h"
 
 #include <stdbool.h>
@@ -20,7 +18,6 @@ void update_cached_time(void);
 
 /* utility */
 int  token_to_ll(kvs_token_t t, long long *out);
-int  token_eq_ci(kvs_token_t t, const char *lit);
 void reply_integer(DynBuf *wb, long long v);
 void reply_bulk(DynBuf *wb, const char *s, int len);
 void entry_cleanup_by_type(kv_entry_t *e);

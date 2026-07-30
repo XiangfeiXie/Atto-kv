@@ -4,7 +4,6 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>     /* TCP_NODELAY */
 #include <string.h>
-#include <pthread.h>
 #include <unistd.h>
 #include <poll.h>
 #include <sys/epoll.h>

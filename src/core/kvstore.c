@@ -117,9 +117,6 @@ void update_cached_time(void) {
 
 /* ── Utility ────────────────────────────────────────────────────────── */
 
-void *kvs_malloc(size_t size) { return malloc(size); }
-void kvs_free(void *ptr)       { free(ptr); }
-
 int token_to_ll(kvs_token_t t, long long *out) {
     if (t.len <= 0 || t.len > 20) return -1;
     int i = 0, neg = 0;
@@ -146,10 +143,20 @@ void kvs_cleanup_entry(kv_entry_t *e) {
     entry_cleanup_by_type(e);
 }
 
+/* Pre-allocated integer responses :0\r\n..:255\r\n */
+static const char *g_int_resp[256];
+static char g_int_buf[256][16];
+
+static void init_shared_responses(void) {
+    for (int i = 0; i < 256; i++) {
+        snprintf(g_int_buf[i], sizeof(g_int_buf[i]), ":%d\r\n", i);
+        g_int_resp[i] = g_int_buf[i];
+    }
+}
+
 void reply_integer(DynBuf *wb, long long v) {
     if (v >= 0 && v <= 255) {
-        const char *shared = g_shared_resp.integers[v];
-        dynbuf_cat(wb, shared, (int)strlen(shared));
+        dynbuf_cat(wb, g_int_resp[v], (int)strlen(g_int_resp[v]));
         return;
     }
     char buf[32];
@@ -165,15 +172,6 @@ void reply_bulk(DynBuf *wb, const char *s, int len) {
     dynbuf_lit(wb, "\r\n");
 }
 
-int token_eq_ci(kvs_token_t t, const char *lit) {
-    size_t n = strlen(lit);
-    if (t.len != (int)n) return 0;
-    for (int i = 0; i < t.len; i++) {
-        if (toupper((unsigned char)t.ptr[i]) != toupper((unsigned char)lit[i]))
-            return 0;
-    }
-    return 1;
-}
 
 /* ── Write journal ──────────────────────────────────────────────────── */
 

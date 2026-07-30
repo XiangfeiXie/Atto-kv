@@ -6,11 +6,52 @@
 #include <string.h>
 #include <ctype.h>
 
-/* Pack first 4 bytes of a command name into uint32_t for jump-table dispatch */
-#define CMD4(a,b,c,d) ((uint32_t)(uint8_t)(a) | ((uint32_t)(uint8_t)(b) << 8) | \
-                        ((uint32_t)(uint8_t)(c) << 16) | ((uint32_t)(uint8_t)(d) << 24))
+/* ── Inline GET/SET macros (hottest commands, 60-80% workload) ──────── */
 
-/* exported for inline GET/SET in dispatch */
+#define INLINE_GET_COMMAND(entry, hash, key_tok, wb) do { \
+    if (!(entry)) { \
+        dynbuf_cat((wb), RESP_NIL, RESP_NIL_LEN); \
+    } else { \
+        uint32_t vlen = 0; \
+        uint8_t enc = KV_ENCODING_RAW; \
+        const char *val = string_engine_get_pre((entry), &vlen, &enc); \
+        if (enc == KV_ENCODING_INT) { \
+            int64_t iv; \
+            memcpy(&iv, val, sizeof(int64_t)); \
+            char ibuf[24]; \
+            int il = snprintf(ibuf, sizeof(ibuf), "%lld", (long long)iv); \
+            char hdr[24]; \
+            int bh = snprintf(hdr, sizeof(hdr), "$%d\r\n", il); \
+            dynbuf_cat((wb), hdr, bh); \
+            dynbuf_cat((wb), ibuf, il); \
+            dynbuf_lit((wb), "\r\n"); \
+        } else { \
+            char hdr[24]; \
+            int bh = snprintf(hdr, sizeof(hdr), "$%u\r\n", vlen); \
+            dynbuf_cat((wb), hdr, bh); \
+            dynbuf_cat((wb), val, (int)vlen); \
+            dynbuf_lit((wb), "\r\n"); \
+        } \
+    } \
+} while (0)
+
+#define INLINE_SET_COMMAND(entry, hash, tokens, argc, wb, msg_raw, msg_len) do { \
+    if ((argc) == 3) { \
+        kvs_token_t key_tok = (tokens)[1]; \
+        kvs_token_t val_tok = (tokens)[2]; \
+        string_engine_set_pre(key_tok.ptr, (uint32_t)key_tok.len, \
+                              val_tok.ptr, (uint32_t)val_tok.len, \
+                              0, 0, (hash), (entry)); \
+        dynbuf_cat((wb), RESP_OK, RESP_OK_LEN); \
+        if (!g_in_reload) { \
+            kvs_write_journal_append((msg_raw), (msg_len)); \
+        } \
+    } else { \
+        string_cmd((tokens)[0], (entry), (hash), (tokens) + 1, (argc) - 1, \
+                   (wb), (msg_raw), (msg_len)); \
+    } \
+} while (0)
+
 extern uint32_t kv_store_count(void);
 
 #include "kv_type_string.h"
@@ -301,8 +342,9 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         for (int i = 1; i + 1 < argc; i += 2) {
             uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                   (uint32_t)tokens[i].len);
-            string_engine_set(tokens[i].ptr, (uint32_t)tokens[i].len,
-                              tokens[i+1].ptr, (uint32_t)tokens[i+1].len, 0, 0);
+            string_engine_set_pre(tokens[i].ptr, (uint32_t)tokens[i].len,
+                                  tokens[i+1].ptr, (uint32_t)tokens[i+1].len,
+                                  0, 0, kh, NULL);
         }
         reply_integer(wb, 1);
         if (!g_in_reload)

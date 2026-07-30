@@ -120,19 +120,6 @@ static int engine_set_pre(const char *key, uint32_t key_len,
 
 /* Backwards-compat wrapper for MGET/MSET/MSETNX batch paths in kvstore.c
  * where the entry hasn't been pre-fetched (each key has its own loop). */
-static int engine_set_raw(const char *key, uint32_t key_len,
-                          const char *val, uint32_t val_len,
-                          long long expire, int mode)
-{
-    uint64_t hash = kv_hash((const uint8_t *)key, key_len);
-    kv_entry_t *existing = dict_find(kv_dict_for(hash), key, key_len, hash);
-    if (existing && existing->expire && get_time_now() > existing->expire) {
-        kvs_cleanup_entry(existing);
-        dict_delete(kv_dict_for(hash), key, key_len, hash);
-        existing = NULL;
-    }
-    return engine_set_pre(key, key_len, val, val_len, expire, mode, hash, existing);
-}
 
 /* Phase 6.1 — engine_get with pre-found entry.  Direct field access; no
  * dict_find, no expire check (dispatcher already cleared expired keys). */
@@ -147,20 +134,6 @@ static inline const char *engine_get_pre(kv_entry_t *e,
     return entry_payload(e);
 }
 
-static const char *engine_get_raw(const char *key, uint32_t key_len,
-                                  uint32_t *vlen_out, long long *expire_out,
-                                  uint8_t *enc_out)
-{
-    uint64_t hash = kv_hash((const uint8_t *)key, key_len);
-    kv_entry_t *e = dict_find(kv_dict_for(hash), key, key_len, hash);
-    if (!e) return NULL;
-
-    if (e->expire && get_time_now() > e->expire) {
-        dict_delete(kv_dict_for(hash), key, key_len, e->hash);
-        return NULL;
-    }
-    return engine_get_pre(e, vlen_out, expire_out, enc_out);
-}
 
 static int engine_mod_raw(const char *key, uint32_t key_len,
                           const char *val, uint32_t val_len,
@@ -221,27 +194,9 @@ static int engine_exist_raw(const char *key, uint32_t key_len)
     return 0;
 }
 
-void string_build_entry_data(const char *value, int val_len, char *out_data)
-{
-    out_data[0] = (char)KV_TYPE_STRING;
-    out_data[1] = (char)KV_ENCODING_RAW;
-    if (value && val_len > 0)
-        memcpy(out_data + 2, value, (size_t)val_len);
-}
 
 /* Public wrappers — delegate to the internal engine_* functions. */
-int string_engine_set(const char *key, uint32_t key_len,
-                      const char *val, uint32_t val_len,
-                      long long expire, int mode)
-{
-    return engine_set_raw(key, key_len, val, val_len, expire, mode);
-}
 
-const char *string_engine_get(const char *key, uint32_t key_len,
-                              uint32_t *vlen_out, uint8_t *enc_out)
-{
-    return engine_get_raw(key, key_len, vlen_out, NULL, enc_out);
-}
 
 /* Pre-computed hash variant — skip redundant kv_hash + dict_find */
 int string_engine_set_pre(const char *key, uint32_t key_len,
@@ -259,13 +214,6 @@ const char *string_engine_get_pre(kv_entry_t *entry,
     return engine_get_pre(entry, vlen_out, NULL, enc_out);
 }
 
-int string_is_write_cmd(kvs_token_t cmd) {
-    return TOKEN_EQ(cmd, "SET")    || TOKEN_EQ(cmd, "SETNX")  ||
-           TOKEN_EQ(cmd, "SETEX")  || TOKEN_EQ(cmd, "MOD")    ||
-           TOKEN_EQ(cmd, "APPEND") || TOKEN_EQ(cmd, "INCR")   ||
-           TOKEN_EQ(cmd, "INCRBY") || TOKEN_EQ(cmd, "DECR")   ||
-           TOKEN_EQ(cmd, "DECRBY") || TOKEN_EQ(cmd, "GETSET");
-}
 
 /* Parse a slice as a positive integer (returns -1 on error). */
 static long long slice_to_ll(kvs_token_t t) {

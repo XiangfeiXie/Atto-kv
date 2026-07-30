@@ -1,9 +1,49 @@
-#ifndef PROACTOR_INLINE_H
-#define PROACTOR_INLINE_H
+#ifndef PROACTOR_H
+#define PROACTOR_H
 
-#include "proactor_types.h"
-#include <liburing.h>
+#include <stdint.h>
 #include <stdlib.h>
+#include <liburing.h>
+#include "server.h"
+
+/* Event types */
+#define EVENT_ACCEPT    0
+#define EVENT_READ      1
+#define EVENT_WRITE     2
+
+/* io_uring configuration */
+#define ENTRIES_LENGTH  2048
+#define CQE_BATCH_SIZE  128
+
+/* Buffer ring configuration */
+#define KVS_BUF_RING_BGID  1
+#define KVS_NR_BUFS        8192
+#define KVS_BUF_SIZE       4096
+
+/* Proactor state (single-threaded, like Redis) */
+typedef struct proactor_worker {
+    int                       listen_fd;
+    struct io_uring           ring;
+    struct io_uring_buf_ring *buf_ring;
+    char                     *buf_base;
+    size_t                    buf_pool_bytes;
+    int                       accept_armed;
+} proactor_worker_t;
+
+/* Connection info packing */
+struct conn_info {
+    int fd;
+    int event;
+    uint32_t gen;
+};
+
+/* Global state (declared here, defined in proactor.c) */
+extern struct conn *conn_pool;
+extern int conn_pool_size;
+extern proactor_worker_t *g_worker;
+extern uint32_t g_next_conn_gen;
+
+/* ── Inline helpers ──────────────────────────────────────────────────── */
 
 /* Pack connection info into user_data */
 static inline uint64_t conn_info_pack(int fd, int event, uint32_t gen) {
@@ -58,4 +98,9 @@ static inline int proactor_debug_enabled(void) {
     return g_proactor_debug;
 }
 
-#endif /* PROACTOR_INLINE_H */
+/* ── Public API ──────────────────────────────────────────────────────── */
+
+int  proactor_start(unsigned short port, msg_handler handler);
+void conn_release(int fd);
+
+#endif /* PROACTOR_H */

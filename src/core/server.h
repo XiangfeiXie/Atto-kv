@@ -4,49 +4,45 @@
 #include <stdint.h>
 #include <signal.h>
 #include "dynbuf.h"
-#include "client.h"
 
-#define ENABLE_HTTP      0
-#define ENABLE_WEBSOCKET 0
-#define ENABLE_KVSTORE   1
+/* ── Per-client application state ── */
+struct conn;
+typedef struct client {
+    struct conn *conn;
+} client_t;
 
-/* Global graceful-shutdown flag; set by SIGTERM/SIGINT handler.
- * Network event loops check this flag to exit cleanly. */
+/* ── Global graceful-shutdown flag ── */
 extern volatile sig_atomic_t g_kvs_stop;
 
-/* Callback types */
+/* ── Callback types ── */
 typedef int (*RCALLBACK)(int fd);
 typedef int (*msg_handler)(char *msg, int len, DynBuf *write_buf);
 
-/* Per-connection state (pure network I/O) */
+/* ── Per-connection state ── */
 struct conn {
     int fd;
     DynBuf read_buf;
     DynBuf write_buf;
-    int r_off;              /* read buffer consumed offset (avoids memmove) */
-    int w_off;              /* write buffer sent offset (avoids memmove) */
-    int active;             /* slot is in use (dynamic pool) */
-    uint32_t cur_events;    /* cached epoll mask (lazy MOD optimization) */
+    int r_off, w_off;
+    int active;
+    int status;
+    uint32_t cur_events;    /* epoll cached mask (reactor) */
     int recv_armed;
     int send_armed;
-    uint32_t gen;
+    uint32_t gen;           /* generation (proactor) */
 
-    struct client *client;  /* application-layer session (NULL until first command) */
+    client_t *client;
 
-    RCALLBACK send_callback;
+    RCALLBACK send_callback;         /* reactor */
     union {
         RCALLBACK recv_callback;
         RCALLBACK accept_callback;
-    } r_action;
-
-    int status;
+    } r_action;                      /* reactor */
 };
 
-#if ENABLE_KVSTORE
-/* Network-layer read buffer initial size for pipeline batching */
+/* Network-layer read buffer initial size */
 #ifndef KVS_NET_BUF_INIT
 #define KVS_NET_BUF_INIT 65536
-#endif
 #endif
 
 #endif

@@ -66,15 +66,4 @@ void config_print(void);
 #define ENABLE_AOF \
     (kvs_config.persist_mode == PERSIST_AOF)
 
-/* ---- Logging helper ---- */
-#define KVS_LOG(level, fmt, ...) \
-    do { \
-        if ((level) >= kvs_config.loglevel) { \
-            const char *_l = (level) == LOG_DEBUG ? "DEBUG" : \
-                             (level) == LOG_INFO  ? "INFO"  : \
-                             (level) == LOG_WARN  ? "WARN"  : "ERROR"; \
-            printf("[%s] " fmt "\n", _l, ##__VA_ARGS__); \
-        } \
-    } while (0)
-
 #endif

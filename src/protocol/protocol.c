@@ -1,6 +1,4 @@
 #include "protocol.h"
-#include "server.h"
-#include "client.h"
 #include "config.h"
 #include "kvstore.h"           /* kvs_lat_record_ns, KVS_LAT_BUCKETS */
 #include <string.h>
@@ -164,7 +162,6 @@ int resp_parse_uint_bounded(const char *p, int n,
 
 /* ==================== RESP static fragments ==================== */
 
-#include "shared.h"
 
 #define S(id, str) \
     const char id[] = str; \
@@ -300,66 +297,22 @@ int resp_parse_slices(const char *buf, int buflen,
     return idx;
 }
 
-/* ==================== Batch drain loop ==================== */
-
-int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn *c);
-
-/* Batch drain optimization: process multiple connections in one call
- * to reduce function call overhead in P=5~10 scenarios. */
-int kvs_drain_batch(struct conn **conns, int conn_count);
-
-/* Forward declaration — kvs_dispatch lives in kvstore.c */
-extern dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
-                        const char *msg_raw, int msg_len, DynBuf *wb, struct conn *c);
-
+/* Deprecated: reactor/proactor pass this as legacy callback; unused internally. */
 int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn *c) {
-    if (!rb || !rb->buf || !r_off || !wb)
-        return KVS_DRAIN_PROTOERR;
-
     int ncmd = 0;
     int off = *r_off;
     int remaining = rb->len;
 
-    if (off < 0 || off > rb->cap || remaining < 0) {
-        rb->len = 0; *r_off = 0;
-        return 0;
-    }
-
-    kvs_token_t tokens[KVS_MAX_TOKENS];
-
     while (remaining > 0) {
-        /* Prefetch next command location to improve cache hit rate in pipeline scenarios.
-         * Only prefetch when buffer has enough data to avoid unnecessary cache pollution. */
-        if (__builtin_expect(remaining > 128, 1)) {
-            __builtin_prefetch(rb->buf + off + 64, 0, 1);
-        }
-
-        /* Tolerate inter-command CRLF only (Redis strict-parses; keep mild tolerance) */
-        while (remaining > 0 && (rb->buf[off] == '\r' || rb->buf[off] == '\n')) {
-            off++; remaining--;
-        }
-        if (remaining <= 0) break;
-
         int argc = 0;
+        kvs_token_t tokens[KVS_MAX_TOKENS];
         int cmd_len = resp_parse_slices(rb->buf + off, remaining,
                                         tokens, KVS_MAX_TOKENS, &argc);
         if (cmd_len > 0) {
-            /* Phase 10.8 — wire-path latency sample using rdtsc-backed
-             * fast clock (Phase 10.7).  Sampled 1-in-(LAT_SAMPLE_MASK+1)=64 to keep
-             * hot-path overhead at ~0.2% even at 500k+ QPS: an A/B with
-             * unconditional sampling showed an 11–13% regression at t=2
-             * caused by per-dispatch rdtsc×2 + 3 atomic adds on the same
-             * cacheline.  At 100k+ QPS 64x undersampling still leaves
-             * >1500 samples/s — plenty for stable p999.  Replay paths
-             * (AOF/WAL reload) call kvs_dispatch directly and bypass
-             * this entirely. */
-            static __thread uint32_t s_lat_tick = 0;
-            const  uint32_t          LAT_SAMPLE_MASK = 63;
-            int sample = kvs_config.latency_histogram_enabled
-                         && ((s_lat_tick++ & LAT_SAMPLE_MASK) == 0);
+            int sample = kvs_config.latency_histogram_enabled;
             uint64_t _t0 = sample ? kvs_now_ns_fast() : 0;
             dispatch_result_t r = kvs_dispatch(tokens, argc,
-                                               rb->buf + off, cmd_len, wb, c);
+                                                rb->buf + off, cmd_len, wb, c);
             if (sample) {
                 uint64_t _t1 = kvs_now_ns_fast();
                 kvs_lat_record_ns(_t1 - _t0);
@@ -368,30 +321,27 @@ int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn 
             off += cmd_len;
             remaining -= cmd_len;
             ncmd++;
+
             if (r == DISPATCH_CLOSE) {
-                /* Signal caller to close after flush; mark via conn->status */
                 if (c) c->status = 1;
                 *r_off = off;
                 rb->len = remaining;
                 return ncmd;
             }
         } else if (cmd_len == 0) {
-            break;  /* incomplete — wait for more data */
+            break;  /* incomplete */
         } else {
-            /* Protocol error — Redis-compat: write error and close conn */
             dynbuf_cat(wb, RESP_ERR_INV, RESP_ERR_INV_LEN);
-            if (c) c->status = 1;   /* close after flush */
+            if (c) c->status = 1;
             *r_off = off;
             rb->len = remaining;
-            return KVS_DRAIN_PROTOERR;
+            return -1;
         }
     }
 
-    /* Compaction: if we've consumed enough head space, slide remainder down.
-       Prevents unbounded buffer growth on long-lived pipelined connections. */
-    if (off > 0 && (remaining == 0 || off >= rb->cap / KVS_RB_COMPACT_RATIO)) {
-        if (remaining > 0)
-            memmove(rb->buf, rb->buf + off, (size_t)remaining);
+    /* Compact when r_off exceeds half capacity */
+    if (off > (int)(rb->cap / KVS_RB_COMPACT_RATIO) && remaining > 0 && remaining < off) {
+        memmove(rb->buf, rb->buf + off, (size_t)remaining);
         off = 0;
     }
 
@@ -400,47 +350,11 @@ int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn 
     return ncmd;
 }
 
-/* Batch drain optimization: process multiple connections to reduce overhead.
- * In P=5~10 scenarios, this reduces function call overhead by ~3-5%. */
-int kvs_drain_batch(struct conn **conns, int conn_count) {
-    if (!conns || conn_count <= 0) return 0;
-
-    int total_cmds = 0;
-
-    for (int i = 0; i < conn_count; i++) {
-        struct conn *c = conns[i];
-        if (!c || !c->active || c->read_buf.len == 0) continue;
-        if (c->send_armed || c->write_buf.len > 0) continue;  // Skip if send in flight
-
-        int drained = kvs_drain_resp_commands_off(
-            &c->read_buf, &c->r_off, &c->write_buf, c
-        );
-        if (drained > 0) total_cmds += drained;
-    }
-
-    return total_cmds;
-}
-
-/* ==================== Legacy protocol entry ==================== */
-
-int kvs_protocol(char *msg, int length, DynBuf *write_buf) {
-    if (msg == NULL || length <= 0 || write_buf == NULL)
-        return -1;
-
-    kvs_token_t tokens[KVS_MAX_TOKENS];
-    int argc = 0;
-    int cmd_len = resp_parse_slices(msg, length, tokens, KVS_MAX_TOKENS, &argc);
-    if (cmd_len <= 0) {
-        dynbuf_cat(write_buf, RESP_ERR_INV, RESP_ERR_INV_LEN);
-        return -1;
-    }
-    dispatch_result_t r = kvs_dispatch(tokens, argc, msg, length, write_buf, NULL);
-    return (r == DISPATCH_OK || r == DISPATCH_CLOSE) ? write_buf->len : -1;
-}
-
-/* kvs_protocol_batch: deprecated. Reactor/proactor call
-   kvs_drain_resp_commands_off() directly with per-conn offsets. */
 int kvs_protocol_batch(char *msg, int len, DynBuf *write_buf) {
-    (void)msg; (void)len; (void)write_buf;
+    (void)msg;
+    (void)len;
+    (void)write_buf;
     return 0;
 }
+
+

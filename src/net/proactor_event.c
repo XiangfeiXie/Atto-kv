@@ -5,16 +5,10 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <liburing.h>
-#include "proactor_types.h"
-#include "proactor_inline.h"
+#include "proactor.h"
 #include "protocol.h"
 #include "kvstore.h"
-#include "client.h"
-
-/* Forward declarations */
-extern void conn_release(int fd);
-extern int conn_pool_init(int max_clients);
-extern struct conn *conn_alloc(int fd);
+#include "server.h"
 
 /* Arm multishot recv */
 static int set_event_recv_multishot(struct io_uring *ring, int sockfd, uint32_t gen) {

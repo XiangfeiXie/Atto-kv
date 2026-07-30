@@ -2,8 +2,7 @@
 #define __KV_TYPE_STRING_H__
 
 #include "kv_dict.h"
-#include "server.h"
-#include "kvstore.h"
+#include "protocol.h"
 
 /* STRING type — handles SET, GET, DEL, MOD, EXIST, PING, ECHO, FLUSHALL, SAVE.
  *
@@ -23,24 +22,6 @@ dispatch_result_t string_cmd(kvs_token_t cmd, kv_entry_t *entry,
                              uint64_t hash,
                              kvs_token_t *args, int argc, DynBuf *wb,
                              const char *msg_raw, int msg_len);
-
-/* Write-command check for AOF / eBPF probe */
-int string_is_write_cmd(kvs_token_t cmd);
-
-/* Build a STRING entry's data[] for dict_add.
-   out_data must be at least val_len + 2 bytes. */
-void string_build_entry_data(const char *value, int val_len, char *out_data);
-
-/* Public helpers used by multi-key string commands (MSET/MGET/MSETNX) in kvs_dispatch.
- * string_engine_set: mode 0 unconditional, 1 NX (absent only), 2 XX (present only).
- *   Returns 0 ok, 1 precondition failed, -1 error.
- * string_engine_get: returns payload pointer + length; NULL if missing / expired.
- *   Caller must honour enc_out (KV_ENCODING_INT means payload is int64). */
-int         string_engine_set(const char *key, uint32_t key_len,
-                              const char *val, uint32_t val_len,
-                              long long expire, int mode);
-const char *string_engine_get(const char *key, uint32_t key_len,
-                              uint32_t *vlen_out, uint8_t *enc_out);
 
 /* Pre-computed-hash variants for the hot path.
  * Caller already did kv_hash+dict_find; pass the result here to

@@ -45,8 +45,7 @@ int resp_parse_slices(const char *buf, int buflen,
    Returns command count, or -1 if a blocked client was encountered. */
 int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn *c);
 
-/* Legacy entry points */
-int kvs_protocol(char *msg, int length, DynBuf *write_buf);
+/* Legacy entry point for network layer init */
 int kvs_protocol_batch(char *msg, int len, DynBuf *write_buf);
 
 /* Commonly-used RESP fragments */

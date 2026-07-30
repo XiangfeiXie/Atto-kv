@@ -150,24 +150,3 @@ void kvs_stop_expire_thread(void) {
     pthread_join(g_expire_thread, NULL);
 }
 
-/* ── KVItem ──────────────────────────────────────────────────────────── */
-
-KVItem* create_kvitem_len(const char *value, int vlen) {
-    if (!value || vlen < 0) return NULL;
-    KVItem *item = (KVItem*)malloc(sizeof(KVItem));
-    if (!item) return NULL;
-    memset(item, 0, sizeof(KVItem));
-    item->len   = (size_t)vlen;
-    item->value = (char*)malloc((size_t)vlen + 1);
-    if (!item->value) { free(item); return NULL; }
-    memcpy(item->value, value, (size_t)vlen);
-    item->value[vlen] = '\0';
-    item->expire = 0;
-    return item;
-}
-
-void free_kvitem(KVItem *item) {
-    if (!item) return;
-    free(item->value);
-    free(item);
-}

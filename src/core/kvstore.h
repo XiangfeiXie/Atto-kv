@@ -17,10 +17,6 @@
 #include <jemalloc/jemalloc.h>
 #endif
 
-#define NETWORK_REACTOR   0
-#define NETWORK_PROACTOR  1
-#define NETWORK_NTYCO     2
-
 extern int reactor_start(unsigned short port, msg_handler handler);
 extern int proactor_start(unsigned short port, msg_handler handler);
 extern int ntyco_start(unsigned short port, msg_handler handler);
@@ -41,21 +37,6 @@ void kvs_cleanup_entry(kv_entry_t *e);  /* free type-specific internal structure
 /* ── Active expire ── */
 void kvs_start_expire_thread(void);
 void kvs_stop_expire_thread(void);
-
-/* ── Value item (legacy, used by persistence layer) ── */
-typedef struct {
-    char      *value;
-    size_t     len;
-    long long  expire;
-} KVItem;
-
-typedef void (*kv_scan_cb)(const char *key, KVItem *item, void *priv);
-
-void *kvs_malloc(size_t size);
-void  kvs_free(void *ptr);
-
-KVItem* create_kvitem_len(const char *value, int vlen);
-void    free_kvitem(KVItem *item);
 
 /* ── Global dict ── */
 extern int g_in_reload;   /* 1 during AOF/RDB reload — suppress AOF append + eBPF */

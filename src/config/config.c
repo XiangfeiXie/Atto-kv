@@ -43,10 +43,6 @@ static void config_default(void) {
 
 /* Resolve sentinel values and emit sanity warnings.  Called once after
  * the .conf file has been parsed. */
-static void config_postprocess(void) {
-    /* No thread/CPU configuration needed for single-threaded mode */
-}
-
 /* ================================================================
  * Helpers
  * ================================================================ */
@@ -99,7 +95,6 @@ int config_load(const char *path) {
     FILE *fp = fopen(path, "r");
     if (!fp) {
         printf("[CONFIG] '%s' not found, using defaults\n", path);
-        config_postprocess();
         return -1;
     }
     printf("[CONFIG] Loading %s\n", path);
@@ -206,7 +201,6 @@ int config_load(const char *path) {
     }
 
     fclose(fp);
-    config_postprocess();
     return 0;
 }
 

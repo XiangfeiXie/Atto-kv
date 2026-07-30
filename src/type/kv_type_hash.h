@@ -5,7 +5,6 @@
 #include "server.h"
 #include "kvstore.h"
 #include "protocol.h"
-#include "client.h"
 
 /* HASH type — map of field-value string pairs.
 

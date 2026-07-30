@@ -40,9 +40,9 @@ struct conn {
     } r_action;                      /* reactor */
 };
 
-/* Network-layer read buffer initial size */
-#ifndef KVS_NET_BUF_INIT
-#define KVS_NET_BUF_INIT 65536
+#define KVS_NET_BUF_INIT  65536     /* 64KB — Redis-style fixed initial */
+#ifndef KVS_NET_BUF_MAX
+#define KVS_NET_BUF_MAX   (16 * 1024 * 1024)  /* 16MB safety cap */
 #endif
 
 #endif

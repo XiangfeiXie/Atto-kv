@@ -1,167 +1,9 @@
 #include "protocol.h"
 #include "config.h"
-#include "kvstore.h"           /* kvs_lat_record_ns, KVS_LAT_BUCKETS */
+#include "kvstore.h"
 #include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
 
-/* ── Debug instrumentation for RESP parser ────
- * Enable via: KVS_DEBUG_RESP=1 ./kvstore ...
- * Levels: 1=parse errors only, 2=all parse decisions, 3=trace */
-#define KVS_DEBUG_RESP_ENABLED() (getenv("KVS_DEBUG_RESP") != NULL)
-#define KVS_DEBUG_RESP_LEVEL() \
-    (KVS_DEBUG_RESP_ENABLED() ? atoi(getenv("KVS_DEBUG_RESP")) : 0)
-#define DEBUG_RESP(level, fmt, ...) \
-    do { if (KVS_DEBUG_RESP_LEVEL() >= (level)) \
-        fprintf(stderr, "[RESP] " fmt "\n", ##__VA_ARGS__); \
-    } while (0)
-
-#if defined(__AVX2__)
-#include <immintrin.h>
-#elif defined(__SSE2__)
-#include <emmintrin.h>
-#endif
-
-/* Locate "\r\n" in a bounded region.  RESP headers are short (argc <= 32B,
- * bulk length <= 24B), but inline commands may scan up to 64KB.  The SIMD
- * path mainly helps inline/debug commands and large pipelined buffers while
- * keeping array-form headers on a tiny scalar fast path.
- * In debug mode, remove always_inline to avoid recursive inlining error. */
-#ifdef NDEBUG
-static inline __attribute__((always_inline))
-const char *resp_find_crlf(const char *p, int n)
-#else
-static inline const char *resp_find_crlf(const char *p, int n)
-#endif
-{
-    if (n <= 0) return NULL;
-
-    if (n < 33) {
-        const char *cr = memchr(p, '\r', (size_t)n);
-        while (cr) {
-            int off = (int)(cr - p);
-            if (off + 1 >= n) return NULL;
-            if (cr[1] == '\n') return cr;
-            cr = memchr(cr + 1, '\r', (size_t)(n - off - 1));
-        }
-        return NULL;
-    }
-
-#if defined(__AVX2__)
-    const __m256i vcr = _mm256_set1_epi8('\r');
-    const __m256i vlf = _mm256_set1_epi8('\n');
-    int i = 0;
-    for (; i + 33 <= n; i += 32) {
-        __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)(p + i));
-        __m256i b = _mm256_loadu_si256((const __m256i *)(const void *)(p + i + 1));
-        __m256i m = _mm256_and_si256(_mm256_cmpeq_epi8(a, vcr),
-                                     _mm256_cmpeq_epi8(b, vlf));
-        uint32_t mask = (uint32_t)_mm256_movemask_epi8(m);
-        if (mask) return p + i + __builtin_ctz(mask);
-    }
-    return resp_find_crlf(p + i, n - i);
-#elif defined(__SSE2__)
-    const __m128i vcr = _mm_set1_epi8('\r');
-    const __m128i vlf = _mm_set1_epi8('\n');
-    int i = 0;
-    for (; i + 17 <= n; i += 16) {
-        __m128i a = _mm_loadu_si128((const __m128i *)(const void *)(p + i));
-        __m128i b = _mm_loadu_si128((const __m128i *)(const void *)(p + i + 1));
-        __m128i m = _mm_and_si128(_mm_cmpeq_epi8(a, vcr),
-                                  _mm_cmpeq_epi8(b, vlf));
-        uint32_t mask = (uint32_t)_mm_movemask_epi8(m);
-        if (mask) return p + i + __builtin_ctz(mask);
-    }
-    return resp_find_crlf(p + i, n - i);
-#else
-    const char *cr = memchr(p, '\r', (size_t)n);
-    while (cr) {
-        int off = (int)(cr - p);
-        if (off + 1 >= n) return NULL;
-        if (cr[1] == '\n') return cr;
-        cr = memchr(cr + 1, '\r', (size_t)(n - off - 1));
-    }
-    return NULL;
-#endif
-}
-
-/* Optimized integer parsing with unrolled loop and reduced branches.
- * Handles common cases (1-4 digits) with minimal overhead.
- * Force inline for hot path optimization. */
-static inline __attribute__((always_inline))
-int resp_parse_uint_bounded(const char *p, int n,
-                                          long max_value, long *out)
-{
-    if (__builtin_expect(n <= 0, 0)) return -1;
-
-    long v = 0;
-
-    /* Fast path for common small numbers (1-4 digits) */
-    if (__builtin_expect(n <= 4, 1)) {
-        switch (n) {
-        case 1: {
-            unsigned c = (unsigned char)p[0] - '0';
-            if (__builtin_expect(c > 9, 0)) return -1;
-            v = c;
-            break;
-        }
-        case 2: {
-            unsigned c0 = (unsigned char)p[0] - '0';
-            unsigned c1 = (unsigned char)p[1] - '0';
-            if (__builtin_expect(c0 > 9 || c1 > 9, 0)) return -1;
-            v = c0 * 10 + c1;
-            break;
-        }
-        case 3: {
-            unsigned c0 = (unsigned char)p[0] - '0';
-            unsigned c1 = (unsigned char)p[1] - '0';
-            unsigned c2 = (unsigned char)p[2] - '0';
-            if (__builtin_expect(c0 > 9 || c1 > 9 || c2 > 9, 0)) return -1;
-            v = c0 * 100 + c1 * 10 + c2;
-            break;
-        }
-        case 4: {
-            unsigned c0 = (unsigned char)p[0] - '0';
-            unsigned c1 = (unsigned char)p[1] - '0';
-            unsigned c2 = (unsigned char)p[2] - '0';
-            unsigned c3 = (unsigned char)p[3] - '0';
-            if (__builtin_expect(c0 > 9 || c1 > 9 || c2 > 9 || c3 > 9, 0)) return -1;
-            v = c0 * 1000 + c1 * 100 + c2 * 10 + c3;
-            break;
-        }
-        }
-        if (__builtin_expect(v > max_value, 0)) return -1;
-        *out = v;
-        return 0;
-    }
-
-    /* Slow path for larger numbers - unrolled by 4 */
-    int i = 0;
-    for (; i + 4 <= n; i += 4) {
-        unsigned c0 = (unsigned char)p[i]   - '0';
-        unsigned c1 = (unsigned char)p[i+1] - '0';
-        unsigned c2 = (unsigned char)p[i+2] - '0';
-        unsigned c3 = (unsigned char)p[i+3] - '0';
-        if (__builtin_expect(c0 > 9 || c1 > 9 || c2 > 9 || c3 > 9, 0)) return -1;
-        v = v * 10000 + c0 * 1000 + c1 * 100 + c2 * 10 + c3;
-        if (__builtin_expect(v > max_value, 0)) return -1;
-    }
-
-    /* Handle remaining digits */
-    for (; i < n; i++) {
-        unsigned c = (unsigned char)p[i] - '0';
-        if (__builtin_expect(c > 9, 0)) return -1;
-        v = v * 10 + c;
-        if (__builtin_expect(v > max_value, 0)) return -1;
-    }
-
-    *out = v;
-    return 0;
-}
-
-/* ==================== RESP static fragments ==================== */
-
+/* ── RESP fragments ─────────────────────────────────────────────────── */
 
 #define S(id, str) \
     const char id[] = str; \
@@ -176,171 +18,83 @@ S(RESP_WRONGTYPE, "-WRONGTYPE Operation against a key holding the wrong kind of 
 
 #undef S
 
-/* ==================== Zero-copy RESP parser ====================
- *
- * Returns:
- *   > 0  : bytes consumed (one complete command extracted)
- *   = 0  : incomplete frame, need more bytes
- *   < 0  : protocol error (caller MUST close the connection — Redis does)
- *
- * Hardened against integer overflow on argc/bulk length, supports the
- * RESP-2 inline form (telnet-style) and the standard array form ("*N\r\n").
- * Uses memchr to locate CRLF boundaries — far cheaper than per-byte loops
- * for long bulk values where the parser only walks the length header.
- */
+/* ── RESP parser — array form "*N\r\n$L\r\n<data>\r\n..." only ──────
+ * Returns bytes consumed (>0), 0 (incomplete), or -1 (protocol error). */
+
 int resp_parse_slices(const char *buf, int buflen,
-                      kvs_token_t *tokens, int max_tokens,
-                      int *out_argc)
+                      kvs_token_t *tokens, int max_tokens, int *out_argc)
 {
-    if (__builtin_expect(buflen < 1, 0)) return 0;
+    if (buflen < 4 || buf[0] != '*') return -1;
 
-    /* ── Inline command (telnet/debug) ── */
-    if (__builtin_expect(buf[0] != '*', 0)) {
-        /* Bound scanning at KVS_MAX_INLINE_LEN to avoid DoS on long garbage */
-        int scan = buflen < KVS_MAX_INLINE_LEN ? buflen : KVS_MAX_INLINE_LEN;
-        const char *cr = resp_find_crlf(buf, scan);
-        if (!cr) {
-            if (__builtin_expect(buflen >= KVS_MAX_INLINE_LEN, 0)) return -1;
-            return 0;
-        }
-        int eol = (int)(cr - buf);
-        if (__builtin_expect(eol + 1 >= buflen, 0)) return 0;
-        if (__builtin_expect(buf[eol + 1] != '\n', 0)) return -1;
+    const char *p = buf + 1, *end = buf + buflen;
 
-        int argc = 0;
-        int pos = 0;
-        while (pos < eol && argc < max_tokens) {
-            while (pos < eol && (buf[pos] == ' ' || buf[pos] == '\t')) pos++;
-            if (pos >= eol) break;
-            int tok_end = pos;
-            while (tok_end < eol && buf[tok_end] != ' ' && buf[tok_end] != '\t')
-                tok_end++;
-            tokens[argc].ptr = buf + pos;
-            tokens[argc].len = tok_end - pos;
-            argc++;
-            pos = tok_end;
-        }
-        if (__builtin_expect(argc == 0, 0)) return -1;
-        *out_argc = argc;
-        return eol + 2;
+    /* ── Parse argc inline (max 3 digits for pipeline, 4 for safety) ── */
+    int argc = 0;
+    while (p < end && *p >= '0' && *p <= '9') {
+        argc = argc * 10 + (*p - '0');
+        if (argc > max_tokens) return -1;
+        p++;
     }
+    if (p + 1 >= end || *p != '\r' || p[1] != '\n') return (p >= end) ? 0 : -1;
+    if (argc <= 0) return -1;
+    p += 2;  /* skip \r\n */
 
-    /* ── Array form "*N\r\n" + N bulk strings ── */
-    int idx = 1;
+    for (int i = 0; i < argc; i++) {
+        if (p >= end) return 0;
+        if (*p != '$') return -1;
+        p++;
 
-    /* Locate first CRLF for argc */
-    int hdr_scan = buflen - idx;
-    if (hdr_scan > 32) hdr_scan = 32;
-    const char *cr = resp_find_crlf(buf + idx, hdr_scan);
-    if (__builtin_expect(!cr, 0)) {
-        if (__builtin_expect(buflen - idx >= 32, 0)) return -1;
-        return 0;
-    }
-    int hdr_end = (int)(cr - buf);
-    if (__builtin_expect(hdr_end + 1 >= buflen, 0)) return 0;
-    if (__builtin_expect(buf[hdr_end + 1] != '\n', 0)) return -1;
-    if (__builtin_expect(hdr_end == idx, 0)) return -1;
-
-    /* Parse argc with overflow guard */
-    long argc = 0;
-    if (__builtin_expect(resp_parse_uint_bounded(buf + idx, hdr_end - idx,
-                                (long)max_tokens, &argc) != 0, 0)) {
-        return -1;
-    }
-    if (__builtin_expect(argc <= 0, 0)) return -1;
-    idx = hdr_end + 2;
-
-    /* Prefetch next bulk string header for better cache utilization */
-    if (__builtin_expect(idx + 32 < buflen, 1))
-        __builtin_prefetch(buf + idx, 0, 3);
-
-    for (long i = 0; i < argc; i++) {
-        if (__builtin_expect(idx >= buflen, 0)) return 0;
-        if (__builtin_expect(buf[idx] != '$', 0)) return -1;
-        idx++;
-
-        /* Bulk length header */
-        int blen_scan = buflen - idx;
-        if (blen_scan > 24) blen_scan = 24;
-        const char *bcr = resp_find_crlf(buf + idx, blen_scan);
-        if (__builtin_expect(!bcr, 0)) {
-            if (__builtin_expect(buflen - idx >= 24, 0)) return -1;
-            return 0;
+        /* ── Parse bulk length inline ── */
+        int slen = 0;
+        while (p < end && *p >= '0' && *p <= '9') {
+            slen = slen * 10 + (*p - '0');
+            if (slen > KVS_MAX_BULK_LEN) return -1;
+            p++;
         }
-        int blen_end = (int)(bcr - buf);
-        if (__builtin_expect(blen_end + 1 >= buflen, 0)) return 0;
-        if (__builtin_expect(buf[blen_end + 1] != '\n', 0)) return -1;
-        if (__builtin_expect(blen_end == idx, 0)) return -1;
+        if (p + 1 >= end || *p != '\r' || p[1] != '\n') return (p >= end) ? 0 : -1;
+        p += 2;
 
-        long slen = 0;
-        int j = idx;
-        if (__builtin_expect(buf[j] == '-', 0)) return -1; /* server-side never has null bulk */
-        if (__builtin_expect(resp_parse_uint_bounded(buf + j, blen_end - j,
-                                    KVS_MAX_BULK_LEN, &slen) != 0, 0)) {
-            return -1;
-        }
-        idx = blen_end + 2;
+        if (p + slen + 2 > end) return 0;
 
-        if (__builtin_expect((long)idx + slen + 2 > (long)buflen, 0)) return 0;
-
-        /* Prefetch bulk data for next iteration to improve cache utilization */
-        if (__builtin_expect(i + 1 < argc && idx + slen + 32 < buflen, 1))
-            __builtin_prefetch(buf + idx + slen + 2, 0, 3);
-
-        tokens[i].ptr = buf + idx;
-        tokens[i].len = (int)slen;
-        idx += (int)slen;
-        if (__builtin_expect(buf[idx] != '\r' || buf[idx + 1] != '\n', 0)) return -1;
-        idx += 2;
+        tokens[i].ptr = p;
+        tokens[i].len = slen;
+        p += slen;
+        if (p + 1 >= end || *p != '\r' || p[1] != '\n') return -1;
+        p += 2;
     }
-    *out_argc = (int)argc;
-    return idx;
+    *out_argc = argc;
+    return (int)(p - buf);
 }
 
-/* Deprecated: reactor/proactor pass this as legacy callback; unused internally. */
-int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn *c) {
-    int ncmd = 0;
-    int off = *r_off;
-    int remaining = rb->len;
+/* ── Drain loop — extract commands from read buffer into write buffer ─ */
+
+int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn *c)
+{
+    int off = *r_off, remaining = rb->len, ncmd = 0;
 
     while (remaining > 0) {
-        int argc = 0;
         kvs_token_t tokens[KVS_MAX_TOKENS];
+        int argc = 0;
         int cmd_len = resp_parse_slices(rb->buf + off, remaining,
                                         tokens, KVS_MAX_TOKENS, &argc);
-        if (cmd_len > 0) {
-            int sample = kvs_config.latency_histogram_enabled;
-            uint64_t _t0 = sample ? kvs_now_ns_fast() : 0;
-            dispatch_result_t r = kvs_dispatch(tokens, argc,
-                                                rb->buf + off, cmd_len, wb, c);
-            if (sample) {
-                uint64_t _t1 = kvs_now_ns_fast();
-                kvs_lat_record_ns(_t1 - _t0);
-            }
-
-            off += cmd_len;
-            remaining -= cmd_len;
-            ncmd++;
-
-            if (r == DISPATCH_CLOSE) {
-                if (c) c->status = 1;
-                *r_off = off;
-                rb->len = remaining;
-                return ncmd;
-            }
-        } else if (cmd_len == 0) {
-            break;  /* incomplete */
-        } else {
+        if (cmd_len <= 0) {
+            if (cmd_len == 0) break;
             dynbuf_cat(wb, RESP_ERR_INV, RESP_ERR_INV_LEN);
             if (c) c->status = 1;
-            *r_off = off;
-            rb->len = remaining;
-            return -1;
+            ncmd = -1; break;
         }
+
+        dispatch_result_t r = kvs_dispatch(tokens, argc,
+                                            rb->buf + off, cmd_len, wb, c);
+        off += cmd_len;
+        remaining -= cmd_len;
+        ncmd++;
+
+        if (r == DISPATCH_CLOSE) { if (c) c->status = 1; break; }
     }
 
-    /* Compact when r_off exceeds half capacity */
-    if (off > (int)(rb->cap / KVS_RB_COMPACT_RATIO) && remaining > 0 && remaining < off) {
+    /* Compact if r_off exceeds half capacity (rare with 64KB+ buffers) */
+    if (off > rb->cap / KVS_RB_COMPACT_RATIO && remaining > 0 && remaining < off) {
         memmove(rb->buf, rb->buf + off, (size_t)remaining);
         off = 0;
     }
@@ -351,10 +105,5 @@ int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn 
 }
 
 int kvs_protocol_batch(char *msg, int len, DynBuf *write_buf) {
-    (void)msg;
-    (void)len;
-    (void)write_buf;
-    return 0;
+    (void)msg; (void)len; (void)write_buf; return 0;
 }
-
-

@@ -35,7 +35,14 @@ int conn_pool_init(int max_clients) {
         fprintf(stderr, "[conn] failed to allocate connection pool\n");
         return -1;
     }
-    printf("[conn] pool: %d slots (%zu MB)\n", max_clients,
+    /* Pre-allocate client_t for every slot so accept never calls calloc */
+    for (int i = 0; i < max_clients; i++) {
+        conn_pool[i].client = calloc(1, sizeof(client_t));
+        if (conn_pool[i].client)
+            conn_pool[i].client->conn = &conn_pool[i];
+    }
+    printf("[conn] pool: %d slots, struct %zu MB (lazy buffer, pre-alloc client)\n",
+           max_clients,
            (sizeof(struct conn) * (size_t)max_clients) / (1024 * 1024));
     return 0;
 }
@@ -45,10 +52,8 @@ void conn_release(int fd) {
 
     struct conn *c = &conn_pool[fd];
 
-    if (c->client) {
-        free(c->client);
-        c->client = NULL;
-    }
+    if (c->client)
+        memset(c->client, 0, sizeof(client_t));  /* pre-allocated, reuse */
 
     if (c->active) {
         atomic_fetch_sub_explicit(&g_kvs_connected_clients, 1,
@@ -58,9 +63,17 @@ void conn_release(int fd) {
     if (proactor_debug_enabled())
         fprintf(stderr, "[proactor] release fd=%d gen=%u\n", fd, c->gen);
 
-    dynbuf_free(&c->read_buf);
-    dynbuf_free(&c->write_buf);
+    /* Save pre-allocated buffers before memset zeroes them */
+    char *rb = c->read_buf.buf;
+    char *wb = c->write_buf.buf;
+    int   rcap = c->read_buf.cap;
+    int   wcap = c->write_buf.cap;
+
     memset(c, 0, sizeof(*c));
+    c->read_buf.buf = rb;
+    c->read_buf.cap = rcap;
+    c->write_buf.buf = wb;
+    c->write_buf.cap = wcap;
     close(fd);
 }
 
@@ -70,6 +83,9 @@ void conn_pool_destroy(void) {
     for (int i = 0; i < conn_pool_size; i++) {
         if (conn_pool[i].active)
             conn_release(i);
+        dynbuf_free(&conn_pool[i].read_buf);
+        dynbuf_free(&conn_pool[i].write_buf);
+        free(conn_pool[i].client);
     }
     free(conn_pool);
     conn_pool = NULL;
@@ -108,16 +124,20 @@ static int setup_io_uring(proactor_worker_t *w) {
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
 
-    /* SINGLE_ISSUER + DEFER_TASKRUN + COOP_TASKRUN: the recommended
-     * combination for single-threaded event loops — reduces syscalls
-     * by letting io_uring defer work to the next submit_and_wait. */
-    params.flags = IORING_SETUP_SINGLE_ISSUER
-                 | IORING_SETUP_DEFER_TASKRUN
-                 | IORING_SETUP_COOP_TASKRUN;
+    /* SQPOLL: kernel thread polls SQ continuously, eliminating
+     * io_uring_submit syscalls. Benchmarks run with sudo. */
+    params.flags = IORING_SETUP_SQPOLL | IORING_SETUP_SINGLE_ISSUER;
+    params.sq_thread_idle = 200;  /* keep polling 200ms after last submit */
     int qret = io_uring_queue_init_params(ENTRIES_LENGTH, &w->ring, &params);
 
     if (qret == -EINVAL) {
-        /* Fallback: plain init for older kernels */
+        memset(&params, 0, sizeof(params));
+        params.flags = IORING_SETUP_SINGLE_ISSUER
+                     | IORING_SETUP_DEFER_TASKRUN
+                     | IORING_SETUP_COOP_TASKRUN;
+        qret = io_uring_queue_init_params(ENTRIES_LENGTH, &w->ring, &params);
+    }
+    if (qret == -EINVAL) {
         memset(&params, 0, sizeof(params));
         params.flags = 0;
         qret = io_uring_queue_init_params(ENTRIES_LENGTH, &w->ring, &params);
@@ -127,7 +147,8 @@ static int setup_io_uring(proactor_worker_t *w) {
         return -1;
     }
 
-    printf("[proactor] io_uring ready (flags=0x%x)\n", params.flags);
+    printf("[proactor] io_uring ready (flags=0x%x%s)\n", params.flags,
+           (params.flags & IORING_SETUP_SQPOLL) ? " SQPOLL" : "");
     return 0;
 }
 
@@ -223,21 +244,27 @@ static void proactor_loop(proactor_worker_t *w) {
     while (!g_kvs_stop) {
         update_cached_time();
 
-        /* [Redis-style] Submit all pending SQEs from last iteration first */
-        int submitted = io_uring_submit(ring);
-        if (submitted < 0 && submitted != -EBUSY)
-            fprintf(stderr, "[proactor] submit failed: %s\n", strerror(-submitted));
+        /* Submit pending SQEs from last iteration (only if any) */
+        if (w->pending_sqes > 0) {
+            int submitted = io_uring_submit(ring);
+            if (submitted < 0 && submitted != -EBUSY)
+                fprintf(stderr, "[proactor] submit: %s\n", strerror(-submitted));
+            w->pending_sqes = 0;
+        }
 
         /* Batch peek CQEs */
         struct io_uring_cqe *cqes[CQE_BATCH_SIZE];
         int nready = io_uring_peek_batch_cqe(ring, cqes, CQE_BATCH_SIZE);
 
         if (nready == 0) {
+            /* Dynamic timeout: 100μs idle poll (vs Redis 100μs epoll).
+             * Adds a timeout SQE so submit_and_wait returns quickly. */
             struct io_uring_sqe *sqe = get_sqe_submit(ring);
             if (sqe) {
-                struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 1000000L };
+                struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 100000L };
                 io_uring_prep_timeout(sqe, &ts, 0, 0);
                 sqe->user_data = conn_info_pack(0, 0, 0);
+                w->pending_sqes = 1;
             }
 
             int ret = io_uring_submit_and_wait(ring, 1);
@@ -246,19 +273,20 @@ static void proactor_loop(proactor_worker_t *w) {
                 fprintf(stderr, "[proactor] submit_and_wait: %s\n", strerror(-ret));
                 break;
             }
+            w->pending_sqes = 0;
             nready = io_uring_peek_batch_cqe(ring, cqes, CQE_BATCH_SIZE);
             if (nready <= 0) continue;
         }
 
-        /* Process CQEs (only prepare SQEs, don't submit yet) */
-        for (int i = 0; i < nready; i++)
+        /* Process CQEs (prepare SQEs for next iteration) */
+        for (int i = 0; i < nready; i++) {
+            w->pending_sqes++;  /* each handler may produce SQEs */
             event_handle_cqe(w, cqes[i]);
+        }
 
-        /* Re-arm accept if needed */
         if (worker_arm_accept(w) != 0)
             fprintf(stderr, "[proactor] failed to re-arm accept\n");
 
-        /* Advance CQ (submission happens at next loop iteration) */
         io_uring_cq_advance(ring, nready);
     }
 

@@ -104,8 +104,25 @@ void event_handle_accept(proactor_worker_t *w, struct io_uring_cqe *cqe) {
     setsockopt(connfd, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
 
     struct conn *nc = &conn_pool[connfd];
-    dynbuf_init(&nc->read_buf, KVS_NET_BUF_INIT);
-    dynbuf_init(&nc->write_buf, KVS_NET_BUF_INIT);
+    /* Lazy-allocate + pre-fault on first use; subsequent reuse gets warm buffer */
+    if (!nc->read_buf.buf) {
+        dynbuf_init(&nc->read_buf, KVS_NET_BUF_INIT);
+        if (nc->read_buf.buf) {
+            for (size_t off = 0; off < (size_t)KVS_NET_BUF_INIT; off += 4096)
+                nc->read_buf.buf[off] = 0;
+        }
+    } else {
+        nc->read_buf.len = 0;
+    }
+    if (!nc->write_buf.buf) {
+        dynbuf_init(&nc->write_buf, KVS_NET_BUF_INIT);
+        if (nc->write_buf.buf) {
+            for (size_t off = 0; off < (size_t)KVS_NET_BUF_INIT; off += 4096)
+                nc->write_buf.buf[off] = 0;
+        }
+    } else {
+        nc->write_buf.len = 0;
+    }
     nc->fd = connfd;
     nc->active = 1;
     nc->r_off = 0;
@@ -117,8 +134,11 @@ void event_handle_accept(proactor_worker_t *w, struct io_uring_cqe *cqe) {
     atomic_fetch_add_explicit(&g_kvs_total_connections, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_kvs_connected_clients, 1, memory_order_relaxed);
 
-    nc->client = calloc(1, sizeof(client_t));
-    if (nc->client) nc->client->conn = nc;
+    /* client_t pre-allocated in conn_pool_init — just reset */
+    if (nc->client) {
+        memset(nc->client, 0, sizeof(client_t));
+        nc->client->conn = nc;
+    }
 
     if (conn_arm_recv(&w->ring, nc) != 0)
         conn_release(connfd);
@@ -167,37 +187,23 @@ fd, result.gen, c->gen & 0xFFFFFFu);
         unsigned bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
         char *src = w->buf_base + (size_t)bid * KVS_BUF_SIZE;
 
+        /* Copy data from buf ring into read buffer, then drain.
+         * With 64KB initial buffer, realloc is rare — pipeline bursts
+         * (~8KB @ P=160) fit comfortably. Page faults are pre-faulted
+         * at accept time and on realloc expansion. */
         size_t need = c->r_off + rb->len + (size_t)res;
         if (need > rb->cap) {
-            size_t new_cap = rb->cap;
-            const size_t MAX_BUF_CAP = 16 * 1024 * 1024;
-
-            if (need > MAX_BUF_CAP) {
-                buf_ring_recycle(bid);
-                conn_release(fd);
-                return;
-            }
-
-            if (need > rb->cap * 2) {
-                new_cap = need + (need >> 1);
-            } else {
-                new_cap = rb->cap * 2;
-                while (new_cap < need) new_cap *= 2;
-            }
-
-            if (new_cap > MAX_BUF_CAP) new_cap = MAX_BUF_CAP;
-
+            size_t new_cap = rb->cap ? rb->cap : 4096;
+            while (new_cap < need && new_cap < (16u << 20)) new_cap *= 2;
+            size_t old_cap = rb->cap;
             char *new_buf = realloc(rb->buf, new_cap);
-            if (!new_buf) {
-                buf_ring_recycle(bid);
-                conn_release(fd);
-                return;
-            }
-            rb->buf = new_buf;
-            rb->cap = new_cap;
+            if (!new_buf) { buf_ring_recycle(bid); conn_release(fd); return; }
+            for (size_t p = (old_cap + 4095) & ~(size_t)4095; p < new_cap; p += 4096) new_buf[p] = 0;
+            rb->buf = new_buf; rb->cap = (int)new_cap;
         }
         memcpy(rb->buf + c->r_off + rb->len, src, (size_t)res);
         rb->len += res;
+        c->r_off = 0;
         buf_ring_recycle(bid);
     } else if (res > 0) {
         rb->len += res;

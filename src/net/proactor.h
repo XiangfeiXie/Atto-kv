@@ -16,7 +16,7 @@
 #define CQE_BATCH_SIZE  128
 
 /* Buffer ring configuration */
-#define KVS_BUF_RING_BGID  1
+#define KVS_BUF_RING_BGID  0
 #define KVS_NR_BUFS        8192
 #define KVS_BUF_SIZE       4096
 
@@ -28,6 +28,7 @@ typedef struct proactor_worker {
     char                     *buf_base;
     size_t                    buf_pool_bytes;
     int                       accept_armed;
+    int                       pending_sqes;      /* batched SQE count */
 } proactor_worker_t;
 
 /* Connection info packing */

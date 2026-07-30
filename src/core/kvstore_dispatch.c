@@ -8,6 +8,17 @@
 
 /* ── Inline GET/SET macros (hottest commands, 60-80% workload) ──────── */
 
+/* Fast uint-to-buffer: writes decimal representation, returns length */
+static inline int u2a(char *dst, uint32_t v) {
+    if (v == 0) { dst[0] = '0'; return 1; }
+    char tmp[12], *p = tmp;
+    while (v) { *p++ = (char)('0' + v % 10); v /= 10; }
+    int n = (int)(p - tmp);
+    for (int i = 0; i < n; i++) dst[i] = tmp[n-1-i];
+    return n;
+}
+
+/* Inline GET — single reserve + manual formatting, zero snprintf */
 #define INLINE_GET_COMMAND(entry, hash, key_tok, wb) do { \
     if (!(entry)) { \
         dynbuf_cat((wb), RESP_NIL, RESP_NIL_LEN); \
@@ -16,25 +27,27 @@
         uint8_t enc = KV_ENCODING_RAW; \
         const char *val = string_engine_get_pre((entry), &vlen, &enc); \
         if (enc == KV_ENCODING_INT) { \
-            int64_t iv; \
-            memcpy(&iv, val, sizeof(int64_t)); \
-            char ibuf[24]; \
-            int il = snprintf(ibuf, sizeof(ibuf), "%lld", (long long)iv); \
-            char hdr[24]; \
-            int bh = snprintf(hdr, sizeof(hdr), "$%d\r\n", il); \
-            dynbuf_cat((wb), hdr, bh); \
-            dynbuf_cat((wb), ibuf, il); \
-            dynbuf_lit((wb), "\r\n"); \
+            int64_t iv; memcpy(&iv, val, sizeof(int64_t)); \
+            char buf[64]; \
+            int n = snprintf(buf, sizeof(buf), "$%lld\r\n%lld\r\n", \
+                             (long long)snprintf(NULL, 0, "%lld", (long long)iv), \
+                             (long long)iv); \
+            dynbuf_cat((wb), buf, n); \
         } else { \
-            char hdr[24]; \
-            int bh = snprintf(hdr, sizeof(hdr), "$%u\r\n", vlen); \
-            dynbuf_cat((wb), hdr, bh); \
-            dynbuf_cat((wb), val, (int)vlen); \
-            dynbuf_lit((wb), "\r\n"); \
+            int need = 24 + (int)vlen; \
+            dynbuf_reserve((wb), (wb)->len + need); \
+            char *dst = (wb)->buf + (wb)->len; \
+            *dst++ = '$'; \
+            int hl = u2a(dst, vlen); dst += hl; \
+            *dst++ = '\r'; *dst++ = '\n'; \
+            memcpy(dst, val, (size_t)vlen); dst += vlen; \
+            *dst++ = '\r'; *dst++ = '\n'; \
+            (wb)->len = (int)(dst - (wb)->buf); \
         } \
     } \
 } while (0)
 
+/* Inline SET — write OK response directly */
 #define INLINE_SET_COMMAND(entry, hash, tokens, argc, wb, msg_raw, msg_len) do { \
     if ((argc) == 3) { \
         kvs_token_t key_tok = (tokens)[1]; \
@@ -42,7 +55,9 @@
         string_engine_set_pre(key_tok.ptr, (uint32_t)key_tok.len, \
                               val_tok.ptr, (uint32_t)val_tok.len, \
                               0, 0, (hash), (entry)); \
-        dynbuf_cat((wb), RESP_OK, RESP_OK_LEN); \
+        dynbuf_reserve((wb), (wb)->len + RESP_OK_LEN); \
+        memcpy((wb)->buf + (wb)->len, RESP_OK, (size_t)RESP_OK_LEN); \
+        (wb)->len += RESP_OK_LEN; \
         if (!g_in_reload) { \
             kvs_write_journal_append((msg_raw), (msg_len)); \
         } \

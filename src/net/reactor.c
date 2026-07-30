@@ -14,7 +14,6 @@
 
 #include "server.h"
 #include "kvstore.h"
-#include "block.h"
 #include "protocol.h"
 #include "config.h"
 
@@ -34,8 +33,6 @@ static void conn_set_events(int fd, struct conn *c) {
     uint32_t ev = EPOLLIN | EPOLLET;  /* Edge-triggered for efficiency */
     if (c->write_buf.len > 0)
         ev |= EPOLLOUT;
-    if (c->client && c->client->state == CLIENT_BLOCKED)
-        ev &= ~EPOLLIN;
 
     if (ev == c->cur_events)
         return;                      /* no change — skip syscall */
@@ -45,19 +42,6 @@ static void conn_set_events(int fd, struct conn *c) {
     e.events = ev;
     e.data.fd = fd;
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &e);
-}
-
-/* ── Notify callback: block subsystem calls this when a client is unblocked ── */
-static void reactor_block_notify(client_t *c) {
-    if (!c || !c->conn) return;
-    struct conn *conn = c->conn;
-    /* Drain remaining pipelined commands from the read buffer */
-    if (conn->read_buf.len > 0) {
-        conn->w_off = 0;
-        kvs_drain_resp_commands_off(&conn->read_buf, &conn->r_off,
-                                     &conn->write_buf, conn);
-    }
-    conn_set_events(conn->fd, conn);
 }
 #endif
 
@@ -122,9 +106,7 @@ static void conn_release(int fd) {
     if (fd < 0 || fd >= conn_pool_size) return;
     struct conn *c = &conn_pool[fd];
 
-    /* Clean up blocking client state */
     if (c->client) {
-        block_remove_client(c->client);
         free(c->client);
         c->client = NULL;
     }
@@ -393,9 +375,6 @@ int reactor_start(unsigned short port, msg_handler handler) {
 
     printf("[reactor] listening on port %d (epoll edge-triggered mode)\n", port);
 
-    /* Register block notification callback */
-    block_set_notify_cb(reactor_block_notify);
-
     /* Main event loop */
     struct epoll_event events[1024];
 
@@ -403,21 +382,13 @@ int reactor_start(unsigned short port, msg_handler handler) {
         /* Update cached time for commands */
         update_cached_time();
 
-        /* Calculate timeout for blocking operations */
-        int timeout_ms = block_nearest_timeout();
-        /* Cap timeout to 100ms for responsive shutdown */
-        if (timeout_ms < 0 || timeout_ms > 100)
-            timeout_ms = 100;
-
-        int nready = epoll_wait(epfd, events, 1024, timeout_ms);
+        /* 100ms timeout for responsive shutdown */
+        int nready = epoll_wait(epfd, events, 1024, 100);
         if (nready < 0) {
             if (errno == EINTR) continue;  /* Signal received — rely on g_kvs_stop to exit */
             fprintf(stderr, "[reactor] epoll_wait error: %s\n", strerror(errno));
             continue;
         }
-
-        /* Check for blocking command timeouts */
-        block_check_timeouts();
 
         /* Process ready events */
         for (int i = 0; i < nready; i++) {

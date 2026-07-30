@@ -25,13 +25,11 @@ typedef struct {
 /* Dispatch return codes */
 typedef enum {
     DISPATCH_OK      = 0,   /* response written to wb */
-    DISPATCH_BLOCKED = 1,   /* client parked, don't send, don't close */
     DISPATCH_CLOSE   = 2,   /* response written, then close after flush (QUIT) */
     DISPATCH_ERROR   = -1,  /* protocol error, close connection */
 } dispatch_result_t;
 
-/* Drain return codes — distinguish blocked vs protocol-error vs ok */
-#define KVS_DRAIN_BLOCKED   (-2)
+/* Drain return codes */
 #define KVS_DRAIN_PROTOERR  (-1)
 
 struct conn;

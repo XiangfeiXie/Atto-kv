@@ -12,7 +12,7 @@
 #include "proactor_inline.h"
 
 /* Initialize listen socket */
-static int init_listen_socket(unsigned short port, int reuseport) {
+static int init_listen_socket(unsigned short port) {
     int sockfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (sockfd < 0) return -1;
 
@@ -24,8 +24,6 @@ static int init_listen_socket(unsigned short port, int reuseport) {
 
     int opt = 1;
     setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    if (reuseport)
-        setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
     if (bind(sockfd, (struct sockaddr*)&serveraddr, sizeof(serveraddr)) == -1) {
         perror("bind");
@@ -69,8 +67,8 @@ static int setup_io_uring(proactor_worker_t *w) {
         qret = io_uring_queue_init_params(ENTRIES_LENGTH, &w->ring, &params);
     }
     if (qret < 0) {
-        fprintf(stderr, "[proactor#%d] io_uring init: %s\n",
-                w->id, strerror(-qret));
+        fprintf(stderr, "[proactor] io_uring init: %s\n",
+                strerror(-qret));
         return -1;
     }
 
@@ -97,8 +95,8 @@ static int setup_buffer_ring(proactor_worker_t *w) {
     w->buf_ring = io_uring_setup_buf_ring(&w->ring, KVS_NR_BUFS,
                                           KVS_BUF_RING_BGID, 0, &br_err);
     if (!w->buf_ring) {
-        fprintf(stderr, "[proactor#%d] setup_buf_ring: %s\n",
-                w->id, strerror(-br_err));
+        fprintf(stderr, "[proactor] setup_buf_ring: %s\n",
+                strerror(-br_err));
         munmap(w->buf_base, w->buf_pool_bytes);
         return -1;
     }
@@ -112,21 +110,20 @@ static int setup_buffer_ring(proactor_worker_t *w) {
     }
     io_uring_buf_ring_advance(w->buf_ring, KVS_NR_BUFS);
 
-    printf("[proactor] buf ring: %d x %d B = %zu MB per worker\n",
+    printf("[proactor] buf ring: %d x %d B = %zu MB\n",
            KVS_NR_BUFS, KVS_BUF_SIZE, w->buf_pool_bytes / (1024 * 1024));
 
     return 0;
 }
 
-/* Initialize worker */
-int worker_init(proactor_worker_t *w, unsigned short port, int worker_id) {
+/* Initialize proactor */
+int worker_init(proactor_worker_t *w, unsigned short port) {
     memset(w, 0, sizeof(*w));
-    w->id = worker_id;
     w->listen_fd = -1;
 
-    w->listen_fd = init_listen_socket(port, 0);
+    w->listen_fd = init_listen_socket(port);
     if (w->listen_fd < 0) {
-        fprintf(stderr, "[proactor#%d] failed to init listen socket\n", w->id);
+        fprintf(stderr, "[proactor] failed to init listen socket\n");
         return -1;
     }
 

@@ -21,7 +21,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-#include "repl_xdp_common.h"
+#include "xdp_common.h"
 
 char _license[] SEC("license") = "GPL";
 
@@ -77,7 +77,6 @@ int xdp_repl_sniff(struct xdp_md *ctx)
     if ((void *)(tcph + 1) > data_end)
         return XDP_PASS;
 
-    /* Filter by destination port (kvstore port) */
     __u32 key = 0;
     __u32 *cfg_port = bpf_map_lookup_elem(&repl_config, &key);
     if (!cfg_port || *cfg_port == 0)

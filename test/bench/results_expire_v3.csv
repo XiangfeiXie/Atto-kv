@@ -1,5 +1,0 @@
-scenario,threads,keys,ttl_sec,write_duration_s,actual_written,expired_before,expired_after,deleted_count,cleanup_duration_s,deletion_rate_keys_per_sec
-burst,1,10000,5,.211958172,10000,0,10000,10000,8,1250
-burst,1,50000,5,.372030313,50000,0,50000,50000,31,1612
-burst,1,100000,5,.648049735,100000,0,56100,56100,32,1753
-mixed,1,50000,5,.351394920,50000,0,40180,40180,32,1255

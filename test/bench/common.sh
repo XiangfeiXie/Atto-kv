@@ -10,7 +10,7 @@ set -euo pipefail
 # ---- 路径常量 ----
 PROJECT_DIR="/home/xxf/9.1-kvstore"
 KVS_BIN="${PROJECT_DIR}/build/kvstore"
-CONF_DIR="${PROJECT_DIR}/conf/bench"
+CONF_DIR="${PROJECT_DIR}/conf"
 LOG_DIR="/tmp/kvstore_bench"
 
 # ---- 默认端口 ----

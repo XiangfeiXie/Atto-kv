@@ -73,6 +73,11 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                 enqueue_expired_key(key_tok.ptr, (uint32_t)key_tok.len, hash);
                 entry = NULL;
             }
+            if (entry && (int)entry_type(entry) != KV_TYPE_STRING) {
+                dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
+                kv_store_unlock();
+                return DISPATCH_ERROR;
+            }
             INLINE_GET_COMMAND(entry, hash, key_tok, wb);
             kv_store_unlock();
             return DISPATCH_OK;
@@ -178,14 +183,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
-    if (TOKEN_EQ(cmd, "BGREWRITEAOF")) {
-        if (aof_rewrite_bg() == 0)
-            dynbuf_lit(wb, "+Background append only file rewriting started\r\n");
-        else
-            dynbuf_lit(wb, "-ERR BGREWRITEAOF not implemented yet\r\n");
-        return DISPATCH_OK;
-    }
-
     if (TOKEN_EQ(cmd, "CONFIG"))
         return handle_config(tokens, argc, wb);
 
@@ -221,14 +218,19 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         for (int i = 1; i < argc; i++) {
             uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                   (uint32_t)tokens[i].len);
+            kv_entry_t *ke = dict_find(kv_dict_for(kh), tokens[i].ptr,
+                                       (uint32_t)tokens[i].len, kh);
+            if (ke && ke->expire && get_time_now() > ke->expire) {
+                dict_delete(kv_dict_for(kh), tokens[i].ptr,
+                            (uint32_t)tokens[i].len, kh);
+                ke = NULL;
+            }
             uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
-            const char *val = string_engine_get(tokens[i].ptr,
-                                                (uint32_t)tokens[i].len,
-                                                &vlen, &enc);
-            if (!val) {
+            if (!ke) {
                 dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
                 continue;
             }
+            const char *val = string_engine_get_pre(ke, &vlen, &enc);
             if (enc == KV_ENCODING_INT) {
                 int64_t iv; memcpy(&iv, val, sizeof(int64_t));
                 char ibuf[24];
@@ -262,9 +264,15 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                 entry_cleanup_by_type(ke);
                 dict_delete(kv_dict_for(kh), tokens[i].ptr,
                             (uint32_t)tokens[i].len, kh);
+            } else if (ke && ke->expire && get_time_now() > ke->expire) {
+                entry_cleanup_by_type(ke);
+                dict_delete(kv_dict_for(kh), tokens[i].ptr,
+                            (uint32_t)tokens[i].len, kh);
+                ke = NULL;
             }
-            string_engine_set(tokens[i].ptr, (uint32_t)tokens[i].len,
-                              tokens[i+1].ptr, (uint32_t)tokens[i+1].len, 0, 0);
+            string_engine_set_pre(tokens[i].ptr, (uint32_t)tokens[i].len,
+                                  tokens[i+1].ptr, (uint32_t)tokens[i+1].len,
+                                  0, 0, kh, ke);
         }
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         if (!g_in_reload)
@@ -488,25 +496,17 @@ single_key:
         return DISPATCH_ERROR;
     }
 
-    dispatch_result_t r = DISPATCH_OK;
     switch (cmd_type) {
     case KV_TYPE_STRING:
         string_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb, msg_raw, msg_len);
-        r = DISPATCH_OK;
         break;
     case KV_TYPE_HASH:
-        r = hash_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb, msg_raw, msg_len,
-                     c ? c->client : NULL);
+        (void)hash_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb, msg_raw, msg_len,
+                       c ? c->client : NULL);
         break;
     default:
         dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
-        r = DISPATCH_ERROR;
         break;
-    }
-
-    if (r == DISPATCH_BLOCKED) {
-        kv_store_unlock();
-        return DISPATCH_BLOCKED;
     }
 
     /* Write-command post-processing */

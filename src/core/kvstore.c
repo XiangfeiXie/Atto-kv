@@ -13,13 +13,10 @@
 #include <pthread.h>
 #include <time.h>
 #include <ctype.h>
-#include <zlib.h>
 
 #include "rdma_repl.h"
 #include "wal_persist.h"
-#include "repl_stream.h"
 #include "persistence.h"
-#include "block.h"
 
 /* ── Global state ───────────────────────────────────────────────────── */
 
@@ -180,55 +177,31 @@ int token_eq_ci(kvs_token_t t, const char *lit) {
 
 /* ── Write journal ──────────────────────────────────────────────────── */
 
+_Atomic uint64_t g_next_seq = 0;
+
 static void kvs_write_journal_append_kind(uint16_t kind, const char *msg, int length) {
-    uint64_t seq = 0;
-    uint32_t crc = 0;
     if (!msg || length <= 0) return;
-    if (!ENABLE_AOF && !kvs_config.incr_repl_enabled) return;
+    if (!ENABLE_AOF) return;
 
-    /* Fast path: AOF-only mode (no replication) */
-    if (ENABLE_AOF && !kvs_config.incr_repl_enabled && !kvs_config.rdma_sync_enabled) {
-        seq = atomic_fetch_add_explicit(&g_next_seq, 1, memory_order_acq_rel);
-        uint32_t len = (uint32_t)length;
-        uint16_t flags = 0;
-        crc = kvs_crc32c(0, &seq, sizeof(seq));
-        crc = kvs_crc32c(crc, &kind, sizeof(kind));
-        crc = kvs_crc32c(crc, &flags, sizeof(flags));
-        crc = kvs_crc32c(crc, &len, sizeof(len));
-        crc = kvs_crc32c(crc, msg, len);
-        kvs_wal_persist_append_raw(seq, kind, 0, msg, len, crc);
-        return;
-    }
-
-    /* Slow path: replication enabled */
-    if (kvs_journal_append(kind, 0, msg, (uint32_t)length, &seq, &crc) != 0)
-        return;
-
-    if (ENABLE_AOF)
-        kvs_wal_persist_append_raw(seq, kind, 0, msg, (uint32_t)length, crc);
-
-    if (kvs_config.incr_repl_enabled || kvs_config.rdma_sync_enabled) {
-        kvs_journal_record_t rec;
-        if (kvs_journal_copy(seq, &rec) == 0) {
-            repl_stream_publish(&rec);
-            kvs_journal_record_release(&rec);
-        }
-    }
+    uint64_t seq = atomic_fetch_add_explicit(&g_next_seq, 1, memory_order_acq_rel);
+    uint32_t len = (uint32_t)length;
+    uint16_t flags = 0;
+    uint32_t crc = kvs_crc32c(0, &seq, sizeof(seq));
+    crc = kvs_crc32c(crc, &kind, sizeof(kind));
+    crc = kvs_crc32c(crc, &flags, sizeof(flags));
+    crc = kvs_crc32c(crc, &len, sizeof(len));
+    crc = kvs_crc32c(crc, msg, len);
+    kvs_wal_persist_append_raw(seq, kind, 0, msg, len, crc);
 }
 
 void kvs_write_journal_append(const char *msg, int length) {
     kvs_write_journal_append_kind(KVS_MUT_KIND_RESP_STRING, msg, length);
 }
 
-void kvs_rdma_incr_probe(const char *msg, int length) {
-    kvs_write_journal_append(msg, length);
-}
-
 /* ── Engine lifecycle ───────────────────────────────────────────────── */
 
 int init_kvengine(void) {
     kv_store_init();
-    block_init();
     init_shared_responses();
     printf("Using string/hash storage engine (single global dict)\n");
     return 0;
@@ -296,20 +269,9 @@ int main(int argc, char *argv[]) {
 
     init_kvengine();
     engine_reload();
-    kvs_journal_init();
     if (ENABLE_AOF) {
         kvs_wal_set_fsync_policy(kvs_config.wal_fsync_policy);
         kvs_wal_persist_start();
-        aof_async_init();
-    }
-    if (kvs_config.incr_repl_enabled) {
-        if (kvs_config.rdma_role == ROLE_MASTER) {
-            repl_stream_start_master();
-        } else if (kvs_config.rdma_role == ROLE_SLAVE) {
-            extern uint64_t repl_incr_load_offset(void);
-            uint64_t start_seq = repl_incr_load_offset();
-            repl_stream_start_slave(start_seq);
-        }
     }
     if (kvs_config.rdma_sync_enabled) {
         if (kvs_config.rdma_role == ROLE_MASTER)
@@ -329,10 +291,7 @@ int main(int argc, char *argv[]) {
 
     kvs_stop_expire_thread();
 
-    if (ENABLE_AOF) aof_async_shutdown();
-    repl_stream_stop();
     kvs_wal_persist_stop();
-    kvs_journal_shutdown();
     dest_kvengine();
     return 0;
 }

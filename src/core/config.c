@@ -35,11 +35,6 @@ static void config_default(void) {
     strncpy(kvs_config.rdma_master_ip, "127.0.0.1",
             sizeof(kvs_config.rdma_master_ip) - 1);
 
-    /* TCP + eBPF incremental replication (Phase 9.1) */
-    kvs_config.incr_repl_enabled = 0;
-    kvs_config.incr_repl_port = 6483;  /* Default TCP port for replication */
-    kvs_config.incr_repl_master_port = 6483;  /* Slave: master's port to connect */
-
     kvs_config.fullsync_timeout = 3600000;  /* 1 hour */
     kvs_config.fullsync_max_retries = 3;
 
@@ -195,17 +190,6 @@ int config_load(const char *path) {
         } else if (strcasecmp(key, "rdma_master_port") == 0) {
             parse_int(val, lineno, "rdma_master_port", 1, 65535, &kvs_config.rdma_master_port);
 
-        /* ---- TCP + eBPF incremental replication (Phase 9.1) ---- */
-        } else if (strcasecmp(key, "incr_repl") == 0) {
-            int v = parse_bool(val, lineno, "incr_repl");
-            if (v >= 0) kvs_config.incr_repl_enabled = v;
-
-        } else if (strcasecmp(key, "incr_repl_port") == 0) {
-            parse_int(val, lineno, "incr_repl_port", 1, 65535, &kvs_config.incr_repl_port);
-
-        } else if (strcasecmp(key, "incr_repl_master_port") == 0) {
-            parse_int(val, lineno, "incr_repl_master_port", 1, 65535, &kvs_config.incr_repl_master_port);
-
         } else if (strcasecmp(key, "fullsync_timeout") == 0) {
             parse_int(val, lineno, "fullsync_timeout", 1000, 7200000, &kvs_config.fullsync_timeout);
 
@@ -256,8 +240,7 @@ void config_print(void) {
     } else {
         printf("\n"
                "  Replication [%s]\n"
-               "    RDMA fullsync : %s://%s:%d\n"
-               "    Incremental  : TCP + eBPF tcp://0.0.0.0:%d\n",
+               "    RDMA fullsync : %s://%s:%d\n",
                role,
                kvs_config.rdma_provider,
                (kvs_config.rdma_role == ROLE_MASTER)
@@ -265,8 +248,7 @@ void config_print(void) {
                    : kvs_config.rdma_master_ip,
                (kvs_config.rdma_role == ROLE_MASTER)
                    ? kvs_config.rdma_listen_port
-                   : kvs_config.rdma_master_port,
-               kvs_config.incr_repl_port);
+                   : kvs_config.rdma_master_port);
     }
 
     if (kvs_config.latency_histogram_enabled)

@@ -42,4 +42,15 @@ int         string_engine_set(const char *key, uint32_t key_len,
 const char *string_engine_get(const char *key, uint32_t key_len,
                               uint32_t *vlen_out, uint8_t *enc_out);
 
+/* Pre-computed-hash variants for the hot path.
+ * Caller already did kv_hash+dict_find; pass the result here to
+ * avoid redundant lookup -- saves ~3% CPU on benchmark workloads. */
+int string_engine_set_pre(const char *key, uint32_t key_len,
+                          const char *val, uint32_t val_len,
+                          long long expire, int mode,
+                          uint64_t hash, kv_entry_t *existing);
+const char *string_engine_get_pre(kv_entry_t *entry,
+                                  uint32_t *vlen_out,
+                                  uint8_t *enc_out);
+
 #endif

@@ -1,18 +1,10 @@
 /* =========================================================
  * persistence.c — path utils, shared buffer, dict scan,
- *                io_uring write, BGSAVE/AOF global state.
+ *                io_uring write, BGSAVE global state.
  *
- * RDB save/load   → persist_rdb.c
- * AOF rewrite/load → persist_aof.c
- *
- * 持久化层当前职责：
- *  1) WAL：写命令进入 journal 内存 backlog 后，由 wal_persist 使用
- *     io_uring 追加到 build/incr.wal；WAL record 格式独立于复制协议。
- *  2) WAL replay：启动时 mmap 读取 incr.wal，校验 JWAL header + CRC，
- *     然后按 RESP 命令回放到 KV 引擎。
- *  3) RDB：保留 fork/io_uring 异步保存、mmap 加载，以及需要的纯内存
- *     序列化/流式加载接口。RDB/WAL 与主从同步不相互依赖，只通过
- *     KV 引擎和 journal record 这种通用数据结构衔接。
+ * RDB save/load → persist_rdb.c
+ * WAL reload    → persist_aof.c
+ * WAL write     → wal_persist.c
  * ========================================================= */
 
 #define _GNU_SOURCE
@@ -26,17 +18,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <pthread.h>
 #include <signal.h>
 #include <libgen.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/eventfd.h>
-#include <stdatomic.h>
 #include <liburing.h>
-#include <inttypes.h>
 
 
 /* ── 项目根目录：由 persist_set_basedir 在启动时设置 ── */
@@ -95,31 +83,7 @@ void persist_set_basedir(const char *argv0) {
 
 
 /* =============================================================================
- * Part 1. AOF — unified with WAL replication
- *
- * Write commands flow through the journal path and are persisted to
- * build/incr.wal (binary WAL + CRC32) for crash recovery.
- *
- * aof_async_append  →  journal path (no-op, handled by wal_persist)
- * aof_reload_mmap   →  reads incr.wal for crash recovery
- * ============================================================================= */
-
-int aof_async_init(void) {
-    printf("[AOF] unified with journal persistence — writes go to %s\n", persist_path(WAL_REL));
-    return 0;
-}
-
-void aof_async_shutdown(void) {
-}
-
-void aof_async_append(const char *buf, int len) {
-    (void)buf;
-    (void)len;
-}
-
-
-/* =============================================================================
- * Part 2. Shared buffer & dict scan
+ * Part 1. Shared buffer & dict scan
  * ============================================================================= */
 
 void rdb_buf_reserve(rdb_buf_t *b, size_t need) {
@@ -268,7 +232,7 @@ int rdb_bgsave_in_progress(void) {
     return (g_rdb_child_pid > 0) ? 1 : 0;
 }
 
-/* SIGCHLD 处理：回收已完成的 BGSAVE / BGREWRITEAOF 子进程 */
+/* SIGCHLD 处理：回收已完成的 BGSAVE 子进程 */
 void rdb_sigchld(int signo) {
     (void)signo;
     pid_t pid;
@@ -276,21 +240,6 @@ void rdb_sigchld(int signo) {
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
         if (pid == g_rdb_child_pid)
             g_rdb_child_pid = 0;
-        if (pid == g_aof_rewrite_child_pid) {
-            g_aof_rewrite_child_pid = 0;
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                printf("[AOF] BGREWRITEAOF child completed successfully\n");
-            } else {
-                fprintf(stderr, "[AOF] BGREWRITEAOF child failed (status=%d)\n", status);
-                pthread_mutex_lock(&g_aof_rewrite_mu);
-                g_aof_rewrite_in_progress = 0;
-                free(g_aof_rewrite_buf.data);
-                g_aof_rewrite_buf.data = NULL;
-                g_aof_rewrite_buf.len = 0;
-                g_aof_rewrite_buf.cap = 0;
-                pthread_mutex_unlock(&g_aof_rewrite_mu);
-            }
-        }
     }
 }
 

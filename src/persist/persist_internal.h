@@ -1,13 +1,12 @@
 #ifndef __PERSIST_INTERNAL_H__
 #define __PERSIST_INTERNAL_H__
 
-#include <pthread.h>
 #include <sys/types.h>
 #include "kv_dict.h"
 
 #define RDB_TMP  "build/dump.rdb.tmp"
 
-/* Dynamic buffer for RDB/AOF serialization */
+/* Dynamic buffer for RDB serialization */
 typedef struct {
     char *buf;
     size_t len;
@@ -22,13 +21,6 @@ typedef struct {
 void rdb_buf_reserve(rdb_buf_t *b, size_t need);
 void rdb_buf_put(rdb_buf_t *b, const void *p, size_t n);
 
-/* AOF rewrite buffer: captures writes during AOF rewrite */
-typedef struct {
-    char *data;
-    size_t len;
-    size_t cap;
-} aof_rewrite_buf_t;
-
 /* Dict scan */
 void store_scan(void (*cb)(kv_entry_t *e, void *priv), void *priv);
 
@@ -40,23 +32,11 @@ const char *mread(const char *p, const char *end, void *out, size_t n);
 
 /* RDB BGSAVE state */
 extern volatile pid_t g_rdb_child_pid;
-extern int g_rdb_in_fork_child;
 
-/* AOF rewrite state */
-extern volatile pid_t g_aof_rewrite_child_pid;
-extern int g_aof_rewrite_in_progress;
-extern aof_rewrite_buf_t g_aof_rewrite_buf;
-extern pthread_mutex_t g_aof_rewrite_mu;
-
-/* SIGCHLD handler for BGSAVE / BGREWRITEAOF children */
+/* SIGCHLD handler for BGSAVE children */
 void rdb_sigchld(int signo);
 
-/* AOF rewrite helpers */
-void aof_rewrite_buf_append(const char *data, size_t len);
-void aof_rewrite_entry(kv_entry_t *e, void *priv);
-
-/* RDB entry payload accessor: returns data pointer and length.
- * Returns 0 on success, -1 if the entry has no inline payload (e.g. DICT encoding). */
+/* RDB entry payload accessor */
 int rdb_entry_payload(kv_entry_t *e, const char **data, int *dlen);
 
 #endif

@@ -79,7 +79,7 @@ static void active_expire_cycle(void) {
         int expired_total = 0;
         int sampled_total = 0;
 
-        if (pthread_rwlock_trywrlock(&g_store_rwlock) != 0)
+        if (__sync_val_compare_and_swap(&g_store_lock, 0, 2) != 0)
             return;
 
         for (int i = 0; i < sample_size; i++) {
@@ -99,7 +99,7 @@ static void active_expire_cycle(void) {
             }
         }
 
-        pthread_rwlock_unlock(&g_store_rwlock);
+        __atomic_store_n(&g_store_lock, 0, __ATOMIC_RELEASE);
 
         double expire_rate = sampled_total > 0 ?
             (double)expired_total / sampled_total : 0;

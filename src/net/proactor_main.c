@@ -3,25 +3,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <pthread.h>
 #include <liburing.h>
 #include "proactor_types.h"
 #include "proactor_inline.h"
 #include "server.h"
 #include "config.h"
 #include "kvstore.h"
-#include "block.h"
-#include "protocol.h"
-#include "shared.h"
 
 /* Global variables */
 struct conn *conn_pool = NULL;
 int conn_pool_size = 0;
 proactor_worker_t *g_worker = NULL;
-atomic_uint g_next_conn_gen = 1;
+uint32_t g_next_conn_gen = 1;
 
 /* External function declarations */
-extern int worker_init(proactor_worker_t *w, unsigned short port, int worker_id);
+extern int worker_init(proactor_worker_t *w, unsigned short port);
 extern void worker_destroy(proactor_worker_t *w);
 extern void event_handle_cqe(proactor_worker_t *w, struct io_uring_cqe *cqe);
 extern int conn_pool_init(int max_clients);
@@ -31,128 +27,71 @@ extern int conn_arm_recv(struct io_uring *ring, struct conn *c);
 extern int conn_arm_send(struct io_uring *ring, struct conn *c);
 extern void conn_release(int fd);
 
-/* Block notify callback */
-static void proactor_block_notify_local(client_t *cl) {
-    if (!cl || !cl->conn || !g_worker) return;
-    struct conn *conn = cl->conn;
-
-    /* Timed-out BLPOP: emit nil reply */
-    if (cl->block_pending_timeout) {
-        dynbuf_cat(&conn->write_buf, "$-1\r\n", 5);
-        cl->block_pending_timeout = 0;
-    }
-
-    /* Awakened BLPOP: re-dispatch saved command */
-    if (cl->block_cmd_len > 0) {
-        kvs_token_t tokens2[KVS_MAX_TOKENS];
-        int argc2 = 0;
-        int consumed = resp_parse_slices(cl->block_cmd_buf,
-                                          cl->block_cmd_len,
-                                          tokens2, KVS_MAX_TOKENS, &argc2);
-        if (consumed > 0) {
-            kvs_dispatch(tokens2, argc2,
-                         cl->block_cmd_buf, consumed,
-                         &conn->write_buf, conn);
-        }
-        cl->block_cmd_len = 0;
-    }
-
-    /* Drain pipelined RX bytes */
-    if (conn->read_buf.len > 0) {
-        conn->w_off = 0;
-        kvs_drain_resp_commands_off(&conn->read_buf, &conn->r_off,
-                                     &conn->write_buf, conn);
-    }
-
-    if (conn->write_buf.len > 0) {
-        if (conn_arm_send(&g_worker->ring, conn) != 0)
-            conn_release(conn->fd);
-    } else {
-        if (conn_arm_recv(&g_worker->ring, conn) != 0)
-            conn_release(conn->fd);
-    }
-}
-
-static void proactor_block_notify(client_t *cl) {
-    if (!cl || !cl->conn) return;
-    proactor_block_notify_local(cl);
-}
-
-void proactor_kick_worker(int id) {
-    (void)id;
-}
-
-/* Main event loop - kept compact for performance */
-static void *worker_loop(void *arg) {
-    proactor_worker_t *w = (proactor_worker_t *)arg;
-    g_worker = w;
-
+/* Main event loop - Redis-style delayed submission for batching */
+static void proactor_loop(proactor_worker_t *w) {
     struct io_uring *ring = &w->ring;
-    struct io_uring_cqe *cqe;
 
     if (worker_arm_accept(w) != 0) {
-        fprintf(stderr, "[proactor#%d] failed to arm accept\n", w->id);
-        return NULL;
+        fprintf(stderr, "[proactor] failed to arm accept\n");
+        return;
     }
 
-    printf("[proactor#%d] event loop started\n", w->id);
+    printf("[proactor] event loop started (Redis-style delayed submit)\n");
 
     while (!g_kvs_stop) {
-        if (w->id == 0) update_cached_time();
+        update_cached_time();
+
+        /* [Redis-style] Submit all pending SQEs from last iteration first */
+        int submitted = io_uring_submit(ring);
+        if (submitted < 0 && submitted != -EBUSY) {
+            fprintf(stderr, "[proactor] submit failed: %s\n",
+                    strerror(-submitted));
+        }
 
         /* Batch peek CQEs */
         struct io_uring_cqe *cqes[CQE_BATCH_SIZE];
         int nready = io_uring_peek_batch_cqe(ring, cqes, CQE_BATCH_SIZE);
 
-        /* Safety check: ensure SQ has space */
-        if (nready > 0) {
-            int sq_space = io_uring_sq_space_left(ring);
-            if (sq_space < nready * 2) {
-                io_uring_submit(ring);
-            }
-        }
-
         if (nready == 0) {
-            /* Check block timeouts */
-            if (w->id == 0) block_check_timeouts();
-            int to_ms = (w->id == 0) ? block_nearest_timeout() : -1;
-            if (to_ms >= 0) {
-                struct io_uring_sqe *sqe = get_sqe_submit(ring);
-                if (sqe) {
-                    struct __kernel_timespec ts;
-                    ts.tv_sec = to_ms / 1000;
-                    ts.tv_nsec = (to_ms % 1000) * 1000000L;
-                    io_uring_prep_timeout(sqe, &ts, 0, 0);
-                    sqe->user_data = conn_info_pack(0, 0, 0);
-                }
+            int to_ms = 1;  /* 1ms idle poll for low latency */
+
+            struct io_uring_sqe *sqe = get_sqe_submit(ring);
+            if (sqe) {
+                struct __kernel_timespec ts;
+                ts.tv_sec = to_ms / 1000;
+                ts.tv_nsec = (to_ms % 1000) * 1000000L;
+                io_uring_prep_timeout(sqe, &ts, 0, 0);
+                sqe->user_data = conn_info_pack(0, 0, 0);
             }
+
             int ret = io_uring_submit_and_wait(ring, 1);
             if (ret < 0) {
                 if (ret == -EINTR) continue;
-                fprintf(stderr, "[proactor#%d] submit_and_wait: %s\n",
-                        w->id, strerror(-ret));
+                fprintf(stderr, "[proactor] submit_and_wait: %s\n",
+                        strerror(-ret));
                 break;
             }
             nready = io_uring_peek_batch_cqe(ring, cqes, CQE_BATCH_SIZE);
             if (nready <= 0) continue;
         }
 
-        /* Process CQEs */
+        /* Process CQEs (only prepare SQEs, don't submit yet) */
         for (int i = 0; i < nready; i++) {
             event_handle_cqe(w, cqes[i]);
         }
 
         /* Re-arm accept if needed */
         if (worker_arm_accept(w) != 0)
-            fprintf(stderr, "[proactor#%d] failed to re-arm accept\n", w->id);
+            fprintf(stderr, "[proactor] failed to re-arm accept\n");
 
-        /* Advance and submit */
+        /* Advance CQ (submission happens at next loop iteration) */
         io_uring_cq_advance(ring, nready);
-        io_uring_submit(ring);
     }
 
-    fprintf(stderr, "[proactor#%d] worker exit stop=%d\n", w->id, (int)g_kvs_stop);
-    return NULL;
+    /* Final submit before exit */
+    io_uring_submit(ring);
+
+    fprintf(stderr, "[proactor] exit stop=%d\n", (int)g_kvs_stop);
 }
 
 /* Start proactor */
@@ -174,7 +113,7 @@ int proactor_start(unsigned short port, msg_handler handler) {
         return -1;
     }
 
-    if (worker_init(g_worker, port, 0) < 0) {
+    if (worker_init(g_worker, port) < 0) {
         free(g_worker);
         conn_pool_destroy();
         return -1;
@@ -182,10 +121,8 @@ int proactor_start(unsigned short port, msg_handler handler) {
 
     printf("[proactor] single-threaded mode, single global dict\n");
 
-    block_set_notify_cb(proactor_block_notify);
-
-    /* Run worker on main thread */
-    worker_loop(g_worker);
+    /* Run event loop on main thread */
+    proactor_loop(g_worker);
 
     /* Teardown */
     worker_destroy(g_worker);

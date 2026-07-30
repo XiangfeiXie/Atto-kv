@@ -40,12 +40,6 @@ struct conn {
     } r_action;
 
     int status;
-
-    /* Phase 4B.2 — index into the proactor worker that accepted this fd.
-     * Used to deliver cross-worker wake events (BLPOP unblock / timeout)
-     * back to the owning worker without violating SINGLE_ISSUER on
-     * someone else's io_uring instance. */
-    int owner_worker_id;
 };
 
 #if ENABLE_KVSTORE

@@ -10,7 +10,6 @@
 #include "rdma_repl.h"
 #include "kvstore.h"
 #include "kv_dict.h"
-#include "repl_incr.h"
 #include "persistence.h"
 #include "config.h"
 
@@ -349,9 +348,6 @@ int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port) {
     rdb_rebuild_all_encodings();
 
     clock_gettime(CLOCK_MONOTONIC, &t_end);
-
-    /* Step 5: Save base_seq for incremental sync */
-    repl_incr_save_offset(base_seq);
 
     /* Print receive-side throughput (pure data path) */
     {

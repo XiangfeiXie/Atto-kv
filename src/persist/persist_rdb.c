@@ -102,43 +102,11 @@ void serialize_entry_to_buf(DynBuf *out, kv_entry_t *e) {
     free(owned);
 }
 
-int serialize_entry_inline(char *dst, size_t max_space, kv_entry_t *e) {
-    char *owned = NULL;
-    const char *data_ptr = NULL;
-    int dlen = 0;
-    uint32_t owned_len = 0;
-    if (e && entry_type(e) == KV_TYPE_HASH && entry_encoding(e) == KV_ENCODING_DICT) {
-        if (hash_flatten_to_packed(e, &owned, &owned_len) != 0) return 0;
-        data_ptr = owned;
-        dlen = (int)owned_len;
-    } else if (rdb_entry_payload(e, &data_ptr, &dlen) != 0) {
-        return 0;
-    }
-
-    const char *key = entry_key(e);
-    int klen = (int)e->key_len;
-    long long expire = e->expire;
-    int total = (int)(sizeof(int) + klen + sizeof(int) + dlen + sizeof(long long));
-    if (total > (int)max_space) { free(owned); return -1; }
-
-    char *q = dst;
-    memcpy(q, &klen, sizeof(int)); q += sizeof(int);
-    memcpy(q, key, klen);          q += klen;
-    memcpy(q, &dlen, sizeof(int)); q += sizeof(int);
-    memcpy(q, data_ptr, dlen);     q += dlen;
-    memcpy(q, &expire, sizeof(long long));
-    free(owned);
-    return total;
-}
-
 /* DynBuf serialization callback (for RDMA fullsync). */
 static void rdb_serialize_cb_dynbuf(kv_entry_t *e, void *priv) {
     if (!e) return;
     serialize_entry_to_buf((DynBuf *)priv, e);
 }
-
-/* Set to 1 inside the BGSAVE fork child (currently unused in single-dict mode) */
-int g_rdb_in_fork_child = 0;
 
 void rdb_serialize_to_buf(DynBuf *out) {
     int magic = 0x524442;
@@ -326,7 +294,6 @@ void rdb_save_async_uring(void) {
         return;
     }
     if (pid == 0) {
-        g_rdb_in_fork_child = 1;
         rdb_save_sync();
         fflush(stdout);
         fflush(stderr);

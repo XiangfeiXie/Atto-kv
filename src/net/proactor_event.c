@@ -9,7 +9,6 @@
 #include "proactor_inline.h"
 #include "protocol.h"
 #include "kvstore.h"
-#include "block.h"
 #include "client.h"
 
 /* Forward declarations */
@@ -30,8 +29,6 @@ static int set_event_recv_multishot(struct io_uring *ring, int sockfd, uint32_t 
 
 int conn_arm_recv(struct io_uring *ring, struct conn *c) {
     if (!c || !c->active || c->recv_armed)
-        return 0;
-    if (c->client && c->client->state == CLIENT_BLOCKED)
         return 0;
     if (c->status)
         return 0;
@@ -78,7 +75,7 @@ int worker_arm_accept(proactor_worker_t *w) {
         return -1;
     w->accept_armed = 1;
     if (proactor_debug_enabled())
-        fprintf(stderr, "[proactor#%d] accept armed\n", w->id);
+        fprintf(stderr, "[proactor] accept armed\n");
     return 0;
 }
 
@@ -93,17 +90,17 @@ void event_handle_accept(proactor_worker_t *w, struct io_uring_cqe *cqe) {
     int connfd = res;
     if (connfd < 0) {
         if (connfd != -EAGAIN && connfd != -ECANCELED)
-            fprintf(stderr, "[proactor#%d] accept cqe: %s\n",
-                    w->id, strerror(-connfd));
+            fprintf(stderr, "[proactor] accept cqe: %s\n",
+                    strerror(-connfd));
         return;
     }
 
     if (proactor_debug_enabled())
-        fprintf(stderr, "[proactor#%d] accept fd=%d\n", w->id, connfd);
+        fprintf(stderr, "[proactor] accept fd=%d\n", connfd);
 
     if (connfd >= conn_pool_size) {
-        fprintf(stderr, "[proactor#%d] fd %d exceeds maxclients %d\n",
-                w->id, connfd, conn_pool_size);
+        fprintf(stderr, "[proactor] fd %d exceeds maxclients %d\n",
+                connfd, conn_pool_size);
         close(connfd);
         return;
     }
@@ -122,7 +119,6 @@ void event_handle_accept(proactor_worker_t *w, struct io_uring_cqe *cqe) {
     nc->recv_armed = 0;
     nc->send_armed = 0;
     nc->gen = next_conn_gen();
-    nc->owner_worker_id = w->id;
 
     atomic_fetch_add_explicit(&g_kvs_total_connections, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_kvs_connected_clients, 1, memory_order_relaxed);
@@ -134,7 +130,7 @@ void event_handle_accept(proactor_worker_t *w, struct io_uring_cqe *cqe) {
         conn_release(connfd);
 
     if (proactor_debug_enabled())
-        fprintf(stderr, "[proactor#%d] armed recv for fd=%d\n", w->id, connfd);
+        fprintf(stderr, "[proactor] armed recv for fd=%d\n", connfd);
 }
 
 /* Handle READ event */
@@ -159,8 +155,8 @@ void event_handle_read(proactor_worker_t *w, struct io_uring_cqe *cqe, int fd,
 
     if (result.gen != (c->gen & 0xFFFFFFu)) {
         if (proactor_debug_enabled())
-            fprintf(stderr, "[proactor#%d] stale read fd=%d cqe_gen=%u cur_gen=%u\n",
-                    w->id, fd, result.gen, c->gen & 0xFFFFFFu);
+            fprintf(stderr, "[proactor] stale read fd=%d cqe_gen=%u cur_gen=%u\n",
+fd, result.gen, c->gen & 0xFFFFFFu);
         if (cqe->flags & IORING_CQE_F_BUFFER)
             buf_ring_recycle(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
         return;
@@ -220,8 +216,8 @@ void event_handle_read(proactor_worker_t *w, struct io_uring_cqe *cqe, int fd,
             return;
         }
         if (res < 0 && res != -ECANCELED)
-            fprintf(stderr, "[proactor#%d] recv fd=%d: %s\n",
-                    w->id, fd, strerror(-res));
+            fprintf(stderr, "[proactor] recv fd=%d: %s\n",
+fd, strerror(-res));
 
         if (rb->len > 0) {
             kvs_drain_resp_commands_off(rb, &c->r_off, wb, c);
@@ -244,13 +240,10 @@ void event_handle_read(proactor_worker_t *w, struct io_uring_cqe *cqe, int fd,
     kvs_drain_resp_commands_off(rb, &c->r_off, wb, c);
 
     if (proactor_debug_enabled())
-        fprintf(stderr, "[proactor#%d] fd=%d read res=%d rb_len=%d wb_len=%d\n",
-                w->id, fd, res, rb->len, wb->len);
+        fprintf(stderr, "[proactor] fd=%d read res=%d rb_len=%d wb_len=%d\n",
+                fd, res, rb->len, wb->len);
 
-    if (c->client && c->client->state == CLIENT_BLOCKED) {
-        if (wb->len > 0 && conn_arm_send(ring, c) != 0)
-            conn_release(fd);
-    } else if (c->status) {
+    if (c->status) {
         if (wb->len > 0) {
             if (conn_arm_send(ring, c) != 0)
                 conn_release(fd);
@@ -288,8 +281,8 @@ void event_handle_write(proactor_worker_t *w, int fd, struct conn_info result, i
     wb->len -= res;
 
     if (proactor_debug_enabled())
-        fprintf(stderr, "[proactor#%d] fd=%d send res=%d wb_len=%d\n",
-                w->id, fd, res, wb->len);
+        fprintf(stderr, "[proactor] fd=%d send res=%d wb_len=%d\n",
+                fd, res, wb->len);
 
     if (wb->len > 0) {
         if (conn_arm_send(ring, c) != 0)
@@ -308,9 +301,6 @@ void event_handle_write(proactor_worker_t *w, int fd, struct conn_info result, i
                 } else {
                     conn_release(fd);
                 }
-            } else if (c->client && c->client->state == CLIENT_BLOCKED) {
-                if (wb->len > 0 && conn_arm_send(ring, c) != 0)
-                    conn_release(fd);
             } else if (wb->len > 0) {
                 if (conn_arm_send(ring, c) != 0)
                     conn_release(fd);

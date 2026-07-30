@@ -9,7 +9,6 @@
 #include "kv_type_hash.h"
 #include "shared.h"
 #include "config.h"
-#include "journal.h"
 
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -28,7 +27,6 @@ void entry_cleanup_by_type(kv_entry_t *e);
 
 /* write journal */
 void kvs_write_journal_append(const char *msg, int length);
-void kvs_rdma_incr_probe(const char *msg, int length);
 
 /* ── from kvstore_expire.c ── */
 

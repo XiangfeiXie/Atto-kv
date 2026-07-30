@@ -1,4 +1,0 @@
-scenario,threads,keys,ttl_sec,write_duration_s,expired_before,expired_after,deleted_count,cleanup_duration_s,vmrss_before_kb,vmrss_after_kb,reclaim_kb,reclaim_pct,qps_baseline,qps_during,qps_impact_pct
-burst,1,10000,5,0,0,12547,12547,64,43348,41580,1768,4.0,rps=0.0,rps=0.0,
-burst,1,50000,5,0,0,52533,52533,65,48520,41984,6536,13.4,rps=0.0,rps=0.0,
-burst,1,100000,5,0,0,102098,102098,65,57768,52264,5504,9.5,rps=0.0,rps=0.0,

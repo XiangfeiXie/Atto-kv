@@ -30,7 +30,6 @@ if(USE_JEMALLOC)
 endif()
 pkg_check_modules(FABRIC   REQUIRED libfabric)
 pkg_check_modules(ZLIB     REQUIRED zlib)
-pkg_check_modules(LIBBPF  REQUIRED libbpf)
 
 # ── NtyCo (third-party coroutine library) ─────────────────────────────
 set(NTYCO_DIR  ${CMAKE_SOURCE_DIR}/NtyCo)
@@ -57,7 +56,6 @@ set(CORE_SRCS
     src/core/kvstore_dispatch.c
     src/core/config.c
     src/core/protocol.c
-    src/core/block.c
     src/core/shared.c
 )
 
@@ -83,25 +81,14 @@ set(PERSIST_SRCS
     src/persist/persistence.c
     src/persist/persist_rdb.c
     src/persist/persist_aof.c
-    src/persist/journal.c
     src/persist/wal_persist.c
 )
 
 set(REPL_SRCS
     src/repl/rdma_repl.c
-    src/repl/repl_stream.c
-    src/repl/repl_backlog.c
-    src/repl/repl_tcp.c
-    src/repl/repl_tcp_master.c
-    src/repl/repl_tcp_slave.c
-    src/repl/repl_incr.c
-    src/repl/repl_xdp_reasm.c
-    src/repl/rdma_ctrl_protocol.c
     src/repl/rdma_repl_master.c
     src/repl/rdma_repl_slave.c
 )
-
-# BPF sources (currently empty — XDP uses repl_xdp_reasm.c)
 
 set(KVSTORE_SRCS
     ${UTIL_SRCS}
@@ -112,24 +99,6 @@ set(KVSTORE_SRCS
     ${PERSIST_SRCS}
     ${REPL_SRCS}
 )
-
-# ── Compile repl_filter_xdp BPF program (XDP packet mirror) ───────────
-set(REPL_FILTER_XDP_KERN_SRC ${CMAKE_SOURCE_DIR}/src/repl/repl_filter_xdp.bpf.c)
-set(REPL_FILTER_XDP_KERN_OBJ ${CMAKE_BINARY_DIR}/repl_filter_xdp.bpf.o)
-
-add_custom_command(
-    OUTPUT  ${REPL_FILTER_XDP_KERN_OBJ}
-    COMMAND clang -O2 -g -target bpf
-            -I${CMAKE_SOURCE_DIR}/src/repl
-            -I/usr/include
-            -I/usr/include/x86_64-linux-gnu
-            -c ${REPL_FILTER_XDP_KERN_SRC}
-            -o ${REPL_FILTER_XDP_KERN_OBJ}
-    DEPENDS ${REPL_FILTER_XDP_KERN_SRC}
-    COMMENT "Compiling repl_filter_xdp.bpf.c (XDP)"
-)
-
-add_custom_target(repl_filter_xdp_kern DEPENDS ${REPL_FILTER_XDP_KERN_OBJ})
 
 # ── kvstore target ────────────────────────────────────────────────────
 add_executable(kvstore ${KVSTORE_SRCS})
@@ -146,7 +115,6 @@ target_include_directories(kvstore PRIVATE
     ${URING_INCLUDE_DIRS}
     ${JEMALLOC_INCLUDE_DIRS}
     ${FABRIC_INCLUDE_DIRS}
-    ${LIBBPF_INCLUDE_DIRS}
 )
 
 target_link_libraries(kvstore PRIVATE
@@ -156,12 +124,10 @@ target_link_libraries(kvstore PRIVATE
     ${JEMALLOC_LIBRARIES}
     ${FABRIC_LIBRARIES}
     ${ZLIB_LIBRARIES}
-    ${LIBBPF_LIBRARIES}
-    elf
     dl
 )
 
-add_dependencies(kvstore ntyco repl_filter_xdp_kern)
+add_dependencies(kvstore ntyco)
 
 # ── Set capabilities for eBPF (requires libcap) ───────────────────────
 # This allows kvstore to load eBPF programs without running as root

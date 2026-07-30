@@ -182,11 +182,27 @@ void        kv_store_iter_init(kv_store_iter_t *it);
 kv_entry_t *kv_store_iter_next(kv_store_iter_t *it);
 void        kv_store_iter_free(kv_store_iter_t *it);
 
-/* Locking helpers for concurrent access protection */
-extern pthread_rwlock_t g_store_rwlock;  /* Global rwlock for dict access */
-void kv_store_rdlock(void);    /* Acquire read lock (shared) */
-void kv_store_wrlock(void);    /* Acquire write lock (exclusive) */
-void kv_store_unlock(void);    /* Release lock */
+/* Lightweight single-threaded lock for expire-thread coordination.
+ * 0 = free, 1 = held by main thread, 2 = held by expire thread.
+ * Main thread always wins (CAS 0→1) — only brief spin when the
+ * background expire thread (once per ~1s) currently holds the lock.
+ * The expire thread uses CAS 0→2 and skips if the main thread is busy. */
+extern volatile int g_store_lock;
+
+static inline void kv_store_rdlock(void) {
+    while (__sync_val_compare_and_swap(&g_store_lock, 0, 1) != 0) {
+        while (__atomic_load_n(&g_store_lock, __ATOMIC_RELAXED) != 0)
+            __builtin_ia32_pause();
+    }
+}
+
+static inline void kv_store_wrlock(void) {
+    kv_store_rdlock();
+}
+
+static inline void kv_store_unlock(void) {
+    __atomic_store_n(&g_store_lock, 0, __ATOMIC_RELEASE);
+}
 
 /* Snapshot helpers (no-op in single-dict mode) */
 static inline void kv_store_lock_for_snapshot(void) { }

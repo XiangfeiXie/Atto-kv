@@ -25,8 +25,7 @@ static inline struct conn_info conn_info_unpack(uint64_t data) {
 static inline uint32_t next_conn_gen(void) {
     uint32_t gen;
     do {
-        gen = atomic_fetch_add_explicit(&g_next_conn_gen, 1,
-                                        memory_order_relaxed) & 0xFFFFFFu;
+        gen = ++g_next_conn_gen & 0xFFFFFFu;
     } while (gen == 0);
     return gen;
 }

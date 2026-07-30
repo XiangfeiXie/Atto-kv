@@ -17,8 +17,8 @@
  *   // ... on shutdown: xdp_reasm_shutdown(); xdp_cleanup(&att, obj, rb);
  */
 
-#ifndef REPL_XDP_REASM_H
-#define REPL_XDP_REASM_H
+#ifndef XDP_REASM_H
+#define XDP_REASM_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -96,4 +96,4 @@ static inline void xdp_cleanup(xdp_attach_t *a,
     xdp_detach(a);
 }
 
-#endif /* REPL_XDP_REASM_H */
+#endif /* XDP_REASM_H */

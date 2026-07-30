@@ -3,7 +3,6 @@
 
 #include <stdint.h>
 #include <sys/types.h>
-#include "journal.h"
 
 /* ===================================================================
  * RDMA replication - Simplified architecture

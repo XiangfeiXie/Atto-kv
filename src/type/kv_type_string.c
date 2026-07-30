@@ -243,6 +243,22 @@ const char *string_engine_get(const char *key, uint32_t key_len,
     return engine_get_raw(key, key_len, vlen_out, NULL, enc_out);
 }
 
+/* Pre-computed hash variant — skip redundant kv_hash + dict_find */
+int string_engine_set_pre(const char *key, uint32_t key_len,
+                          const char *val, uint32_t val_len,
+                          long long expire, int mode,
+                          uint64_t hash, kv_entry_t *existing)
+{
+    return engine_set_pre(key, key_len, val, val_len, expire, mode, hash, existing);
+}
+
+const char *string_engine_get_pre(kv_entry_t *entry,
+                                  uint32_t *vlen_out,
+                                  uint8_t *enc_out)
+{
+    return engine_get_pre(entry, vlen_out, NULL, enc_out);
+}
+
 int string_is_write_cmd(kvs_token_t cmd) {
     return TOKEN_EQ(cmd, "SET")    || TOKEN_EQ(cmd, "SETNX")  ||
            TOKEN_EQ(cmd, "SETEX")  || TOKEN_EQ(cmd, "MOD")    ||

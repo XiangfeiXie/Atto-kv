@@ -29,9 +29,13 @@
  * bulk length <= 24B), but inline commands may scan up to 64KB.  The SIMD
  * path mainly helps inline/debug commands and large pipelined buffers while
  * keeping array-form headers on a tiny scalar fast path.
- * Force inline for hot path optimization. */
+ * In debug mode, remove always_inline to avoid recursive inlining error. */
+#ifdef NDEBUG
 static inline __attribute__((always_inline))
 const char *resp_find_crlf(const char *p, int n)
+#else
+static inline const char *resp_find_crlf(const char *p, int n)
+#endif
 {
     if (n <= 0) return NULL;
 
@@ -364,11 +368,6 @@ int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn 
             off += cmd_len;
             remaining -= cmd_len;
             ncmd++;
-            if (r == DISPATCH_BLOCKED) {
-                *r_off = off;
-                rb->len = remaining;
-                return KVS_DRAIN_BLOCKED;
-            }
             if (r == DISPATCH_CLOSE) {
                 /* Signal caller to close after flush; mark via conn->status */
                 if (c) c->status = 1;
@@ -412,7 +411,6 @@ int kvs_drain_batch(struct conn **conns, int conn_count) {
         struct conn *c = conns[i];
         if (!c || !c->active || c->read_buf.len == 0) continue;
         if (c->send_armed || c->write_buf.len > 0) continue;  // Skip if send in flight
-        if (c->client && c->client->state == CLIENT_BLOCKED) continue;
 
         int drained = kvs_drain_resp_commands_off(
             &c->read_buf, &c->r_off, &c->write_buf, c

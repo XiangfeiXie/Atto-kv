@@ -15,9 +15,8 @@
  */
 
 #define _GNU_SOURCE
-#include "repl_xdp_reasm.h"
-#include "repl_xdp_common.h"
-#include "repl_tcp_internal.h"   /* for is_write_command, find_complete_resp_command */
+#include "xdp_reasm.h"
+#include "xdp_common.h"
 
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
@@ -246,6 +245,92 @@ static void ooo_drain(xdp_conn_t *c) {
         free(seg);
         g_xdp.stats.ooo_segments--;
     }
+}
+
+/* ── RESP command parser + write-command filter ─────────────────────── */
+
+#define MAX_RESP_CMD_LEN  (4 * 1024 * 1024)
+
+static int find_complete_resp_command(const uint8_t *data, size_t len)
+{
+    if (len < 4 || data[0] != '*') return -1;
+
+    /* Parse array count: *N\r\n */
+    size_t i = 1;
+    int argc = 0;
+    while (i < len && data[i] >= '0' && data[i] <= '9') {
+        argc = argc * 10 + (data[i] - '0');
+        if (argc > 64) return -1;
+        i++;
+    }
+    if (i == 1) return -1;
+    if (i + 1 >= len) return 0;
+    if (data[i] != '\r' || data[i + 1] != '\n') return -1;
+    i += 2;
+
+    for (int arg = 0; arg < argc; arg++) {
+        if (i >= len) return 0;
+        if (data[i] != '$') return -1;
+        i++;
+
+        int arg_len = 0;
+        while (i < len && data[i] >= '0' && data[i] <= '9') {
+            arg_len = arg_len * 10 + (data[i] - '0');
+            if (arg_len > MAX_RESP_CMD_LEN) return -1;
+            i++;
+        }
+        if (i + 1 >= len) return 0;
+        if (data[i] != '\r' || data[i + 1] != '\n') return -1;
+        i += 2;
+
+        if (i + (size_t)arg_len + 2 > len) return 0;
+        i += (size_t)arg_len + 2;
+    }
+
+    return (int)i;
+}
+
+static int is_write_command(const uint8_t *data, size_t len)
+{
+    if (!data || len < 12 || data[0] != '*') return 0;
+
+    /* Skip *N\r\n */
+    size_t i = 1;
+    while (i < len && data[i] >= '0' && data[i] <= '9') i++;
+    if (i + 1 >= len || data[i] != '\r' || data[i + 1] != '\n') return 0;
+    i += 2;
+
+    /* Skip $L\r\n to reach command name */
+    if (i >= len || data[i] != '$') return 0;
+    i++;
+    while (i < len && data[i] >= '0' && data[i] <= '9') i++;
+    if (i + 1 >= len || data[i] != '\r' || data[i + 1] != '\n') return 0;
+    i += 2;
+
+    if (i + 2 >= len) return 0;
+
+    /* Uppercase first 3 chars */
+    char c0 = (char)data[i];
+    char c1 = (char)data[i + 1];
+    char c2 = (char)data[i + 2];
+    if (c0 >= 'a' && c0 <= 'z') c0 -= 32;
+    if (c1 >= 'a' && c1 <= 'z') c1 -= 32;
+    if (c2 >= 'a' && c2 <= 'z') c2 -= 32;
+
+    if (c0 == 'S' && c1 == 'E' && c2 == 'T') return 1;
+    if (c0 == 'D' && c1 == 'E' && c2 == 'L') return 1;
+    if (c0 == 'D' && c1 == 'E' && c2 == 'C') return 1;
+    if (c0 == 'L' && c1 == 'P')              return 1;
+    if (c0 == 'R' && c1 == 'P')              return 1;
+    if (c0 == 'H' && (c1 == 'S' || c1 == 'D')) return 1;
+    if (c0 == 'S' && (c1 == 'A' || c1 == 'R')) return 1;
+    if (c0 == 'Z' && (c1 == 'A' || c1 == 'R')) return 1;
+    if (c0 == 'I' && c1 == 'N' && c2 == 'C') return 1;
+    if (c0 == 'A' && c1 == 'P' && c2 == 'P') return 1;
+    if (c0 == 'M' && c1 == 'S' && c2 == 'E') return 1;
+    if (c0 == 'F' && c1 == 'L' && c2 == 'U') return 1;
+
+    return 0;
 }
 
 /* ── Ordered data consumer ──────────────────────────────────────────── */

@@ -11,7 +11,6 @@
 #include "rdma_repl.h"
 #include "kvstore.h"
 #include "kv_dict.h"
-#include "repl_incr.h"
 #include "config.h"
 
 #include <rdma/fabric.h>

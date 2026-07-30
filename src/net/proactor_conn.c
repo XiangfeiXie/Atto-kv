@@ -4,8 +4,6 @@
 #include "proactor_types.h"
 #include "proactor_inline.h"
 #include "kvstore.h"
-#include "block.h"
-#include "client.h"
 #include "config.h"
 
 /* Initialize connection pool (lazy allocation - no pre-heating) */
@@ -62,7 +60,6 @@ void conn_reset(struct conn *c) {
     dynbuf_clear(&c->write_buf);
 
     if (c->client) {
-        block_remove_client(c->client);
         memset(c->client, 0, sizeof(client_t));
         c->client->conn = c;
     }
@@ -75,7 +72,6 @@ void conn_release(int fd) {
     struct conn *c = &conn_pool[fd];
 
     if (c->client) {
-        block_remove_client(c->client);
         free(c->client);
         c->client = NULL;
     }

@@ -2,7 +2,6 @@
 #define PROACTOR_TYPES_H
 
 #include <stdint.h>
-#include <stdatomic.h>
 #include <liburing.h>
 #include "server.h"
 
@@ -21,9 +20,8 @@
 #define KVS_NR_BUFS        8192
 #define KVS_BUF_SIZE       4096
 
-/* Proactor worker structure */
+/* Proactor state (single-threaded, like Redis) */
 typedef struct proactor_worker {
-    int                       id;
     int                       listen_fd;
     struct io_uring           ring;
     struct io_uring_buf_ring *buf_ring;
@@ -44,6 +42,6 @@ struct conn_info {
 extern struct conn *conn_pool;
 extern int conn_pool_size;
 extern proactor_worker_t *g_worker;
-extern atomic_uint g_next_conn_gen;
+extern uint32_t g_next_conn_gen;
 
 #endif /* PROACTOR_TYPES_H */

@@ -1,3 +1,0 @@
-allocator,scenario,keys,idle_vmsize,idle_vmrss,idle_vmdata,peak_vmsize,peak_vmrss,peak_vmdata,final_vmsize,final_vmrss,final_vmdata,utilization_pct,fragmentation_pct,reclaim_pct
-jemalloc,顺序写入,5000000,60176,8424,47344,569104,515752,556272,569104,175653,556272,114.5,-14.5,67.0
-glibc,顺序写入,5000000,46456,5664,38064,513888,499824,505496,450660,436720,442268,118.2,-18.2,12.7

@@ -48,11 +48,6 @@ typedef struct {
     char rdma_master_ip[64];
     int  rdma_master_port;
 
-    /* TCP + eBPF incremental replication (Phase 9.1) */
-    int  incr_repl_enabled;
-    int  incr_repl_port;        /* Master: TCP listen port */
-    int  incr_repl_master_port; /* Slave: master's TCP port to connect */
-
     int  fullsync_timeout;      /* Fullsync timeout (ms) */
     int  fullsync_max_retries;  /* Max retry count */
 

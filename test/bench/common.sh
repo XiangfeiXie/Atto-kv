@@ -225,11 +225,20 @@ populate() {
 # ---- redis-benchmark ----
 run_bench() {
     local host=$1 port=$2 test=$3 n=${4:-1000000} c=${5:-50} P=${6:-20} d=${7:-3}
-    local csv_line
-    csv_line=$(redis-benchmark -h "$host" -p "$port" -t "$test" \
-        -n "$n" -c "$c" -P "$P" -d "$d" --csv 2>/dev/null | tail -1)
-    # 解析 CSV: "test","rps","..."
-    local qps=$(echo "$csv_line" | cut -d',' -f2 | tr -d '"')
+    local csv_line qps="0" retry=0
+    while [ $retry -lt 2 ]; do
+        csv_line=$(redis-benchmark -h "$host" -p "$port" -t "$test" \
+            -n "$n" -c "$c" -P "$P" -d "$d" --csv 2>/dev/null | grep -E '^"[^"]+","[0-9]' | tail -1)
+        if [ -n "$csv_line" ]; then
+            qps=$(echo "$csv_line" | cut -d',' -f2 | tr -d '"')
+            if [[ "$qps" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                echo "$qps"
+                return 0
+            fi
+        fi
+        retry=$((retry + 1))
+        [ $retry -lt 2 ] && sleep 0.5
+    done
     echo "${qps:-0}"
 }
 

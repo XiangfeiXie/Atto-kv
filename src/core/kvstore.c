@@ -113,6 +113,7 @@ long long get_time_now(void) {
 
 void update_cached_time(void) {
     atomic_store_explicit(&g_cached_ms, get_time_now_real(), memory_order_relaxed);
+    if (ENABLE_AOF) kvs_wal_periodic();
 }
 
 /* ── Utility ────────────────────────────────────────────────────────── */
@@ -172,29 +173,6 @@ void reply_bulk(DynBuf *wb, const char *s, int len) {
     dynbuf_lit(wb, "\r\n");
 }
 
-
-/* ── Write journal ──────────────────────────────────────────────────── */
-
-_Atomic uint64_t g_next_seq = 0;
-
-static void kvs_write_journal_append_kind(uint16_t kind, const char *msg, int length) {
-    if (!msg || length <= 0) return;
-    if (!ENABLE_AOF) return;
-
-    uint64_t seq = atomic_fetch_add_explicit(&g_next_seq, 1, memory_order_acq_rel);
-    uint32_t len = (uint32_t)length;
-    uint16_t flags = 0;
-    uint32_t crc = kvs_crc32c(0, &seq, sizeof(seq));
-    crc = kvs_crc32c(crc, &kind, sizeof(kind));
-    crc = kvs_crc32c(crc, &flags, sizeof(flags));
-    crc = kvs_crc32c(crc, &len, sizeof(len));
-    crc = kvs_crc32c(crc, msg, len);
-    kvs_wal_persist_append_raw(seq, kind, 0, msg, len, crc);
-}
-
-void kvs_write_journal_append(const char *msg, int length) {
-    kvs_write_journal_append_kind(KVS_MUT_KIND_RESP_STRING, msg, length);
-}
 
 /* ── Engine lifecycle ───────────────────────────────────────────────── */
 

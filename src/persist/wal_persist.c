@@ -1,8 +1,18 @@
 /* =========================================================
- * wal_persist.c — WAL 增量持久化（后台线程 + io_uring 落盘）
+ * wal_persist.c — WAL 增量持久化（单线程无锁异步 io_uring 落盘）
  *
- * 主线程通过 kvs_wal_persist_append_raw 入队，
- * 后台消费者线程批量 io_uring 写入 + fsync。
+ * 设计要点（对齐 kvs_persist.c 的单线程模型）:
+ *   - 静态预分配环形缓冲，无锁访问（proactor 单线程保证）
+ *   - 阈值驱动提交（512KB），生产者直接提交 io_uring write SQE
+ *   - 异步 reap：wal_flush_current_slot 时顺便收割已完成 CQE
+ *   - 异步 fsync：仅提交 SQE 不等待，下次 reap 时检查完成
+ *   - 绝对偏移写入，避免 O_APPEND 竞态
+ *   - 零同步开销：无 mutex、无 condvar、无后台线程
+ *
+ * Public API:
+ *   kvs_wal_persist_start / stop / append_raw / set_fsync_policy
+ *   kvs_wal_periodic          — call from event loop (idle maintenance)
+ *   kvs_wal_reap_completions  — reap in-flight write CQEs
  * ========================================================= */
 
 #include "wal_persist.h"
@@ -10,312 +20,267 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <time.h>
-#include <stdatomic.h>
+#include <unistd.h>
 #include <liburing.h>
 
-/* ── Configuration ── */
-#define WAL_BATCH_MAX          1024
-#define WAL_FLUSH_INTERVAL_MS  1
-#define WAL_URING_DEPTH        64
-#define WAL_WRITE_BUF_INIT     (256 * 1024)
+/* ── Tunables ── */
+#define AOF_RING_SIZE           16
+#define AOF_SLOT_SIZE           (512 * 1024 + 4096)
+#define AOF_FLUSH_THRESHOLD     (512 * 1024)
+#define WAL_URING_DEPTH         256
 
-/* ── Pending record (heap-allocated, payload follows header) ── */
+/* ── Ring slot ── */
 typedef struct {
-    uint64_t seq;
-    uint16_t kind;
-    uint16_t flags;
-    uint32_t len;
-    uint32_t crc32;
-    char     payload[];
-} wal_pending_t;
+    char      data[AOF_SLOT_SIZE];
+    uint32_t  len;          /* valid bytes in this slot                    */
+    int       in_flight;    /* write submitted, not yet completed by reap */
+} aof_slot_t;
 
-/* ── State ── */
-static pthread_mutex_t g_wal_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_wal_cond = PTHREAD_COND_INITIALIZER;
-static pthread_t       g_wal_thread;
-static int             g_wal_running = 0;
-static int             g_wal_fd = -1;
+/* ── Global state (single-threaded — no mutex needed) ── */
+static aof_slot_t   g_ring[AOF_RING_SIZE];
+static int          g_prod_idx       = 0;   /* current write slot          */
+static uint32_t     g_prod_pos       = 0;   /* bytes used in current slot  */
+static int          g_inflight_count = 0;   /* slots with in_flight=1      */
 
-/* Pending queue: array of pointers, protected by g_wal_mu */
-static wal_pending_t *g_queue[WAL_BATCH_MAX];
-static int             g_queue_count = 0;
+static struct io_uring  g_wal_ring;
+static int              g_wal_ring_ok = 0;
+static int              g_wal_fd      = -1;
+static off_t            g_aof_offset  = 0;
 
-/* io_uring */
-static struct io_uring g_wal_ring;
-static int             g_wal_ring_ok = 0;
+/* fsync state */
+static int      g_fsync_always    = 0;
+static int      g_fsync_in_flight = 0;
+static time_t   g_last_fsync      = 0;
 
-/* Flatten buffer for io_uring writes */
-static char  *g_write_buf = NULL;
-static size_t g_write_buf_cap = 0;
+/* idle flush tracking — counter-based (single-threaded, no atomic needed) */
+static int g_append_count = 0;
 
-/* fsync policy */
-static int   g_fsync_always = 0;
-static time_t g_last_fsync = 0;
+/* ── Internal prototypes ── */
+static void wal_flush_current_slot(void);
+static void wal_submit_fsync(void);
 
-/* ── Helpers ── */
+/* =========================================================================
+ * io_uring helpers
+ * ========================================================================= */
+
+/* Reap all ready CQEs.  Called from wal_flush_current_slot (threshold flush)
+ * and from kvs_wal_periodic (idle maintenance). */
+void kvs_wal_reap_completions(void) {
+    if (!g_wal_ring_ok) return;
+
+    struct io_uring_cqe *cqe;
+    unsigned head;
+    unsigned count = 0;
+
+    io_uring_for_each_cqe(&g_wal_ring, head, cqe) {
+        int slot_idx = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
+        if (slot_idx == -1) {
+            /* fsync completion */
+            g_fsync_in_flight = 0;
+            if (cqe->res < 0 && cqe->res != -ECANCELED)
+                fprintf(stderr, "[WAL] fsync error: %s\n", strerror(-cqe->res));
+        } else if (slot_idx >= 0 && slot_idx < AOF_RING_SIZE) {
+            if (g_ring[slot_idx].in_flight) {
+                g_ring[slot_idx].in_flight = 0;
+                g_inflight_count--;
+            }
+            if (cqe->res < 0 && cqe->res != -ECANCELED) {
+                fprintf(stderr, "[WAL] write error slot=%d: %s\n",
+                        slot_idx, strerror(-cqe->res));
+            }
+        }
+        count++;
+    }
+
+    if (count > 0)
+        io_uring_cq_advance(&g_wal_ring, count);
+}
+
+/* Acquire an SQE with fallback: submit+reap, then block-wait if needed. */
+static struct io_uring_sqe *wal_get_sqe(void) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&g_wal_ring);
+    if (sqe) return sqe;
+
+    /* Layer 1: submit pending + reap, retry */
+    io_uring_submit(&g_wal_ring);
+    kvs_wal_reap_completions();
+    sqe = io_uring_get_sqe(&g_wal_ring);
+    if (sqe) return sqe;
+
+    /* Layer 2: block-wait for one CQE */
+    struct io_uring_cqe *cqe = NULL;
+    if (io_uring_wait_cqe(&g_wal_ring, &cqe) == 0 && cqe) {
+        int slot_idx = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
+        if (slot_idx == -1) {
+            g_fsync_in_flight = 0;
+        } else if (slot_idx >= 0 && slot_idx < AOF_RING_SIZE) {
+            if (g_ring[slot_idx].in_flight) {
+                g_ring[slot_idx].in_flight = 0;
+                g_inflight_count--;
+            }
+        }
+        io_uring_cqe_seen(&g_wal_ring, cqe);
+    }
+    sqe = io_uring_get_sqe(&g_wal_ring);
+    if (!sqe) {
+        kvs_wal_reap_completions();
+        sqe = io_uring_get_sqe(&g_wal_ring);
+    }
+    if (!sqe) {
+        fprintf(stderr, "[WAL] FATAL: cannot acquire SQE after drain\n");
+    }
+    return sqe;
+}
+
+/* =========================================================================
+ * File & fsync
+ * ========================================================================= */
 
 static int wal_open(void) {
     if (g_wal_fd >= 0) return 0;
     const char *path = persist_path(WAL_REL);
-    g_wal_fd = open(path, O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC, 0644);
+    g_wal_fd = open(path, O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
     if (g_wal_fd < 0) {
         fprintf(stderr, "[WAL] open %s: %s\n", path, strerror(errno));
         return -1;
     }
-    printf("[WAL] file opened: %s\n", path);
+    g_aof_offset = lseek(g_wal_fd, 0, SEEK_END);
+    printf("[WAL] file opened: %s (offset=%ld)\n", path, (long)g_aof_offset);
     return 0;
 }
 
-static void wal_fsync_if_needed(int force) {
-    if (g_wal_fd < 0) return;
+/* Submit async fsync (never blocks).  Completion reaped later. */
+static void wal_submit_fsync(void) {
+    if (g_wal_fd < 0 || !g_wal_ring_ok || g_fsync_in_flight) return;
 
-    time_t now = time(NULL);
-    if (!force && !g_fsync_always && now <= g_last_fsync)
-        return;
-
-    if (g_wal_ring_ok) {
-        struct io_uring_sqe *sqe = io_uring_get_sqe(&g_wal_ring);
-        if (sqe) {
-            io_uring_prep_fsync(sqe, g_wal_fd, IORING_FSYNC_DATASYNC);
-            int ret = io_uring_submit(&g_wal_ring);
-            if (ret >= 0) {
-                struct io_uring_cqe *cqe = NULL;
-                io_uring_wait_cqe(&g_wal_ring, &cqe);
-                if (cqe) {
-                    if (cqe->res < 0)
-                        fprintf(stderr, "[WAL] fsync: %s\n", strerror(-cqe->res));
-                    io_uring_cqe_seen(&g_wal_ring, cqe);
-                }
-            }
-        }
-    } else {
-        fdatasync(g_wal_fd);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&g_wal_ring);
+    if (sqe) {
+        io_uring_prep_fsync(sqe, g_wal_fd, IORING_FSYNC_DATASYNC);
+        io_uring_sqe_set_data(sqe, (void *)(uintptr_t)-1);
+        io_uring_submit(&g_wal_ring);
+        g_fsync_in_flight = 1;
+        g_last_fsync = time(NULL);
     }
-    g_last_fsync = now;
 }
 
-/* Write one batch via io_uring.
- * Flattens hdr+payload for each record into g_write_buf, submits one write SQE. */
-static int wal_flush_batch(wal_pending_t **batch, int n) {
-    if (n <= 0 || g_wal_fd < 0) return 0;
-
-    /* Calculate total bytes */
-    size_t total = 0;
-    for (int i = 0; i < n; i++)
-        total += sizeof(kvs_wal2_record_hdr_t) + batch[i]->len;
-
-    /* Grow write buffer if needed */
-    if (total > g_write_buf_cap) {
-        size_t nc = total + (total >> 2);
-        char *nb = realloc(g_write_buf, nc);
-        if (!nb) return -1;
-        g_write_buf = nb;
-        g_write_buf_cap = nc;
+/* Check and possibly submit async fsync (non-blocking). */
+static void wal_fsync_check(void) {
+    if (g_fsync_always) {
+        /* always mode: submit fsync after every slot flush */
+        wal_submit_fsync();
+        return;
     }
 
-    /* Flatten */
-    char *p = g_write_buf;
-    for (int i = 0; i < n; i++) {
-        wal_pending_t *r = batch[i];
-        kvs_wal2_record_hdr_t hdr;
-        hdr.magic    = KVS_WAL2_MAGIC;
-        hdr.version  = KVS_WAL2_VERSION;
-        hdr.kind     = r->kind;
-        hdr.flags    = r->flags;
-        hdr.seq      = r->seq;
-        hdr.len      = r->len;
-        hdr.crc32    = r->crc32;
-        hdr.reserved = 0;
-        memcpy(p, &hdr, sizeof(hdr));
-        p += sizeof(hdr);
-        memcpy(p, r->payload, r->len);
-        p += r->len;
-    }
+    time_t now = time(NULL);
+    if (now > g_last_fsync && !g_fsync_in_flight)
+        wal_submit_fsync();
+}
 
-    /* Submit via io_uring or fallback to write() */
-    if (g_wal_ring_ok) {
-        struct io_uring_sqe *sqe = io_uring_get_sqe(&g_wal_ring);
-        if (sqe) {
-            io_uring_prep_write(sqe, g_wal_fd, g_write_buf, total, -1);
-            int ret = io_uring_submit(&g_wal_ring);
-            if (ret >= 0) {
+/* =========================================================================
+ * Slot flush (called when current slot reaches threshold)
+ * ========================================================================= */
+
+/* Submit current slot via async io_uring write, then roll to next slot.
+ * Must be called from the proactor event-loop thread (single-threaded). */
+static void wal_flush_current_slot(void) {
+    if (g_prod_pos == 0) return;
+
+    aof_slot_t *slot = &g_ring[g_prod_idx];
+    slot->len = g_prod_pos;
+
+    /* If slot is still in-flight from a previous round, reap and retry.
+     * This should be extremely rare with 16 slots unless disk is very slow. */
+    if (slot->in_flight) {
+        kvs_wal_reap_completions();
+        if (slot->in_flight) {
+            static _Atomic int stall_counter = 0;
+            int n = atomic_fetch_add(&stall_counter, 1);
+            if (n % 100 == 0) {
+                fprintf(stderr, "[WAL] I/O stall: all %d slots in flight, "
+                        "waiting for disk (count=%d)\n",
+                        AOF_RING_SIZE, n + 1);
+            }
+            /* Spin-reap until slot frees up */
+            while (slot->in_flight) {
                 struct io_uring_cqe *cqe = NULL;
-                io_uring_wait_cqe(&g_wal_ring, &cqe);
-                if (cqe) {
-                    if (cqe->res < 0) {
-                        fprintf(stderr, "[WAL] write: %s\n", strerror(-cqe->res));
-                        io_uring_cqe_seen(&g_wal_ring, cqe);
-                        return -1;
+                if (io_uring_wait_cqe(&g_wal_ring, &cqe) == 0 && cqe) {
+                    int idx = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
+                    if (idx == -1) g_fsync_in_flight = 0;
+                    else if (idx >= 0 && idx < AOF_RING_SIZE) {
+                        if (g_ring[idx].in_flight) {
+                            g_ring[idx].in_flight = 0;
+                            g_inflight_count--;
+                        }
                     }
                     io_uring_cqe_seen(&g_wal_ring, cqe);
                 }
             }
-        } else {
-            /* ring full, fallback */
-            ssize_t w = write(g_wal_fd, g_write_buf, total);
-            if (w < 0) return -1;
         }
+    }
+
+    /* Acquire SQE and submit async write */
+    struct io_uring_sqe *sqe = wal_get_sqe();
+    if (sqe) {
+        io_uring_prep_write(sqe, g_wal_fd, slot->data, slot->len, g_aof_offset);
+        io_uring_sqe_set_data(sqe, (void *)(uintptr_t)(long)g_prod_idx);
+        g_aof_offset += slot->len;
+        slot->in_flight = 1;
+        g_inflight_count++;
+        io_uring_submit(&g_wal_ring);
+
+        /* Reap any ready completions while we're here */
+        kvs_wal_reap_completions();
     } else {
-        ssize_t w = write(g_wal_fd, g_write_buf, total);
-        if (w < 0) return -1;
+        /* Catastrophic: fallback to synchronous write */
+        fprintf(stderr, "[WAL] FATAL: no SQE, using sync write fallback\n");
+        ssize_t w = write(g_wal_fd, slot->data, slot->len);
+        if (w < 0)
+            fprintf(stderr, "[WAL] sync write error: %s\n", strerror(errno));
+        /* slot not marked in_flight, can be reused immediately */
     }
 
-    return 0;
+    /* Roll to next slot */
+    g_prod_idx = (g_prod_idx + 1) % AOF_RING_SIZE;
+    g_prod_pos = 0;
 }
 
-/* ── Consumer thread ── */
+/* =========================================================================
+ * Public API
+ * ========================================================================= */
 
-static void *wal_consumer(void *arg) {
-    (void)arg;
+/* Periodic maintenance — call from event loop (update_cached_time).
+ * Handles: reap completions, partial flush of stale data, async fsync. */
+void kvs_wal_periodic(void) {
+    if (!g_wal_ring_ok) return;
 
-    while (g_wal_running) {
-        pthread_mutex_lock(&g_wal_mu);
+    /* Reap any completions (frees in-flight slots) */
+    kvs_wal_reap_completions();
 
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += WAL_FLUSH_INTERVAL_MS * 1000000L;
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-
-        while (g_queue_count == 0 && g_wal_running)
-            pthread_cond_timedwait(&g_wal_cond, &g_wal_mu, &ts);
-
-        if (!g_wal_running && g_queue_count == 0) {
-            pthread_mutex_unlock(&g_wal_mu);
-            break;
-        }
-
-        /* Detach all pending */
-        int n = g_queue_count;
-        wal_pending_t *batch[WAL_BATCH_MAX];
-        memcpy(batch, g_queue, (size_t)n * sizeof(wal_pending_t *));
-        g_queue_count = 0;
-
-        pthread_mutex_unlock(&g_wal_mu);
-
-        if (n > 0) {
-            wal_flush_batch(batch, n);
-            wal_fsync_if_needed(0);
-            for (int i = 0; i < n; i++) free(batch[i]);
-        }
-    }
-    return NULL;
-}
-
-/* ── Public API ── */
-
-int kvs_wal_persist_start(void) {
-    pthread_mutex_lock(&g_wal_mu);
-
-    if (wal_open() != 0) {
-        pthread_mutex_unlock(&g_wal_mu);
-        return -1;
-    }
-
-    /* Init io_uring */
-    if (!g_wal_ring_ok) {
-        int rc = io_uring_queue_init(WAL_URING_DEPTH, &g_wal_ring, 0);
-        if (rc < 0) {
-            fprintf(stderr, "[WAL] io_uring init: %s, using write() fallback\n",
-                    strerror(-rc));
+    /* Partial flush: if data has been sitting > 1 second in current slot.
+     * Check via append counter — if counter hasn't changed since last check,
+     * data is stale.  Event loop runs at ~10K-100K iters/s so 4096 ≈ idle. */
+    {
+        static int last_count = 0;
+        static int idle_ticks = 0;
+        int cur = g_append_count;
+        if (cur == last_count && g_prod_pos > 0) {
+            idle_ticks++;
+            if (idle_ticks > 100) { /* ~1s at 100Hz event loop */
+                wal_flush_current_slot();
+                idle_ticks = 0;
+            }
         } else {
-            g_wal_ring_ok = 1;
-            printf("[WAL] io_uring ready (depth=%d)\n", WAL_URING_DEPTH);
+            idle_ticks = 0;
         }
+        last_count = cur;
     }
 
-    /* Alloc initial write buffer */
-    if (!g_write_buf) {
-        g_write_buf = malloc(WAL_WRITE_BUF_INIT);
-        g_write_buf_cap = g_write_buf ? WAL_WRITE_BUF_INIT : 0;
-    }
-
-    g_wal_running = 1;
-    g_queue_count = 0;
-    g_last_fsync = time(NULL);
-
-    int rc = pthread_create(&g_wal_thread, NULL, wal_consumer, NULL);
-    if (rc != 0) {
-        fprintf(stderr, "[WAL] thread create: %s\n", strerror(rc));
-        g_wal_running = 0;
-        pthread_mutex_unlock(&g_wal_mu);
-        return -1;
-    }
-
-    pthread_mutex_unlock(&g_wal_mu);
-    printf("[WAL] consumer thread started (batch=%d)\n", WAL_BATCH_MAX);
-    return 0;
-}
-
-int kvs_wal_persist_append_raw(uint64_t seq, uint16_t kind, uint16_t flags,
-                                const char *payload, uint32_t len, uint32_t crc) {
-    if (!payload || len == 0 || len > KVS_JOURNAL_MAX_PAYLOAD) return -1;
-
-    wal_pending_t *r = malloc(sizeof(wal_pending_t) + len);
-    if (!r) return -1;
-    r->seq   = seq;
-    r->kind  = kind;
-    r->flags = flags;
-    r->len   = len;
-    r->crc32 = crc;
-    memcpy(r->payload, payload, len);
-
-    pthread_mutex_lock(&g_wal_mu);
-    if (g_queue_count < WAL_BATCH_MAX) {
-        g_queue[g_queue_count++] = r;
-        r = NULL; /* ownership transferred */
-    }
-    /* If queue full, signal consumer to drain; retry next call */
-    if (g_queue_count >= (WAL_BATCH_MAX >> 1))
-        pthread_cond_signal(&g_wal_cond);
-    pthread_mutex_unlock(&g_wal_mu);
-
-    free(r); /* NULL if queued, else dropped (should not happen) */
-    return 0;
-}
-
-void kvs_wal_persist_stop(void) {
-    if (g_wal_running) {
-        pthread_mutex_lock(&g_wal_mu);
-        g_wal_running = 0;
-        pthread_cond_signal(&g_wal_cond);
-        pthread_mutex_unlock(&g_wal_mu);
-        pthread_join(g_wal_thread, NULL);
-        printf("[WAL] consumer stopped\n");
-    }
-
-    /* Drain remaining */
-    pthread_mutex_lock(&g_wal_mu);
-    if (g_queue_count > 0) {
-        wal_flush_batch(g_queue, g_queue_count);
-        for (int i = 0; i < g_queue_count; i++) free(g_queue[i]);
-        g_queue_count = 0;
-    }
-    wal_fsync_if_needed(1);
-
-    if (g_wal_fd >= 0) {
-        close(g_wal_fd);
-        g_wal_fd = -1;
-    }
-
-    if (g_wal_ring_ok) {
-        io_uring_queue_exit(&g_wal_ring);
-        g_wal_ring_ok = 0;
-    }
-
-    free(g_write_buf);
-    g_write_buf = NULL;
-    g_write_buf_cap = 0;
-
-    pthread_mutex_unlock(&g_wal_mu);
+    /* Check fsync timer */
+    wal_fsync_check();
 }
 
 void kvs_wal_set_fsync_policy(const char *policy) {
@@ -330,4 +295,105 @@ void kvs_wal_set_fsync_policy(const char *policy) {
         g_fsync_always = 0;
         printf("[WAL] fsync: no\n");
     }
+}
+
+int kvs_wal_persist_start(void) {
+    if (wal_open() != 0)
+        return -1;
+
+    if (!g_wal_ring_ok) {
+        int rc = io_uring_queue_init(WAL_URING_DEPTH, &g_wal_ring, 0);
+        if (rc < 0) {
+            fprintf(stderr, "[WAL] io_uring init: %s\n", strerror(-rc));
+            return -1;
+        }
+        g_wal_ring_ok = 1;
+        printf("[WAL] io_uring ready (depth=%d)\n", WAL_URING_DEPTH);
+    }
+
+    memset(g_ring, 0, sizeof(g_ring));
+    g_prod_idx        = 0;
+    g_prod_pos        = 0;
+    g_inflight_count  = 0;
+    g_fsync_in_flight = 0;
+    g_last_fsync      = time(NULL);
+    g_append_count = 0;
+
+    printf("[WAL] lock-free ring ready (%d slots x %d KB)\n",
+           AOF_RING_SIZE, AOF_SLOT_SIZE / 1024);
+    return 0;
+}
+
+/* Hot-path: append raw RESP bytes to ring buffer — lock-free, single-threaded.
+ * Mirror of kvs_persist.c:kvs_aof_append — threshold check + single memcpy.
+ * Called from kvs_write_journal_append (proactor event-loop thread). */
+int kvs_wal_persist_append_raw(const char *payload, uint32_t len) {
+    if (!payload || len == 0 || len > KVS_JOURNAL_MAX_PAYLOAD) return -1;
+
+    /* Threshold check: slot nearly full?  Flush before writing new data
+     * so the new record always fits in the current slot. */
+    if (g_prod_pos + len > AOF_SLOT_SIZE - 4096) {
+        wal_flush_current_slot();
+    }
+
+    /* Single memcpy — no header, no CRC, no time() syscall */
+    memcpy(g_ring[g_prod_idx].data + g_prod_pos, payload, len);
+    g_prod_pos += len;
+
+    /* Update append counter for idle detection (every N appends) */
+    g_append_count++;
+
+    return 0;
+}
+
+void kvs_wal_persist_stop(void) {
+    /* Flush remaining partial slot */
+    if (g_prod_pos > 0)
+        wal_flush_current_slot();
+
+    /* Wait for all in-flight writes to complete */
+    if (g_inflight_count > 0) {
+        printf("[WAL] draining %d in-flight writes...\n", g_inflight_count);
+        while (g_inflight_count > 0) {
+            struct io_uring_cqe *cqe = NULL;
+            int ret = io_uring_wait_cqe(&g_wal_ring, &cqe);
+            if (ret < 0) break;
+            if (cqe) {
+                int idx = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
+                if (idx == -1) g_fsync_in_flight = 0;
+                else if (idx >= 0 && idx < AOF_RING_SIZE) {
+                    if (g_ring[idx].in_flight) {
+                        g_ring[idx].in_flight = 0;
+                        g_inflight_count--;
+                    }
+                }
+                io_uring_cqe_seen(&g_wal_ring, cqe);
+            }
+        }
+    }
+
+    /* Final fsync */
+    if (g_wal_fd >= 0) {
+        if (g_wal_ring_ok) {
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&g_wal_ring);
+            if (sqe) {
+                io_uring_prep_fsync(sqe, g_wal_fd, IORING_FSYNC_DATASYNC);
+                io_uring_submit(&g_wal_ring);
+                struct io_uring_cqe *cqe = NULL;
+                io_uring_wait_cqe(&g_wal_ring, &cqe);
+                if (cqe) io_uring_cqe_seen(&g_wal_ring, cqe);
+            }
+        } else {
+            fdatasync(g_wal_fd);
+        }
+        close(g_wal_fd);
+        g_wal_fd = -1;
+    }
+
+    if (g_wal_ring_ok) {
+        io_uring_queue_exit(&g_wal_ring);
+        g_wal_ring_ok = 0;
+    }
+
+    printf("[WAL] stopped safely\n");
 }

@@ -7,6 +7,7 @@
 #include "kv_type_string.h"
 #include "kv_type_hash.h"
 #include "config.h"
+#include "wal_persist.h"
 
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -22,8 +23,12 @@ void reply_integer(DynBuf *wb, long long v);
 void reply_bulk(DynBuf *wb, const char *s, int len);
 void entry_cleanup_by_type(kv_entry_t *e);
 
-/* write journal */
-void kvs_write_journal_append(const char *msg, int length);
+/* write journal — inline for hot-path (threshold check + single memcpy) */
+static inline void kvs_write_journal_append(const char *msg, int length) {
+    if (!msg || length <= 0) return;
+    if (!ENABLE_AOF) return;
+    kvs_wal_persist_append_raw(msg, (uint32_t)length);
+}
 
 /* ── from kvstore_expire.c ── */
 

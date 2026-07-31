@@ -53,11 +53,22 @@ REDIS_PING_QPS=0
 
 # ---- PING 测试 ----
 run_ping_test() {
-    local host=$1 port=$2 label=$3
-    local qps
-    qps=$(redis-benchmark -h "$host" -p "$port" -t ping \
-        -n $BENCH_N -c $BENCH_C --csv 2>/dev/null | tail -1 | cut -d',' -f2 | tr -d '"')
-    echo "${qps:-0}"
+    local host=$1 port=$2 label=$3 qps="0" retry=0
+    while [ $retry -lt 2 ]; do
+        local csv_line
+        csv_line=$(redis-benchmark -h "$host" -p "$port" -t ping \
+            -n $BENCH_N -c $BENCH_C --csv 2>/dev/null | tail -1)
+        if [ -n "$csv_line" ]; then
+            qps=$(echo "$csv_line" | cut -d',' -f2 | tr -d '"')
+            if [[ "$qps" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                echo "$qps"
+                return 0
+            fi
+        fi
+        retry=$((retry + 1))
+        [ $retry -lt 2 ] && sleep 0.5
+    done
+    echo "0"
 }
 
 # ---- 预热函数（写入 WARMUP_N 个 key）----
@@ -113,10 +124,16 @@ test_t2_kvs_aof_off() {
     echo "════════════════════════════════════════════════"
 
     stop_redis
-    start_kvs "kvstore-none.conf"
-    rm -f "${PROJECT_DIR}/build/incr.wal"
 
     for P in "${PIPELINES[@]}"; do
+        # Fresh kvstore + clean WAL for each P (isolates I/O effects)
+        start_kvs "kvstore-none.conf"
+        rm -f "${PROJECT_DIR}/build/incr.wal"
+
+        # Warmup to eliminate cold-start bias (200K ops, not recorded)
+        redis-benchmark -h 127.0.0.1 -p "$KVS_PORT" -t set \
+            -n $WARMUP_N -c $BENCH_C -P 16 -d 16 -q >/dev/null 2>&1 || true
+
         # SET
         local s_qps
         s_qps=$(run_bench 127.0.0.1 "$KVS_PORT" set $BENCH_N $BENCH_C "$P" 16)
@@ -131,9 +148,9 @@ test_t2_kvs_aof_off() {
         KVS_AOF_OFF_GET[$P]=$g_qps
         record_wal "Pipeline-${P}-GET" "kvstore" "off" "$g_qps"
         echo -e "  P=${P} GET  → ${GREEN}${g_qps} req/s${NC}"
-    done
 
-    stop_kvs
+        stop_kvs
+    done
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -146,10 +163,16 @@ test_t3_kvs_aof_on() {
     echo "════════════════════════════════════════════════"
 
     stop_redis
-    start_kvs "kvstore-aof.conf"
-    rm -f "${PROJECT_DIR}/build/incr.wal"
 
     for P in "${PIPELINES[@]}"; do
+        # Fresh kvstore + clean WAL for each P (isolates I/O effects)
+        start_kvs "kvstore-aof.conf"
+        rm -f "${PROJECT_DIR}/build/incr.wal"
+
+        # Warmup to eliminate cold-start bias (200K ops, not recorded)
+        redis-benchmark -h 127.0.0.1 -p "$KVS_PORT" -t set \
+            -n $WARMUP_N -c $BENCH_C -P 16 -d 16 -q >/dev/null 2>&1 || true
+
         # SET
         local s_qps
         s_qps=$(run_bench 127.0.0.1 "$KVS_PORT" set $BENCH_N $BENCH_C "$P" 16)
@@ -164,9 +187,9 @@ test_t3_kvs_aof_on() {
         KVS_AOF_ON_GET[$P]=$g_qps
         record_wal "Pipeline-${P}-GET" "kvstore" "on" "$g_qps"
         echo -e "  P=${P} GET  → ${GREEN}${g_qps} req/s${NC}"
-    done
 
-    stop_kvs
+        stop_kvs
+    done
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -203,12 +226,16 @@ test_t5_redis_aof_off() {
     echo "════════════════════════════════════════════════"
 
     stop_kvs
-    stop_redis
-    start_redis
-    redis_configure none
-    redis-cli -p $REDIS_PORT FLUSHALL >/dev/null
 
     for P in "${PIPELINES[@]}"; do
+        # Fresh Redis + clean AOF for each P (isolates I/O effects)
+        stop_redis
+        start_redis
+        redis_configure none
+
+        # Warmup to eliminate cold-start bias
+        warmup_keys 127.0.0.1 "$REDIS_PORT" 10
+
         # SET
         local s_qps
         s_qps=$(run_bench 127.0.0.1 "$REDIS_PORT" set $BENCH_N $BENCH_C "$P" 16)
@@ -238,11 +265,16 @@ test_t6_redis_aof_on() {
     echo "════════════════════════════════════════════════"
 
     stop_kvs
-    stop_redis
-    start_redis
-    redis_configure aof
 
     for P in "${PIPELINES[@]}"; do
+        # Fresh Redis + clean AOF for each P (isolates I/O effects)
+        stop_redis
+        start_redis
+        redis_configure aof
+
+        # Warmup to eliminate cold-start bias
+        warmup_keys 127.0.0.1 "$REDIS_PORT" 10
+
         # SET
         local s_qps
         s_qps=$(run_bench 127.0.0.1 "$REDIS_PORT" set $BENCH_N $BENCH_C "$P" 16)
@@ -311,13 +343,13 @@ print_summary() {
         # AOF 开销 = (1 - on/off) * 100%
         local kvs_cost kvs_cost_str red_cost red_cost_str
         if [ "$(echo "$kvs_off > 0" | bc -l 2>/dev/null)" = "1" ]; then
-            kvs_cost=$(echo "scale=1; (1 - $kvs_on/$kvs_off)*100" | bc -l 2>/dev/null || echo "N/A")
+            kvs_cost=$(echo "scale=2; (1 - $kvs_on/$kvs_off)*100" | bc -l 2>/dev/null || echo "N/A")
             kvs_cost_str="${kvs_cost}%"
         else
             kvs_cost_str="N/A"
         fi
         if [ "$(echo "$red_off > 0" | bc -l 2>/dev/null)" = "1" ]; then
-            red_cost=$(echo "scale=1; (1 - $red_on/$red_off)*100" | bc -l 2>/dev/null || echo "N/A")
+            red_cost=$(echo "scale=2; (1 - $red_on/$red_off)*100" | bc -l 2>/dev/null || echo "N/A")
             red_cost_str="${red_cost}%"
         else
             red_cost_str="N/A"
@@ -352,13 +384,13 @@ print_summary() {
 
         local kvs_cost kvs_cost_str red_cost red_cost_str
         if [ "$(echo "$kvs_off > 0" | bc -l 2>/dev/null)" = "1" ]; then
-            kvs_cost=$(echo "scale=1; (1 - $kvs_on/$kvs_off)*100" | bc -l 2>/dev/null || echo "N/A")
+            kvs_cost=$(echo "scale=2; (1 - $kvs_on/$kvs_off)*100" | bc -l 2>/dev/null || echo "N/A")
             kvs_cost_str="${kvs_cost}%"
         else
             kvs_cost_str="N/A"
         fi
         if [ "$(echo "$red_off > 0" | bc -l 2>/dev/null)" = "1" ]; then
-            red_cost=$(echo "scale=1; (1 - $red_on/$red_off)*100" | bc -l 2>/dev/null || echo "N/A")
+            red_cost=$(echo "scale=2; (1 - $red_on/$red_off)*100" | bc -l 2>/dev/null || echo "N/A")
             red_cost_str="${red_cost}%"
         else
             red_cost_str="N/A"
@@ -378,11 +410,19 @@ print_summary() {
     local p160_red_set_off=${REDIS_AOF_OFF_SET[160]:-0}
     local p160_red_set_on=${REDIS_AOF_ON_SET[160]:-0}
 
+    local p160_kvs_cost="N/A" p160_red_cost="N/A"
+    if [ "$(echo "$p160_kvs_set_off > 0" | bc -l 2>/dev/null)" = "1" ]; then
+        p160_kvs_cost="$(echo "scale=2; (1 - $p160_kvs_set_on/$p160_kvs_set_off)*100" | bc -l 2>/dev/null)%"
+    fi
+    if [ "$(echo "$p160_red_set_off > 0" | bc -l 2>/dev/null)" = "1" ]; then
+        p160_red_cost="$(echo "scale=2; (1 - $p160_red_set_on/$p160_red_set_off)*100" | bc -l 2>/dev/null)%"
+    fi
+
     echo "  压测参数: -n $BENCH_N -c $BENCH_C -d 16"
     echo "  PING:  kvstore=${KVS_PING_QPS} req/s,  Redis=${REDIS_PING_QPS} req/s"
     echo "  SET@P=160:"
-    echo "    kvstore AOF off: ${p160_kvs_set_off} req/s,  on: ${p160_kvs_set_on} req/s  (开销: ${kvs_cost_str:-N/A})"
-    echo "    Redis   AOF off: ${p160_red_set_off} req/s,  on: ${p160_red_set_on} req/s  (开销: ${red_cost_str:-N/A})"
+    echo "    kvstore AOF off: ${p160_kvs_set_off} req/s,  on: ${p160_kvs_set_on} req/s  (开销: ${p160_kvs_cost})"
+    echo "    Redis   AOF off: ${p160_red_set_off} req/s,  on: ${p160_red_set_on} req/s  (开销: ${p160_red_cost})"
     echo ""
 
     {

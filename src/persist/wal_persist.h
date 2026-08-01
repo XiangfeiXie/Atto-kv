@@ -6,6 +6,9 @@
 
 /* ── Tunables ── */
 #define KVS_JOURNAL_MAX_PAYLOAD  (1024u * 1024u)
+#define AOF_REWRITE_MIN_SIZE     ((off_t)64 * 1024 * 1024)   /* 64 MB  */
+#define AOF_REWRITE_PERC_DEF     100                          /* 100%    */
+#define AOF_REWRITE_COOLDOWN_SEC 5
 
 /* ── Public API ── */
 
@@ -27,5 +30,10 @@ void kvs_wal_periodic(void);
 
 /* Reap in-flight io_uring write completions (frees ring slots). */
 void kvs_wal_reap_completions(void);
+
+/* ── AOF rewrite (BGREWRITEAOF) ── */
+int  kvs_aof_rewrite_bg(void);
+void kvs_aof_rewrite_done(int status);
+void kvs_aof_auto_rewrite_check(void);
 
 #endif

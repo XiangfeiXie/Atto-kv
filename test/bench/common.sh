@@ -11,7 +11,8 @@ set -euo pipefail
 PROJECT_DIR="/home/xxf/9.1-kvstore"
 KVS_BIN="${PROJECT_DIR}/build/kvstore"
 CONF_DIR="${PROJECT_DIR}/conf"
-LOG_DIR="/tmp/kvstore_bench"
+LOG_DIR="/tmp/kvstore_bench_$$"
+mkdir -p "$LOG_DIR" 2>/dev/null || LOG_DIR="$(mktemp -d -t kvstore_bench.XXXXXX)"
 
 # ---- 默认端口 ----
 KVS_PORT=2000
@@ -212,7 +213,7 @@ populate() {
         local batch=$batch_size
         [ $batch -gt $remaining ] && batch=$remaining
         for i in $(seq $((sent+1)) $((sent+batch))); do
-            printf 'SET key%06d benchmark_value_\r\n' $i
+            printf 'SET key:%012d benchmark_value_\r\n' $i
         done | timeout 300 redis-cli -h "$host" -p "$port" --pipe > /dev/null 2>&1
         sent=$((sent + batch))
         remaining=$((remaining - batch))

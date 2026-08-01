@@ -113,7 +113,10 @@ long long get_time_now(void) {
 
 void update_cached_time(void) {
     atomic_store_explicit(&g_cached_ms, get_time_now_real(), memory_order_relaxed);
-    if (ENABLE_AOF) kvs_wal_periodic();
+    if (ENABLE_AOF) {
+        kvs_wal_periodic();
+        kvs_aof_auto_rewrite_check();
+    }
 }
 
 /* ── Utility ────────────────────────────────────────────────────────── */

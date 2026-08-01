@@ -33,19 +33,13 @@
 
 /* ── Dynamic buffer for RDB serialization ── */
 typedef struct {
-    char *buf;
+    char  *buf;
     size_t len;
     size_t cap;
-    /* P0: per-page reference count — pre-scan populates, serialize
-       scan decrements; madvise(MADV_DONTNEED) when count → 0 */
-    struct { uintptr_t page; int count; } *page_map;
-    size_t page_map_size;   /* power of 2 */
-    size_t page_map_mask;
 } rdb_buf_t;
 
 /* ── Forward declarations ── */
 static void rdb_buf_reserve(rdb_buf_t *b, size_t need);
-static void rdb_buf_put(rdb_buf_t *b, const void *p, size_t n);
 static void store_scan(void (*cb)(kv_entry_t *e, void *priv), void *priv);
 static void rdb_write_uring(int fd, const char *data, size_t total);
 static void rdb_sigchld(int signo);
@@ -72,12 +66,6 @@ static void rdb_buf_reserve(rdb_buf_t *b, size_t need) {
 
     b->buf = (char *)realloc(b->buf, ncap);
     b->cap = ncap;
-}
-
-static void rdb_buf_put(rdb_buf_t *b, const void *p, size_t n) {
-    rdb_buf_reserve(b, n);
-    memcpy(b->buf + b->len, p, n);
-    b->len += n;
 }
 
 /* =========================================================================
@@ -236,72 +224,81 @@ int rdb_entry_payload(kv_entry_t *e, const char **data, int *dlen) {
     return 0;
 }
 
-/* ── Serialization callbacks ── */
+/* Extract serializable data from an entry. Handles hash dict flattening.
+ * Returns 0 on success; *owned is set when the caller must free it. */
+static int rdb_entry_extract(kv_entry_t *e,
+                              const char **key, int *klen,
+                              const char **data, int *dlen,
+                              long long *expire,
+                              char **owned) {
+    *owned = NULL;
+    if (!e) return -1;
 
-/* Forward decl — defined after rdb_save_sync section */
-static int *page_map_get(rdb_buf_t *b, uintptr_t page);
-
-/* Serialize one STRING dict entry to RDB binary format (rdb_buf_t). */
-static void rdb_save_callback_buf(kv_entry_t *e, void *priv) {
-    char *owned = NULL;
-    const char *data_ptr = NULL;
-    int dlen = 0;
     uint32_t owned_len = 0;
-    if (e && entry_type(e) == KV_TYPE_HASH && entry_encoding(e) == KV_ENCODING_DICT) {
-        if (hash_flatten_to_packed(e, &owned, &owned_len) != 0) return;
-        data_ptr = owned;
-        dlen = (int)owned_len;
-    } else if (rdb_entry_payload(e, &data_ptr, &dlen) != 0) {
-        return;
+    if (entry_type(e) == KV_TYPE_HASH && entry_encoding(e) == KV_ENCODING_DICT) {
+        if (hash_flatten_to_packed(e, owned, &owned_len) != 0) return -1;
+        *data = *owned;
+        *dlen = (int)owned_len;
+    } else if (rdb_entry_payload(e, data, dlen) != 0) {
+        return -1;
     }
 
-    rdb_buf_t *b = (rdb_buf_t *)priv;
-    const char *key = entry_key(e);
-    int klen = (int)e->key_len;
-    long long expire = e->expire;
+    *key    = entry_key(e);
+    *klen   = (int)e->key_len;
+    *expire = e->expire;
+    return 0;
+}
 
-    /* P1: single reserve + direct memcpy instead of 5 rdb_buf_put calls */
-    size_t total = sizeof(int) + (size_t)klen + sizeof(int) + (size_t)dlen + sizeof(long long);
+/* ── Serialization callbacks ── */
+
+/* Single-entry serialize into rdb_buf_t (used by rdb_save_sync).
+ * Format: [klen:4][key:klen][dlen:4][data:dlen][expire:8] */
+static void rdb_save_callback_buf(kv_entry_t *e, void *priv) {
+    const char *key, *data;
+    int klen, dlen;
+    long long expire;
+    char *owned = NULL;
+
+    if (rdb_entry_extract(e, &key, &klen, &data, &dlen, &expire, &owned) != 0)
+        return;
+
+    rdb_buf_t *b = (rdb_buf_t *)priv;
+    size_t total = sizeof(int) + (size_t)klen + sizeof(int)
+                 + (size_t)dlen + sizeof(long long);
     rdb_buf_reserve(b, total);
     char *dst = b->buf + b->len;
-    memcpy(dst, &klen, sizeof(int)); dst += sizeof(int);
-    memcpy(dst, key, (size_t)klen);  dst += klen;
-    memcpy(dst, &dlen, sizeof(int)); dst += sizeof(int);
-    memcpy(dst, data_ptr, (size_t)dlen); dst += dlen;
+    memcpy(dst, &klen,   sizeof(int));   dst += sizeof(int);
+    memcpy(dst, key,     (size_t)klen);  dst += klen;
+    memcpy(dst, &dlen,   sizeof(int));   dst += sizeof(int);
+    memcpy(dst, data,    (size_t)dlen);  dst += dlen;
     memcpy(dst, &expire, sizeof(long long));
     b->len += total;
-
-    /* P0: decrement page refcount, madvise when last entry on page done */
-    uintptr_t page = ((uintptr_t)e) & ~(uintptr_t)0xFFF;
-    int *cnt = page_map_get(b, page);
-    if (cnt && --(*cnt) == 0)
-        madvise((void *)page, 4096, MADV_DONTNEED);
 
     free(owned);
 }
 
+/* Single-entry serialize into DynBuf (used by RDMA fullsync).
+ * Same binary format as rdb_save_callback_buf. */
 void serialize_entry_to_buf(DynBuf *out, kv_entry_t *e) {
+    const char *key, *data;
+    int klen, dlen;
+    long long expire;
     char *owned = NULL;
-    const char *data_ptr = NULL;
-    int dlen = 0;
-    uint32_t owned_len = 0;
-    if (e && entry_type(e) == KV_TYPE_HASH && entry_encoding(e) == KV_ENCODING_DICT) {
-        if (hash_flatten_to_packed(e, &owned, &owned_len) != 0) return;
-        data_ptr = owned;
-        dlen = (int)owned_len;
-    } else if (rdb_entry_payload(e, &data_ptr, &dlen) != 0) {
+
+    if (rdb_entry_extract(e, &key, &klen, &data, &dlen, &expire, &owned) != 0)
         return;
-    }
 
-    const char *key = entry_key(e);
-    int klen = (int)e->key_len;
-    long long expire = e->expire;
+    size_t total = sizeof(int) + (size_t)klen + sizeof(int)
+                 + (size_t)dlen + sizeof(long long);
+    dynbuf_reserve(out, out->len + (int)total);
+    char *dst = out->buf + out->len;
+    memcpy(dst, &klen,   sizeof(int));   dst += sizeof(int);
+    memcpy(dst, key,     (size_t)klen);  dst += klen;
+    memcpy(dst, &dlen,   sizeof(int));   dst += sizeof(int);
+    memcpy(dst, data,    (size_t)dlen);  dst += dlen;
+    memcpy(dst, &expire, sizeof(long long));
+    out->len += (int)total;
 
-    dynbuf_append(out, (const char *)&klen, sizeof(int));
-    dynbuf_append(out, key, klen);
-    dynbuf_append(out, (const char *)&dlen, sizeof(int));
-    dynbuf_append(out, data_ptr, dlen);
-    dynbuf_append(out, (const char *)&expire, sizeof(long long));
     free(owned);
 }
 
@@ -312,9 +309,9 @@ static void rdb_serialize_cb_dynbuf(kv_entry_t *e, void *priv) {
 }
 
 void rdb_serialize_to_buf(DynBuf *out) {
-    int magic = 0x524442;
-    int version = 2;
-    int db_num = 0;
+    int magic     = 0x524442;
+    int version   = 2;
+    int db_num    = 0;
     int key_count = (int)kv_store_count();
 
     dynbuf_reserve(out, 16 + key_count * 64);
@@ -329,121 +326,41 @@ void rdb_serialize_to_buf(DynBuf *out) {
 
 
 /* =============================================================================
- * RDB synchronous save (called from fork child or fallback path)
+ * RDB synchronous save (single-pass: serialize → io_uring write → rename)
  * ============================================================================= */
 
-#define PAGE_MAP_INIT_SIZE  16384   /* power of 2, ~17K pages for 1M entries */
-
-/* Find or create a slot for |page| in the open-addressing hash map.
- * Returns pointer to the count field. */
-static int *page_map_find_or_create(rdb_buf_t *b, uintptr_t page) {
-    size_t mask = b->page_map_mask;
-    size_t slot = (size_t)((page >> 12) * 11400714819323198549ULL) & mask;
-
-    for (;;) {
-        if (b->page_map[slot].page == page)
-            return &b->page_map[slot].count;
-        if (b->page_map[slot].page == 0)
-            break;
-        slot = (slot + 1) & mask;
-    }
-
-    /* check load factor, grow if >= 75% */
-    size_t used = 0;
-    for (size_t i = 0; i < b->page_map_size; i++)
-        if (b->page_map[i].page) used++;
-
-    if ((used + 1) * 4 >= b->page_map_size * 3 && b->page_map_size < (1 << 20)) {
-        size_t old_sz = b->page_map_size;
-        size_t new_sz = old_sz * 2;
-        size_t new_mask = new_sz - 1;
-        typeof(b->page_map) old = b->page_map;
-
-        b->page_map = calloc(new_sz, sizeof(*b->page_map));
-        if (b->page_map) {
-            b->page_map_size = new_sz;
-            b->page_map_mask = new_mask;
-            for (size_t i = 0; i < old_sz; i++) {
-                if (old[i].page) {
-                    int *c = page_map_find_or_create(b, old[i].page);
-                    *c = old[i].count;
-                }
-            }
-        }
-        free(old);
-        if (!b->page_map) return NULL;
-
-        /* re-find slot in new table */
-        slot = (size_t)((page >> 12) * 11400714819323198549ULL) & b->page_map_mask;
-        for (;;) {
-            if (b->page_map[slot].page == page && b->page_map[slot].page)
-                return &b->page_map[slot].count;
-            if (b->page_map[slot].page == 0) break;
-            slot = (slot + 1) & b->page_map_mask;
-        }
-    }
-
-    b->page_map[slot].page = page;
-    b->page_map[slot].count = 0;
-    return &b->page_map[slot].count;
-}
-
-/* Look up count for |page| (must exist). Returns NULL if not found. */
-static int *page_map_get(rdb_buf_t *b, uintptr_t page) {
-    size_t mask = b->page_map_mask;
-    size_t slot = (size_t)((page >> 12) * 11400714819323198549ULL) & mask;
-
-    for (;;) {
-        if (b->page_map[slot].page == page)
-            return &b->page_map[slot].count;
-        if (b->page_map[slot].page == 0)
-            return NULL;
-        slot = (slot + 1) & mask;
-    }
-}
-
-/* Phase-1 callback: count entries per page (no allocation) */
-static void rdb_pre_scan_cb(kv_entry_t *e, void *priv) {
-    if (!e) return;
-    rdb_buf_t *b = (rdb_buf_t *)priv;
-    uintptr_t page = ((uintptr_t)e) & ~(uintptr_t)0xFFF;
-    int *cnt = page_map_find_or_create(b, page);
-    if (cnt) (*cnt)++;
-}
-
 void rdb_save_sync(void) {
-    rdb_buf_t b = {0};
-
+    rdb_buf_t b  = {0};
     int key_count = (int)kv_store_count();
 
-    /* P0 Phase 1: pre-scan — count entries per page */
-    b.page_map = calloc(PAGE_MAP_INIT_SIZE, sizeof(*b.page_map));
-    if (b.page_map) {
-        b.page_map_size = PAGE_MAP_INIT_SIZE;
-        b.page_map_mask = PAGE_MAP_INIT_SIZE - 1;
-        store_scan(rdb_pre_scan_cb, &b);
-    }
-
+    /* Reserve estimate: 16-byte header + ~64 bytes per key */
     rdb_buf_reserve(&b, 16 + (size_t)key_count * 64);
 
-    int magic = 0x524442;
+    /* Write header */
+    int magic   = 0x524442;
     int version = 2;
-    int db_num = 0;
-    rdb_buf_put(&b, &magic, sizeof(int));
-    rdb_buf_put(&b, &version, sizeof(int));
-    rdb_buf_put(&b, &db_num, sizeof(int));
-    rdb_buf_put(&b, &key_count, sizeof(int));
+    int db_num  = 0;
+    {
+        size_t hl  = sizeof(int) * 4;
+        rdb_buf_reserve(&b, hl);
+        char *dst = b.buf + b.len;
+        memcpy(dst, &magic,     sizeof(int)); dst += sizeof(int);
+        memcpy(dst, &version,   sizeof(int)); dst += sizeof(int);
+        memcpy(dst, &db_num,    sizeof(int)); dst += sizeof(int);
+        memcpy(dst, &key_count, sizeof(int));
+        b.len += hl;
+    }
 
-    /* P0 Phase 2: serialize with incremental MADV_DONTNEED */
+    /* Single-pass: serialize all entries */
     store_scan(rdb_save_callback_buf, &b);
-    free(b.page_map);
 
-    /* persist_path() returns a static buffer; copy before 2nd call */
+    /* Write to file */
     char tmp_path[1024], dst_path[1024];
     strncpy(tmp_path, persist_path(RDB_TMP), sizeof(tmp_path) - 1);
     tmp_path[sizeof(tmp_path) - 1] = '\0';
     strncpy(dst_path, persist_path(RDB_REL), sizeof(dst_path) - 1);
     dst_path[sizeof(dst_path) - 1] = '\0';
+
     int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         fprintf(stderr, "[RDB] open tmp failed: %s\n", strerror(errno));
@@ -456,7 +373,7 @@ void rdb_save_sync(void) {
     rename(tmp_path, dst_path);
 
     free(b.buf);
-    printf("[RDB] saved via io_uring, %zu bytes\n", b.len);
+    printf("[RDB] saved via io_uring, %zu bytes (%d keys)\n", b.len, key_count);
 }
 
 

@@ -239,6 +239,15 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
+    if (TOKEN_EQ(cmd, "BGREWRITEAOF")) {
+        int rc = kvs_aof_rewrite_bg();
+        if (rc == 0)
+            dynbuf_lit(wb, "+Background append only file rewriting started\r\n");
+        else
+            dynbuf_lit(wb, "-ERR BGREWRITEAOF already in progress\r\n");
+        return DISPATCH_OK;
+    }
+
     if (TOKEN_EQ(cmd, "CONFIG"))
         return handle_config(tokens, argc, wb);
 

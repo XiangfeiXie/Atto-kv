@@ -25,6 +25,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #include <liburing.h>
 
 /* ── Tunables ── */
@@ -58,6 +59,11 @@ static time_t   g_last_fsync      = 0;
 
 /* idle flush tracking — counter-based (single-threaded, no atomic needed) */
 static int g_append_count = 0;
+
+/* ── AOF rewrite state ── */
+static pid_t  g_aof_rewrite_pid   = 0;
+static off_t  g_aof_base_size     = 0;
+static time_t g_last_rewrite_time = 0;
 
 /* ── Internal prototypes ── */
 static void wal_flush_current_slot(void);
@@ -249,6 +255,335 @@ static void wal_flush_current_slot(void) {
 }
 
 /* =========================================================================
+ * AOF rewrite — compact WAL file from in-memory data (BGREWRITEAOF)
+ * ========================================================================= */
+
+#define AOF_REWRITE_BUF_CAP  (4 * 1024 * 1024)   /* 4 MB user-space buffer */
+
+typedef struct {
+    char   *buf;
+    size_t  len;
+    size_t  cap;
+    int     fd;
+} rewrite_ctx_t;
+
+/* Fast uint32 → decimal, returns length */
+static int rw_u2a(char *dst, uint32_t v) {
+    if (v == 0) { dst[0] = '0'; return 1; }
+    char tmp[12], *p = tmp;
+    while (v) { *p++ = (char)('0' + (v % 10)); v /= 10; }
+    int n = (int)(p - tmp);
+    for (int i = 0; i < n; i++) dst[i] = tmp[n - 1 - i];
+    return n;
+}
+
+/* Little-endian uint32 read (safe for unaligned) */
+static inline uint32_t rw_pk_u32(const char *p) {
+    uint32_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+static void rw_flush(rewrite_ctx_t *ctx) {
+    if (ctx->len == 0) return;
+    size_t off = 0;
+    while (off < ctx->len) {
+        ssize_t n = write(ctx->fd, ctx->buf + off, ctx->len - off);
+        if (n <= 0) break;
+        off += (size_t)n;
+    }
+    ctx->len = 0;
+}
+
+static void rw_reserve(rewrite_ctx_t *ctx, size_t need) {
+    if (ctx->len + need > ctx->cap) rw_flush(ctx);
+}
+
+static void rw_append(rewrite_ctx_t *ctx, const void *data, size_t len) {
+    rw_reserve(ctx, len);
+    memcpy(ctx->buf + ctx->len, data, len);
+    ctx->len += len;
+}
+
+/* Append RESP bulk string: $<len>\r\n<data>\r\n */
+static void rw_bulk(rewrite_ctx_t *ctx, const char *data, uint32_t len) {
+    char hdr[32], *p = hdr;
+    *p++ = '$';
+    p += rw_u2a(p, len);
+    *p++ = '\r'; *p++ = '\n';
+    rw_append(ctx, hdr, (size_t)(p - hdr));
+    rw_append(ctx, data, (size_t)len);
+    rw_append(ctx, "\r\n", 2);
+}
+
+/* Start a RESP array: *<argc>\r\n */
+static void rw_cmd_start(rewrite_ctx_t *ctx, uint32_t argc) {
+    char hdr[16], *p = hdr;
+    *p++ = '*';
+    p += rw_u2a(p, argc);
+    *p++ = '\r'; *p++ = '\n';
+    rw_append(ctx, hdr, (size_t)(p - hdr));
+}
+
+/* Write int64 as decimal bulk string */
+static void rw_bulk_int(rewrite_ctx_t *ctx, int64_t v) {
+    char num[24];
+    int n = snprintf(num, sizeof(num), "%lld", (long long)v);
+    rw_bulk(ctx, num, (uint32_t)n);
+}
+
+/* Encode one STRING entry as SET command */
+static void rw_encode_string(rewrite_ctx_t *ctx, kv_entry_t *e) {
+    const char *key = entry_key(e);
+    uint32_t   klen = e->key_len;
+    uint8_t     enc = entry_encoding(e);
+    const char *val = entry_payload(e);
+    uint32_t    vlen = entry_payload_len(e);
+
+    rw_cmd_start(ctx, 3);
+    rw_bulk(ctx, "SET", 3);
+    rw_bulk(ctx, key, klen);
+    if (enc == KV_ENCODING_INT) {
+        int64_t iv;
+        memcpy(&iv, val, sizeof(int64_t));
+        rw_bulk_int(ctx, iv);
+    } else {
+        rw_bulk(ctx, val, vlen);
+    }
+}
+
+/* Encode one HASH entry (PACKED encoding) as HSET command */
+static void rw_encode_hash_packed(rewrite_ctx_t *ctx, kv_entry_t *e) {
+    const char *key  = entry_key(e);
+    uint32_t    klen = e->key_len;
+    const char *data = e->data + 2;          /* skip type + encoding      */
+    const char *end  = e->data + e->val_len;
+
+    uint32_t count = rw_pk_u32(data);
+    data += 4;
+    if (count == 0) return;
+
+    rw_cmd_start(ctx, 2 + 2 * count);
+    rw_bulk(ctx, "HSET", 4);
+    rw_bulk(ctx, key, klen);
+
+    for (uint32_t i = 0; i < count && data < end; i++) {
+        uint32_t flen = rw_pk_u32(data); data += 4;
+        if (data + flen > end) break;
+        rw_bulk(ctx, data, flen);
+        data += flen;
+
+        if (data >= end) break;
+        uint8_t fenc = (uint8_t)*data++;
+
+        if (fenc == 1 /* INT inline: [enc:1][i64:8], no length prefix */) {
+            int64_t iv;
+            memcpy(&iv, data, sizeof(int64_t));
+            rw_bulk_int(ctx, iv);
+            data += 8;
+        } else /* RAW: [enc:1=0][val_len:4][val_bytes] */ {
+            uint32_t fvlen = rw_pk_u32(data); data += 4;
+            if (data + fvlen > end) break;
+            rw_bulk(ctx, data, fvlen);
+            data += fvlen;
+        }
+    }
+}
+
+/* Encode one HASH entry (DICT encoding) as HSET command */
+static void rw_encode_hash_dict(rewrite_ctx_t *ctx, kv_entry_t *e) {
+    const char *key  = entry_key(e);
+    uint32_t    klen = e->key_len;
+    kv_dict_t  *d    = (kv_dict_t *)(e->data + 2);
+
+    uint32_t count = dict_count(d);
+    if (count == 0) return;
+
+    rw_cmd_start(ctx, 2 + 2 * count);
+    rw_bulk(ctx, "HSET", 4);
+    rw_bulk(ctx, key, klen);
+
+    kv_iter_t *it = dict_iter_new(d, 1);
+    kv_entry_t *de;
+    while ((de = dict_iter_next(it)) != NULL) {
+        const char *field = entry_key(de);
+        uint32_t    flen  = de->key_len;
+        uint8_t     fenc  = entry_encoding(de);
+        const char *fval  = entry_payload(de);
+        uint32_t    fvlen = entry_payload_len(de);
+
+        rw_bulk(ctx, field, flen);
+        if (fenc == KV_ENCODING_INT) {
+            int64_t iv;
+            memcpy(&iv, fval, sizeof(int64_t));
+            rw_bulk_int(ctx, iv);
+        } else {
+            rw_bulk(ctx, fval, fvlen);
+        }
+    }
+    dict_iter_free(it);
+}
+
+/* Traverse all in-memory data and write compact RESP to temp file */
+static int aof_rewrite_traverse_and_write(int fd) {
+    rewrite_ctx_t ctx;
+    ctx.buf = malloc(AOF_REWRITE_BUF_CAP);
+    if (!ctx.buf) { fprintf(stderr, "[REWRITE] OOM\n"); return -1; }
+    ctx.len = 0;
+    ctx.cap = AOF_REWRITE_BUF_CAP;
+    ctx.fd  = fd;
+
+    long long now = (long long)time(NULL) * 1000;
+
+    kv_store_iter_t it;
+    kv_store_iter_init(&it);
+    kv_entry_t *e;
+    long long written = 0;
+
+    while ((e = kv_store_iter_next(&it)) != NULL) {
+        /* Skip expired keys */
+        if (e->expire && e->expire < now) continue;
+
+        uint8_t type = entry_type(e);
+
+        if (type == KV_TYPE_STRING) {
+            rw_encode_string(&ctx, e);
+            written++;
+        } else if (type == KV_TYPE_HASH) {
+            uint8_t enc = entry_encoding(e);
+            if (enc == KV_ENCODING_PACKED) {
+                rw_encode_hash_packed(&ctx, e);
+                written++;
+            } else if (enc == KV_ENCODING_DICT) {
+                rw_encode_hash_dict(&ctx, e);
+                written++;
+            }
+        }
+    }
+    kv_store_iter_free(&it);
+
+    rw_flush(&ctx);
+    if (fdatasync(fd) < 0)
+        fprintf(stderr, "[REWRITE] fdatasync error: %s\n", strerror(errno));
+    free(ctx.buf);
+    printf("[REWRITE] compacted %lld keys to temp file\n", written);
+    return 0;
+}
+
+/* ── Public rewrite API ── */
+
+int kvs_aof_rewrite_bg(void) {
+    if (g_aof_rewrite_pid != 0) return -1;
+
+    const char *tmp_path = persist_path("build/incr.wal.tmp");
+    const char *dst_path = persist_path(WAL_REL);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "[REWRITE] fork failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (pid == 0) {
+        /* Child: destroy parent's io_uring, close parent's WAL fd */
+        if (g_wal_ring_ok) { io_uring_queue_exit(&g_wal_ring); g_wal_ring_ok = 0; }
+        if (g_wal_fd >= 0)  { close(g_wal_fd); g_wal_fd = -1; }
+
+        int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            fprintf(stderr, "[REWRITE] open tmp failed: %s\n", strerror(errno));
+            _exit(1);
+        }
+
+        /* Best-effort pre-allocate to reduce fragmentation */
+        if (g_aof_offset > 0)
+            posix_fallocate(fd, 0, (off_t)(g_aof_offset * 9 / 10));
+
+        int rc = aof_rewrite_traverse_and_write(fd);
+        close(fd);
+
+        if (rc != 0) {
+            unlink(tmp_path);
+            _exit(1);
+        }
+
+        /* Atomic rename */
+        if (rename(tmp_path, dst_path) < 0) {
+            fprintf(stderr, "[REWRITE] rename failed: %s\n", strerror(errno));
+            unlink(tmp_path);
+            _exit(1);
+        }
+
+        printf("[REWRITE] child done, new AOF written\n");
+        fflush(stdout);
+        _exit(0);
+    }
+
+    /* Parent */
+    g_aof_rewrite_pid = pid;
+    printf("[REWRITE] started, child pid=%d\n", (int)pid);
+    return 0;
+}
+
+void kvs_aof_rewrite_done(int status) {
+    if (g_aof_rewrite_pid == 0) return;
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        /* Close old WAL fd and re-open the compacted file */
+        if (g_wal_fd >= 0) {
+            close(g_wal_fd);
+            g_wal_fd = -1;
+        }
+
+        const char *path = persist_path(WAL_REL);
+        g_wal_fd = open(path, O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+        if (g_wal_fd < 0) {
+            fprintf(stderr, "[REWRITE] re-open after rewrite failed: %s\n",
+                    strerror(errno));
+        }
+        g_aof_offset = lseek(g_wal_fd, 0, SEEK_END);
+        g_aof_base_size = g_aof_offset;
+        g_last_rewrite_time = time(NULL);
+        printf("[REWRITE] completed, new AOF size=%ld bytes\n",
+               (long)g_aof_offset);
+    } else {
+        fprintf(stderr, "[REWRITE] child failed, status=%d\n", status);
+    }
+
+    g_aof_rewrite_pid = 0;
+}
+
+void kvs_aof_auto_rewrite_check(void) {
+    /* Not yet started */
+    if (!g_wal_ring_ok || g_wal_fd < 0) return;
+    /* Already in progress */
+    if (g_aof_rewrite_pid != 0) return;
+    /* Cooldown */
+    time_t now = time(NULL);
+    if (now - g_last_rewrite_time < AOF_REWRITE_COOLDOWN_SEC) return;
+    /* Min size gate */
+    if (g_aof_offset < AOF_REWRITE_MIN_SIZE) return;
+
+    /* First rewrite: set baseline */
+    if (g_aof_base_size == 0) {
+        g_aof_base_size = g_aof_offset;
+        return;
+    }
+
+    /* Growth check */
+    if (g_aof_base_size > 0) {
+        long long growth = (g_aof_offset - g_aof_base_size) * 100
+                         / g_aof_base_size;
+        if (growth >= AOF_REWRITE_PERC_DEF) {
+            printf("[REWRITE] auto-trigger: %lld%% growth "
+                   "(%ld → %ld bytes)\n",
+                   growth, (long)g_aof_base_size, (long)g_aof_offset);
+            kvs_aof_rewrite_bg();
+        }
+    }
+}
+
+/* =========================================================================
  * Public API
  * ========================================================================= */
 
@@ -281,6 +616,14 @@ void kvs_wal_periodic(void) {
 
     /* Check fsync timer */
     wal_fsync_check();
+
+    /* Poll AOF rewrite child completion */
+    if (g_aof_rewrite_pid > 0) {
+        int status;
+        pid_t r = waitpid(g_aof_rewrite_pid, &status, WNOHANG);
+        if (r == g_aof_rewrite_pid)
+            kvs_aof_rewrite_done(status);
+    }
 }
 
 void kvs_wal_set_fsync_policy(const char *policy) {

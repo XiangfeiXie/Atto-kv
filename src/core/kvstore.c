@@ -117,6 +117,7 @@ void update_cached_time(void) {
         kvs_wal_periodic();
         kvs_aof_auto_rewrite_check();
     }
+    if (ENABLE_RDB) rdb_periodic();
 }
 
 /* ── Utility ────────────────────────────────────────────────────────── */
@@ -141,10 +142,6 @@ int token_to_ll(kvs_token_t t, long long *out) {
 
 void entry_cleanup_by_type(kv_entry_t *e) {
     hash_cleanup_entry(e);
-}
-
-void kvs_cleanup_entry(kv_entry_t *e) {
-    entry_cleanup_by_type(e);
 }
 
 /* Pre-allocated integer responses :0\r\n..:255\r\n */

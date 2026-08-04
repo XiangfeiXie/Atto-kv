@@ -3,28 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
 #include <inttypes.h>
-#include <math.h>
-
-/* =====================================================================
- * Static RESP fragments
- * ===================================================================== */
-
-#define S(id, str) \
-    static const char id[] = str; \
-    static const int  id##_LEN = (int)(sizeof(str) - 1)
-
-S(REP_OK,        "+OK\r\n");
-S(REP_NIL,       "$-1\r\n");
-S(REP_ONE,       ":1\r\n");
-S(REP_ZERO,      ":0\r\n");
-S(REP_ERR_ARGS,  "-ERR wrong number of arguments\r\n");
-S(REP_ERR_UNK,   "-ERR unknown command\r\n");
-S(REP_WRONGTYPE, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
-S(REP_ERR_INT,   "-ERR value is not an integer or out of range\r\n");
-
-#undef S
 
 /* =====================================================================
  * Limits
@@ -277,29 +256,6 @@ static const char *pk_get_value(char *vp, int *vlen_out, uint8_t *enc_out) {
     return vp + 1 + 4;
 }
 
-/* Parse token as int64 safely. Returns 1 on success. */
-static int parse_int64(const char *p, int len, int64_t *out) {
-    if (len <= 0 || len > 20) return 0;
-    const char *end = p + len;
-    int negative = 0;
-    if (*p == '-') {
-        if (len == 1) return 0;
-        negative = 1;
-        p++;
-    }
-    if (p >= end) return 0;
-    if (*p == '0' && (end - p) > 1) return 0;
-    int64_t v = 0;
-    for (; p < end; p++) {
-        if (*p < '0' || *p > '9') return 0;
-        int64_t nv = v * 10 + (*p - '0');
-        if (nv < v) return 0;  /* overflow */
-        v = nv;
-    }
-    *out = negative ? -v : v;
-    return 1;
-}
-
 /* =====================================================================
  * Engine access
  * ===================================================================== */
@@ -536,7 +492,7 @@ static int hash_set(kv_entry_t **pe, const char *field, int field_len,
     uint8_t venc = KV_ENCODING_RAW;
     const char *vptr = value;
     int vlen_stored = value_len;
-    if (parse_int64(value, value_len, &iv)) {
+    if (kvs_parse_int64(value, value_len, &iv)) {
         venc = 1;  /* INT encoding in packed format */
         vptr = (const char *)&iv;
         vlen_stored = 8;
@@ -773,99 +729,17 @@ void hash_rebuild_encoding(kv_entry_t *e) {
 }
 
 /* =====================================================================
- * HINCRBY implementation
- *   - Parse existing value as int64, increment, store back.
- *   - If field does not exist, treat as 0 + increment.
- *   - Returns the new value as integer RESP.
- * ===================================================================== */
-
-static int hash_incrby(kv_entry_t **pe, const char *field, int field_len,
-                       int64_t delta, int64_t *out_val) {
-    kv_entry_t *e = *pe;
-
-    /* Check if field exists */
-    int vlen;
-    uint8_t enc;
-    const char *val = hash_get(e, field, field_len, &vlen, &enc);
-
-    int64_t cur = 0;
-    if (val) {
-        if (enc == KV_ENCODING_INT) {
-            cur = *(int64_t *)val;
-        } else if (enc == KV_ENCODING_RAW || enc == 0) {
-            /* Try to parse string as integer */
-            char tmp[32];
-            int n = vlen < 31 ? vlen : 31;
-            memcpy(tmp, val, (size_t)n);
-            tmp[n] = '\0';
-            char *endp;
-            cur = (int64_t)strtoll(tmp, &endp, 10);
-            if (*endp != '\0') return -2;  /* not an integer */
-        } else {
-            return -2;
-        }
-    }
-
-    int64_t new_val = cur + delta;
-    /* Check overflow */
-    if ((delta > 0 && new_val < cur) || (delta < 0 && new_val > cur))
-        return -2;
-
-    /* Store the new value as an int64 in our packed format */
-    char sbuf[32];
-    int slen = snprintf(sbuf, sizeof(sbuf), "%" PRId64, new_val);
-    int added;
-
-    int rc = hash_set(pe, field, field_len, sbuf, slen, &added, 0);
-    if (rc < 0) return -1;
-    *out_val = new_val;
-    return 0;
-}
-
-/* =====================================================================
  * Write a single hash field-value pair as RESP bulk strings
  * ===================================================================== */
 
-static void write_field_value_resp(DynBuf *wb, const char *field,
-                                   uint32_t flen, const char *val,
-                                   uint32_t vlen, uint8_t enc) {
-    char hdr[32];
-    int hl;
-    if (enc == KV_ENCODING_INT) {
-        int64_t iv;
-        memcpy(&iv, val, 8);
-        char istr[24];
-        int il = snprintf(istr, sizeof(istr), "%" PRId64, iv);
-        hl = snprintf(hdr, sizeof(hdr), "$%u\r\n", flen);
-        dynbuf_cat(wb, hdr, hl);
-        dynbuf_cat(wb, field, (int)flen);
-        dynbuf_lit(wb, "\r\n");
-        hl = snprintf(hdr, sizeof(hdr), "$%d\r\n", il);
-        dynbuf_cat(wb, hdr, hl);
-        dynbuf_cat(wb, istr, il);
-        dynbuf_lit(wb, "\r\n");
-    } else {
-        hl = snprintf(hdr, sizeof(hdr), "$%u\r\n", flen);
-        dynbuf_cat(wb, hdr, hl);
-        dynbuf_cat(wb, field, (int)flen);
-        dynbuf_lit(wb, "\r\n");
-        hl = snprintf(hdr, sizeof(hdr), "$%u\r\n", vlen);
-        dynbuf_cat(wb, hdr, hl);
-        dynbuf_cat(wb, val, (int)vlen);
-        dynbuf_lit(wb, "\r\n");
-    }
-}
-
-/* =====================================================================
- * Write a RESP bulk string for a HASH value (used by HMGET)
- * ===================================================================== */
+/* Write a RESP bulk string for a HASH value (used by HGET) */
 
 static void write_value_resp(DynBuf *wb, const char *val,
                              uint32_t vlen, uint8_t enc) {
     char hdr[32];
     int hl;
     if (!val) {
-        dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
+        dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
     } else if (enc == KV_ENCODING_INT) {
         int64_t iv;
         memcpy(&iv, val, 8);
@@ -932,21 +806,7 @@ static void write_all_fields(DynBuf *wb, kv_entry_t *entry, int keys_only,
             p += pk_value_bytes((char *)p);
 
             if (vals_only || !keys_only) {
-                if (enc == 1) {
-                    int64_t iv;
-                    memcpy(&iv, val, 8);
-                    char istr[24];
-                    int il = snprintf(istr, sizeof(istr), "%" PRId64, iv);
-                    temp_hl = snprintf(temp, sizeof(temp), "$%d\r\n", il);
-                    dynbuf_cat(wb, temp, temp_hl);
-                    dynbuf_cat(wb, istr, il);
-                    dynbuf_lit(wb, "\r\n");
-                } else {
-                    temp_hl = snprintf(temp, sizeof(temp), "$%u\r\n", vlen);
-                    dynbuf_cat(wb, temp, temp_hl);
-                    dynbuf_cat(wb, val, (int)vlen);
-                    dynbuf_lit(wb, "\r\n");
-                }
+                write_value_resp(wb, val, (uint32_t)vlen, enc);
             }
             if (p > end) break;
         }
@@ -969,21 +829,7 @@ static void write_all_fields(DynBuf *wb, kv_entry_t *entry, int keys_only,
             dynbuf_lit(wb, "\r\n");
         }
         if (!keys_only) {
-            if (enc == KV_ENCODING_INT) {
-                int64_t iv;
-                memcpy(&iv, entry_payload(de), 8);
-                char istr[24];
-                int il = snprintf(istr, sizeof(istr), "%" PRId64, iv);
-                temp_hl = snprintf(temp, sizeof(temp), "$%d\r\n", il);
-                dynbuf_cat(wb, temp, temp_hl);
-                dynbuf_cat(wb, istr, il);
-                dynbuf_lit(wb, "\r\n");
-            } else {
-                temp_hl = snprintf(temp, sizeof(temp), "$%u\r\n", vlen);
-                dynbuf_cat(wb, temp, temp_hl);
-                dynbuf_cat(wb, entry_payload(de), (int)vlen);
-                dynbuf_lit(wb, "\r\n");
-            }
+            write_value_resp(wb, entry_payload(de), vlen, enc);
         }
     }
     dict_iter_free(it);
@@ -1014,15 +860,13 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
 
     switch (cmd.ptr[0]) {
 
-    /* ── HSET / HGET / HDEL / HGETALL / HKEYS / HVALS / HLEN / HEXISTS /
-          HSETNX / HINCRBY / HMGET / HSTRLEN ── */
+    /* ── HSET / HGET / HDEL / HGETALL / HKEYS / HVALS / HLEN / HEXISTS ── */
     case 'H':
         if (TOKEN_EQ(cmd, "HSET")) {
-            if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (argc < 3) { dynbuf_cat(wb, RESP_ERR_ARGS, RESP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
 
             uint64_t h = hash;  /* Phase 6.1b: reuse dispatcher hash */
             kv_entry_t *e = entry;
-            int existed = 0;
 
             if (!e) {
                 char data[16];
@@ -1031,18 +875,16 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
                 if (!e) { dynbuf_lit(wb, "-ERR create hash failed\r\n"); return DISPATCH_ERROR; }
             } else {
                 if (entry_type(e) != KV_TYPE_HASH) {
-                    dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                    dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
                     return DISPATCH_ERROR;
                 }
                 if (check_expiry(e, key, key_len, h)) {
-                    existed = 1;
                     char data[16];
                     hash_build_empty(data);
                     e = dict_add(kv_dict_for(h), key, key_len, data, HASH_EMPTY_SIZE, h);
                     if (!e) { dynbuf_lit(wb, "-ERR create hash failed\r\n"); return DISPATCH_ERROR; }
                 }
             }
-            (void)existed;
 
             int total_added = 0;
             for (int i = 1; i + 1 < argc; i += 2) {
@@ -1060,86 +902,16 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
             return DISPATCH_OK;
         }
 
-        /* ── HMSET key f v [f v ...] — legacy multi-set, returns +OK ── */
-        if (TOKEN_EQ(cmd, "HMSET")) {
-            if (argc < 3 || ((argc - 1) % 2) != 0) {
-                dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN);
-                return DISPATCH_ERROR;
-            }
-            uint64_t h = hash;  /* Phase 6.1b: reuse dispatcher hash */
-            kv_entry_t *e = entry;
-            if (!e) {
-                char data[16]; hash_build_empty(data);
-                e = dict_add(kv_dict_for(h), key, key_len, data, HASH_EMPTY_SIZE, h);
-                if (!e) { dynbuf_lit(wb, "-ERR create hash failed\r\n"); return DISPATCH_ERROR; }
-            } else {
-                if (entry_type(e) != KV_TYPE_HASH) {
-                    dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                    return DISPATCH_ERROR;
-                }
-                if (check_expiry(e, key, key_len, h)) {
-                    char data[16]; hash_build_empty(data);
-                    e = dict_add(kv_dict_for(h), key, key_len, data, HASH_EMPTY_SIZE, h);
-                    if (!e) { dynbuf_lit(wb, "-ERR create hash failed\r\n"); return DISPATCH_ERROR; }
-                }
-            }
-            for (int i = 1; i + 1 < argc; i += 2) {
-                int added = 0;
-                if (hash_set(&e, args[i].ptr, args[i].len,
-                             args[i+1].ptr, args[i+1].len, &added, 0) < 0) {
-                    dynbuf_lit(wb, "-ERR hmset failed\r\n");
-                    return DISPATCH_ERROR;
-                }
-            }
-            dynbuf_cat(wb, REP_OK, REP_OK_LEN);
-            return DISPATCH_OK;
-        }
-
-        if (TOKEN_EQ(cmd, "HSETNX")) {
-            if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
-
-            uint64_t h = hash;  /* Phase 6.1b: reuse dispatcher hash */
-            kv_entry_t *e = entry;
-
-            if (!e) {
-                char data[16];
-                hash_build_empty(data);
-                e = dict_add(kv_dict_for(h), key, key_len, data, HASH_EMPTY_SIZE, h);
-                if (!e) { dynbuf_lit(wb, "-ERR create hash failed\r\n"); return DISPATCH_ERROR; }
-            } else {
-                if (entry_type(e) != KV_TYPE_HASH) {
-                    dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                    return DISPATCH_ERROR;
-                }
-                if (check_expiry(e, key, key_len, h)) {
-                    char data[16];
-                    hash_build_empty(data);
-                    e = dict_add(kv_dict_for(h), key, key_len, data, HASH_EMPTY_SIZE, h);
-                    if (!e) { dynbuf_lit(wb, "-ERR create hash failed\r\n"); return DISPATCH_ERROR; }
-                }
-            }
-
-            int added = 0;
-            if (hash_set(&e, args[1].ptr, args[1].len,
-                        args[2].ptr, args[2].len, &added, 1) < 0) {
-                dynbuf_lit(wb, "-ERR hsetnx failed\r\n");
-                return DISPATCH_ERROR;
-            }
-            dynbuf_cat(wb, added ? REP_ONE : REP_ZERO,
-                           added ? REP_ONE_LEN : REP_ZERO_LEN);
-            return DISPATCH_OK;
-        }
-
         if (TOKEN_EQ(cmd, "HGET")) {
-            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
-            if (!entry) { dynbuf_cat(wb, REP_NIL, REP_NIL_LEN); return DISPATCH_OK; }
+            if (argc < 2) { dynbuf_cat(wb, RESP_ERR_ARGS, RESP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) { dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_HASH) {
-                dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
             uint64_t h = hash;  /* Phase 6.1b: reuse dispatcher hash */
             if (check_expiry(entry, key, key_len, h)) {
-                dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
+                dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
                 return DISPATCH_OK;
             }
 
@@ -1150,81 +922,16 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
             return DISPATCH_OK;
         }
 
-        if (TOKEN_EQ(cmd, "HMGET")) {
-            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
-
-            int field_count = argc - 1;
-            char hdr[32];
-            int hl = snprintf(hdr, sizeof(hdr), "*%d\r\n", field_count);
-            dynbuf_cat(wb, hdr, hl);
-
-            if (!entry) {
-                for (int i = 0; i < field_count; i++)
-                    dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
-                return DISPATCH_OK;
-            }
-            if (entry_type(entry) != KV_TYPE_HASH) {
-                dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                return DISPATCH_ERROR;
-            }
-            uint64_t h = hash;  /* Phase 6.1b: reuse dispatcher hash */
-            if (check_expiry(entry, key, key_len, h)) {
-                for (int i = 0; i < field_count; i++)
-                    dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
-                return DISPATCH_OK;
-            }
-
-            for (int i = 1; i < argc; i++) {
-                int vlen = 0;
-                uint8_t enc = 0;
-                const char *val = hash_get(entry, args[i].ptr, args[i].len, &vlen, &enc);
-                write_value_resp(wb, val, (uint32_t)vlen, enc);
-            }
-            return DISPATCH_OK;
-        }
-
-        if (TOKEN_EQ(cmd, "HSTRLEN")) {
-            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
-            if (!entry) { dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN); return DISPATCH_OK; }
-            if (entry_type(entry) != KV_TYPE_HASH) {
-                dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                return DISPATCH_ERROR;
-            }
-            uint64_t h = hash;  /* Phase 6.1b: reuse dispatcher hash */
-            if (check_expiry(entry, key, key_len, h)) {
-                dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN);
-                return DISPATCH_OK;
-            }
-
-            int vlen = 0;
-            uint8_t enc = 0;
-            const char *val = hash_get(entry, args[1].ptr, args[1].len, &vlen, &enc);
-            if (!val) {
-                dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN);
-            } else if (enc == KV_ENCODING_INT) {
-                int64_t iv;
-                memcpy(&iv, val, 8);
-                char istr[24];
-                int il = snprintf(istr, sizeof(istr), "%" PRId64, iv);
-                int hl = snprintf(temp, sizeof(temp), ":%d\r\n", il);
-                dynbuf_cat(wb, temp, hl);
-            } else {
-                int hl = snprintf(temp, sizeof(temp), ":%d\r\n", vlen);
-                dynbuf_cat(wb, temp, hl);
-            }
-            return DISPATCH_OK;
-        }
-
         if (TOKEN_EQ(cmd, "HDEL")) {
-            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
-            if (!entry) { dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN); return DISPATCH_OK; }
+            if (argc < 2) { dynbuf_cat(wb, RESP_ERR_ARGS, RESP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) { dynbuf_cat(wb, RESP_ZERO, RESP_ZERO_LEN); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_HASH) {
-                dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
             uint64_t h = hash;  /* Phase 6.1b: reuse dispatcher hash */
             if (check_expiry(entry, key, key_len, h)) {
-                dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN);
+                dynbuf_cat(wb, RESP_ZERO, RESP_ZERO_LEN);
                 return DISPATCH_OK;
             }
 
@@ -1243,143 +950,15 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
             return DISPATCH_OK;
         }
 
-        if (TOKEN_EQ(cmd, "HINCRBY")) {
-            if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
-
-            /* Parse increment */
-            int64_t delta;
-            if (!parse_int64(args[2].ptr, args[2].len, &delta)) {
-                dynbuf_cat(wb, REP_ERR_INT, REP_ERR_INT_LEN);
-                return DISPATCH_ERROR;
-            }
-
-            uint64_t h = hash;  /* Phase 6.1b: reuse dispatcher hash */
-            kv_entry_t *e = entry;
-
-            if (!e) {
-                char data[16];
-                hash_build_empty(data);
-                e = dict_add(kv_dict_for(h), key, key_len, data, HASH_EMPTY_SIZE, h);
-                if (!e) { dynbuf_lit(wb, "-ERR create hash failed\r\n"); return DISPATCH_ERROR; }
-            } else {
-                if (entry_type(e) != KV_TYPE_HASH) {
-                    dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                    return DISPATCH_ERROR;
-                }
-                if (check_expiry(e, key, key_len, h)) {
-                    char data[16];
-                    hash_build_empty(data);
-                    e = dict_add(kv_dict_for(h), key, key_len, data, HASH_EMPTY_SIZE, h);
-                    if (!e) { dynbuf_lit(wb, "-ERR create hash failed\r\n"); return DISPATCH_ERROR; }
-                }
-            }
-
-            int64_t new_val;
-            int rc = hash_incrby(&e, args[1].ptr, args[1].len, delta, &new_val);
-            if (rc == -2) {
-                dynbuf_cat(wb, REP_ERR_INT, REP_ERR_INT_LEN);
-                return DISPATCH_ERROR;
-            }
-            if (rc < 0) {
-                dynbuf_lit(wb, "-ERR hincrby failed\r\n");
-                return DISPATCH_ERROR;
-            }
-
-            char buf[32];
-            int bl = snprintf(buf, sizeof(buf), ":%" PRId64 "\r\n", new_val);
-            dynbuf_cat(wb, buf, bl);
-            return DISPATCH_OK;
-        }
-
-        /* ── HINCRBYFLOAT key field delta ── */
-        if (TOKEN_EQ(cmd, "HINCRBYFLOAT")) {
-            if (argc < 3) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
-
-            /* Parse delta */
-            char dbuf[64];
-            int dn = args[2].len < (int)sizeof(dbuf) - 1 ? args[2].len : (int)sizeof(dbuf) - 1;
-            memcpy(dbuf, args[2].ptr, (size_t)dn); dbuf[dn] = '\0';
-            char *endp;
-            double delta = strtod(dbuf, &endp);
-            if (*endp != '\0' || dn == 0) {
-                dynbuf_lit(wb, "-ERR value is not a valid float\r\n");
-                return DISPATCH_ERROR;
-            }
-
-            uint64_t h = hash;  /* Phase 6.1b: reuse dispatcher hash */
-            kv_entry_t *e = entry;
-            if (!e) {
-                char data[16]; hash_build_empty(data);
-                e = dict_add(kv_dict_for(h), key, key_len, data, HASH_EMPTY_SIZE, h);
-                if (!e) { dynbuf_lit(wb, "-ERR create hash failed\r\n"); return DISPATCH_ERROR; }
-            } else {
-                if (entry_type(e) != KV_TYPE_HASH) {
-                    dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
-                    return DISPATCH_ERROR;
-                }
-                if (check_expiry(e, key, key_len, h)) {
-                    char data[16]; hash_build_empty(data);
-                    e = dict_add(kv_dict_for(h), key, key_len, data, HASH_EMPTY_SIZE, h);
-                    if (!e) { dynbuf_lit(wb, "-ERR create hash failed\r\n"); return DISPATCH_ERROR; }
-                }
-            }
-
-            /* Current value */
-            int vlen = 0; uint8_t enc = 0;
-            const char *val = hash_get(e, args[1].ptr, args[1].len, &vlen, &enc);
-            double cur = 0.0;
-            if (val) {
-                if (enc == KV_ENCODING_INT) {
-                    int64_t iv; memcpy(&iv, val, 8); cur = (double)iv;
-                } else {
-                    char tmp[64];
-                    int n = vlen < (int)sizeof(tmp) - 1 ? vlen : (int)sizeof(tmp) - 1;
-                    memcpy(tmp, val, (size_t)n); tmp[n] = '\0';
-                    cur = strtod(tmp, &endp);
-                    if (*endp != '\0') {
-                        dynbuf_lit(wb, "-ERR hash value is not a float\r\n");
-                        return DISPATCH_ERROR;
-                    }
-                }
-            }
-
-            double nv = cur + delta;
-            if (!isfinite(nv)) {
-                dynbuf_lit(wb, "-ERR increment would produce NaN or Infinity\r\n");
-                return DISPATCH_ERROR;
-            }
-
-            /* Format like Redis: %.17g, strip trailing zeros after dot. */
-            char sbuf[48];
-            int sl = snprintf(sbuf, sizeof(sbuf), "%.17g", nv);
-            /* Strip trailing zeros if there is a '.' */
-            if (memchr(sbuf, '.', (size_t)sl)) {
-                while (sl > 0 && sbuf[sl - 1] == '0') sl--;
-                if (sl > 0 && sbuf[sl - 1] == '.') sl--;
-            }
-            sbuf[sl] = '\0';
-
-            int added;
-            if (hash_set(&e, args[1].ptr, args[1].len, sbuf, sl, &added, 0) < 0) {
-                dynbuf_lit(wb, "-ERR hincrbyfloat failed\r\n");
-                return DISPATCH_ERROR;
-            }
-            int hl = snprintf(temp, sizeof(temp), "$%d\r\n", sl);
-            dynbuf_cat(wb, temp, hl);
-            dynbuf_cat(wb, sbuf, sl);
-            dynbuf_lit(wb, "\r\n");
-            return DISPATCH_OK;
-        }
-
         if (TOKEN_EQ(cmd, "HLEN")) {
-            if (!entry) { dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN); return DISPATCH_OK; }
+            if (!entry) { dynbuf_cat(wb, RESP_ZERO, RESP_ZERO_LEN); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_HASH) {
-                dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
             uint64_t h = hash;  /* Phase 6.1b: reuse dispatcher hash */
             if (check_expiry(entry, key, key_len, h)) {
-                dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN);
+                dynbuf_cat(wb, RESP_ZERO, RESP_ZERO_LEN);
                 return DISPATCH_OK;
             }
             int hl = snprintf(temp, sizeof(temp), ":%u\r\n", hash_len(entry));
@@ -1388,29 +967,29 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
         }
 
         if (TOKEN_EQ(cmd, "HEXISTS")) {
-            if (argc < 2) { dynbuf_cat(wb, REP_ERR_ARGS, REP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
-            if (!entry) { dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN); return DISPATCH_OK; }
+            if (argc < 2) { dynbuf_cat(wb, RESP_ERR_ARGS, RESP_ERR_ARGS_LEN); return DISPATCH_ERROR; }
+            if (!entry) { dynbuf_cat(wb, RESP_ZERO, RESP_ZERO_LEN); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_HASH) {
-                dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
             uint64_t h = hash;  /* Phase 6.1b: reuse dispatcher hash */
             if (check_expiry(entry, key, key_len, h)) {
-                dynbuf_cat(wb, REP_ZERO, REP_ZERO_LEN);
+                dynbuf_cat(wb, RESP_ZERO, RESP_ZERO_LEN);
                 return DISPATCH_OK;
             }
 
             int vlen;
             const char *val = hash_get(entry, args[1].ptr, args[1].len, &vlen, NULL);
-            dynbuf_cat(wb, val ? REP_ONE : REP_ZERO,
-                           val ? REP_ONE_LEN : REP_ZERO_LEN);
+            dynbuf_cat(wb, val ? RESP_ONE : RESP_ZERO,
+                           val ? RESP_ONE_LEN : RESP_ZERO_LEN);
             return DISPATCH_OK;
         }
 
         if (TOKEN_EQ(cmd, "HGETALL")) {
             if (!entry) { dynbuf_lit(wb, "*0\r\n"); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_HASH) {
-                dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
             uint64_t h = hash;  /* Phase 6.1b: reuse dispatcher hash */
@@ -1425,7 +1004,7 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
         if (TOKEN_EQ(cmd, "HKEYS")) {
             if (!entry) { dynbuf_lit(wb, "*0\r\n"); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_HASH) {
-                dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
             uint64_t h = hash;  /* Phase 6.1b: reuse dispatcher hash */
@@ -1440,7 +1019,7 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
         if (TOKEN_EQ(cmd, "HVALS")) {
             if (!entry) { dynbuf_lit(wb, "*0\r\n"); return DISPATCH_OK; }
             if (entry_type(entry) != KV_TYPE_HASH) {
-                dynbuf_cat(wb, REP_WRONGTYPE, REP_WRONGTYPE_LEN);
+                dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
                 return DISPATCH_ERROR;
             }
             uint64_t h = hash;  /* Phase 6.1b: reuse dispatcher hash */
@@ -1452,140 +1031,9 @@ dispatch_result_t hash_cmd(kvs_token_t cmd, kv_entry_t *entry,
             return DISPATCH_OK;
         }
 
-        /* ── HRANDFIELD key [count [WITHVALUES]] ──
-             Without count: returns a single random field (bulk string or nil).
-             count > 0:  up to N distinct fields (clamped to hash size).
-             count < 0:  N fields with replacement (may repeat).
-             WITHVALUES: pairs (field, value) interleaved. */
-        if (TOKEN_EQ(cmd, "HRANDFIELD")) {
-            if (!entry) {
-                if (argc < 2) dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
-                else          dynbuf_lit(wb, "*0\r\n");
-                return DISPATCH_OK;
-            }
-            uint64_t h = hash;  /* Phase 6.1b: reuse dispatcher hash */
-            if (check_expiry(entry, key, key_len, h)) {
-                if (argc < 2) dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
-                else          dynbuf_lit(wb, "*0\r\n");
-                return DISPATCH_OK;
-            }
-
-            uint32_t total = hash_len(entry);
-            if (total == 0) {
-                if (argc < 2) dynbuf_cat(wb, REP_NIL, REP_NIL_LEN);
-                else          dynbuf_lit(wb, "*0\r\n");
-                return DISPATCH_OK;
-            }
-
-            /* Materialize (field, value, enc) triples. */
-            typedef struct { const char *f; uint32_t fl;
-                             const char *v; uint32_t vl; uint8_t enc; } fv_t;
-            fv_t *arr = (fv_t *)malloc(sizeof(fv_t) * total);
-            if (!arr) { dynbuf_lit(wb, "-ERR oom\r\n"); return DISPATCH_ERROR; }
-
-            uint32_t n = 0;
-            if (entry_encoding(entry) == KV_ENCODING_PACKED) {
-                const char *p = entry->data + 6;
-                const char *end = entry->data + entry->val_len;
-                while (p < end && n < total) {
-                    uint32_t fl = pk_read_u32(p);
-                    arr[n].f = p + 4; arr[n].fl = fl;
-                    p += 4 + fl;
-                    if (p >= end) break;
-                    uint8_t enc_norm;
-                    int vl_i;
-                    const char *v = pk_get_value((char *)p, &vl_i, &enc_norm);
-                    arr[n].v = v; arr[n].vl = (uint32_t)vl_i; arr[n].enc = enc_norm;
-                    p += pk_value_bytes((char *)p);
-                    n++;
-                }
-            } else {
-                kv_dict_t *d = (kv_dict_t *)(entry->data + 2);
-                kv_iter_t *it = dict_iter_new(d, 1);
-                kv_entry_t *de;
-                while (it && (de = dict_iter_next(it)) != NULL && n < total) {
-                    arr[n].f = entry_key(de); arr[n].fl = de->key_len;
-                    arr[n].v = entry_payload(de); arr[n].vl = entry_payload_len(de);
-                    arr[n].enc = entry_encoding(de);
-                    n++;
-                }
-                if (it) dict_iter_free(it);
-            }
-
-            /* No count → single field as bulk string */
-            if (argc < 2) {
-                uint32_t r = (uint32_t)rand() % n;
-                int hl = snprintf(temp, sizeof(temp), "$%u\r\n", arr[r].fl);
-                dynbuf_cat(wb, temp, hl);
-                dynbuf_cat(wb, arr[r].f, (int)arr[r].fl);
-                dynbuf_lit(wb, "\r\n");
-                free(arr);
-                return DISPATCH_OK;
-            }
-
-            /* Parse count */
-            int64_t count64;
-            if (!parse_int64(args[1].ptr, args[1].len, &count64)) {
-                free(arr);
-                dynbuf_cat(wb, REP_ERR_INT, REP_ERR_INT_LEN);
-                return DISPATCH_ERROR;
-            }
-
-            int withvalues = 0;
-            if (argc >= 3) {
-                kvs_token_t w = args[2];
-                if (w.len == 10 && (memcmp(w.ptr, "WITHVALUES", 10) == 0 ||
-                                     memcmp(w.ptr, "withvalues", 10) == 0)) withvalues = 1;
-                else {
-                    free(arr);
-                    dynbuf_lit(wb, "-ERR syntax error\r\n");
-                    return DISPATCH_ERROR;
-                }
-            }
-
-            uint32_t want = (count64 < 0) ? (uint32_t)(-count64) : (uint32_t)count64;
-            int with_replacement = (count64 < 0);
-            if (!with_replacement && want > n) want = n;
-
-            uint32_t out_items = withvalues ? want * 2 : want;
-            int hl = snprintf(temp, sizeof(temp), "*%u\r\n", out_items);
-            dynbuf_cat(wb, temp, hl);
-
-            if (want == 0) { free(arr); return DISPATCH_OK; }
-
-            /* For "without replacement" sampling, perform a partial Fisher-Yates
-               shuffle of an index array of size n, take the first `want`. */
-            uint32_t *idx = NULL;
-            if (!with_replacement) {
-                idx = (uint32_t *)malloc(sizeof(uint32_t) * n);
-                if (!idx) { free(arr);
-                            dynbuf_lit(wb, "-ERR oom\r\n");
-                            return DISPATCH_ERROR; }
-                for (uint32_t i = 0; i < n; i++) idx[i] = i;
-                for (uint32_t i = 0; i < want; i++) {
-                    uint32_t j = i + ((uint32_t)rand() % (n - i));
-                    uint32_t t = idx[i]; idx[i] = idx[j]; idx[j] = t;
-                }
-            }
-
-            for (uint32_t i = 0; i < want; i++) {
-                uint32_t r = with_replacement ? ((uint32_t)rand() % n) : idx[i];
-                int hh = snprintf(temp, sizeof(temp), "$%u\r\n", arr[r].fl);
-                dynbuf_cat(wb, temp, hh);
-                dynbuf_cat(wb, arr[r].f, (int)arr[r].fl);
-                dynbuf_lit(wb, "\r\n");
-                if (withvalues) {
-                    write_value_resp(wb, arr[r].v, arr[r].vl, arr[r].enc);
-                }
-            }
-
-            free(idx);
-            free(arr);
-            return DISPATCH_OK;
-        }
         break; /* 'H' */
     }
 
-    dynbuf_cat(wb, REP_ERR_UNK, REP_ERR_UNK_LEN);
+    dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
     return DISPATCH_ERROR;
 }

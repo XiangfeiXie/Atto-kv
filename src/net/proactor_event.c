@@ -202,13 +202,12 @@ fd, result.gen, c->gen & 0xFFFFFFu);
             rb->buf = new_buf; rb->cap = (int)new_cap;
         }
         size_t old_len = (size_t)rb->len;
-        memcpy(rb->buf + c->r_off + rb->len, src, (size_t)res);
-        rb->len += res;
-        /* Only reset r_off if there was no pending partial data
-         * from a previous drain — otherwise we lose track of
-         * unparsed bytes spanning multiple buf-ring entries. */
+        /* If the previous drain consumed all data, reset r_off
+         * BEFORE copying so data lands at offset 0. */
         if (old_len == 0)
             c->r_off = 0;
+        memcpy(rb->buf + c->r_off + rb->len, src, (size_t)res);
+        rb->len += res;
         buf_ring_recycle(bid);
     } else if (res > 0) {
         rb->len += res;

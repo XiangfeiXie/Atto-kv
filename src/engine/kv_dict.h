@@ -13,7 +13,7 @@
  *  - Progressive rehashing (two hash tables, incremental bucket migration)
  *  - Cached hash value (no recomputation during rehash)
  *  - FNV-1a + Murmur3 finalizer for excellent distribution
- *  - Auto-grow (load factor > 2) and auto-shrink (load factor < 0.1)
+ *  - Auto-grow (load factor > 1) and auto-shrink (load factor < 0.1)
  *
  * data[] layout:  [type:1][encoding:1][payload: val_len-2]
  * ===================================================================== */
@@ -22,7 +22,6 @@
 enum {
     KV_TYPE_STRING = 0,
     KV_TYPE_HASH = 1,
-    KV_TYPE_COUNT
 };
 
 /* --- Entry encoding (the "encoding" byte in data[1]) --- */
@@ -196,10 +195,5 @@ static inline void kv_store_unlock(void) {
 /* Snapshot helpers (no-op in single-dict mode) */
 static inline void kv_store_lock_for_snapshot(void) { }
 static inline void kv_store_unlock_snapshot(void) { }
-
-void     kv_store_init(void);
-void     kv_store_destroy(void);
-uint32_t kv_store_count(void);
-void     kv_store_clear(void);
 
 #endif

@@ -12,6 +12,9 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 
+/* ── RDB changes counter (defined in persist_rdb.c) ── */
+extern uint64_t g_rdb_changes;
+
 /* ── from kvstore.c ── */
 
 /* cached time */
@@ -26,8 +29,8 @@ void entry_cleanup_by_type(kv_entry_t *e);
 /* write journal — inline for hot-path (threshold check + single memcpy) */
 static inline void kvs_write_journal_append(const char *msg, int length) {
     if (!msg || length <= 0) return;
-    if (!ENABLE_AOF) return;
-    kvs_wal_persist_append_raw(msg, (uint32_t)length);
+    if (ENABLE_RDB) g_rdb_changes++;
+    if (ENABLE_AOF) kvs_wal_persist_append_raw(msg, (uint32_t)length);
 }
 
 /* ── from kvstore_expire.c ── */

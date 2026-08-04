@@ -1,4 +1,5 @@
 #include "kv_dict.h"
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -19,12 +20,13 @@
 #define DICT_INIT_SIZE  16          /* must be power of 2 */
 #define DICT_MAX_SIZE   (1U << 24)  /* ~16M buckets max */
 
-/* Incremental rehash batch size.
- *
- * Each dict_add/dict_replace/dict_delete amortises the cost of moving
- * REHASH_BATCH buckets from ht[0] to ht[1].  Larger N finishes the
- * rehash window faster. */
-#define REHASH_BATCH    8
+/* Rehash batch size — scales with ht[0].size so larger tables migrate
+ * proportionally more buckets per operation, keeping rehash completion
+ * roughly constant at ~60 operations regardless of table size. */
+static inline int rehash_batch(kv_dict_t *d) {
+    int n = (int)(d->ht[0].size >> 6);  /* d->ht[0].size / 64 */
+    return n < 8 ? 8 : n;
+}
 
 static uint32_t next_pow2(uint32_t v) {
     if (v <= DICT_INIT_SIZE) return DICT_INIT_SIZE;
@@ -180,7 +182,7 @@ void dict_arena_init(kv_dict_t *d, size_t size) {
 
 /* =====================================================================
  * Progressive rehash: migrate up to 'steps' buckets from ht[0] to ht[1].
- * Called inside dict_add / dict_replace / dict_delete — amortised O(1).
+ * Called inside dict_add / dict_delete — amortised O(1).
  * ===================================================================== */
 
 static void dict_rehash_step(kv_dict_t *d, int steps) {
@@ -304,41 +306,38 @@ kv_entry_t *dict_find(kv_dict_t *d, const char *key, uint32_t key_len,
 }
 
 
+/* ── Insertion helper: expand, rehash, select target ht, lazy init ── */
+
+static kv_ht_t *dict_prepare_insert(kv_dict_t *d) {
+    dict_maybe_expand(d);
+
+    if (d->rehash_idx >= 0) {
+        dict_rehash_step(d, rehash_batch(d));
+        if (d->ht[1].size == 0) goto use_ht0;
+        return &d->ht[1];
+    }
+
+use_ht0:
+    if (d->ht[0].size == 0) {
+        if (ht_alloc(&d->ht[0], DICT_INIT_SIZE) < 0)
+            return NULL;
+    }
+    return &d->ht[0];
+}
+
 kv_entry_t *dict_add(kv_dict_t *d, const char *key, uint32_t key_len,
                      const char *data, uint32_t data_len, uint64_t hash)
 {
-    /* Expand if needed (and start rehashing) */
-    dict_maybe_expand(d);
-
-    /* Determine target table */
-    kv_ht_t *ht;
-    if (d->rehash_idx >= 0) {
-        /* During rehash: insert into ht[1] */
-        dict_rehash_step(d, REHASH_BATCH);
-        if (d->ht[1].size == 0) {
-            /* Rehash just finished — fall through to ht[0] */
-            goto use_ht0;
-        }
-        ht = &d->ht[1];
-    } else {
-use_ht0:
-        /* Lazy init */
-        if (d->ht[0].size == 0) {
-            if (ht_alloc(&d->ht[0], DICT_INIT_SIZE) < 0)
-                return NULL;
-        }
-        ht = &d->ht[0];
-    }
+    kv_ht_t *ht = dict_prepare_insert(d);
+    if (!ht) return NULL;
 
     kv_entry_t *e = entry_alloc(d, key, key_len, data, data_len, hash);
     if (!e) return NULL;
 
-    /* Prepend to bucket chain */
     uint32_t idx = (uint32_t)(hash & ht->size_mask);
     e->next = ht->buckets[idx];
     ht->buckets[idx] = e;
     ht->used++;
-
     return e;
 }
 
@@ -347,23 +346,9 @@ kv_entry_t *dict_add_raw(kv_dict_t *d, const char *key, uint32_t key_len,
                          const char *payload, uint32_t payload_len,
                          uint64_t hash)
 {
-    dict_maybe_expand(d);
+    kv_ht_t *ht = dict_prepare_insert(d);
+    if (!ht) return NULL;
 
-    kv_ht_t *ht;
-    if (d->rehash_idx >= 0) {
-        dict_rehash_step(d, REHASH_BATCH);
-        if (d->ht[1].size == 0) goto use_ht0;
-        ht = &d->ht[1];
-    } else {
-use_ht0:
-        if (d->ht[0].size == 0) {
-            if (ht_alloc(&d->ht[0], DICT_INIT_SIZE) < 0)
-                return NULL;
-        }
-        ht = &d->ht[0];
-    }
-
-    /* Build entry directly: [type:1][enc:1][payload][key] — one malloc */
     uint32_t data_len = (uint32_t)(2 + payload_len);
     kv_entry_t *e = entry_alloc(d, key, key_len, NULL, data_len, hash);
     if (!e) return NULL;
@@ -377,7 +362,6 @@ use_ht0:
     e->next = ht->buckets[idx];
     ht->buckets[idx] = e;
     ht->used++;
-
     return e;
 }
 
@@ -406,7 +390,7 @@ int dict_delete(kv_dict_t *d, const char *key, uint32_t key_len,
 
                 free(e);
                 ht->used--;
-                dict_rehash_step(d, REHASH_BATCH);
+                dict_rehash_step(d, rehash_batch(d));
                 dict_maybe_shrink(d);
                 return 0;
             }
@@ -415,13 +399,17 @@ int dict_delete(kv_dict_t *d, const char *key, uint32_t key_len,
         }
     }
 
-    dict_rehash_step(d, REHASH_BATCH);
+    dict_rehash_step(d, rehash_batch(d));
     return -1;  /* not found */
 }
 
 kv_entry_t *dict_resize_entry(kv_dict_t *d, kv_entry_t *e,
                                uint32_t new_data_len)
 {
+    /* Also advance rehash: SET-on-existing-key is the dominant path
+     * under overwrite-heavy workloads and must not stall migration. */
+    dict_rehash_step(d, rehash_batch(d));
+
     uint32_t old_val_len = e->val_len;
 
     if (new_data_len == old_val_len)

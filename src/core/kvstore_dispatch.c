@@ -6,6 +6,29 @@
 #include <string.h>
 #include <ctype.h>
 
+/* ── Key resolution helper — shared by inline GET/SET and single-key path ──
+ * Hash + lookup + lazy-expire.  Caller must hold the appropriate lock.
+ * On expiry the entry is cleaned and NULL is returned. */
+
+static inline kv_entry_t *dispatch_resolve(kvs_token_t key_tok,
+                                            uint64_t *hash_out, int is_write) {
+    uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
+    *hash_out = hash;
+    kv_entry_t *entry = dict_find(kv_dict_for(hash), key_tok.ptr,
+                                   (uint32_t)key_tok.len, hash);
+    if (entry && entry->expire && get_time_now() > entry->expire) {
+        if (is_write) {
+            entry_cleanup_by_type(entry);
+            dict_delete(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
+            atomic_fetch_add_explicit(kvs_expired_keys_ptr(), 1, memory_order_relaxed);
+        } else {
+            enqueue_expired_key(key_tok.ptr, (uint32_t)key_tok.len, hash);
+        }
+        return NULL;
+    }
+    return entry;
+}
+
 /* ── Inline GET/SET macros (hottest commands, 60-80% workload) ──────── */
 
 /* Fast uint-to-buffer: writes decimal representation, returns length */
@@ -121,14 +144,9 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     if (cmd.len == 3 && cmd.ptr[0] == 'G' && cmd.ptr[1] == 'E' && cmd.ptr[2] == 'T') {
         if (argc >= 2) {
             kvs_token_t key_tok = tokens[1];
-            uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
+            uint64_t hash;
             kv_store_rdlock();
-            kv_entry_t *entry = dict_find(kv_dict_for(hash), key_tok.ptr,
-                                          (uint32_t)key_tok.len, hash);
-            if (entry && entry->expire && get_time_now() > entry->expire) {
-                enqueue_expired_key(key_tok.ptr, (uint32_t)key_tok.len, hash);
-                entry = NULL;
-            }
+            kv_entry_t *entry = dispatch_resolve(key_tok, &hash, 0);
             if (entry && (int)entry_type(entry) != KV_TYPE_STRING) {
                 dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
                 kv_store_unlock();
@@ -143,17 +161,9 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     if (cmd.len == 3 && cmd.ptr[0] == 'S' && cmd.ptr[1] == 'E' && cmd.ptr[2] == 'T') {
         if (argc >= 2) {
             kvs_token_t key_tok = tokens[1];
-            uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
+            uint64_t hash;
             kv_store_wrlock();
-            kv_entry_t *entry = dict_find(kv_dict_for(hash), key_tok.ptr,
-                                          (uint32_t)key_tok.len, hash);
-            if (entry && entry->expire && get_time_now() > entry->expire) {
-                entry_cleanup_by_type(entry);
-                dict_delete(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
-                atomic_fetch_add_explicit(
-                    kvs_expired_keys_ptr(), 1, memory_order_relaxed);
-                entry = NULL;
-            }
+            kv_entry_t *entry = dispatch_resolve(key_tok, &hash, 1);
             if (entry && (int)entry_type(entry) != KV_TYPE_STRING) {
                 dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
                 kv_store_unlock();
@@ -185,43 +195,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             reply_bulk(wb, tokens[1].ptr, tokens[1].len);
         else
             dynbuf_lit(wb, "-ERR wrong number of arguments for 'echo' command\r\n");
-        return DISPATCH_OK;
-    }
-
-    if (TOKEN_EQ(cmd, "HELLO")) {
-        dynbuf_lit(wb, "-NOPROTO sorry, this protocol version is not supported\r\n");
-        return DISPATCH_OK;
-    }
-
-    if (TOKEN_EQ(cmd, "CLIENT")) {
-        if (argc >= 2 && (TOKEN_EQ(tokens[1], "SETNAME") ||
-                          TOKEN_EQ(tokens[1], "NO-EVICT") ||
-                          TOKEN_EQ(tokens[1], "NO-TOUCH") ||
-                          TOKEN_EQ(tokens[1], "REPLY")))
-            dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-        else if (argc >= 2 && TOKEN_EQ(tokens[1], "GETNAME"))
-            dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
-        else if (argc >= 2 && TOKEN_EQ(tokens[1], "ID"))
-            reply_integer(wb, c ? (long long)c->fd : 0);
-        else
-            dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-        return DISPATCH_OK;
-    }
-
-    if (TOKEN_EQ(cmd, "COMMAND")) {
-        if (argc >= 2 && TOKEN_EQ(tokens[1], "COUNT"))
-            reply_integer(wb, 0);
-        else
-            dynbuf_lit(wb, "*0\r\n");
-        return DISPATCH_OK;
-    }
-
-    if (TOKEN_EQ(cmd, "SELECT")) {
-        long long db = 0;
-        if (argc != 2 || token_to_ll(tokens[1], &db) < 0 || db != 0)
-            dynbuf_lit(wb, "-ERR DB index out of range\r\n");
-        else
-            dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         return DISPATCH_OK;
     }
 
@@ -346,37 +319,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
-    if (TOKEN_EQ(cmd, "MSETNX")) {
-        if (argc < 3 || ((argc - 1) % 2) != 0) {
-            dynbuf_lit(wb, "-ERR wrong number of arguments for 'msetnx' command\r\n");
-            return DISPATCH_ERROR;
-        }
-        kv_store_wrlock();
-        for (int i = 1; i + 1 < argc; i += 2) {
-            uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
-                                  (uint32_t)tokens[i].len);
-            kv_entry_t *ke = dict_find(kv_dict_for(kh), tokens[i].ptr,
-                                       (uint32_t)tokens[i].len, kh);
-            if (ke && (!ke->expire || get_time_now() <= ke->expire)) {
-                reply_integer(wb, 0);
-                kv_store_unlock();
-                return DISPATCH_OK;
-            }
-        }
-        for (int i = 1; i + 1 < argc; i += 2) {
-            uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
-                                  (uint32_t)tokens[i].len);
-            string_engine_set_pre(tokens[i].ptr, (uint32_t)tokens[i].len,
-                                  tokens[i+1].ptr, (uint32_t)tokens[i+1].len,
-                                  0, 0, kh, NULL);
-        }
-        reply_integer(wb, 1);
-        if (!g_in_reload)
-            kvs_write_journal_append(msg_raw, msg_len);
-        kv_store_unlock();
-        return DISPATCH_OK;
-    }
-
     if (TOKEN_EQ(cmd, "DEL") || TOKEN_EQ(cmd, "UNLINK")) {
         if (argc < 2) {
             dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
@@ -461,23 +403,17 @@ single_key:
         cmd_type = -2; is_write = 0;
     } else if (TOKEN_EQ(cmd, "EXPIRE") || TOKEN_EQ(cmd, "PERSIST")) {
         cmd_type = -2; is_write = 1;
-    } else if (TOKEN_EQ(cmd, "SET") || TOKEN_EQ(cmd, "SETNX") ||
-               TOKEN_EQ(cmd, "SETEX") || TOKEN_EQ(cmd, "GETSET") ||
-               TOKEN_EQ(cmd, "APPEND") || TOKEN_EQ(cmd, "INCR") ||
+    } else if (TOKEN_EQ(cmd, "SET") || TOKEN_EQ(cmd, "INCR") ||
                TOKEN_EQ(cmd, "INCRBY") || TOKEN_EQ(cmd, "DECR") ||
-               TOKEN_EQ(cmd, "DECRBY") || TOKEN_EQ(cmd, "MOD")) {
+               TOKEN_EQ(cmd, "DECRBY")) {
         cmd_type = KV_TYPE_STRING; is_write = 1;
     } else if (TOKEN_EQ(cmd, "GET") || TOKEN_EQ(cmd, "STRLEN")) {
         cmd_type = KV_TYPE_STRING; is_write = 0;
-    } else if (TOKEN_EQ(cmd, "HSET") || TOKEN_EQ(cmd, "HMSET") ||
-               TOKEN_EQ(cmd, "HSETNX") || TOKEN_EQ(cmd, "HDEL") ||
-               TOKEN_EQ(cmd, "HINCRBY") || TOKEN_EQ(cmd, "HINCRBYFLOAT")) {
+    } else if (TOKEN_EQ(cmd, "HSET") || TOKEN_EQ(cmd, "HDEL")) {
         cmd_type = KV_TYPE_HASH; is_write = 1;
-    } else if (TOKEN_EQ(cmd, "HGET") || TOKEN_EQ(cmd, "HMGET") ||
-               TOKEN_EQ(cmd, "HGETALL") || TOKEN_EQ(cmd, "HKEYS") ||
-               TOKEN_EQ(cmd, "HVALS") || TOKEN_EQ(cmd, "HLEN") ||
-               TOKEN_EQ(cmd, "HEXISTS") || TOKEN_EQ(cmd, "HSTRLEN") ||
-               TOKEN_EQ(cmd, "HRANDFIELD")) {
+    } else if (TOKEN_EQ(cmd, "HGET") || TOKEN_EQ(cmd, "HGETALL") ||
+               TOKEN_EQ(cmd, "HKEYS") || TOKEN_EQ(cmd, "HVALS") ||
+               TOKEN_EQ(cmd, "HLEN") || TOKEN_EQ(cmd, "HEXISTS")) {
         cmd_type = KV_TYPE_HASH; is_write = 0;
     } else {
         dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
@@ -487,20 +423,7 @@ single_key:
     if (is_write) kv_store_wrlock();
     else           kv_store_rdlock();
 
-    kv_entry_t *entry = dict_find(kv_dict_for(hash), key_tok.ptr,
-                                  (uint32_t)key_tok.len, hash);
-
-    /* Lazy-expire */
-    if (entry && entry->expire && get_time_now() > entry->expire) {
-        if (is_write) {
-            entry_cleanup_by_type(entry);
-            dict_delete(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
-            atomic_fetch_add_explicit(kvs_expired_keys_ptr(), 1, memory_order_relaxed);
-        } else {
-            enqueue_expired_key(key_tok.ptr, (uint32_t)key_tok.len, hash);
-        }
-        entry = NULL;
-    }
+    kv_entry_t *entry = dispatch_resolve(key_tok, &hash, is_write);
 
     int pre_len = wb->len;
 

@@ -46,7 +46,26 @@ static void rdb_sigchld(int signo);
 static const char *mread(const char *p, const char *end, void *out, size_t n);
 
 /* ── BGSAVE child PID (access via rdb_bgsave_in_progress()) ── */
-static volatile pid_t g_rdb_child_pid = 0;
+static volatile pid_t g_rdb_child_pid    = 0;
+
+/* ── BGSAVE three-layer defense ── */
+#define BGSAVE_COOLDOWN_MIN_SEC  1
+#define BGSAVE_COOLDOWN_MULT     5   /* cooldown = max(MIN, duration * MULT) */
+
+static int      g_bgsave_pending             = 0;
+static time_t   g_last_save_time             = 0;
+static time_t   g_last_bgsave_start          = 0;
+static int      g_last_bgsave_duration_sec   = 0;
+static uint64_t g_bgsave_skipped             = 0;
+static uint64_t g_bgsave_total               = 0;
+
+static inline time_t bgsave_cooldown(void) {
+    time_t dur = (time_t)g_last_bgsave_duration_sec * BGSAVE_COOLDOWN_MULT;
+    return dur > BGSAVE_COOLDOWN_MIN_SEC ? dur : BGSAVE_COOLDOWN_MIN_SEC;
+}
+
+/* ── Changes since last save (incremented on hot path) ── */
+uint64_t g_rdb_changes = 0;
 
 /* =========================================================================
  * RDB buffer helpers (moved from persistence.c)
@@ -187,11 +206,24 @@ static void rdb_write_uring(int fd, const char *data, size_t total) {
 }
 
 /* =========================================================================
- * BGSAVE state machine
+ * BGSAVE state machine — three-layer defense
+ *
+ *   Layer 1  Coalesce  : one pending retry queued when child is running
+ *   Layer 2  Cooldown  : minimum interval between successive BGSAVE starts
+ *   Layer 3  Drop      : redundant request when pending already exists
  * ========================================================================= */
 
 int rdb_bgsave_in_progress(void) {
     return (g_rdb_child_pid > 0) ? 1 : 0;
+}
+
+static void rdb_bgsave_done(void) {
+    time_t now = time(NULL);
+    g_rdb_child_pid              = 0;
+    g_bgsave_total++;
+    g_last_save_time             = now;
+    g_last_bgsave_duration_sec   = (int)(now - g_last_bgsave_start);
+    g_rdb_changes                = 0;
 }
 
 static void rdb_sigchld(int signo) {
@@ -200,9 +232,28 @@ static void rdb_sigchld(int signo) {
     int   status;
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
         if (pid == g_rdb_child_pid)
-            g_rdb_child_pid = 0;
+            rdb_bgsave_done();
     }
 }
+
+/* Called from event loop — retries pending BGSAVE when cooldown expires */
+void rdb_periodic(void) {
+    if (g_rdb_child_pid > 0)   return;
+    if (!g_bgsave_pending)      return;
+
+    time_t now = time(NULL);
+    if (now - g_last_bgsave_start >= bgsave_cooldown()) {
+        g_bgsave_pending = 0;
+        rdb_save_async_uring();
+    }
+}
+
+/* ── Stat accessors ── */
+uint64_t rdb_save_time(void)            { return (uint64_t)g_last_save_time; }
+uint64_t rdb_bgsave_total(void)         { return g_bgsave_total; }
+uint64_t rdb_bgsave_skipped(void)       { return g_bgsave_skipped; }
+int     rdb_bgsave_cooldown_sec(void)   { return (int)bgsave_cooldown(); }
+int     rdb_bgsave_last_duration(void)  { return g_last_bgsave_duration_sec; }
 
 /* =========================================================================
  * Binary-safe read helper (RDB load)
@@ -379,9 +430,15 @@ void rdb_save_sync(void) {
 
 /* =============================================================================
  * RDB asynchronous save (fork + child writes via io_uring)
+ *
+ * Return codes:
+ *    0  BGSAVE started normally
+ *   -1  drop — child already running + pending slot occupied
+ *   -2  scheduled — child running, coalesced as pending
+ *   -3  cooldown — too soon after last BGSAVE start, request rejected
  * ============================================================================= */
 
-void rdb_save_async_uring(void) {
+int rdb_save_async_uring(void) {
     static int installed = 0;
     if (!installed) {
         struct sigaction sa;
@@ -392,11 +449,34 @@ void rdb_save_async_uring(void) {
         installed = 1;
     }
 
-    if (g_rdb_child_pid > 0) {
-        printf("[RDB] BGSAVE already in progress (pid=%d), skipping\n",
-               (int)g_rdb_child_pid);
-        return;
+    time_t now = time(NULL);
+
+    /* ── Layer 2: adaptive cooldown (applies whether or not child is running) ── */
+    if (now - g_last_bgsave_start < bgsave_cooldown()) {
+        g_bgsave_skipped++;
+        return -3;
     }
+
+    /* ── Child already running ── */
+    if (g_rdb_child_pid > 0) {
+        /* Layer 3: already have a pending retry → drop */
+        if (g_bgsave_pending) {
+            g_bgsave_skipped++;
+            fprintf(stderr, "[RDB] BGSAVE dropped: child running + pending full "
+                    "(pid=%d, skipped=%llu)\n",
+                    (int)g_rdb_child_pid,
+                    (unsigned long long)g_bgsave_skipped);
+            return -1;
+        }
+        /* Layer 1: coalesce — queue one pending retry */
+        g_bgsave_pending = 1;
+        g_bgsave_skipped++;
+        return -2;
+    }
+
+    /* ── Normal path: no child running ── */
+    g_last_bgsave_start = now;
+    g_bgsave_pending    = 0;
 
     long long t_lock = get_time_now_real();
     kv_store_lock_for_snapshot();
@@ -408,7 +488,8 @@ void rdb_save_async_uring(void) {
                 strerror(errno));
         kv_store_unlock_snapshot();
         rdb_save_sync();
-        return;
+        rdb_bgsave_done();
+        return 0;
     }
     if (pid == 0) {
         rdb_save_sync();
@@ -419,8 +500,10 @@ void rdb_save_async_uring(void) {
     kv_store_unlock_snapshot();
     long long t_done = get_time_now_real();
     g_rdb_child_pid = pid;
-    printf("[RDB] BGSAVE started, child pid=%d (snapshot stall: %lld ms acquire, %lld ms total)\n",
+    printf("[RDB] BGSAVE started, child pid=%d "
+           "(stall: %lld ms acquire, %lld ms total)\n",
            (int)pid, t_locked - t_lock, t_done - t_lock);
+    return 0;
 }
 
 

@@ -32,7 +32,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                                DynBuf *wb, struct conn *c);
 
 void kvs_flush_all(void);
-void kvs_cleanup_entry(kv_entry_t *e);  /* free type-specific internal structures */
 
 /* ── Active expire ── */
 void kvs_start_expire_thread(void);

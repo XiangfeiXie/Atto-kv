@@ -113,6 +113,16 @@ dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) {
         APPEND("rdb_enabled:%d\r\n", ENABLE_RDB ? 1 : 0);
         APPEND("loading:%d\r\n", g_in_reload ? 1 : 0);
         APPEND("rdb_bgsave_in_progress:%d\r\n", rdb_bgsave_in_progress());
+        APPEND("rdb_last_save_time:%llu\r\n",
+               (unsigned long long)rdb_save_time());
+        APPEND("rdb_changes_since_last_save:%llu\r\n",
+               (unsigned long long)g_rdb_changes);
+        APPEND("rdb_bgsave_total:%llu\r\n",
+               (unsigned long long)rdb_bgsave_total());
+        APPEND("rdb_bgsave_skipped:%llu\r\n",
+               (unsigned long long)rdb_bgsave_skipped());
+        APPEND("rdb_bgsave_cooldown:%d\r\n", rdb_bgsave_cooldown_sec());
+        APPEND("rdb_bgsave_last_duration:%d\r\n", rdb_bgsave_last_duration());
         APPEND("\r\n");
     }
 

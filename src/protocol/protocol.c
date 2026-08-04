@@ -1,6 +1,7 @@
 #include "protocol.h"
 #include "config.h"
 #include "kvstore.h"
+#include <stdio.h>
 #include <string.h>
 
 /* ── RESP fragments ─────────────────────────────────────────────────── */
@@ -9,11 +10,16 @@
     const char id[] = str; \
     const int  id##_LEN = (int)(sizeof(str) - 1)
 
-S(RESP_OK,    "+OK\r\n");
-S(RESP_PONG,  "+PONG\r\n");
-S(RESP_NIL,   "$-1\r\n");
-S(RESP_ERR_INV, "-ERR invalid RESP protocol\r\n");
-S(RESP_ERR_UNK, "-ERR unknown command\r\n");
+S(RESP_OK,        "+OK\r\n");
+S(RESP_PONG,      "+PONG\r\n");
+S(RESP_NIL,       "$-1\r\n");
+S(RESP_ONE,       ":1\r\n");
+S(RESP_ZERO,      ":0\r\n");
+S(RESP_ERROR,     "-ERR error\r\n");
+S(RESP_ERR_INV,   "-ERR invalid RESP protocol\r\n");
+S(RESP_ERR_UNK,   "-ERR unknown command\r\n");
+S(RESP_ERR_ARGS,  "-ERR wrong number of arguments\r\n");
+S(RESP_ERR_INT,   "-ERR value is not an integer or out of range\r\n");
 S(RESP_WRONGTYPE, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
 
 #undef S

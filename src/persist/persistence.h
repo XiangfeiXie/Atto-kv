@@ -5,6 +5,8 @@
 #include "server.h"
 #include "kv_dict.h"
 
+#define BGSAVE_COOLDOWN_MIN_SEC 1
+
 /* =========================================================
  * 持久化模块：WAL io_uring 落盘 + RDB fork 保存 + mmap 加载
  *
@@ -26,9 +28,19 @@ const char *persist_path(const char *rel);
 /* RDB：同步 io_uring 写 */
 void rdb_save_sync(void);
 /* RDB：fork + io_uring 批量写 */
-void rdb_save_async_uring(void);
+int rdb_save_async_uring(void);
 /* RDB：检查 BGSAVE 是否正在进行 */
 int rdb_bgsave_in_progress(void);
+/* RDB：事件循环周期性维护（pending BGSAVE 重试） */
+void rdb_periodic(void);
+
+/* RDB 保存状态统计 */
+extern uint64_t g_rdb_changes;
+uint64_t rdb_save_time(void);
+uint64_t rdb_bgsave_total(void);
+uint64_t rdb_bgsave_skipped(void);
+int     rdb_bgsave_cooldown_sec(void);
+int     rdb_bgsave_last_duration(void);
 
 /* mmap 加载 */
 void rdb_load_mmap(void);

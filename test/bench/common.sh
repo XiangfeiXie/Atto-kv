@@ -20,6 +20,11 @@ KVS_SLAVE_PORT=2002
 REDIS_PORT=6379
 MASTER_RDMA_PORT=2100
 
+# ---- CPU 核绑定（对齐 inazuma-kv 方法：server/client 分核，消除核心争抢）----
+SERVER_CORES=${SERVER_CORES:-"0,3"}   # 服务器绑核
+CLIENT_CORES=${CLIENT_CORES:-"1,2"}   # redis-benchmark 客户端绑核
+BENCH_RAND=${BENCH_RAND:-1000000}     # -r 随机 key 范围（0 关闭随机）
+
 # ---- 结果输出 ----
 RESULT_FILE="${PROJECT_DIR}/test/bench/results.txt"
 RESULT_CSV="${PROJECT_DIR}/test/bench/results.csv"
@@ -111,7 +116,7 @@ start_kvs() {
     # 提取配置中 port 的值
     local port=$(grep '^port ' "$conf_path" | awk '{print $2}')
     port=${port:-$KVS_PORT}
-    nohup "$KVS_BIN" "$conf_path" > "${LOG_DIR}/kvstore_${conf}.log" 2>&1 &
+    nohup taskset -c "$SERVER_CORES" "$KVS_BIN" "$conf_path" > "${LOG_DIR}/kvstore_${conf}.log" 2>&1 &
     local pid=$!
     sleep 0.2
     if ! kill -0 "$pid" 2>/dev/null; then
@@ -172,6 +177,13 @@ start_redis() {
     systemctl start redis-server
     sleep 1
     redis-cli -p $REDIS_PORT PING >/dev/null 2>&1 || { err "Redis 启动失败"; exit 1; }
+    # 绑定 redis-server 主线程到指定核
+    local redis_pid
+    redis_pid=$(pgrep -x redis-server | head -1)
+    if [ -n "$redis_pid" ]; then
+        taskset -pc "$SERVER_CORES" "$redis_pid" >/dev/null 2>&1 \
+            || warn "taskset 绑定 redis-server 失败 (pid=$redis_pid)"
+    fi
     redis-cli -p $REDIS_PORT FLUSHALL >/dev/null
     log "Redis 已启动 (port=$REDIS_PORT)"
 }
@@ -228,8 +240,10 @@ run_bench() {
     local host=$1 port=$2 test=$3 n=${4:-1000000} c=${5:-50} P=${6:-20} d=${7:-3}
     local csv_line qps="0" retry=0
     while [ $retry -lt 2 ]; do
-        csv_line=$(redis-benchmark -h "$host" -p "$port" -t "$test" \
-            -n "$n" -c "$c" -P "$P" -d "$d" --csv 2>/dev/null | grep -E '^"[^"]+","[0-9]' | tail -1)
+        # 客户端绑核 (CLIENT_CORES) + 随机 key (-r)：消除客户端瓶颈与单 key 热点
+        csv_line=$(taskset -c "$CLIENT_CORES" redis-benchmark -h "$host" -p "$port" -t "$test" \
+            -n "$n" -c "$c" -P "$P" -d "$d" -r "$BENCH_RAND" --csv 2>/dev/null \
+            | grep -E '^"[^"]+","[0-9]' | tail -1)
         if [ -n "$csv_line" ]; then
             qps=$(echo "$csv_line" | cut -d',' -f2 | tr -d '"')
             if [[ "$qps" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
@@ -251,7 +265,7 @@ run_bench_quiet() {
 run_bench_r() {
     local host=$1 port=$2 test=$3 n=${4:-1000000} c=${5:-50} P=${6:-20} d=${7:-3} r=${8:-1000000}
     local csv_line
-    csv_line=$(redis-benchmark -h "$host" -p "$port" -t "$test" \
+    csv_line=$(taskset -c "$CLIENT_CORES" redis-benchmark -h "$host" -p "$port" -t "$test" \
         -n "$n" -c "$c" -P "$P" -d "$d" -r "$r" --csv 2>/dev/null | tail -1)
     local qps=$(echo "$csv_line" | cut -d',' -f2 | tr -d '"')
     echo "${qps:-0}"

@@ -17,6 +17,7 @@
 
 #include "wal_persist.h"
 #include "persistence.h"
+#include "kvstore.h"     /* get_time_now (cached clock) */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -595,23 +596,26 @@ void kvs_wal_periodic(void) {
     /* Reap any completions (frees in-flight slots) */
     kvs_wal_reap_completions();
 
-    /* Partial flush: if data has been sitting > 1 second in current slot.
-     * Check via append counter — if counter hasn't changed since last check,
-     * data is stale.  Event loop runs at ~10K-100K iters/s so 4096 ≈ idle. */
+    /* Partial flush: flush the current slot once its data has been
+     * buffered for ≥ 1 second (everysec semantics).  Time-based, NOT
+     * tick-based: the event-loop frequency varies wildly between engines
+     * (reactor idle ≈ 10 Hz, proactor idle ≈ 10 kHz), so a tick counter
+     * was an unreliable proxy for wall-clock time — it delayed the flush
+     * by up to 10 s on the reactor, silently widening the crash window
+     * well past the advertised 1 s. */
     {
-        static int last_count = 0;
-        static int idle_ticks = 0;
-        int cur = g_append_count;
-        if (cur == last_count && g_prod_pos > 0) {
-            idle_ticks++;
-            if (idle_ticks > 100) { /* ~1s at 100Hz event loop */
+        static long long last_flush_ms = 0;
+        long long now_ms = get_time_now();
+        if (g_prod_pos > 0) {
+            if (last_flush_ms == 0)
+                last_flush_ms = now_ms;
+            else if (now_ms - last_flush_ms >= 1000) {
                 wal_flush_current_slot();
-                idle_ticks = 0;
+                last_flush_ms = now_ms;
             }
         } else {
-            idle_ticks = 0;
+            last_flush_ms = 0;
         }
-        last_count = cur;
     }
 
     /* Check fsync timer */

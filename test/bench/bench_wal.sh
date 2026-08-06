@@ -56,7 +56,7 @@ run_ping_test() {
     local host=$1 port=$2 label=$3 qps="0" retry=0
     while [ $retry -lt 2 ]; do
         local csv_line
-        csv_line=$(redis-benchmark -h "$host" -p "$port" -t ping \
+        csv_line=$(taskset -c "$CLIENT_CORES" redis-benchmark -h "$host" -p "$port" -t ping \
             -n $BENCH_N -c $BENCH_C --csv 2>/dev/null | tail -1)
         if [ -n "$csv_line" ]; then
             qps=$(echo "$csv_line" | cut -d',' -f2 | tr -d '"')
@@ -74,7 +74,7 @@ run_ping_test() {
 # ---- 预热函数（写入 WARMUP_N 个 key）----
 warmup_keys() {
     local host=$1 port=$2 P=$3
-    redis-benchmark -h "$host" -p "$port" -t set \
+    taskset -c "$CLIENT_CORES" redis-benchmark -h "$host" -p "$port" -t set \
         -n $WARMUP_N -c $BENCH_C -P "$P" -d 16 -q >/dev/null 2>&1 || true
 }
 
@@ -82,6 +82,7 @@ warmup_keys() {
 init_wal_results() {
     echo "# WAL/AOF 持久化性能对比 — $(date '+%Y-%m-%d %H:%M:%S')" > "$RESULT_TXT"
     echo "压测参数: redis-benchmark -n $BENCH_N -c $BENCH_C -P <depth> -d 16" >> "$RESULT_TXT"
+    echo "CPU 绑核: server=$SERVER_CORES client=$CLIENT_CORES" >> "$RESULT_TXT"
     echo "" >> "$RESULT_TXT"
     echo "test,system,aof,qps" > "$RESULT_CSV"
 }
@@ -131,7 +132,7 @@ test_t2_kvs_aof_off() {
         rm -f "${PROJECT_DIR}/build/incr.wal"
 
         # Warmup to eliminate cold-start bias (200K ops, not recorded)
-        redis-benchmark -h 127.0.0.1 -p "$KVS_PORT" -t set \
+        taskset -c "$CLIENT_CORES" redis-benchmark -h 127.0.0.1 -p "$KVS_PORT" -t set \
             -n $WARMUP_N -c $BENCH_C -P 16 -d 16 -q >/dev/null 2>&1 || true
 
         # SET
@@ -170,7 +171,7 @@ test_t3_kvs_aof_on() {
         rm -f "${PROJECT_DIR}/build/incr.wal"
 
         # Warmup to eliminate cold-start bias (200K ops, not recorded)
-        redis-benchmark -h 127.0.0.1 -p "$KVS_PORT" -t set \
+        taskset -c "$CLIENT_CORES" redis-benchmark -h 127.0.0.1 -p "$KVS_PORT" -t set \
             -n $WARMUP_N -c $BENCH_C -P 16 -d 16 -q >/dev/null 2>&1 || true
 
         # SET

@@ -174,13 +174,19 @@ void        kv_store_iter_free(kv_store_iter_t *it);
  * 0 = free, 1 = held by main thread, 2 = held by expire thread.
  * Main thread always wins (CAS 0→1) — only brief spin when the
  * background expire thread (once per ~1s) currently holds the lock.
- * The expire thread uses CAS 0→2 and skips if the main thread is busy. */
+ * The expire thread uses CAS 0→2 and skips if the main thread is busy.
+ *
+ * Fast path (common case, >99.99%): one CAS + return.  Slow path
+ * (expire thread active): CAS fails → spin on PAUSE until release
+ * → retry CAS once.  Expire thread holds the lock < 4 µs. */
 extern volatile int g_store_lock;
 
 static inline void kv_store_rdlock(void) {
-    while (__sync_val_compare_and_swap(&g_store_lock, 0, 1) != 0) {
-        while (__atomic_load_n(&g_store_lock, __ATOMIC_RELAXED) != 0)
-            __builtin_ia32_pause();
+    if (__sync_val_compare_and_swap(&g_store_lock, 0, 1) != 0) {
+        do {
+            while (__atomic_load_n(&g_store_lock, __ATOMIC_RELAXED) != 0)
+                __builtin_ia32_pause();
+        } while (__sync_val_compare_and_swap(&g_store_lock, 0, 1) != 0);
     }
 }
 

@@ -39,6 +39,7 @@ static void config_default(void) {
     kvs_config.fullsync_max_retries = 3;
 
     kvs_config.latency_histogram_enabled = 0;
+    kvs_config.expire_enabled            = 1;  /* on by default */
 }
 
 /* Resolve sentinel values and emit sanity warnings.  Called once after
@@ -195,6 +196,10 @@ int config_load(const char *path) {
             int v = parse_bool(val, lineno, "latency_histogram");
             if (v >= 0) kvs_config.latency_histogram_enabled = v;
 
+        } else if (strcasecmp(key, "expire") == 0) {
+            int v = parse_bool(val, lineno, "expire");
+            if (v >= 0) kvs_config.expire_enabled = v;
+
         } else {
             printf("[CONFIG] line %d: unknown key '%s'\n", lineno, key);
         }
@@ -247,6 +252,8 @@ void config_print(void) {
 
     if (kvs_config.latency_histogram_enabled)
         printf("  Latency hist  : sampled dispatch histogram enabled\n");
+    printf("  Expire        : %s\n",
+           kvs_config.expire_enabled ? "on (lazy+queue+thread)" : "off");
     printf("  Workers       : 1 (single-thread proactor)\n");
     printf("  CPU pin       : off (single-threaded mode)\n");
     printf("========================================\n\n");

@@ -17,7 +17,7 @@ require_tools
 
 # ---- 参数 ----
 BENCH_N=1000000   # 每轮请求数
-BENCH_C=50        # 并发连接数
+BENCH_C=20        # 并发连接数
 WARMUP_N=200000   # GET 前预热 SET 数量
 
 CONF="kvstore-none.conf"
@@ -46,7 +46,8 @@ declare -A KVS_SET REDIS_SET KVS_GET REDIS_GET
 init_results
 record_raw "=== Pipeline 批量处理性能对比 ==="
 record_raw "配置文件: $CONF"
-record_raw "压测参数: redis-benchmark -n $BENCH_N -c $BENCH_C -P <depth> -d 16"
+record_raw "压测参数: redis-benchmark -n $BENCH_N -c $BENCH_C -P <depth> -d 16 -r $BENCH_RAND"
+record_raw "CPU 绑核: server=$SERVER_CORES client=$CLIENT_CORES"
 record_raw "测试时间: $(date '+%Y-%m-%d %H:%M:%S')"
 record_raw ""
 
@@ -82,10 +83,10 @@ for P in "${PIPELINES[@]}"; do
 
     # ── GET 预热 ────────────────────────────────────
     step "P=$P  GET 预热（写入 ${WARMUP_N} keys）"
-    redis-benchmark -h 127.0.0.1 -p "$KVS_PORT"   -t set \
-        -n $WARMUP_N -c $BENCH_C -P "$P" -d 16 -q >/dev/null 2>&1 || true
-    redis-benchmark -h 127.0.0.1 -p "$REDIS_PORT" -t set \
-        -n $WARMUP_N -c $BENCH_C -P "$P" -d 16 -q >/dev/null 2>&1 || true
+    taskset -c "$CLIENT_CORES" redis-benchmark -h 127.0.0.1 -p "$KVS_PORT"   -t set \
+        -n $WARMUP_N -c $BENCH_C -P "$P" -d 16 -r "$BENCH_RAND" -q >/dev/null 2>&1 || true
+    taskset -c "$CLIENT_CORES" redis-benchmark -h 127.0.0.1 -p "$REDIS_PORT" -t set \
+        -n $WARMUP_N -c $BENCH_C -P "$P" -d 16 -r "$BENCH_RAND" -q >/dev/null 2>&1 || true
 
     # ── GET ──────────────────────────────────────────
     step "P=$P  GET — kvstore"

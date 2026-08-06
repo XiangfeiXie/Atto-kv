@@ -53,6 +53,12 @@ typedef struct {
 
     /* Latency histogram for performance monitoring */
     int  latency_histogram_enabled;
+
+    /* Expiration (lazy + queue + background thread).  Turn off with
+     *   expire off
+     * in conf to eliminate all expire-related overhead — useful for
+     * clean pipeline benchmarks where no keys carry a TTL. */
+    int  expire_enabled;
 } KvsConfig;
 
 extern KvsConfig kvs_config;
@@ -65,5 +71,7 @@ void config_print(void);
     (kvs_config.persist_mode == PERSIST_RDB  || kvs_config.persist_mode == PERSIST_AOF)
 #define ENABLE_AOF \
     (kvs_config.persist_mode == PERSIST_AOF)
+#define ENABLE_EXPIRE \
+    (kvs_config.expire_enabled)
 
 #endif

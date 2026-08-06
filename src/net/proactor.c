@@ -4,6 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>        /* nanosleep (idle poll) */
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <netinet/in.h>
@@ -257,25 +258,26 @@ static void proactor_loop(proactor_worker_t *w) {
         int nready = io_uring_peek_batch_cqe(ring, cqes, CQE_BATCH_SIZE);
 
         if (nready == 0) {
-            /* Dynamic timeout: 100μs idle poll (vs Redis 100μs epoll).
-             * Adds a timeout SQE so submit_and_wait returns quickly. */
-            struct io_uring_sqe *sqe = get_sqe_submit(ring);
-            if (sqe) {
-                struct __kernel_timespec ts = { .tv_sec = 0, .tv_nsec = 100000L };
-                io_uring_prep_timeout(sqe, &ts, 0, 0);
-                sqe->user_data = conn_info_pack(0, 0, 0);
-                w->pending_sqes = 1;
-            }
-
-            int ret = io_uring_submit_and_wait(ring, 1);
-            if (ret < 0) {
-                if (ret == -EINTR) continue;
-                fprintf(stderr, "[proactor] submit_and_wait: %s\n", strerror(-ret));
-                break;
-            }
-            w->pending_sqes = 0;
-            nready = io_uring_peek_batch_cqe(ring, cqes, CQE_BATCH_SIZE);
-            if (nready <= 0) continue;
+            /* Idle poll: hand any unsubmitted SQEs (accept re-arm, recv
+             * arms queued by event handlers) to the SQPOLL kernel thread,
+             * then sleep a bounded 100μs before re-polling.  This keeps the
+             * loop waking periodically so update_cached_time()/kvs_wal_periodic()
+             * run (WAL flush, RDB periodic saves) even with zero traffic.
+             *
+             * A timeout-SQE + io_uring_submit_and_wait() was tried first but
+             * blocks indefinitely under SQPOLL — the kernel submission thread
+             * does not pick up the timeout SQE while idle, freezing the loop
+             * and stalling the WAL flush for the entire idle period.  A plain
+             * poll+sleep sidesteps io_uring's idle semantics entirely.
+             *
+             * The io_uring_submit() here is required: without it, SQEs added
+             * via get_sqe_submit() (notably the initial accept) would never
+             * be handed to the kernel thread while w->pending_sqes stays 0,
+             * so no connections would ever be accepted. */
+            io_uring_submit(ring);
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000L };
+            nanosleep(&ts, NULL);
+            continue;
         }
 
         /* Process CQEs (prepare SQEs for next iteration) */

@@ -16,7 +16,7 @@ static inline kv_entry_t *dispatch_resolve(kvs_token_t key_tok,
     *hash_out = hash;
     kv_entry_t *entry = dict_find(kv_dict_for(hash), key_tok.ptr,
                                    (uint32_t)key_tok.len, hash);
-    if (entry && entry->expire && get_time_now() > entry->expire) {
+    if (ENABLE_EXPIRE && entry && entry->expire && get_time_now() > entry->expire) {
         if (is_write) {
             entry_cleanup_by_type(entry);
             dict_delete(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
@@ -170,7 +170,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                 return DISPATCH_ERROR;
             }
             INLINE_SET_COMMAND(entry, hash, tokens, argc, wb, msg_raw, msg_len);
-            flush_expire_queue();
+            if (ENABLE_EXPIRE) flush_expire_queue();
             kv_store_unlock();
             return DISPATCH_OK;
         }
@@ -506,7 +506,7 @@ single_key:
                   !(rlen >= 5 && memcmp(resp, "$-1\r\n", 5) == 0));
         if (ok && !g_in_reload)
             kvs_write_journal_append(msg_raw, msg_len);
-        flush_expire_queue();
+        if (ENABLE_EXPIRE) flush_expire_queue();
     }
 
     kv_store_unlock();

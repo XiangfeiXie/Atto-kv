@@ -5,7 +5,6 @@
 #include <netinet/tcp.h>     /* TCP_NODELAY */
 #include <string.h>
 #include <unistd.h>
-#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/time.h>
 #include <stdlib.h>
@@ -16,56 +15,39 @@
 #include "protocol.h"
 #include "config.h"
 
-#define MAX_PORTS  1             /* Single port for production */
 
-#define TIME_SUB_MS(tv1, tv2)  ((tv1.tv_sec - tv2.tv_sec) * 1000 + (tv1.tv_usec - tv2.tv_usec) / 1000)
+/* ── Global epoll fd — must be declared before conn_set_events ── */
+int epfd = 0;
 
 /* ── Dynamic connection pool ── */
 static struct conn *conn_pool = NULL;
 static int          conn_pool_size = 0;
 
-#if ENABLE_KVSTORE
-extern int epfd;
-
-/* ── Lazy event mask update: only epoll_ctl when mask actually changed ── */
+/* ── LT event mask: EPOLLIN always armed (level-triggered — no re-arm
+ *   needed).  EPOLLOUT toggled dynamically: added when write_buf has
+ *   data, removed when empty to avoid LT write-ready storm.
+ *
+ *   When c->status is set (close-after-flush), EPOLLIN is suppressed
+ *   so the peer cannot inject more commands after QUIT / proto error. ── */
 static void conn_set_events(int fd, struct conn *c) {
-    uint32_t ev = EPOLLIN | EPOLLET;  /* Edge-triggered for efficiency */
+    uint32_t want = c->status ? 0 : EPOLLIN;
     if (c->write_buf.len > 0)
-        ev |= EPOLLOUT;
+        want |= EPOLLOUT;
 
-    if (ev == c->cur_events)
+    if (want == c->cur_events)
         return;                      /* no change — skip syscall */
-    c->cur_events = ev;
+    c->cur_events = want;
 
     struct epoll_event e;
-    e.events = ev;
+    e.events = want;
     e.data.fd = fd;
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &e);
 }
-#endif
 
-int accept_cb(int fd);
 int recv_cb(int fd);
 int send_cb(int fd);
 
-int epfd = 0;
-struct timeval begin;
-
-int set_event(int fd, int event, int flag) {
-    if (flag) {
-        struct epoll_event ev;
-        ev.events = event;
-        ev.data.fd = fd;
-        epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
-    } else {
-        struct epoll_event ev;
-        ev.events = event;
-        ev.data.fd = fd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-    }
-}
-
-int event_register(int fd, int event) {
+int event_register(int fd) {
     if (fd < 0) return -1;
     if (fd >= conn_pool_size) {
         fprintf(stderr, "[reactor] fd %d exceeds maxclients %d\n", fd, conn_pool_size);
@@ -76,7 +58,6 @@ int event_register(int fd, int event) {
     struct conn *c = &conn_pool[fd];
     c->fd = fd;
     c->active = 1;
-    c->cur_events = (uint32_t)event;
     c->r_action.recv_callback = recv_cb;
     c->send_callback = send_cb;
     c->status = 0;
@@ -89,14 +70,18 @@ int event_register(int fd, int event) {
     c->r_off = 0;
     c->w_off = 0;
 
-    /* Set non-blocking + TCP_NODELAY for low latency */
+    /* Non-blocking + TCP_NODELAY for low latency */
     if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1)
         perror("fcntl O_NONBLOCK");
 
     int nodelay = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-    set_event(fd, event, 1);
+    struct epoll_event ev;
+    ev.events = EPOLLIN;                  /* LT: EPOLLIN only, no EPOLLET */
+    ev.data.fd = fd;
+    c->cur_events = EPOLLIN;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
     return 0;
 }
 
@@ -126,18 +111,17 @@ int accept_cb(int fd) {
     struct sockaddr_in clientaddr;
     socklen_t len = sizeof(clientaddr);
 
-    /* Edge-triggered: drain all pending accepts */
+    /* Level-triggered: drain all pending accepts in one go */
     for (;;) {
         int clientfd = accept(fd, (struct sockaddr*)&clientaddr, &len);
         if (clientfd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
-                break;  /* No more pending connections */
+                break;
             fprintf(stderr, "[reactor] accept error: %s\n", strerror(errno));
             return -1;
         }
 
-        /* Register new connection with EPOLLIN | EPOLLET */
-        if (event_register(clientfd, EPOLLIN | EPOLLET) != 0) {
+        if (event_register(clientfd) != 0) {
             close(clientfd);
             continue;
         }
@@ -161,7 +145,7 @@ int recv_cb(int fd) {
 
     int eof = 0;
 
-    /* Edge-triggered: drain all available data */
+    /* Level-triggered: drain all available data in one go */
     for (;;) {
         int tail = c->r_off + c->read_buf.len;
         int remain = c->read_buf.cap - tail;
@@ -199,14 +183,29 @@ int recv_cb(int fd) {
         c->read_buf.len += n;
     }
 
-#if ENABLE_KVSTORE
+
     /* Prefetch read buffer for protocol parsing */
     if (__builtin_expect(c->read_buf.len > 64, 1))
         __builtin_prefetch(c->read_buf.buf + c->r_off, 0, 3);
 
+    /* Defer drain while a send is in progress — avoids write-buffer
+     * corruption when new responses would be appended with w_off > 0.
+     * Pending data is drained in send_cb once the write buffer empties. */
+    if (c->write_buf.len > 0) {
+        conn_set_events(fd, c);
+        return 0;
+    }
+
     /* Process all available commands in the buffer */
     c->w_off = 0;
     kvs_drain_resp_commands_off(&c->read_buf, &c->r_off, &c->write_buf, c);
+
+    /* Reset r_off when buffer is fully consumed to prevent unbounded
+     * growth of the read offset — without this, repeated drain→empty
+     * cycles let r_off creep past cap, forcing unnecessary realloc
+     * (doubling up to 16 MB) even though the buffer is logically empty. */
+    if (c->read_buf.len == 0)
+        c->r_off = 0;
 
     /* QUIT / protocol error: close-after-flush */
     if (__builtin_expect(c->status != 0, 0)) {
@@ -214,18 +213,15 @@ int recv_cb(int fd) {
             conn_release(fd);
             return 0;
         }
-        /* Disable EPOLLIN, keep EPOLLOUT to flush remaining bytes */
+        /* Suppress EPOLLIN, keep EPOLLOUT to drain remaining bytes.
+         * conn_set_events honours c->status and won't re-enable reads. */
         struct epoll_event ev;
-        ev.events = EPOLLOUT | EPOLLET;
+        ev.events = EPOLLOUT;
         ev.data.fd = fd;
-        c->cur_events = EPOLLOUT | EPOLLET;
+        c->cur_events = EPOLLOUT;
         epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
         return 0;
     }
-
-    /* Update event mask based on new state */
-    conn_set_events(fd, c);
-#endif
 
     /* Defer close until response is sent */
     if (eof && c->write_buf.len == 0) {
@@ -242,7 +238,7 @@ int send_cb(int fd) {
 
     DynBuf *wb = &c->write_buf;
 
-    /* Edge-triggered: drain all available send buffer space */
+    /* Drain all available send buffer space */
     while (wb->len > 0) {
         ssize_t n = send(fd, wb->buf + c->w_off, wb->len, MSG_NOSIGNAL);
         if (n < 0) {
@@ -265,12 +261,28 @@ int send_cb(int fd) {
             conn_release(fd);
             return 0;
         }
+
+        /* Pending read data was deferred in recv_cb (write_buf was busy).
+         * Process it now to unblock the pipeline. */
+        if (c->read_buf.len > 0) {
+            kvs_drain_resp_commands_off(&c->read_buf, &c->r_off, &c->write_buf, c);
+            if (c->read_buf.len == 0)
+                c->r_off = 0;
+
+            /* New responses may have been generated — re-arm send if needed */
+            if (c->status) {
+                if (c->write_buf.len > 0) {
+                    conn_set_events(fd, c);
+                    return 0;
+                }
+                conn_release(fd);
+                return 0;
+            }
+        }
     }
 
-#if ENABLE_KVSTORE
     /* Update event mask based on new state */
     conn_set_events(fd, c);
-#endif
     return 0;
 }
 
@@ -288,7 +300,7 @@ int r_init_server(unsigned short port) {
     /* Enable SO_REUSEPORT for potential multi-process support */
     setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
-    /* Set non-blocking for edge-triggered accept */
+    /* Set non-blocking */
     if (fcntl(sockfd, F_SETFL, O_NONBLOCK) == -1) {
         fprintf(stderr, "[reactor] fcntl O_NONBLOCK failed: %s\n", strerror(errno));
         close(sockfd);
@@ -347,7 +359,7 @@ int reactor_start(unsigned short port, msg_handler handler) {
         return -1;
     }
 
-    /* Register listen socket with edge-triggered mode */
+    /* Register listen socket */
     if (sockfd >= conn_pool_size) {
         fprintf(stderr, "[reactor] listen fd %d exceeds maxclients %d\n",
                 sockfd, conn_pool_size);
@@ -359,10 +371,11 @@ int reactor_start(unsigned short port, msg_handler handler) {
 
     conn_pool[sockfd].fd = sockfd;
     conn_pool[sockfd].active = 1;
+    conn_pool[sockfd].cur_events = EPOLLIN;
     conn_pool[sockfd].r_action.accept_callback = accept_cb;
 
     struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLET;
+    ev.events = EPOLLIN;
     ev.data.fd = sockfd;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, sockfd, &ev) < 0) {
         fprintf(stderr, "[reactor] epoll_ctl ADD failed: %s\n", strerror(errno));
@@ -372,7 +385,7 @@ int reactor_start(unsigned short port, msg_handler handler) {
         return -1;
     }
 
-    printf("[reactor] listening on port %d (epoll edge-triggered mode)\n", port);
+    printf("[reactor] listening on port %d (epoll level-triggered mode)\n", port);
 
     /* Main event loop */
     struct epoll_event events[1024];
@@ -421,9 +434,20 @@ int reactor_start(unsigned short port, msg_handler handler) {
                     continue;
             }
 
-            /* Handle write events */
-            if (events[i].events & EPOLLOUT) {
+            /* Inline flush: send responses in the same epoll iteration
+             * instead of waiting for the next EPOLLOUT.  This eliminates
+             * the "batch barrier" — one extra epoll_wait round-trip per
+             * pipeline batch — that penalises low-P throughput.
+             *
+             * The first send_callback drains the current write buffer and
+             * may process deferred reads (generating new responses).  A
+             * second call flushes those new responses.  We stop at two:
+             * further sends would spin on a full TCP send buffer (EAGAIN),
+             * which is handled by the EPOLLOUT fallback in conn_set_events. */
+            if (c->write_buf.len > 0) {
                 c->send_callback(connfd);
+                if (conn_pool[connfd].active && c->write_buf.len > 0)
+                    c->send_callback(connfd);
             }
         }
     }

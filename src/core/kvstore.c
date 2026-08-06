@@ -256,7 +256,7 @@ int main(int argc, char *argv[]) {
         printf("[RDMA-REPL] rdma replication disabled by config\n");
     }
 
-    kvs_start_expire_thread();
+    if (ENABLE_EXPIRE) kvs_start_expire_thread();
 
     if (kvs_config.network_model == NET_REACTOR)
         reactor_start(kvs_config.port, kvs_protocol_batch);
@@ -265,7 +265,7 @@ int main(int argc, char *argv[]) {
     else if (kvs_config.network_model == NET_NTYCO)
         ntyco_start(kvs_config.port, kvs_protocol_batch);
 
-    kvs_stop_expire_thread();
+    if (ENABLE_EXPIRE) kvs_stop_expire_thread();
 
     kvs_wal_persist_stop();
     dest_kvengine();

@@ -83,6 +83,42 @@ int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn 
         int argc = 0;
         int cmd_len = resp_parse_slices(rb->buf + off, remaining,
                                         tokens, KVS_MAX_TOKENS, &argc);
+
+        /* Inline command fallback (redis-benchmark sends "PING\r\n",
+         * redis-cli sends inline commands, etc.) */
+        if (cmd_len == -1) {
+            const char *p = rb->buf + off;
+            const char *end = p + remaining;
+            const char *ln = memchr(p, '\n', (size_t)(end - p));
+            if (!ln || p == ln) break;  /* no complete line yet */
+
+            /* Tokenise by spaces.  Replace \r\n with \0\0 for strtok_r. */
+            char line[256];
+            int linelen = (int)(ln - p);
+            if (linelen > 255) linelen = 255;
+            if (linelen > 0 && p[linelen - 1] == '\r') linelen--;
+            memcpy(line, p, linelen);
+            line[linelen] = '\0';
+
+            /* Extract space-delimited tokens */
+            argc = 0;
+            char *saveptr = NULL;
+            char *tok = strtok_r(line, " ", &saveptr);
+            while (tok && argc < KVS_MAX_TOKENS) {
+                tokens[argc].ptr = tok;
+                tokens[argc].len = (int)strlen(tok);
+                argc++;
+                tok = strtok_r(NULL, " ", &saveptr);
+            }
+            if (argc == 0) {
+                dynbuf_cat(wb, RESP_ERR_INV, RESP_ERR_INV_LEN);
+                if (c) c->status = 1;
+                ncmd = -1; break;
+            }
+
+            cmd_len = (int)(ln + 1 - p); /* bytes consumed including \n */
+        }
+
         if (cmd_len <= 0) {
             if (cmd_len == 0) break;
             dynbuf_cat(wb, RESP_ERR_INV, RESP_ERR_INV_LEN);

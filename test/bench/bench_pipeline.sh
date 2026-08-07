@@ -17,7 +17,7 @@ require_tools
 
 # ---- 参数 ----
 BENCH_N=1000000   # 每轮请求数
-BENCH_C=20        # 并发连接数
+BENCH_C=50        # 并发连接数
 WARMUP_N=200000   # GET 前预热 SET 数量
 
 CONF="kvstore-none.conf"

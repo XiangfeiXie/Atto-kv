@@ -252,6 +252,8 @@ int main(int argc, char *argv[]) {
     if (kvs_config.rdma_sync_enabled) {
         if (kvs_config.rdma_role == ROLE_MASTER)
             rdma_repl_master_start();
+        else if (kvs_config.rdma_role == ROLE_SLAVE)
+            rdma_repl_slave_start();
     } else {
         printf("[RDMA-REPL] rdma replication disabled by config\n");
     }

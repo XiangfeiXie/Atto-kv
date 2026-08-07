@@ -28,8 +28,17 @@ if(USE_JEMALLOC)
     pkg_check_modules(JEMALLOC REQUIRED jemalloc)
     add_compile_definitions(USE_JEMALLOC)
 endif()
-pkg_check_modules(FABRIC   REQUIRED libfabric)
 pkg_check_modules(ZLIB     REQUIRED zlib)
+
+# RDMA: libibverbs (pkg-config) + librdmacm (find_library — dev pkg not installed)
+pkg_check_modules(IBVERBS  REQUIRED libibverbs)
+find_path(RDMACM_INCLUDE_DIR rdma/rdma_cma.h)
+find_library(RDMACM_LIBRARY rdmacm)
+if(NOT RDMACM_INCLUDE_DIR OR NOT RDMACM_LIBRARY)
+    message(FATAL_ERROR "librdmacm not found. Install librdmacm-dev or set RDMACM_INCLUDE_DIR/RDMACM_LIBRARY")
+endif()
+message(STATUS "RDMACM include: ${RDMACM_INCLUDE_DIR}")
+message(STATUS "RDMACM library: ${RDMACM_LIBRARY}")
 
 # ── NtyCo (third-party coroutine library) ─────────────────────────────
 set(NTYCO_DIR  ${CMAKE_SOURCE_DIR}/NtyCo)
@@ -91,6 +100,8 @@ set(REPL_SRCS
     src/repl/rdma_repl.c
     src/repl/rdma_repl_master.c
     src/repl/rdma_repl_slave.c
+    src/repl/tcp_repl_master.c
+    src/repl/tcp_repl_slave.c
 )
 
 set(KVSTORE_SRCS
@@ -121,7 +132,8 @@ target_include_directories(kvstore PRIVATE
     ${NTYCO_DIR}/core
     ${URING_INCLUDE_DIRS}
     ${JEMALLOC_INCLUDE_DIRS}
-    ${FABRIC_INCLUDE_DIRS}
+    ${IBVERBS_INCLUDE_DIRS}
+    ${RDMACM_INCLUDE_DIR}
 )
 
 target_link_libraries(kvstore PRIVATE
@@ -129,9 +141,11 @@ target_link_libraries(kvstore PRIVATE
     ${NTYCO_LIB}
     ${URING_LIBRARIES}
     ${JEMALLOC_LIBRARIES}
-    ${FABRIC_LIBRARIES}
+    ${IBVERBS_LIBRARIES}
+    ${RDMACM_LIBRARY}
     ${ZLIB_LIBRARIES}
     dl
+    nl-3
 )
 
 add_dependencies(kvstore ntyco)

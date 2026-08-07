@@ -1,6 +1,7 @@
 /* kvstore_dispatch.c — RESP command dispatch */
 
 #include "kvstore_internal.h"
+#include "rdma_repl.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -137,6 +138,16 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             reply_bulk(wb, tokens[1].ptr, tokens[1].len);
         else
             dynbuf_lit(wb, "-ERR wrong number of arguments for 'ping' command\r\n");
+        return DISPATCH_OK;
+    }
+
+    /* FULLSYNC — Slave 请求全量同步（Master fork RDMA 子进程） */
+    if (TOKEN_EQ(cmd, "FULLSYNC")) {
+        int ret = rdma_repl_master_trigger_sync();
+        if (ret == 0)
+            dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        else
+            dynbuf_lit(wb, "-ERR fullsync trigger failed\r\n");
         return DISPATCH_OK;
     }
 

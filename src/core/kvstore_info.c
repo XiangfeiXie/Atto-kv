@@ -207,7 +207,7 @@ dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) {
         APPEND("rdma_sync_enabled:%d\r\n",
                kvs_config.rdma_sync_enabled ? 1 : 0);
         if (kvs_config.rdma_sync_enabled) {
-            APPEND("rdma_provider:%s\r\n", kvs_config.rdma_provider);
+            APPEND("rdma_transport:verbs/RoCE\r\n");
             if (kvs_config.rdma_role == ROLE_MASTER)
                 APPEND("rdma_listen:%s:%d\r\n",
                        kvs_config.rdma_listen_ip, kvs_config.rdma_listen_port);

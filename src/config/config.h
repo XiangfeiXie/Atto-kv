@@ -35,16 +35,18 @@ typedef struct {
     int  maxclients;
     char wal_fsync_policy[16];  /* "always", "everysec", or "no" */
 
-    /* Replication master switch */
+    /* Replication: RDMA fullsync (verbs/RoCE) */
     int  rdma_sync_enabled;
-    int  rdma_role;
-    char rdma_provider[32];
+    int  rdma_role;              /* ROLE_MASTER=0 / ROLE_SLAVE=1 */
 
-    /* Master only: RDMA fullsync listen address */
+    /* 传输方式: "rdma" (RDMA verbs) | "tcp" (sendfile 零拷贝) */
+    char fullsync_transport[16];
+
+    /* Slave listens on this IP:port; Master connects to it */
     char rdma_listen_ip[64];
     int  rdma_listen_port;
 
-    /* Slave only: RDMA fullsync connect target */
+    /* (保留字段，兼容旧配置) */
     char rdma_master_ip[64];
     int  rdma_master_port;
 

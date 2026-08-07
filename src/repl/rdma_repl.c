@@ -1,24 +1,21 @@
-/* ===================================================================
- * rdma_repl.c — RDMA replication session management
+/**
+ * rdma_repl.c — RDMA 全量同步会话管理
  *
- * Architecture:
- *   - TCP (6483): Control plane (handled by repl_tcp.c)
- *   - RDMA (2101): Data plane (fullsync child process only)
- *   - This file only manages child process lifecycle (fork/wait)
- * =================================================================== */
+ * fork 子进程生命周期管理：SIGCHLD 回收、PID 追踪、清理。
+ */
 
 #include "rdma_repl.h"
+#include "tcp_repl.h"
 #include "kvstore.h"
-#include "config.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <unistd.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <netdb.h>
 #include <pthread.h>
-
-/* ── Child process session management ─────────────────────────────── */
 
 #define MAX_CHILD_SESSIONS  16
 
@@ -30,57 +27,39 @@ static struct {
 
 static void sigchld_handler(int sig) {
     (void)sig;
-    int status;
-    pid_t pid;
-    /* Reap all terminated children */
+    int status; pid_t pid;
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
         pthread_mutex_lock(&g_sessions.lock);
-        for (int i = 0; i < g_sessions.count; i++) {
+        for (int i = 0; i < g_sessions.count; i++)
             if (g_sessions.pids[i] == pid) {
-                /* Remove from array */
-                g_sessions.pids[i] = g_sessions.pids[g_sessions.count - 1];
-                g_sessions.count--;
+                g_sessions.pids[i] = g_sessions.pids[--g_sessions.count];
                 break;
             }
-        }
         pthread_mutex_unlock(&g_sessions.lock);
-
-        if (WIFEXITED(status)) {
-            printf("[RDMA-REPL] Child %d exited with status %d\n",
-                   pid, WEXITSTATUS(status));
-        } else if (WIFSIGNALED(status)) {
-            fprintf(stderr, "[RDMA-REPL] Child %d killed by signal %d\n",
-                    pid, WTERMSIG(status));
-        }
+        if (WIFEXITED(status))
+            printf("[RDMA-REPL] child %d exit=%d\n", pid, WEXITSTATUS(status));
+        else if (WIFSIGNALED(status))
+            fprintf(stderr, "[RDMA-REPL] child %d signal=%d\n", pid, WTERMSIG(status));
     }
 }
 
 void session_add(pid_t pid) {
     pthread_mutex_lock(&g_sessions.lock);
-    if (g_sessions.count < MAX_CHILD_SESSIONS) {
+    if (g_sessions.count < MAX_CHILD_SESSIONS)
         g_sessions.pids[g_sessions.count++] = pid;
-        printf("[RDMA-REPL] Registered child session: pid=%d\n", pid);
-    } else {
-        fprintf(stderr, "[RDMA-REPL] Session table full, cannot add pid=%d\n", pid);
-    }
+    else
+        fprintf(stderr, "[RDMA-REPL] session table full\n");
     pthread_mutex_unlock(&g_sessions.lock);
 }
 
-/* Kill all tracked child processes before forking a new one.
- * Prevents fi_getinfo failure caused by a previous child still
- * holding the RDMA_CM listener on the fullsync port. */
 void session_kill_all(void) {
     pthread_mutex_lock(&g_sessions.lock);
     for (int i = 0; i < g_sessions.count; i++) {
-        pid_t pid = g_sessions.pids[i];
-        if (pid > 0) {
-            printf("[RDMA-REPL] Killing old child pid=%d\n", pid);
-            kill(pid, SIGTERM);
-            /* Give it a moment to exit and release the port */
+        if (g_sessions.pids[i] > 0) {
+            kill(g_sessions.pids[i], SIGTERM);
             usleep(50000);
-            /* Force kill if still alive */
-            if (kill(pid, 0) == 0) {
-                kill(pid, SIGKILL);
+            if (kill(g_sessions.pids[i], 0) == 0) {
+                kill(g_sessions.pids[i], SIGKILL);
                 usleep(50000);
             }
         }
@@ -90,32 +69,102 @@ void session_kill_all(void) {
 }
 
 static void session_init(void) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
+    struct sigaction sa = {0};
     sa.sa_handler = sigchld_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
     sigaction(SIGCHLD, &sa, NULL);
 }
 
-/* ── Master: session management only ───────────────────────────── */
+/* ── Master ──────────────────────────────────────────────────────── */
 
 int rdma_repl_master_start(void) {
-    printf("[RDMA-REPL] Initializing session management\n");
-
-    /* Initialize child process session management */
     session_init();
-
-    printf("[RDMA-REPL] Session management initialized\n");
     return 0;
 }
 
-/* ── Slave: entry point (called by repl_tcp.c) ────────────────── */
+/* 收到 Slave 的 FULLSYNC 命令后 fork 子进程监听推送 */
+static int is_tcp(void) { return strcmp(kvs_config.fullsync_transport, "tcp") == 0; }
 
-int rdma_repl_slave_run(void) {
-    /* This function is now implemented in rdma_repl_slave.c */
-    extern int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port);
-    extern KvsConfig kvs_config;
+int rdma_repl_master_trigger_sync(void) {
+    session_kill_all();
 
-    return rdma_repl_slave_fullsync(kvs_config.rdma_master_ip, 2101);
+    int pipefd[2];
+    if (pipe(pipefd) < 0) { perror("pipe"); return -1; }
+
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); close(pipefd[0]); close(pipefd[1]); return -1; }
+    if (pid == 0) {
+        close(pipefd[0]);
+        if (is_tcp())
+            _exit(tcp_master_fullsync_child(0, pipefd[1]));
+        else
+            master_fullsync_child(0, pipefd[1]);
+        _exit(0);
+    }
+    close(pipefd[1]);
+    char ready; read(pipefd[0], &ready, 1);
+    close(pipefd[0]);
+
+    session_add(pid);
+    return 0;
+}
+
+/* ── Slave ───────────────────────────────────────────────────────── */
+
+/* 通过 TCP 向 Master Redis 端口发送 FULLSYNC 命令，等 +OK 响应 */
+static int slave_send_fullsync_cmd(void) {
+    const char *ip   = kvs_config.rdma_master_ip;
+    int         port = kvs_config.rdma_master_port;  /* Master TCP/RDMA 端口 */
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    struct addrinfo hints = {0}, *ai;
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(ip, port_str, &hints, &ai) != 0) {
+        perror("[slave] getaddrinfo"); return -1;
+    }
+
+    int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (fd < 0) { perror("[slave] socket"); freeaddrinfo(ai); return -1; }
+
+    if (connect(fd, ai->ai_addr, ai->ai_addrlen) < 0) {
+        perror("[slave] connect"); close(fd); freeaddrinfo(ai); return -1;
+    }
+    freeaddrinfo(ai);
+
+    const char *cmd = "FULLSYNC\r\n";
+    if (send(fd, cmd, strlen(cmd), 0) < 0) {
+        perror("[slave] send FULLSYNC"); close(fd); return -1;
+    }
+
+    char resp[16] = {0};
+    ssize_t n = recv(fd, resp, sizeof(resp) - 1, 0);
+    close(fd);
+    if (n < 0) { perror("[slave] recv FULLSYNC response"); return -1; }
+
+    if (strncmp(resp, "+OK", 3) != 0) {
+        fprintf(stderr, "[slave] FULLSYNC rejected: %.*s\n", (int)n, resp);
+        return -1;
+    }
+    printf("[slave] FULLSYNC accepted by master\n");
+    return 0;
+}
+
+int rdma_repl_slave_start(void) {
+    session_init();
+
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); return -1; }
+    if (pid == 0) {
+        if (slave_send_fullsync_cmd() < 0)
+            exit(1);
+        if (is_tcp())
+            exit(tcp_slave_fullsync());
+        else
+            exit(rdma_repl_slave_fullsync());
+    }
+    session_add(pid);
+    return 0;
 }

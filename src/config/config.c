@@ -25,11 +25,11 @@ static void config_default(void) {
 
     kvs_config.rdma_sync_enabled = 0;
     kvs_config.rdma_role         = ROLE_MASTER;
-    kvs_config.rdma_listen_port  = 2100;
-    kvs_config.rdma_master_port  = 2100;
+    kvs_config.rdma_listen_port  = 2101;
+    kvs_config.rdma_master_port  = 2101;
 
-    strncpy(kvs_config.rdma_provider,  "tcp",
-            sizeof(kvs_config.rdma_provider) - 1);
+    strncpy(kvs_config.fullsync_transport, "rdma",
+            sizeof(kvs_config.fullsync_transport) - 1);
     strncpy(kvs_config.rdma_listen_ip, "0.0.0.0",
             sizeof(kvs_config.rdma_listen_ip) - 1);
     strncpy(kvs_config.rdma_master_ip, "127.0.0.1",
@@ -168,9 +168,11 @@ int config_load(const char *path) {
             else if (strcasecmp(val, "slave")  == 0) kvs_config.rdma_role = ROLE_SLAVE;
             else printf("[CONFIG] line %d: unknown rdma_role '%s'\n", lineno, val);
 
-        } else if (strcasecmp(key, "rdma_provider") == 0) {
-            strncpy(kvs_config.rdma_provider, val,
-                    sizeof(kvs_config.rdma_provider) - 1);
+        } else if (strcasecmp(key, "fullsync_transport") == 0) {
+            if (strcasecmp(val, "rdma") == 0 || strcasecmp(val, "tcp") == 0)
+                strncpy(kvs_config.fullsync_transport, val,
+                        sizeof(kvs_config.fullsync_transport) - 1);
+            else printf("[CONFIG] line %d: unknown transport '%s'\n", lineno, val);
 
         } else if (strcasecmp(key, "rdma_listen_ip") == 0) {
             strncpy(kvs_config.rdma_listen_ip, val,
@@ -239,9 +241,8 @@ void config_print(void) {
     } else {
         printf("\n"
                "  Replication [%s]\n"
-               "    RDMA fullsync : %s://%s:%d\n",
+               "    RDMA fullsync (verbs/RoCE) : %s:%d\n",
                role,
-               kvs_config.rdma_provider,
                (kvs_config.rdma_role == ROLE_MASTER)
                    ? kvs_config.rdma_listen_ip
                    : kvs_config.rdma_master_ip,

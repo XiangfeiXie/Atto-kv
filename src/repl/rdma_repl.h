@@ -4,33 +4,50 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-/* ===================================================================
- * RDMA replication - Simplified architecture
+/* =========================================================================
+ * RDMA 全量同步 — librdmacm + libibverbs (RoCEv2 / Soft-RoCE)
  *
- * Architecture:
- *   - TCP (6483): All control (sync request, heartbeat, coordination)
- *   - RDMA (2101): Data only (fullsync streaming)
- *   - Master: rdma_repl_master_start() only manages child sessions
- *   - Slave: rdma_repl_slave_run() called by repl_tcp when fullsync needed
- * =================================================================== */
+ *   1. Slave TCP "FULLSYNC" → Master fork → rdma_listen
+ *   2. Slave rdma_connect → 发目标 MR → Master RDMA_WRITE_WITH_IMM
+ *   3. Slave 边收边解析 → ACK → rebuild_encodings
+ * ========================================================================= */
 
-/* Master: Initialize session management (SIGCHLD handler) */
-int rdma_repl_master_start(void);
+/* ── 共享常量 ──────────────────────────────────────────────────────── */
 
-/* Slave: Perform full sync via RDMA (called by repl_tcp.c) */
-int rdma_repl_slave_run(void);
+#define FULLSYNC_BUF_SIZE   (256ULL * 1024 * 1024)
+#define FULLSYNC_MAGIC      0x52444233u
+#define FULLSYNC_VERSION    3
+#define FULLSYNC_IMM_DONE   0xFFFFFFFFu
+#define FULLSYNC_NUM_BUFS   2
 
-/* Session management: Add child process PID for tracking */
+/* ── 握手 & ACK 结构 ──────────────────────────────────────────────── */
+
+struct buf_info {
+    uint64_t addr[2];
+    uint32_t rkey[2];
+    uint32_t buf_size;
+} __attribute__((packed));
+
+struct batch_hdr {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t flags;
+    uint64_t base_seq;
+} __attribute__((packed));
+
+struct ack_msg {
+    uint32_t buf_idx;
+    uint32_t entries;
+} __attribute__((packed));
+
+/* ── 公共 API ─────────────────────────────────────────────────────── */
+
+int  rdma_repl_master_start(void);
+int  rdma_repl_master_trigger_sync(void);
+int  rdma_repl_slave_start(void);
 void session_add(pid_t pid);
-
-/* Kill all tracked child processes (clean up before re-fork). */
 void session_kill_all(void);
+int  master_fullsync_child(uint64_t base_seq, int ready_fd);
+int  rdma_repl_slave_fullsync(void);
 
-/* Master child process: Pure RDMA data streaming (called after fork).
- * ready_fd >= 0: write a byte after fi_listen() so parent knows we're ready. */
-int master_fullsync_child(uint64_t base_seq, int ready_fd);
-
-/* Slave: Direct RDMA fullsync connection (called by repl_tcp.c) */
-int rdma_repl_slave_fullsync(const char *master_ip, uint16_t rdma_port);
-
-#endif /* __RDMA_REPL_H__ */
+#endif

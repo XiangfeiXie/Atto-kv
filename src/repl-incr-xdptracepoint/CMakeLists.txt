@@ -19,7 +19,7 @@ add_custom_command(
             -I/usr/include/x86_64-linux-gnu
             -c ${BPF_SRC}
             -o ${BPF_OBJ}
-    DEPENDS ${BPF_SRC}
+    DEPENDS ${BPF_SRC} ${CMAKE_SOURCE_DIR}/xdp_common.h
     COMMENT "Compiling xdp_filter.bpf.c (XDP BPF)"
 )
 
@@ -33,7 +33,14 @@ set(SRCS
     tcp_sender.c
 )
 
-add_executable(kvstore-incr-sync ${SRCS})
+set(HEADERS
+    config.h
+    xdp_common.h
+    xdp_reasm.h
+    tcp_sender.h
+)
+
+add_executable(kvstore-incr-sync ${SRCS} ${HEADERS})
 target_include_directories(kvstore-incr-sync PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${LIBBPF_INCLUDE_DIRS}

@@ -2,17 +2,15 @@
  *
  * Pipeline:
  *   XDP BPF → ringbuf → xdp_reasm (TCP reassembly + RESP extract)
- *          → is_write_command() filter → tcp_send_all() → slave
+ *          → is_write_command() filter → cmd_queue → writer thread → slave
  *
- * Configuration via #define (edit and recompile):
- *   SLAVE_IP          slave kvstore IP
- *   SLAVE_PORT        slave kvstore port (default 6379)
- *   KVS_FILTER_PORT   XDP capture filter port (must match kvstore's port)
- *   XDP_IFACE         network interface to attach XDP to
- *   XDP_MODE          "auto" (default), "generic" (SKB), "native" (DRV)
+ * Configuration via config.h macros (edit and recompile):
+ *   SLAVE_IP, SLAVE_PORT, KVS_FILTER_PORT, XDP_IFACE
+ *   CONN_HASH_BITS, CONN_MAX, CMD_QUEUE_SIZE, WRITER_BATCH_SIZE
  */
 
 #define _GNU_SOURCE
+#include "config.h"
 #include "xdp_reasm.h"
 #include "tcp_sender.h"
 
@@ -23,39 +21,22 @@
 #include <time.h>
 #include <unistd.h>
 
-/* ── Configuration ─────────────────────────────────────────────────── */
-
-#ifndef SLAVE_IP
-#define SLAVE_IP  "127.0.0.1"
-#endif
-#ifndef SLAVE_PORT
-#define SLAVE_PORT  6379
-#endif
-#ifndef KVS_FILTER_PORT
-#define KVS_FILTER_PORT  6379
-#endif
-#ifndef XDP_IFACE
-#define XDP_IFACE  "lo"
-#endif
-
-/* ── Global state ──────────────────────────────────────────────────── */
+/* --Global state ──────────────────────────────────────────────────── */
 
 static volatile int g_running = 1;
-static int g_slave_fd = -1;
+static cmd_queue_t   g_cmdq;
+static tcp_writer_t  g_writer;
+static uint64_t      g_queue_dropped;  /* counter, updated from callback */
 
-/* ── Callback: forward write command to slave ──────────────────────── */
+/* Callback: called from xdp_reasm (inside bucket lock) */
 
-static void forward_to_slave(const uint8_t *cmd, uint32_t cmd_len)
+static void on_write_command(const uint8_t *cmd, uint32_t cmd_len)
 {
-    if (g_slave_fd < 0) return;
-
-    if (tcp_send_all(g_slave_fd, cmd, (size_t)cmd_len) < 0) {
-        fprintf(stderr, "[MAIN] send to slave failed, exiting\n");
-        g_running = 0;
-    }
+    if (cmdq_push(&g_cmdq, cmd, cmd_len) < 0)
+        __atomic_add_fetch(&g_queue_dropped, 1, __ATOMIC_RELAXED);
 }
 
-/* ── Signal handler ────────────────────────────────────────────────── */
+/* --Signal handler ────────────────────────────────────────────────── */
 
 static void sig_handler(int sig)
 {
@@ -63,80 +44,130 @@ static void sig_handler(int sig)
     g_running = 0;
 }
 
-/* ── Main ──────────────────────────────────────────────────────────── */
+/* --Stats printer ─────────────────────────────────────────────────── */
+
+static void print_stats(void)
+{
+    struct xdp_reasm_stats st;
+    xdp_reasm_get_stats(&st);
+
+    uint64_t dropped = __atomic_load_n(&g_queue_dropped, __ATOMIC_RELAXED);
+
+    printf("[STATS] events=%lu data=%lu syn=%lu fin_rst=%lu "
+           "ordered=%lu cmds=%lu written=%lu "
+           "ooo=%lu dup=%lu queue_drop=%lu frag=%lu conns=%u\n",
+           (unsigned long)st.events_total,
+           (unsigned long)st.events_data,
+           (unsigned long)st.events_syn,
+           (unsigned long)st.events_fin_rst,
+           (unsigned long)st.bytes_ordered,
+           (unsigned long)st.cmds_extracted,
+           (unsigned long)st.cmds_written,
+           (unsigned long)st.ooo_segments,
+           (unsigned long)st.dup_discarded,
+           (unsigned long)dropped,
+           (unsigned long)st.fragment_events,
+           (unsigned)st.conns_active);
+}
+
+/* --Main ──────────────────────────────────────────────────────────── */
 
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGINT, sig_handler);
+    signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
 
     printf("[MAIN] kvstore-incr-sync starting\n");
-    printf("[MAIN] config: slave=%s:%u filter_port=%u iface=%s\n",
+    printf("[MAIN] slave=%s:%u filter_port=%u iface=%s\n",
            SLAVE_IP, (unsigned)SLAVE_PORT,
            (unsigned)KVS_FILTER_PORT, XDP_IFACE);
 
-    /* 1. Init XDP reassembly */
-    if (xdp_reasm_init(forward_to_slave) != 0) {
+    /* 1. Init command queue */
+    cmdq_init(&g_cmdq, CMD_QUEUE_SIZE);
+
+    /* 2. Init XDP reassembly */
+    if (xdp_reasm_init(on_write_command) != 0) {
         fprintf(stderr, "[MAIN] xdp_reasm_init failed\n");
         return 1;
     }
 
-    /* 2. Load + attach XDP BPF */
+    /* 3. Load + attach XDP BPF */
     struct bpf_object *bpf_obj = NULL;
     struct ring_buffer *ringbuf = NULL;
-    xdp_attach_t xdp_att;
+    xdp_attach_t        xdp_att;
 
     if (xdp_load_bpf(KVS_FILTER_PORT, XDP_IFACE,
                      xdp_reasm_on_event,
                      &bpf_obj, &ringbuf, &xdp_att) != 0) {
         fprintf(stderr, "[MAIN] xdp_load_bpf failed\n");
         xdp_reasm_shutdown();
+        cmdq_drain(&g_cmdq);
         return 1;
     }
 
-    /* 3. Connect to slave — loop until connected */
-    while (g_running && g_slave_fd < 0) {
-        g_slave_fd = tcp_connect_slave(SLAVE_IP, SLAVE_PORT);
-        if (g_slave_fd < 0) {
-            fprintf(stderr, "[MAIN] slave connect failed, retrying in 3s...\n");
-            sleep(3);
-        }
-    }
-
-    if (!g_running) {
+    /* 4. Start writer thread */
+    if (tcp_writer_start(&g_writer, &g_cmdq, SLAVE_IP, SLAVE_PORT) != 0) {
+        fprintf(stderr, "[MAIN] writer start failed\n");
         xdp_cleanup(&xdp_att, bpf_obj, ringbuf);
         xdp_reasm_shutdown();
+        cmdq_drain(&g_cmdq);
         return 1;
     }
 
     printf("[MAIN] incremental sync active\n");
 
-    /* 4. Main loop */
-    time_t last_gc = time(NULL);
+    /* 5. Main loop */
+    time_t last_gc    = time(NULL);
+    time_t last_stats = last_gc;
+    uint64_t last_events = 0;
 
     while (g_running) {
-        /* Poll XDP ringbuf — drain all available events */
-        ring_buffer__poll(ringbuf, 1);
+        /* Poll XDP ringbuf */
+        ring_buffer__poll(ringbuf, RINGBUF_POLL_MS);
 
-        /* Drain slave responses */
-        tcp_drain(g_slave_fd);
-
-        /* Periodic GC of stale connections (~5s) */
         time_t now = time(NULL);
-        if (now - last_gc >= 5) {
+
+        /* Periodic GC */
+        if (now - last_gc >= GC_INTERVAL_S) {
             xdp_reasm_gc();
             last_gc = now;
         }
+
+        /* Periodic stats (~10s) */
+        if (now - last_stats >= 10) {
+            struct xdp_reasm_stats st;
+            xdp_reasm_get_stats(&st);
+            uint64_t rate = (st.events_total - last_events) / (uint64_t)(now - last_stats);
+            printf("[MAIN] events=%lu (%.0f/s) written=%lu conns=%u ooo=%lu\n",
+                   (unsigned long)st.events_total,
+                   (double)rate,
+                   (unsigned long)st.cmds_written,
+                   (unsigned)st.conns_active,
+                   (unsigned long)st.ooo_segments);
+            last_events = st.events_total;
+            last_stats  = now;
+        }
     }
 
-    /* 5. Cleanup */
+    /* 6. Shutdown */
     printf("[MAIN] shutting down...\n");
 
-    if (g_slave_fd >= 0) close(g_slave_fd);
+    /* Detach XDP first — stop producing new events */
     xdp_cleanup(&xdp_att, bpf_obj, ringbuf);
+
+    /* Signal writer and drain */
+    tcp_writer_stop(&g_writer);
+    cmdq_shutdown(&g_cmdq);
+
+    /* Give writer a moment to flush */
+    usleep(200000);
+
+    cmdq_drain(&g_cmdq);
     xdp_reasm_shutdown();
 
+    /* Final stats */
+    print_stats();
     printf("[MAIN] done\n");
     return 0;
 }

@@ -15,21 +15,23 @@
  *  - FNV-1a + Murmur3 finalizer for excellent distribution
  *  - Auto-grow (load factor > 1) and auto-shrink (load factor < 0.1)
  *
- * data[] layout:  [type:1][encoding:1][payload: val_len-2]
+ * data[] layout:  [type:1][encoding:1][key: key_len][payload: val_len-2]
+ *
+ * Key is stored BEFORE payload (fixed offset data+2).  This makes
+ * entry_key() a compile-time constant and avoids moving the key during
+ * resize — only the trailing payload shifts.  dict_find's memcmp is
+ * also more cache-friendly (key starts right after the header).
  * ===================================================================== */
 
-/* --- Entry types (the "type" byte in data[0]) --- */
+/* --- Entry type (data[0]) — string only --- */
 enum {
     KV_TYPE_STRING = 0,
-    KV_TYPE_HASH = 1,
 };
 
-/* --- Entry encoding (the "encoding" byte in data[1]) --- */
+/* --- Entry encoding (data[1]) — RAW or INT --- */
 enum {
     KV_ENCODING_RAW = 0,
     KV_ENCODING_INT = 1,
-    KV_ENCODING_PACKED = 2,
-    KV_ENCODING_DICT = 3,
 };
 
 /* --- Single heap allocation entry --- */
@@ -39,15 +41,15 @@ typedef struct kv_entry_s {
     long long          expire;  /* expiration timestamp (ms)  (8B) */
     uint32_t           key_len; /* key length                 (4B) */
     uint32_t           val_len; /* data[] total size          (4B) */
-    char               data[];  /* [type:1][encoding:1][payload...] */
+    char               data[];  /* [type:1][enc:1][key:key_len][payload:val_len-2] */
 } kv_entry_t;
 
-/* Inline accessors */
+/* ── Inline accessors (Key-First layout) ── */
 static inline uint8_t  entry_type(kv_entry_t *e)     { return (uint8_t)e->data[0]; }
 static inline uint8_t  entry_encoding(kv_entry_t *e)  { return (uint8_t)e->data[1]; }
-static inline char    *entry_payload(kv_entry_t *e)   { return e->data + 2; }
+static inline const char *entry_key(kv_entry_t *e)    { return e->data + 2; }
+static inline char    *entry_payload(kv_entry_t *e)   { return e->data + 2 + e->key_len; }
 static inline uint32_t entry_payload_len(kv_entry_t *e){ return e->val_len - 2; }
-static inline const char *entry_key(kv_entry_t *e)    { return e->data + e->val_len; }
 
 /* --- Hash table sub-table --- */
 typedef struct {
@@ -134,72 +136,9 @@ uint32_t    dict_count(kv_dict_t *d);
 kv_entry_t *dict_get_random_key(kv_dict_t *d);  /* get a random key for expire sampling */
 
 /* =====================================================================
- * Single global dict
+ * Single global dict — single-threaded, no sharding (like Redis server.db[0])
  * ===================================================================== */
 
-typedef struct {
-    kv_dict_t dict;
-} kv_store_t;
-
-extern kv_store_t g_store;
-
-static inline kv_dict_t *kv_dict_global(void) {
-    return &g_store.dict;
-}
-
-/* =====================================================================
- * Single global dict access helpers
- * ===================================================================== */
-static inline kv_dict_t *kv_dict_for(uint64_t hash) {
-    (void)hash;  /* unused in single-dict mode */
-    return &g_store.dict;
-}
-
-void     kv_store_init(void);
-void     kv_store_destroy(void);
-uint32_t kv_store_count(void);
-void     kv_store_clear(void);
-void     kv_store_reserve(uint32_t count);
-
-/* Single dict iteration helper */
-typedef struct {
-    kv_iter_t *iter;
-} kv_store_iter_t;
-
-void        kv_store_iter_init(kv_store_iter_t *it);
-kv_entry_t *kv_store_iter_next(kv_store_iter_t *it);
-void        kv_store_iter_free(kv_store_iter_t *it);
-
-/* Lightweight single-threaded lock for expire-thread coordination.
- * 0 = free, 1 = held by main thread, 2 = held by expire thread.
- * Main thread always wins (CAS 0→1) — only brief spin when the
- * background expire thread (once per ~1s) currently holds the lock.
- * The expire thread uses CAS 0→2 and skips if the main thread is busy.
- *
- * Fast path (common case, >99.99%): one CAS + return.  Slow path
- * (expire thread active): CAS fails → spin on PAUSE until release
- * → retry CAS once.  Expire thread holds the lock < 4 µs. */
-extern volatile int g_store_lock;
-
-static inline void kv_store_rdlock(void) {
-    if (__sync_val_compare_and_swap(&g_store_lock, 0, 1) != 0) {
-        do {
-            while (__atomic_load_n(&g_store_lock, __ATOMIC_RELAXED) != 0)
-                __builtin_ia32_pause();
-        } while (__sync_val_compare_and_swap(&g_store_lock, 0, 1) != 0);
-    }
-}
-
-static inline void kv_store_wrlock(void) {
-    kv_store_rdlock();
-}
-
-static inline void kv_store_unlock(void) {
-    __atomic_store_n(&g_store_lock, 0, __ATOMIC_RELEASE);
-}
-
-/* Snapshot helpers (no-op in single-dict mode) */
-static inline void kv_store_lock_for_snapshot(void) { }
-static inline void kv_store_unlock_snapshot(void) { }
+extern kv_dict_t g_dict;
 
 #endif

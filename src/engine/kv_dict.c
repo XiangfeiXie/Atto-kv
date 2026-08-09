@@ -37,9 +37,16 @@ static uint32_t next_pow2(uint32_t v) {
     return v + 1;
 }
 
-/* Allocate a new entry with key appended after data[].
-   Layout in memory: [kv_entry_t header][data[...type+encoding+payload]][key bytes]
-   When dict has an arena, allocates from arena (bump pointer); falls back to malloc. */
+/* Allocate a new entry.  Key-First layout:
+ *
+ *   [kv_entry_t header][type:1][enc:1][key:key_len][payload:val_len-2]
+ *
+ * When dict has an arena, allocates from arena (bump pointer); falls back to malloc.
+ *
+ * The caller (dict_add) passes type+enc+payload as a contiguous buffer in `data`.
+ * We split it: type+enc go at data[0..1], key at data[2..], payload at the tail.
+ * This is transparent to all callers because only the accessor macros touch data[]
+ * layout.                                                                */
 static kv_entry_t *entry_alloc(kv_dict_t *d, const char *key, uint32_t key_len,
                                 const char *data, uint32_t data_len,
                                 uint64_t hash)
@@ -58,14 +65,18 @@ static kv_entry_t *entry_alloc(kv_dict_t *d, const char *key, uint32_t key_len,
     e->hash    = hash;
     e->expire  = 0;
     e->key_len = key_len;
-    e->val_len = data_len;
+    e->val_len = data_len;   /* = 2 + payload_len */
 
-    /* Copy payload (type + encoding + value) */
-    if (data && data_len)
-        memcpy(e->data, data, data_len);
+    /* type + encoding (always 2 bytes at data[0..1]) */
+    if (data && data_len >= 2)
+        memcpy(e->data, data, 2);
 
-    /* Append key after data[] */
-    memcpy(e->data + data_len, key, key_len);
+    /* key at data + 2 (compile-time constant offset) */
+    memcpy(e->data + 2, key, key_len);
+
+    /* payload after key (remaining data_len-2 bytes) */
+    if (data && data_len > 2)
+        memcpy(e->data + 2 + key_len, data + 2, (size_t)(data_len - 2));
 
     return e;
 }
@@ -278,24 +289,28 @@ kv_entry_t *dict_find(kv_dict_t *d, const char *key, uint32_t key_len,
     if (d->ht[0].size == 0 && d->rehash_idx < 0)
         return NULL;
 
-    /* Search ht[0] */
-    if (d->ht[0].size > 0) {
+    /* Search ht[0] — inazuma-kv style: key_len + memcmp only.
+     * The hash comparison (e->hash == hash) is redundant when
+     * hash distribution is good (collision chains are short).
+     * For well-distributed tables, every chain has ≤1 entry,
+     * so the extra hash cmp is 100% wasted. */
+    {
         uint32_t idx = (uint32_t)(hash & d->ht[0].size_mask);
         kv_entry_t *e = d->ht[0].buckets[idx];
         while (e) {
-            if (e->hash == hash && e->key_len == key_len &&
+            if (e->key_len == key_len &&
                 memcmp(entry_key(e), key, key_len) == 0)
                 return e;
             e = e->next;
         }
     }
 
-    /* Search ht[1] if rehashing */
+    /* Search ht[1] only when rehash is actually in progress */
     if (d->rehash_idx >= 0 && d->ht[1].size > 0) {
         uint32_t idx = (uint32_t)(hash & d->ht[1].size_mask);
         kv_entry_t *e = d->ht[1].buckets[idx];
         while (e) {
-            if (e->hash == hash && e->key_len == key_len &&
+            if (e->key_len == key_len &&
                 memcmp(entry_key(e), key, key_len) == 0)
                 return e;
             e = e->next;
@@ -356,7 +371,7 @@ kv_entry_t *dict_add_raw(kv_dict_t *d, const char *key, uint32_t key_len,
     e->data[0] = (char)type;
     e->data[1] = (char)enc;
     if (payload && payload_len)
-        memcpy(e->data + 2, payload, payload_len);
+        memcpy(entry_payload(e), payload, payload_len);
 
     uint32_t idx = (uint32_t)(hash & ht->size_mask);
     e->next = ht->buckets[idx];
@@ -388,7 +403,14 @@ int dict_delete(kv_dict_t *d, const char *key, uint32_t key_len,
                 else
                     ht->buckets[idx] = e->next;
 
-                free(e);
+                /* Arena entries must not be freed individually —
+                 * they belong to the bulk arena freed in dict_clear(). */
+                int has_arena = (d->arena != NULL);
+                const char *arena_end = d->arena + d->arena_cap;
+                if (!has_arena ||
+                    (char *)e < d->arena || (char *)e >= arena_end) {
+                    free(e);
+                }
                 ht->used--;
                 dict_rehash_step(d, rehash_batch(d));
                 dict_maybe_shrink(d);
@@ -415,14 +437,17 @@ kv_entry_t *dict_resize_entry(kv_dict_t *d, kv_entry_t *e,
     if (new_data_len == old_val_len)
         return e;
 
+    /* Key-First layout: key sits at data+2 (fixed), payload at data+2+key_len.
+     * Shrinking or growing only affects the trailing payload — no key memmove
+     * and no chain pointer fixup needed unless realloc moves the whole entry. */
+
     if (new_data_len < old_val_len) {
-        /* Shrink: move key backwards, no realloc needed */
+        /* Shrink: only the tail payload shrinks, key doesn't move */
         e->val_len = new_data_len;
-        memmove(e->data + new_data_len, e->data + old_val_len, e->key_len);
         return e;
     }
 
-    /* Grow: realloc then move key forward */
+    /* Grow: realloc to make room for larger payload at the tail */
     uint32_t old_total = (uint32_t)sizeof(kv_entry_t) + old_val_len + e->key_len;
     uint32_t new_total = (uint32_t)sizeof(kv_entry_t) + new_data_len + e->key_len;
 
@@ -430,9 +455,6 @@ kv_entry_t *dict_resize_entry(kv_dict_t *d, kv_entry_t *e,
     if (!ne) return NULL;
 
     ne->val_len = new_data_len;
-
-    /* Relocate key from old position to new position */
-    memmove(ne->data + new_data_len, ne->data + old_val_len, ne->key_len);
 
     /* Fix up bucket chain pointers if realloc moved the entry */
     if (ne != e) {
@@ -444,13 +466,13 @@ kv_entry_t *dict_resize_entry(kv_dict_t *d, kv_entry_t *e,
             while (*pp) {
                 if (*pp == e) {
                     *pp = ne;
-                    goto fixed;
+                    goto done;
                 }
                 pp = &(*pp)->next;
             }
         }
     }
-fixed:
+done:
     return ne;
 }
 
@@ -571,49 +593,7 @@ kv_entry_t *dict_get_random_key(kv_dict_t *d) {
 }
 
 /* =====================================================================
- * Single global store
+ * Single global dict — single-threaded, no sharding
  * ===================================================================== */
 
-kv_store_t g_store;
-
-/* Single-threaded lock for expire-thread coordination.
- * See kv_dict.h for details.  Starts free (0). */
-volatile int g_store_lock = 0;
-
-void kv_store_init(void) {
-    dict_init(&g_store.dict);
-}
-
-void kv_store_destroy(void) {
-    dict_destroy(&g_store.dict);
-}
-
-uint32_t kv_store_count(void) {
-    return dict_count(&g_store.dict);
-}
-
-void kv_store_clear(void) {
-    dict_clear(&g_store.dict);
-}
-
-void kv_store_reserve(uint32_t count) {
-    dict_reserve(&g_store.dict, count);
-}
-
-/* ---- Single store iterator ---- */
-
-void kv_store_iter_init(kv_store_iter_t *it) {
-    it->iter = dict_iter_new(&g_store.dict, 1);
-}
-
-kv_entry_t *kv_store_iter_next(kv_store_iter_t *it) {
-    if (!it->iter) return NULL;
-    return dict_iter_next(it->iter);
-}
-
-void kv_store_iter_free(kv_store_iter_t *it) {
-    if (it->iter) {
-        dict_iter_free(it->iter);
-        it->iter = NULL;
-    }
-}
+kv_dict_t g_dict;

@@ -79,13 +79,11 @@ set(ENGINE_SRCS
 
 set(TYPE_SRCS
     src/type/kv_type_string.c
-    src/type/kv_type_hash.c
 )
 
 set(NET_SRCS
     src/net/reactor.c
     src/net/proactor.c
-    src/net/proactor_event.c
     src/net/ntyco.c
 )
 

@@ -37,7 +37,11 @@ static inline size_t serialize_one(char *dst, kv_entry_t *e) {
     memcpy(p, &kl, 4); p += 4;
     memcpy(p, entry_key(e), e->key_len); p += e->key_len;
     memcpy(p, &dl, 4); p += 4;
-    memcpy(p, e->data, e->val_len); p += e->val_len;
+    /* Key-First layout: data = [type:1][enc:1][key][payload].
+     * Wire format wants type+enc+payload (contiguous), so copy in two parts. */
+    memcpy(p, e->data, 2);                               /* type + enc */
+    memcpy(p + 2, entry_payload(e), entry_payload_len(e)); /* payload */
+    p += e->val_len;
     memcpy(p, &xb, 8); p += 8;
     return (size_t)(p - dst);
 }
@@ -108,8 +112,8 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
 
     printf("[master] xfer-begin\n");
     struct timespec t1, t2; clock_gettime(CLOCK_MONOTONIC, &t1);
-    kv_store_iter_t it; kv_store_iter_init(&it); kv_entry_t *e;
-    while ((e = kv_store_iter_next(&it)) != NULL) {
+    kv_iter_t *iter = dict_iter_new(&g_dict, 1); kv_entry_t *e;
+    while ((e = dict_iter_next(iter)) != NULL) {
         size_t need = 8+4+e->key_len+4+e->val_len+8;
         if (off + need > FULLSYNC_BUF_SIZE) {
             if (ack_inflight >= 4) { poll_cq(id->recv_cq); ack_inflight--; }
@@ -120,7 +124,7 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
         }
         off += serialize_one(buf+off, e);
     }
-    kv_store_iter_free(&it);
+    dict_iter_free(iter);
 
     /* final batch */
     if (ack_inflight >= 4) { poll_cq(id->recv_cq); ack_inflight--; }

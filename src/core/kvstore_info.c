@@ -233,7 +233,7 @@ dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) {
     }
 
     if (want_keyspace) {
-        uint32_t nkeys = kv_store_count();
+        uint32_t nkeys = dict_count(&g_dict);
         APPEND("# Keyspace\r\n");
         if (nkeys > 0)
             APPEND("db0:keys=%u,expires=0,avg_ttl=0\r\n", nkeys);

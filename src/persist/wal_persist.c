@@ -353,78 +353,6 @@ static void rw_encode_string(rewrite_ctx_t *ctx, kv_entry_t *e) {
     }
 }
 
-/* Encode one HASH entry (PACKED encoding) as HSET command */
-static void rw_encode_hash_packed(rewrite_ctx_t *ctx, kv_entry_t *e) {
-    const char *key  = entry_key(e);
-    uint32_t    klen = e->key_len;
-    const char *data = e->data + 2;          /* skip type + encoding      */
-    const char *end  = e->data + e->val_len;
-
-    uint32_t count = rw_pk_u32(data);
-    data += 4;
-    if (count == 0) return;
-
-    rw_cmd_start(ctx, 2 + 2 * count);
-    rw_bulk(ctx, "HSET", 4);
-    rw_bulk(ctx, key, klen);
-
-    for (uint32_t i = 0; i < count && data < end; i++) {
-        uint32_t flen = rw_pk_u32(data); data += 4;
-        if (data + flen > end) break;
-        rw_bulk(ctx, data, flen);
-        data += flen;
-
-        if (data >= end) break;
-        uint8_t fenc = (uint8_t)*data++;
-
-        if (fenc == 1 /* INT inline: [enc:1][i64:8], no length prefix */) {
-            int64_t iv;
-            memcpy(&iv, data, sizeof(int64_t));
-            rw_bulk_int(ctx, iv);
-            data += 8;
-        } else /* RAW: [enc:1=0][val_len:4][val_bytes] */ {
-            uint32_t fvlen = rw_pk_u32(data); data += 4;
-            if (data + fvlen > end) break;
-            rw_bulk(ctx, data, fvlen);
-            data += fvlen;
-        }
-    }
-}
-
-/* Encode one HASH entry (DICT encoding) as HSET command */
-static void rw_encode_hash_dict(rewrite_ctx_t *ctx, kv_entry_t *e) {
-    const char *key  = entry_key(e);
-    uint32_t    klen = e->key_len;
-    kv_dict_t  *d    = (kv_dict_t *)(e->data + 2);
-
-    uint32_t count = dict_count(d);
-    if (count == 0) return;
-
-    rw_cmd_start(ctx, 2 + 2 * count);
-    rw_bulk(ctx, "HSET", 4);
-    rw_bulk(ctx, key, klen);
-
-    kv_iter_t *it = dict_iter_new(d, 1);
-    kv_entry_t *de;
-    while ((de = dict_iter_next(it)) != NULL) {
-        const char *field = entry_key(de);
-        uint32_t    flen  = de->key_len;
-        uint8_t     fenc  = entry_encoding(de);
-        const char *fval  = entry_payload(de);
-        uint32_t    fvlen = entry_payload_len(de);
-
-        rw_bulk(ctx, field, flen);
-        if (fenc == KV_ENCODING_INT) {
-            int64_t iv;
-            memcpy(&iv, fval, sizeof(int64_t));
-            rw_bulk_int(ctx, iv);
-        } else {
-            rw_bulk(ctx, fval, fvlen);
-        }
-    }
-    dict_iter_free(it);
-}
-
 /* Traverse all in-memory data and write compact RESP to temp file */
 static int aof_rewrite_traverse_and_write(int fd) {
     rewrite_ctx_t ctx;
@@ -436,12 +364,12 @@ static int aof_rewrite_traverse_and_write(int fd) {
 
     long long now = (long long)time(NULL) * 1000;
 
-    kv_store_iter_t it;
-    kv_store_iter_init(&it);
+    kv_iter_t *iter;
+    iter = dict_iter_new(&g_dict, 1);
     kv_entry_t *e;
     long long written = 0;
 
-    while ((e = kv_store_iter_next(&it)) != NULL) {
+    while ((e = dict_iter_next(iter)) != NULL) {
         /* Skip expired keys */
         if (e->expire && e->expire < now) continue;
 
@@ -450,18 +378,9 @@ static int aof_rewrite_traverse_and_write(int fd) {
         if (type == KV_TYPE_STRING) {
             rw_encode_string(&ctx, e);
             written++;
-        } else if (type == KV_TYPE_HASH) {
-            uint8_t enc = entry_encoding(e);
-            if (enc == KV_ENCODING_PACKED) {
-                rw_encode_hash_packed(&ctx, e);
-                written++;
-            } else if (enc == KV_ENCODING_DICT) {
-                rw_encode_hash_dict(&ctx, e);
-                written++;
-            }
         }
     }
-    kv_store_iter_free(&it);
+    dict_iter_free(iter);
 
     rw_flush(&ctx);
     if (fdatasync(fd) < 0)

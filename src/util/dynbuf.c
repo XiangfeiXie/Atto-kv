@@ -22,12 +22,6 @@ int dynbuf_reserve(DynBuf *db, int total_cap) {
     char *nb = (char *)realloc(db->buf, (size_t)new_cap);
     if (!nb) return -1;
 
-    /* Pre-fault newly added pages to avoid minor faults on write */
-    size_t old_bytes = db->cap > 0 ? (size_t)db->cap : 0;
-    for (size_t off = (old_bytes + 4095) & ~(size_t)4095;
-         off < (size_t)new_cap; off += 4096)
-        nb[off] = 0;
-
     db->buf = nb;
     db->cap = new_cap;
     return 0;

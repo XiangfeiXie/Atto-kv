@@ -7,27 +7,34 @@
 #include <string.h>
 #include <ctype.h>
 
+/* ── Fast inline write-buffer helpers ───────────────────────────────────
+ * Bypass dynbuf_cat/dynbuf_reserve overhead on the hot path.
+ * The write buffer starts at 64KB, so small fixed-length responses
+ * (RESP_OK, RESP_NIL, RESP_PONG, etc.) never trigger growth. */
+
+static inline void wb_write(DynBuf *wb, const char *data, int len) {
+    if (wb->len + len > wb->cap)
+        dynbuf_reserve(wb, wb->len + len + 4096);
+    memcpy(wb->buf + wb->len, data, (size_t)len);
+    wb->len += len;
+}
+
+static inline void wb_ensure(DynBuf *wb, int need) {
+    if (wb->len + need > wb->cap)
+        dynbuf_reserve(wb, wb->len + need + 4096);
+}
+
 /* ── Key resolution helper — shared by inline GET/SET and single-key path ──
- * Hash + lookup + lazy-expire.  Caller must hold the appropriate lock.
- * On expiry the entry is cleaned and NULL is returned. */
+ * Hash + lookup.  No lazy-expire on the hot path — active_expire_cycle()
+ * handles cleanup asynchronously (inazuma-kv pattern). */
 
 static inline kv_entry_t *dispatch_resolve(kvs_token_t key_tok,
                                             uint64_t *hash_out, int is_write) {
+    (void)is_write;
     uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
     *hash_out = hash;
-    kv_entry_t *entry = dict_find(kv_dict_for(hash), key_tok.ptr,
-                                   (uint32_t)key_tok.len, hash);
-    if (ENABLE_EXPIRE && entry && entry->expire && get_time_now() > entry->expire) {
-        if (is_write) {
-            entry_cleanup_by_type(entry);
-            dict_delete(kv_dict_for(hash), key_tok.ptr, (uint32_t)key_tok.len, hash);
-            atomic_fetch_add_explicit(kvs_expired_keys_ptr(), 1, memory_order_relaxed);
-        } else {
-            enqueue_expired_key(key_tok.ptr, (uint32_t)key_tok.len, hash);
-        }
-        return NULL;
-    }
-    return entry;
+    return dict_find(&g_dict, key_tok.ptr,
+                     (uint32_t)key_tok.len, hash);
 }
 
 /* ── Inline GET/SET macros (hottest commands, 60-80% workload) ──────── */
@@ -45,7 +52,7 @@ static inline int u2a(char *dst, uint32_t v) {
 /* Inline GET — single reserve + manual formatting, zero snprintf */
 #define INLINE_GET_COMMAND(entry, hash, key_tok, wb) do { \
     if (!(entry)) { \
-        dynbuf_cat((wb), RESP_NIL, RESP_NIL_LEN); \
+        wb_write((wb), RESP_NIL, RESP_NIL_LEN); \
     } else { \
         uint32_t vlen = 0; \
         uint8_t enc = KV_ENCODING_RAW; \
@@ -56,10 +63,10 @@ static inline int u2a(char *dst, uint32_t v) {
             int n = snprintf(buf, sizeof(buf), "$%lld\r\n%lld\r\n", \
                              (long long)snprintf(NULL, 0, "%lld", (long long)iv), \
                              (long long)iv); \
-            dynbuf_cat((wb), buf, n); \
+            wb_write((wb), buf, n); \
         } else { \
             int need = 24 + (int)vlen; \
-            dynbuf_reserve((wb), (wb)->len + need); \
+            wb_ensure((wb), need); \
             char *dst = (wb)->buf + (wb)->len; \
             *dst++ = '$'; \
             int hl = u2a(dst, vlen); dst += hl; \
@@ -79,9 +86,7 @@ static inline int u2a(char *dst, uint32_t v) {
         string_engine_set_pre(key_tok.ptr, (uint32_t)key_tok.len, \
                               val_tok.ptr, (uint32_t)val_tok.len, \
                               0, 0, (hash), (entry)); \
-        dynbuf_reserve((wb), (wb)->len + RESP_OK_LEN); \
-        memcpy((wb)->buf + (wb)->len, RESP_OK, (size_t)RESP_OK_LEN); \
-        (wb)->len += RESP_OK_LEN; \
+        wb_write((wb), RESP_OK, RESP_OK_LEN); \
         if (!g_in_reload) { \
             kvs_write_journal_append((msg_raw), (msg_len)); \
         } \
@@ -91,10 +96,8 @@ static inline int u2a(char *dst, uint32_t v) {
     } \
 } while (0)
 
-extern uint32_t kv_store_count(void);
 
 #include "kv_type_string.h"
-#include "kv_type_hash.h"
 #include "persistence.h"
 
 dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
@@ -156,15 +159,8 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (argc >= 2) {
             kvs_token_t key_tok = tokens[1];
             uint64_t hash;
-            kv_store_rdlock();
             kv_entry_t *entry = dispatch_resolve(key_tok, &hash, 0);
-            if (entry && (int)entry_type(entry) != KV_TYPE_STRING) {
-                dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
-                kv_store_unlock();
-                return DISPATCH_ERROR;
-            }
             INLINE_GET_COMMAND(entry, hash, key_tok, wb);
-            kv_store_unlock();
             return DISPATCH_OK;
         }
     }
@@ -173,27 +169,10 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (argc >= 2) {
             kvs_token_t key_tok = tokens[1];
             uint64_t hash;
-            kv_store_wrlock();
             kv_entry_t *entry = dispatch_resolve(key_tok, &hash, 1);
-            if (entry && (int)entry_type(entry) != KV_TYPE_STRING) {
-                dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
-                kv_store_unlock();
-                return DISPATCH_ERROR;
-            }
             INLINE_SET_COMMAND(entry, hash, tokens, argc, wb, msg_raw, msg_len);
-            if (ENABLE_EXPIRE) flush_expire_queue();
-            kv_store_unlock();
             return DISPATCH_OK;
         }
-    }
-
-    switch (cmd.ptr[0]) {
-    case 'H':
-        if (cmd.len == 4 && cmd.ptr[1] == 'S' && cmd.ptr[2] == 'E' && cmd.ptr[3] == 'T')
-            goto single_key;
-        if (cmd.len == 4 && cmd.ptr[1] == 'G' && cmd.ptr[2] == 'E' && cmd.ptr[3] == 'T')
-            goto single_key;
-        break;
     }
 
     if (TOKEN_EQ(cmd, "QUIT")) {
@@ -210,9 +189,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     }
 
     if (TOKEN_EQ(cmd, "DBSIZE")) {
-        kv_store_rdlock();
-        long long count = (long long)kv_store_count();
-        kv_store_unlock();
+        long long count = (long long)dict_count(&g_dict);
         reply_integer(wb, count);
         return DISPATCH_OK;
     }
@@ -239,17 +216,15 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return handle_info(tokens, argc, wb);
 
     if (TOKEN_EQ(cmd, "FLUSHALL") || TOKEN_EQ(cmd, "FLUSHDB")) {
-        kv_store_wrlock();
-        kv_store_iter_t it; kv_store_iter_init(&it);
+        kv_iter_t *iter = dict_iter_new(&g_dict, 1);
         kv_entry_t *e;
-        while ((e = kv_store_iter_next(&it)) != NULL)
+        while ((e = dict_iter_next(iter)) != NULL)
             entry_cleanup_by_type(e);
-        kv_store_iter_free(&it);
-        kv_store_clear();
+        dict_iter_free(iter);
+        dict_clear(&g_dict);
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         if (!g_in_reload)
             kvs_write_journal_append(msg_raw, msg_len);
-        kv_store_unlock();
         return DISPATCH_OK;
     }
 
@@ -260,20 +235,14 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
             return DISPATCH_ERROR;
         }
-        kv_store_rdlock();
         char hdr[32];
         int hl = snprintf(hdr, sizeof(hdr), "*%d\r\n", argc - 1);
         dynbuf_cat(wb, hdr, hl);
         for (int i = 1; i < argc; i++) {
             uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                   (uint32_t)tokens[i].len);
-            kv_entry_t *ke = dict_find(kv_dict_for(kh), tokens[i].ptr,
+            kv_entry_t *ke = dict_find(&g_dict, tokens[i].ptr,
                                        (uint32_t)tokens[i].len, kh);
-            if (ke && ke->expire && get_time_now() > ke->expire) {
-                dict_delete(kv_dict_for(kh), tokens[i].ptr,
-                            (uint32_t)tokens[i].len, kh);
-                ke = NULL;
-            }
             uint32_t vlen = 0; uint8_t enc = KV_ENCODING_RAW;
             if (!ke) {
                 dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
@@ -294,7 +263,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                 dynbuf_lit(wb, "\r\n");
             }
         }
-        kv_store_unlock();
         return DISPATCH_OK;
     }
 
@@ -303,22 +271,11 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             dynbuf_lit(wb, "-ERR wrong number of arguments for 'mset' command\r\n");
             return DISPATCH_ERROR;
         }
-        kv_store_wrlock();
         for (int i = 1; i + 1 < argc; i += 2) {
             uint64_t kh = kv_hash((const uint8_t *)tokens[i].ptr,
                                   (uint32_t)tokens[i].len);
-            kv_entry_t *ke = dict_find(kv_dict_for(kh), tokens[i].ptr,
+            kv_entry_t *ke = dict_find(&g_dict, tokens[i].ptr,
                                        (uint32_t)tokens[i].len, kh);
-            if (ke && entry_type(ke) != KV_TYPE_STRING) {
-                entry_cleanup_by_type(ke);
-                dict_delete(kv_dict_for(kh), tokens[i].ptr,
-                            (uint32_t)tokens[i].len, kh);
-            } else if (ke && ke->expire && get_time_now() > ke->expire) {
-                entry_cleanup_by_type(ke);
-                dict_delete(kv_dict_for(kh), tokens[i].ptr,
-                            (uint32_t)tokens[i].len, kh);
-                ke = NULL;
-            }
             string_engine_set_pre(tokens[i].ptr, (uint32_t)tokens[i].len,
                                   tokens[i+1].ptr, (uint32_t)tokens[i+1].len,
                                   0, 0, kh, ke);
@@ -326,7 +283,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         if (!g_in_reload)
             kvs_write_journal_append(msg_raw, msg_len);
-        kv_store_unlock();
         return DISPATCH_OK;
     }
 
@@ -335,22 +291,20 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
             return DISPATCH_ERROR;
         }
-        kv_store_wrlock();
         long long ndel = 0;
         for (int i = 1; i < argc; i++) {
             kvs_token_t kt = tokens[i];
             uint64_t kh = kv_hash((const uint8_t *)kt.ptr, (uint32_t)kt.len);
-            kv_entry_t *ke = dict_find(kv_dict_for(kh), kt.ptr,
+            kv_entry_t *ke = dict_find(&g_dict, kt.ptr,
                                        (uint32_t)kt.len, kh);
             if (!ke) continue;
             entry_cleanup_by_type(ke);
-            if (dict_delete(kv_dict_for(kh), kt.ptr, (uint32_t)kt.len, kh) == 0)
+            if (dict_delete(&g_dict, kt.ptr, (uint32_t)kt.len, kh) == 0)
                 ndel++;
         }
         reply_integer(wb, ndel);
         if (ndel > 0 && !g_in_reload)
             kvs_write_journal_append(msg_raw, msg_len);
-        kv_store_unlock();
         return DISPATCH_OK;
     }
 
@@ -359,42 +313,35 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
             return DISPATCH_ERROR;
         }
-        kv_store_rdlock();
         long long nfound = 0;
         for (int i = 1; i < argc; i++) {
             kvs_token_t kt = tokens[i];
             uint64_t kh = kv_hash((const uint8_t *)kt.ptr, (uint32_t)kt.len);
-            kv_entry_t *ke = dict_find(kv_dict_for(kh), kt.ptr,
+            kv_entry_t *ke = dict_find(&g_dict, kt.ptr,
                                        (uint32_t)kt.len, kh);
             if (!ke) continue;
-            if (ke->expire && get_time_now() > ke->expire) continue;
             nfound++;
         }
         reply_integer(wb, nfound);
-        kv_store_unlock();
         return DISPATCH_OK;
     }
 
     if (TOKEN_EQ(cmd, "KEYS")) {
-        kv_store_rdlock();
-        kv_store_iter_t it; kv_store_iter_init(&it);
+        kv_iter_t *iter = dict_iter_new(&g_dict, 1);
         kv_entry_t *ke;
         long long nkeys = 0;
-        while ((ke = kv_store_iter_next(&it)) != NULL) {
-            if (!(ke->expire && get_time_now() > ke->expire))
-                nkeys++;
+        while ((ke = dict_iter_next(iter)) != NULL) {
+            nkeys++;
         }
-        kv_store_iter_free(&it);
+        dict_iter_free(iter);
         char hdr[32];
         int hl = snprintf(hdr, sizeof(hdr), "*%lld\r\n", nkeys);
         dynbuf_cat(wb, hdr, hl);
-        kv_store_iter_init(&it);
-        while ((ke = kv_store_iter_next(&it)) != NULL) {
-            if (ke->expire && get_time_now() > ke->expire) continue;
+        iter = dict_iter_new(&g_dict, 1);
+        while ((ke = dict_iter_next(iter)) != NULL) {
             reply_bulk(wb, entry_key(ke), ke->key_len);
         }
-        kv_store_iter_free(&it);
-        kv_store_unlock();
+        dict_iter_free(iter);
         return DISPATCH_OK;
     }
 
@@ -420,19 +367,10 @@ single_key:
         cmd_type = KV_TYPE_STRING; is_write = 1;
     } else if (TOKEN_EQ(cmd, "GET") || TOKEN_EQ(cmd, "STRLEN")) {
         cmd_type = KV_TYPE_STRING; is_write = 0;
-    } else if (TOKEN_EQ(cmd, "HSET") || TOKEN_EQ(cmd, "HDEL")) {
-        cmd_type = KV_TYPE_HASH; is_write = 1;
-    } else if (TOKEN_EQ(cmd, "HGET") || TOKEN_EQ(cmd, "HGETALL") ||
-               TOKEN_EQ(cmd, "HKEYS") || TOKEN_EQ(cmd, "HVALS") ||
-               TOKEN_EQ(cmd, "HLEN") || TOKEN_EQ(cmd, "HEXISTS")) {
-        cmd_type = KV_TYPE_HASH; is_write = 0;
     } else {
         dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
         return DISPATCH_ERROR;
     }
-
-    if (is_write) kv_store_wrlock();
-    else           kv_store_rdlock();
 
     kv_entry_t *entry = dispatch_resolve(key_tok, &hash, is_write);
 
@@ -441,73 +379,50 @@ single_key:
     if (TOKEN_EQ(cmd, "TYPE")) {
         const char *r = "+none\r\n"; int rlen = 7;
         if (entry) {
-            if (entry_type(entry) == KV_TYPE_HASH) { r = "+hash\r\n"; rlen = 7; }
-            else { r = "+string\r\n"; rlen = 9; }
+            r = "+string\r\n"; rlen = 9;
         }
         dynbuf_cat(wb, r, rlen);
-        kv_store_unlock();
         return DISPATCH_OK;
     }
 
     if (TOKEN_EQ(cmd, "EXPIRE")) {
         if (argc < 3) {
             dynbuf_lit(wb, "-ERR wrong number of arguments for 'expire' command\r\n");
-            kv_store_unlock();
             return DISPATCH_ERROR;
         }
         long long secs;
         if (token_to_ll(tokens[2], &secs) < 0) {
             dynbuf_lit(wb, "-ERR value is not an integer or out of range\r\n");
-            kv_store_unlock();
             return DISPATCH_ERROR;
         }
-        if (!entry) { reply_integer(wb, 0); kv_store_unlock(); return DISPATCH_OK; }
+        if (!entry) { reply_integer(wb, 0); return DISPATCH_OK; }
         entry->expire = get_time_now() + secs * 1000;
         reply_integer(wb, 1);
         if (!g_in_reload) kvs_write_journal_append(msg_raw, msg_len);
-        kv_store_unlock();
         return DISPATCH_OK;
     }
 
     if (TOKEN_EQ(cmd, "TTL") || TOKEN_EQ(cmd, "PTTL")) {
-        if (!entry) { reply_integer(wb, -2); kv_store_unlock(); return DISPATCH_OK; }
-        if (!entry->expire) { reply_integer(wb, -1); kv_store_unlock(); return DISPATCH_OK; }
+        if (!entry) { reply_integer(wb, -2); return DISPATCH_OK; }
+        if (!entry->expire) { reply_integer(wb, -1); return DISPATCH_OK; }
         long long rem_ms = entry->expire - get_time_now();
-        if (rem_ms < 0) { reply_integer(wb, -2); kv_store_unlock(); return DISPATCH_OK; }
+        if (rem_ms < 0) { reply_integer(wb, -2); return DISPATCH_OK; }
         reply_integer(wb, TOKEN_EQ(cmd, "TTL") ? (rem_ms + 500) / 1000 : rem_ms);
-        kv_store_unlock();
         return DISPATCH_OK;
     }
 
     if (TOKEN_EQ(cmd, "PERSIST")) {
         if (!entry || !entry->expire) {
-            reply_integer(wb, 0); kv_store_unlock(); return DISPATCH_OK;
+            reply_integer(wb, 0); return DISPATCH_OK;
         }
         entry->expire = 0;
         reply_integer(wb, 1);
         if (!g_in_reload) kvs_write_journal_append(msg_raw, msg_len);
-        kv_store_unlock();
         return DISPATCH_OK;
     }
 
-    if (entry && (int)entry_type(entry) != cmd_type) {
-        dynbuf_cat(wb, RESP_WRONGTYPE, RESP_WRONGTYPE_LEN);
-        kv_store_unlock();
-        return DISPATCH_ERROR;
-    }
-
-    switch (cmd_type) {
-    case KV_TYPE_STRING:
+    if (cmd_type == KV_TYPE_STRING)
         string_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb, msg_raw, msg_len);
-        break;
-    case KV_TYPE_HASH:
-        (void)hash_cmd(cmd, entry, hash, tokens + 1, argc - 1, wb, msg_raw, msg_len,
-                       c ? c->client : NULL);
-        break;
-    default:
-        dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
-        break;
-    }
 
     /* Write-command post-processing */
     if (is_write) {
@@ -517,9 +432,7 @@ single_key:
                   !(rlen >= 5 && memcmp(resp, "$-1\r\n", 5) == 0));
         if (ok && !g_in_reload)
             kvs_write_journal_append(msg_raw, msg_len);
-        if (ENABLE_EXPIRE) flush_expire_queue();
     }
 
-    kv_store_unlock();
     return DISPATCH_OK;
 }

@@ -1,10 +1,8 @@
 #include "config.h"
-#include "kv_dict.h"     /* KV_NR_SHARDS */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <ctype.h>
 #include <errno.h>
 #include <unistd.h>      /* sysconf */
 #include <sys/stat.h>
@@ -18,7 +16,7 @@ KvsConfig kvs_config;
 static void config_default(void) {
     kvs_config.port          = 6379;
     kvs_config.loglevel      = LOG_INFO;
-    kvs_config.persist_mode  = PERSIST_AOF;
+    kvs_config.persist_mode  = PERSIST_NONE;  /* off by default */
     kvs_config.network_model = NET_REACTOR;
     kvs_config.maxclients    = 10000;
     strncpy(kvs_config.wal_fsync_policy, "everysec", sizeof(kvs_config.wal_fsync_policy) - 1);
@@ -39,7 +37,7 @@ static void config_default(void) {
     kvs_config.fullsync_max_retries = 3;
 
     kvs_config.latency_histogram_enabled = 0;
-    kvs_config.expire_enabled            = 1;  /* on by default */
+    kvs_config.expire_enabled            = 0;  /* off by default */
 }
 
 /* Resolve sentinel values and emit sanity warnings.  Called once after
@@ -254,7 +252,7 @@ void config_print(void) {
     if (kvs_config.latency_histogram_enabled)
         printf("  Latency hist  : sampled dispatch histogram enabled\n");
     printf("  Expire        : %s\n",
-           kvs_config.expire_enabled ? "on (lazy+queue+thread)" : "off");
+           kvs_config.expire_enabled ? "on (Redis-style lazy)" : "off");
     printf("  Workers       : 1 (single-thread proactor)\n");
     printf("  CPU pin       : off (single-threaded mode)\n");
     printf("========================================\n\n");

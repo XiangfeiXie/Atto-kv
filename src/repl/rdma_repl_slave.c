@@ -53,12 +53,12 @@ static int parse_and_insert(const char *buf, size_t len, int is_first, int *aren
         if (p+dlen+8 > end) break;
         const char *dat = p; p+=dlen;
         uint64_t exp = be64toh(*(const uint64_t *)p);   p+=8;
-        kv_entry_t *e = dict_add(kv_dict_for(hash), key, klen, dat, dlen, hash);
+        kv_entry_t *e = dict_add(&g_dict, key, klen, dat, dlen, hash);
         if (e) e->expire = (long long)exp;
         n++;
     }
     if (!*arena_done && n>0) {
-        kv_dict_t *dict = kv_dict_global();
+        kv_dict_t *dict = &g_dict;
         if (!dict->arena) {
             size_t est = (size_t)n*320;
             if (est > 64*1024*1024) dict_arena_init(dict, est);

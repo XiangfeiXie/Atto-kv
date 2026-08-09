@@ -52,20 +52,20 @@ static int engine_set_pre(const char *key, uint32_t key_len,
         if (existing->val_len == nd) {
             existing->data[0] = (char)KV_TYPE_STRING;
             existing->data[1] = (char)enc;
-            memcpy(existing->data + 2, pload, plen);
+            memcpy(entry_payload(existing), pload, plen);
             existing->expire = expire;
             return 0;
         }
-        kv_entry_t *e = dict_resize_entry(kv_dict_for(hash), existing, nd);
+        kv_entry_t *e = dict_resize_entry(&g_dict, existing, nd);
         if (!e) return -1;
         e->data[0] = (char)KV_TYPE_STRING;
         e->data[1] = (char)enc;
-        memcpy(e->data + 2, pload, plen);
+        memcpy(entry_payload(e), pload, plen);
         e->expire = expire;
         return 0;
     }
 
-    kv_entry_t *e = dict_add_raw(kv_dict_for(hash), key, key_len,
+    kv_entry_t *e = dict_add_raw(&g_dict, key, key_len,
                                  KV_TYPE_STRING, enc,
                                  pload, plen, hash);
     if (!e) return -1;

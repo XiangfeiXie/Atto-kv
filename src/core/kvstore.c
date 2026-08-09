@@ -118,6 +118,7 @@ void update_cached_time(void) {
         kvs_aof_auto_rewrite_check();
     }
     if (ENABLE_RDB) rdb_periodic();
+    if (ENABLE_EXPIRE) active_expire_cycle();
 }
 
 /* ── Utility ────────────────────────────────────────────────────────── */
@@ -141,7 +142,9 @@ int token_to_ll(kvs_token_t t, long long *out) {
 }
 
 void entry_cleanup_by_type(kv_entry_t *e) {
-    hash_cleanup_entry(e);
+    (void)e;
+    /* String entries have no internal resources to free.
+     * Kept as a hook for future type extensions. */
 }
 
 /* Pre-allocated integer responses :0\r\n..:255\r\n */
@@ -177,24 +180,24 @@ void reply_bulk(DynBuf *wb, const char *s, int len) {
 /* ── Engine lifecycle ───────────────────────────────────────────────── */
 
 int init_kvengine(void) {
-    kv_store_init();
+    dict_init(&g_dict);
     init_shared_responses();
-    printf("Using string/hash storage engine (single global dict)\n");
+    printf("Using string storage engine (single global dict)\n");
     return 0;
 }
 
 void dest_kvengine(void) {
     kvs_flush_all();
-    kv_store_destroy();
+    dict_destroy(&g_dict);
 }
 
 void kvs_flush_all(void) {
-    kv_store_iter_t it; kv_store_iter_init(&it);
+    kv_iter_t *iter = dict_iter_new(&g_dict, 1);
     kv_entry_t *e;
-    while ((e = kv_store_iter_next(&it)) != NULL)
+    while ((e = dict_iter_next(iter)) != NULL)
         entry_cleanup_by_type(e);
-    kv_store_iter_free(&it);
-    kv_store_clear();
+    dict_iter_free(iter);
+    dict_clear(&g_dict);
 #ifdef USE_JEMALLOC
     mallctl("arenas.purge", NULL, NULL, NULL, 0);
 #endif
@@ -258,16 +261,12 @@ int main(int argc, char *argv[]) {
         printf("[RDMA-REPL] rdma replication disabled by config\n");
     }
 
-    if (ENABLE_EXPIRE) kvs_start_expire_thread();
-
     if (kvs_config.network_model == NET_REACTOR)
         reactor_start(kvs_config.port, kvs_protocol_batch);
     else if (kvs_config.network_model == NET_PROACTOR)
         proactor_start(kvs_config.port, kvs_protocol_batch);
     else if (kvs_config.network_model == NET_NTYCO)
         ntyco_start(kvs_config.port, kvs_protocol_batch);
-
-    if (ENABLE_EXPIRE) kvs_stop_expire_thread();
 
     kvs_wal_persist_stop();
     dest_kvengine();

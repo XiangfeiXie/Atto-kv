@@ -11,7 +11,6 @@
 
 #include "persistence.h"
 #include "kvstore.h"
-#include "kv_type_hash.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,12 +91,12 @@ static void rdb_buf_reserve(rdb_buf_t *b, size_t need) {
  * ========================================================================= */
 
 static void store_scan(void (*cb)(kv_entry_t *e, void *priv), void *priv) {
-    kv_store_iter_t it;
-    kv_store_iter_init(&it);
+    kv_iter_t *iter;
+    iter = dict_iter_new(&g_dict, 1);
     kv_entry_t *e;
-    while ((e = kv_store_iter_next(&it)) != NULL)
+    while ((e = dict_iter_next(iter)) != NULL)
         cb(e, priv);
-    kv_store_iter_free(&it);
+    dict_iter_free(iter);
 }
 
 /* =========================================================================
@@ -268,8 +267,6 @@ static const char *mread(const char *p, const char *end, void *out, size_t n) {
 /* ── RDB entry payload accessor ── */
 int rdb_entry_payload(kv_entry_t *e, const char **data, int *dlen) {
     if (!e) return -1;
-    if (entry_type(e) == KV_TYPE_HASH && entry_encoding(e) == KV_ENCODING_DICT)
-        return -1;
     *data = e->data;
     *dlen = (int)e->val_len;
     return 0;
@@ -285,12 +282,7 @@ static int rdb_entry_extract(kv_entry_t *e,
     *owned = NULL;
     if (!e) return -1;
 
-    uint32_t owned_len = 0;
-    if (entry_type(e) == KV_TYPE_HASH && entry_encoding(e) == KV_ENCODING_DICT) {
-        if (hash_flatten_to_packed(e, owned, &owned_len) != 0) return -1;
-        *data = *owned;
-        *dlen = (int)owned_len;
-    } else if (rdb_entry_payload(e, data, dlen) != 0) {
+    if (rdb_entry_payload(e, data, dlen) != 0) {
         return -1;
     }
 
@@ -363,7 +355,7 @@ void rdb_serialize_to_buf(DynBuf *out) {
     int magic     = 0x524442;
     int version   = 2;
     int db_num    = 0;
-    int key_count = (int)kv_store_count();
+    int key_count = (int)dict_count(&g_dict);
 
     dynbuf_reserve(out, 16 + key_count * 64);
 
@@ -382,7 +374,7 @@ void rdb_serialize_to_buf(DynBuf *out) {
 
 void rdb_save_sync(void) {
     rdb_buf_t b  = {0};
-    int key_count = (int)kv_store_count();
+    int key_count = (int)dict_count(&g_dict);
 
     /* Reserve estimate: 16-byte header + ~64 bytes per key */
     rdb_buf_reserve(&b, 16 + (size_t)key_count * 64);
@@ -479,14 +471,11 @@ int rdb_save_async_uring(void) {
     g_bgsave_pending    = 0;
 
     long long t_lock = get_time_now_real();
-    kv_store_lock_for_snapshot();
-    long long t_locked = get_time_now_real();
 
     pid_t pid = fork();
     if (pid < 0) {
         fprintf(stderr, "[RDB] fork failed (%s), falling back to sync save\n",
                 strerror(errno));
-        kv_store_unlock_snapshot();
         rdb_save_sync();
         rdb_bgsave_done();
         return 0;
@@ -497,12 +486,11 @@ int rdb_save_async_uring(void) {
         fflush(stderr);
         _exit(0);
     }
-    kv_store_unlock_snapshot();
     long long t_done = get_time_now_real();
     g_rdb_child_pid = pid;
     printf("[RDB] BGSAVE started, child pid=%d "
-           "(stall: %lld ms acquire, %lld ms total)\n",
-           (int)pid, t_locked - t_lock, t_done - t_lock);
+           "(fork stall: %lld ms)\n",
+           (int)pid, t_done - t_lock);
     return 0;
 }
 
@@ -549,12 +537,11 @@ int rdb_load_stream_append(const char *buf, size_t len) {
         if (p + dlen > end) break;
 
         uint64_t h = kv_hash((const uint8_t *)ks, (uint32_t)klen);
-        kv_entry_t *e = dict_add(kv_dict_for(h), ks, (uint32_t)klen, p, (uint32_t)dlen, h);
+        kv_entry_t *e = dict_add(&g_dict, ks, (uint32_t)klen, p, (uint32_t)dlen, h);
         p += dlen;
 
         if (!(p = mread(p, end, &expire, sizeof(long long)))) break;
         if (e && expire) e->expire = expire;
-        if (e) hash_rebuild_encoding(e);
         loaded++;
     }
 
@@ -562,12 +549,7 @@ int rdb_load_stream_append(const char *buf, size_t len) {
 }
 
 void rdb_rebuild_all_encodings(void) {
-    kv_store_iter_t it;
-    kv_store_iter_init(&it);
-    kv_entry_t *e;
-    while ((e = kv_store_iter_next(&it)) != NULL)
-        hash_rebuild_encoding(e);
-    kv_store_iter_free(&it);
+    /* No-op: with string-only storage, no encoding rebuild is needed. */
 }
 
 int rdb_load_from_buf(const char *buf, size_t len) {
@@ -577,7 +559,7 @@ int rdb_load_from_buf(const char *buf, size_t len) {
     if (key_count < 0) return -1;
 
     int loaded = rdb_load_stream_append(buf + 16, len - 16);
-    if (loaded < 0) { kv_store_clear(); return -1; }
+    if (loaded < 0) { dict_clear(&g_dict); return -1; }
 
     rdb_rebuild_all_encodings();
 

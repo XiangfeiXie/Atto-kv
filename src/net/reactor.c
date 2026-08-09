@@ -188,16 +188,17 @@ int recv_cb(int fd) {
     if (__builtin_expect(c->read_buf.len > 64, 1))
         __builtin_prefetch(c->read_buf.buf + c->r_off, 0, 3);
 
-    /* Defer drain while a send is in progress — avoids write-buffer
-     * corruption when new responses would be appended with w_off > 0.
-     * Pending data is drained in send_cb once the write buffer empties. */
-    if (c->write_buf.len > 0) {
-        conn_set_events(fd, c);
-        return 0;
+    /* Always drain immediately.
+     * If a partial send left stale w_off, compact unsent data
+     * to buf[0] so new responses append cleanly. */
+    if (c->write_buf.len > 0 && c->w_off > 0) {
+        memmove(c->write_buf.buf,
+                c->write_buf.buf + c->w_off,
+                (size_t)c->write_buf.len);
+        c->w_off = 0;
     }
 
     /* Process all available commands in the buffer */
-    c->w_off = 0;
     kvs_drain_resp_commands_off(&c->read_buf, &c->r_off, &c->write_buf, c);
 
     /* Reset r_off when buffer is fully consumed to prevent unbounded

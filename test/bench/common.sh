@@ -167,14 +167,15 @@ start_kvs_slave() {
     log "kvstore slave 已启动 (pid=$pid, port=$KVS_SLAVE_PORT)"
 }
 
-# ---- Redis 管理 ----
+# ---- Redis 管理 (Redis 6.0 daemonize mode) ----
 start_redis() {
-    if systemctl is-active --quiet redis-server 2>/dev/null; then
-        systemctl stop redis-server 2>/dev/null || true
-    fi
+    # 先停旧实例
+    pkill -x redis-server 2>/dev/null || true
+    sleep 0.5
     # 清理持久化文件
     rm -f /var/lib/redis/dump.rdb /var/lib/redis/appendonly.aof
-    systemctl start redis-server
+    rm -f /home/xxf/dump.rdb /home/xxf/appendonly.aof
+    redis-server --daemonize yes --port $REDIS_PORT
     sleep 1
     redis-cli -p $REDIS_PORT PING >/dev/null 2>&1 || { err "Redis 启动失败"; exit 1; }
     # 绑定 redis-server 主线程到指定核
@@ -185,7 +186,7 @@ start_redis() {
             || warn "taskset 绑定 redis-server 失败 (pid=$redis_pid)"
     fi
     redis-cli -p $REDIS_PORT FLUSHALL >/dev/null
-    log "Redis 已启动 (port=$REDIS_PORT)"
+    log "Redis 6.0 已启动 (port=$REDIS_PORT)"
 }
 
 redis_configure() {
@@ -210,7 +211,7 @@ redis_configure() {
 }
 
 stop_redis() {
-    systemctl stop redis-server 2>/dev/null || true
+    pkill -x redis-server 2>/dev/null || true
     sleep 0.5
 }
 

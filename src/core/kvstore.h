@@ -33,10 +33,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
 
 void kvs_flush_all(void);
 
-/* ── Active expire ── */
-void kvs_start_expire_thread(void);
-void kvs_stop_expire_thread(void);
-
 /* ── Global dict ── */
 extern int g_in_reload;   /* 1 during AOF/RDB reload — suppress AOF append + eBPF */
 

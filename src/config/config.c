@@ -167,10 +167,15 @@ int config_load(const char *path) {
             else printf("[CONFIG] line %d: unknown rdma_role '%s'\n", lineno, val);
 
         } else if (strcasecmp(key, "fullsync_transport") == 0) {
-            if (strcasecmp(val, "rdma") == 0 || strcasecmp(val, "tcp") == 0)
-                strncpy(kvs_config.fullsync_transport, val,
+            if (strcasecmp(val, "sendfile") == 0 || strcasecmp(val, "tcp") == 0) {
+                /* "tcp" is a legacy alias — normalize to "sendfile" */
+                strncpy(kvs_config.fullsync_transport, "sendfile",
                         sizeof(kvs_config.fullsync_transport) - 1);
-            else printf("[CONFIG] line %d: unknown transport '%s'\n", lineno, val);
+            } else if (strcasecmp(val, "rdma") == 0) {
+                strncpy(kvs_config.fullsync_transport, "rdma",
+                        sizeof(kvs_config.fullsync_transport) - 1);
+            } else printf("[CONFIG] line %d: unknown transport '%s' "
+                           "(expected 'sendfile' or 'rdma')\n", lineno, val);
 
         } else if (strcasecmp(key, "rdma_listen_ip") == 0) {
             strncpy(kvs_config.rdma_listen_ip, val,

@@ -39,7 +39,7 @@ typedef struct {
     int  rdma_sync_enabled;
     int  rdma_role;              /* ROLE_MASTER=0 / ROLE_SLAVE=1 */
 
-    /* 传输方式: "rdma" (RDMA verbs) | "tcp" (sendfile 零拷贝) */
+    /* 传输方式: "sendfile" (TCP sendfile 零拷贝) | "rdma" (RDMA verbs) */
     char fullsync_transport[16];
 
     /* Slave listens on this IP:port; Master connects to it */

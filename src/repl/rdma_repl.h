@@ -18,14 +18,20 @@
 #define FULLSYNC_MAGIC      0x52444233u
 #define FULLSYNC_VERSION    3
 #define FULLSYNC_IMM_DONE   0xFFFFFFFFu
-#define FULLSYNC_NUM_BUFS   2
+
+/* Slave buffer count — exposed to master via buf_info.num_bufs.
+ * Must fit within buf_info.addr[] / rkey[] static arrays.           */
+#define FULLSYNC_NUM_BUFS   8
+#define FULLSYNC_QP_SEND_WR 512   /* 256 MB / 1 MB chunks × 2 headroom */
+#define FULLSYNC_QP_RECV_WR 16
 
 /* ── 握手 & ACK 结构 ──────────────────────────────────────────────── */
 
 struct buf_info {
-    uint64_t addr[2];
-    uint32_t rkey[2];
+    uint64_t addr[FULLSYNC_NUM_BUFS];
+    uint32_t rkey[FULLSYNC_NUM_BUFS];
     uint32_t buf_size;
+    uint32_t num_bufs;       /* actual number of buffers in use */
 } __attribute__((packed));
 
 struct batch_hdr {

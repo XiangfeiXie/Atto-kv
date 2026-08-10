@@ -84,7 +84,7 @@ int rdma_repl_master_start(void) {
 }
 
 /* 收到 Slave 的 FULLSYNC 命令后 fork 子进程监听推送 */
-static int is_tcp(void) { return strcmp(kvs_config.fullsync_transport, "tcp") == 0; }
+static int is_tcp(void) { return strcmp(kvs_config.fullsync_transport, "sendfile") == 0; }
 
 int rdma_repl_master_trigger_sync(void) {
     session_kill_all();
@@ -155,16 +155,13 @@ static int slave_send_fullsync_cmd(void) {
 int rdma_repl_slave_start(void) {
     session_init();
 
-    pid_t pid = fork();
-    if (pid < 0) { perror("fork"); return -1; }
-    if (pid == 0) {
-        if (slave_send_fullsync_cmd() < 0)
-            exit(1);
-        if (is_tcp())
-            exit(tcp_slave_fullsync());
-        else
-            exit(rdma_repl_slave_fullsync());
-    }
-    session_add(pid);
-    return 0;
+    /* Run fullsync inline — fork + COW would lose the loaded data in the
+     * parent process since g_dict modifications don't cross fork boundary.
+     * TODO: restore async fork with shared memory or post-fork reload. */
+    if (slave_send_fullsync_cmd() < 0)
+        return -1;
+    if (is_tcp())
+        return tcp_slave_fullsync();
+    else
+        return rdma_repl_slave_fullsync();
 }

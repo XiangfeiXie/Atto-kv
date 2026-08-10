@@ -59,6 +59,9 @@ int tcp_slave_fullsync(void) {
     freeaddrinfo(ai);
     if (!ok) { perror("connect"); close(fd); return -1; }
 
+    /* Signal master that we are ready (so master can start SAVE + sendfile timer) */
+    { char ready = 1; if (send(fd, &ready, 1, 0) != 1) { perror("send ready"); close(fd); return -1; } }
+
     /* recv size */
     uint64_t fsz = 0;
     if (recv(fd, &fsz, 8, MSG_WAITALL) != 8) { perror("recv size"); close(fd); return -1; }

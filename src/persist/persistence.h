@@ -52,15 +52,37 @@ void rdb_serialize_to_buf(DynBuf *out);
 /* RDB 二进制反序列化 ← 内存 buffer（全量同步用） */
 int rdb_load_from_buf(const char *buf, size_t len);
 
-/* Single-entry serialization (used by streaming fullsync).
- * [klen:4][key][dlen:4][data][expire:8] */
-void serialize_entry_to_buf(DynBuf *out, kv_entry_t *e);
-
 /* Streaming RDB load (for RDMA fullsync slave). */
 int rdb_load_stream_begin(const char *buf, size_t len);
 int rdb_load_stream_append(const char *buf, size_t len);
 
 /* Rebuild encodings after streaming load */
 void rdb_rebuild_all_encodings(void);
+
+/* ── Incremental RDB serialiser (for RDMA fullsync master) ──
+ *
+ * Replaces rdb_serialize_to_buf() when the caller wants to write batches
+ * directly into an RDMA MR buffer, avoiding an intermediate DynBuf copy.
+ *
+ * Usage:
+ *   rdb_serializer_t rs;
+ *   rdb_serialize_begin(&rs);
+ *   int done = 0;
+ *   while (!done) {
+ *       size_t n = rdb_serialize_next(&rs, dst, max_bytes, &done);
+ *       // n bytes of RDB data in dst, send it...
+ *   }
+ *   rdb_serialize_end(&rs);                                   */
+
+typedef struct {
+    kv_iter_t *iter;        /* dict iterator, NULL after end */
+    int        header_sent; /* has the 16-byte RDB header been emitted? */
+    int        exhausted;   /* all entries consumed */
+} rdb_serializer_t;
+
+void   rdb_serialize_begin(rdb_serializer_t *rs);
+size_t rdb_serialize_next(rdb_serializer_t *rs, char *dst,
+                          size_t max_bytes, int *done);
+void   rdb_serialize_end(rdb_serializer_t *rs);
 
 #endif

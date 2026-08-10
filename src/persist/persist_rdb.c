@@ -11,6 +11,7 @@
 
 #include "persistence.h"
 #include "kvstore.h"
+#include "protocol.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -267,8 +268,8 @@ static const char *mread(const char *p, const char *end, void *out, size_t n) {
 /* ── RDB entry payload accessor ── */
 int rdb_entry_payload(kv_entry_t *e, const char **data, int *dlen) {
     if (!e) return -1;
-    *data = e->data;
-    *dlen = (int)e->val_len;
+    *data = entry_payload(e);
+    *dlen = (int)entry_payload_len(e);
     return 0;
 }
 
@@ -320,9 +321,9 @@ static void rdb_save_callback_buf(kv_entry_t *e, void *priv) {
     free(owned);
 }
 
-/* Single-entry serialize into DynBuf (used by RDMA fullsync).
+/* Single-entry serialize into DynBuf (RDB per-entry format).
  * Same binary format as rdb_save_callback_buf. */
-void serialize_entry_to_buf(DynBuf *out, kv_entry_t *e) {
+static void serialize_entry_to_buf(DynBuf *out, kv_entry_t *e) {
     const char *key, *data;
     int klen, dlen;
     long long expire;
@@ -365,6 +366,104 @@ void rdb_serialize_to_buf(DynBuf *out) {
     dynbuf_append(out, (const char *)&key_count, sizeof(int));
 
     store_scan(rdb_serialize_cb_dynbuf, out);
+}
+
+/* ── Incremental RDB serialiser (RDMA fullsync master) ────────────────── */
+
+/* Serialised size of one entry (RDB per-entry format):
+ *   [klen:4][key:klen][dlen:4][data:dlen][expire:8]                        */
+static inline size_t entry_serialized_size(kv_entry_t *e) {
+    return sizeof(int) + (size_t)e->key_len
+         + sizeof(int) + (size_t)entry_payload_len(e)
+         + sizeof(long long);
+}
+
+/* Write one entry into a raw buffer pointer (no DynBuf overhead).
+ * Returns the number of bytes written.                                    */
+static size_t serialize_entry_to_ptr(char *dst, kv_entry_t *e) {
+    const char *key, *data;
+    int klen, dlen;
+    long long expire;
+    char *owned = NULL;
+
+    if (rdb_entry_extract(e, &key, &klen, &data, &dlen, &expire, &owned) != 0)
+        return 0;
+
+    size_t total = entry_serialized_size(e);
+    char *p = dst;
+    memcpy(p, &klen,   sizeof(int));   p += sizeof(int);
+    memcpy(p, key,     (size_t)klen);  p += klen;
+    memcpy(p, &dlen,   sizeof(int));   p += sizeof(int);
+    memcpy(p, data,    (size_t)dlen);  p += dlen;
+    memcpy(p, &expire, sizeof(long long));
+
+    free(owned);
+    return total;
+}
+
+void rdb_serialize_begin(rdb_serializer_t *rs) {
+    rs->iter        = dict_iter_new(&g_dict, 1);
+    rs->header_sent = 0;
+    rs->exhausted   = (dict_iter_peek(rs->iter) == NULL);
+}
+
+size_t rdb_serialize_next(rdb_serializer_t *rs, char *dst,
+                          size_t max_bytes, int *done) {
+    size_t written = 0;
+    *done = 0;
+
+    if (rs->exhausted) {
+        *done = 1;
+        return 0;
+    }
+
+    /* RDB header (16 bytes) on first call */
+    if (!rs->header_sent) {
+        if (max_bytes < 16) return 0;  /* need at least header room */
+
+        int magic     = 0x524442;
+        int version   = 2;
+        int db_num    = 0;
+        int key_count = (int)dict_count(&g_dict);
+
+        memcpy(dst,       &magic,     sizeof(int));
+        memcpy(dst + 4,   &version,   sizeof(int));
+        memcpy(dst + 8,   &db_num,    sizeof(int));
+        memcpy(dst + 12,  &key_count, sizeof(int));
+        written    += 16;
+        dst        += 16;
+        max_bytes  -= 16;
+        rs->header_sent = 1;
+    }
+
+    /* Serialize entries until max_bytes exhausted or dict done */
+    while (max_bytes >= 16) {  /* minimum one entry: 4+0+4+0+8 = 16 */
+        kv_entry_t *e = dict_iter_peek(rs->iter);
+        if (!e) {
+            rs->exhausted = 1;
+            break;
+        }
+
+        size_t sz = entry_serialized_size(e);
+        if (sz > max_bytes) break;         /* entry doesn't fit → next batch */
+
+        dict_iter_next(rs->iter);          /* consume */
+        size_t n = serialize_entry_to_ptr(dst, e);
+        written   += n;
+        dst       += n;
+        max_bytes -= n;
+    }
+
+    if (rs->exhausted) *done = 1;
+    return written;
+}
+
+void rdb_serialize_end(rdb_serializer_t *rs) {
+    if (rs->iter) {
+        dict_iter_free(rs->iter);
+        rs->iter = NULL;
+    }
+    rs->exhausted = 1;
 }
 
 
@@ -537,7 +636,9 @@ int rdb_load_stream_append(const char *buf, size_t len) {
         if (p + dlen > end) break;
 
         uint64_t h = kv_hash((const uint8_t *)ks, (uint32_t)klen);
-        kv_entry_t *e = dict_add(&g_dict, ks, (uint32_t)klen, p, (uint32_t)dlen, h);
+        kv_entry_t *e = dict_add_raw(&g_dict, ks, (uint32_t)klen,
+                                     KV_TYPE_STRING, KV_ENCODING_RAW,
+                                     p, (uint32_t)dlen, h);
         p += dlen;
 
         if (!(p = mread(p, end, &expire, sizeof(long long)))) break;
@@ -549,7 +650,38 @@ int rdb_load_stream_append(const char *buf, size_t len) {
 }
 
 void rdb_rebuild_all_encodings(void) {
-    /* No-op: with string-only storage, no encoding rebuild is needed. */
+    /* After RDB load via dict_add_raw(), all entries are KV_ENCODING_RAW.
+     * Saved INT values were serialised as their 8-byte int64_t binary;
+     * genuine RAW strings are ASCII text.  Distinguish by checking
+     * whether the 8-byte payload consists entirely of digit characters:
+     *   - all ASCII digits → genuine RAW string, leave as-is
+     *   - contains non-digit bytes → binary int64 blob, upgrade to INT */
+    kv_iter_t *iter = dict_iter_new(&g_dict, 1);
+    kv_entry_t *e;
+    while ((e = dict_iter_next(iter)) != NULL) {
+        if (entry_type(e) != KV_TYPE_STRING) continue;
+        if (entry_encoding(e) != KV_ENCODING_RAW) continue;
+
+        const char *payload = entry_payload(e);
+        uint32_t plen = entry_payload_len(e);
+
+        /* Only 8-byte payloads can be saved INT blobs (int64_t binary). */
+        if (plen != 8) continue;
+
+        /* If all 8 bytes are ASCII digits, this is a genuine 8-char
+         * numeric string — keep it as RAW. */
+        int all_digits = 1;
+        for (uint32_t i = 0; i < 8; i++) {
+            unsigned char c = (unsigned char)payload[i];
+            if (c < '0' || c > '9') { all_digits = 0; break; }
+        }
+        if (all_digits) continue;
+
+        /* Contains non-digit bytes → saved int64_t binary blob.
+         * Upgrade to KV_ENCODING_INT so GET/INCR use the fast path. */
+        e->data[1] = (char)KV_ENCODING_INT;
+    }
+    dict_iter_free(iter);
 }
 
 int rdb_load_from_buf(const char *buf, size_t len) {

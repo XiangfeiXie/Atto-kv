@@ -131,6 +131,13 @@ kv_iter_t  *dict_iter_new(kv_dict_t *d, int safe);
 kv_entry_t *dict_iter_next(kv_iter_t *it);
 void        dict_iter_free(kv_iter_t *it);
 
+/* Peek at the next entry without advancing the iterator.
+ * Returns NULL when no more entries are available.
+ * Useful for batch serialisation: check entry size before committing. */
+static inline kv_entry_t *dict_iter_peek(kv_iter_t *it) {
+    return it ? it->next : NULL;
+}
+
 /* --- Stats --- */
 uint32_t    dict_count(kv_dict_t *d);
 kv_entry_t *dict_get_random_key(kv_dict_t *d);  /* get a random key for expire sampling */

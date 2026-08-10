@@ -44,7 +44,13 @@ int tcp_master_fullsync_child(uint64_t base_seq, int ready_fd) {
     if (cfd < 0) { perror("accept"); close(lfd); return -1; }
     printf("[tcp-master] slave connected\n");
 
-    /* 3. SAVE → open RDB */
+    /* 3. 接收 slave 确认(告知 master 可以开始传输) */
+    printf("[tcp-master] waiting for slave ready signal...\n");
+    { char ready_sig; if (recv(cfd, &ready_sig, 1, 0) != 1) { perror("recv ready"); goto out; } }
+
+    /* 4. 计时开始: SAVE + sendfile（与 RDMA 路径计时口径对齐） */
+    struct timespec t1, t2; clock_gettime(CLOCK_MONOTONIC, &t1);
+
     printf("[tcp-master] SAVE ...\n");
     rdb_save_sync();
     const char *path = persist_path("build/dump.rdb");
@@ -55,13 +61,13 @@ int tcp_master_fullsync_child(uint64_t base_seq, int ready_fd) {
     uint64_t file_size = (uint64_t)st.st_size;
     printf("[tcp-master] RDB: %lu bytes\n", (unsigned long)file_size);
 
-    /* 4. sendfile: size(8B) + data */
+    /* 5. sendfile: size(8B) + data */
     uint64_t sz_be = htobe64(file_size);
     if (send(cfd, &sz_be, 8, 0) != 8) { perror("send size"); goto out; }
 
-    struct timespec t1, t2; clock_gettime(CLOCK_MONOTONIC, &t1);
     off_t off = 0;
     ssize_t sent = sendfile(cfd, fd, &off, (size_t)file_size);
+
     clock_gettime(CLOCK_MONOTONIC, &t2);
 
     if (sent < 0) { perror("sendfile"); sent = 0; }

@@ -98,6 +98,7 @@ set(REPL_SRCS
     src/repl/rdma_repl.c
     src/repl/rdma_repl_master.c
     src/repl/rdma_repl_slave.c
+    src/repl/rdma_transport.c
     src/repl/tcp_repl_master.c
     src/repl/tcp_repl_slave.c
 )

@@ -35,7 +35,7 @@ typedef struct {
 } proactor_worker_t;
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  conn_info pack/unpack — zero malloc (inazuma-kv does malloc per SQE)
+ *  conn_info pack/unpack — zero malloc
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static inline uint64_t conn_info_pack(int fd, int event, uint32_t gen) {
@@ -227,7 +227,7 @@ static int arm_accept(struct io_uring *ring, int listen_fd) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  CQE handlers — inazuma-kv pattern (always drain, no deferred processing)
+ *  CQE handlers (always drain, no deferred processing)
  * ═══════════════════════════════════════════════════════════════════════ */
 
 static void handle_accept(proactor_worker_t *w, struct io_uring_cqe *cqe) {

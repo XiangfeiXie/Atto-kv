@@ -498,129 +498,109 @@ export MALLOC_CONF=dirty_decay_ms:1000,muzzy_decay_ms:1000,background_thread:tru
 
 ## 5. 全量同步传输性能
 
-**测试时间:** 2026-07-21 | **工具:** `tools/libfabric_bw.c`, `tools/tcp_raw_bw.c`
-**环境:** Ubuntu 24.04, Kernel 6.8.0-124, VMware 虚拟机, ens33 虚拟网卡
-**RXE:** `rxe0` 绑定 `ens33` (SoftRoCE), libfabric 1.17, liburing 2.5
+**测试时间:** 2026-08-11 | **脚本:** `test/bench/rdma_fullsync_bench.sh`
+**环境:** Ubuntu 24.04, Kernel 6.8.0-137, VMware 虚拟机, SoftRoCE (rxe0)
+**配置:** proactor, persistence=rdb, expire=off, memlock=unlimited (RDMA 需要 2GB MR 注册)
+**数据规模:** 50K keys (RDB 14.07 MB) / 400K keys (RDB 109.86 MB), value=256B
 
-### 5a. 本地 localhost 多尺寸对比
+> **测试方法:** 每轮测试独立启停 kvstore 实例。Phase 1 使用 `populate_kv.py` 4 并行 worker 流式填充数据（单 worker ~90K ops/s），SAVE RDB 后重启实例。Phase 2/3 启动 master → 启动 slave 触发 inline fullsync → 记录 slave ready 时刻为 end-to-end 终点。NET 时间从日志解析纯传输耗时（排除序列化/反序列化），NET_MB/s = RDB 文件大小 / NET 时间。每模式 1 次 warmup + 3 次正式测试。
 
-排除网络变量，在本地回环上对比 libfabric tcp 与原生 TCP socket 在不同数据量下的吞吐。
+### 5a. kvstore 50K keys（RDB 14.07 MB，1 轮 × 3 次）
 
-| 数据量 | libfabric tcp | 原生 TCP socket | 差异 |
-|---|---:|---:|---:|
-| 1 MB | 60.9 MB/s | 82.1 MB/s | −25.8% |
-| 10 MB | 114.7 MB/s | 125.5 MB/s | −8.6% |
-| 50 MB | 176.2 MB/s | 181.8 MB/s | −3.1% |
-| 100 MB | 174.1 MB/s | 203.3 MB/s | −14.4% |
-| 500 MB | 186.6 MB/s | 196.6 MB/s | −5.1% |
+| MODE | WALL_S | TOT_MB/s | NET_MS | PREP_MS | NET_MB/s | ENT/s |
+|------|:------:|:--------:|:------:|:-------:|:--------:|:-----:|
+| sendfile | 0.57 ± 0.01s | 24.8 ± 0.3 | 214.4 ± 19.3 | 0 | 65.9 ± 5.7 | 88.3K ± 1.2K |
+| rdma | 2.71 ± 0.03s | 5.2 ± 0.1 | 73.4 ± 2.1 | 8.4 ± 1.2 | 191.7 ± 5.5 | 18.4K ± 0.2K |
 
-> **分析:** 小块（1–10MB）时 libfabric tcp 开销较明显（连接建立+协议封包未摊销），50MB 以上两者基本持平（180+ MB/s），差异落入测量噪声。说明 libfabric tcp provider 在大块传输中开销可忽略。
+> 小规模下 RDMA 固定开销（MR 注册 2GB + CM 建链 + buf_info 交换）占主导。sendfile E2E 仅 0.57s，RDMA 需 2.71s（4.8× 慢）。但纯网络 RDMA 73ms vs sendfile 214ms（**2.9× 快**），网络层优势已充分体现。
 
-### 5b. 跨 VM 多尺寸对比
+### 5b. kvstore 400K keys（RDB 109.86 MB，3 轮 × 3 次 = 9 次）
 
-两台 VMware 虚拟机（192.168.30.135 ↔ 192.168.30.136），ens33 虚拟网卡，同一物理主机。
+| MODE | WALL_S | TOT_MB/s | NET_MS | PREP_MS | NET_MB/s | ENT/s |
+|------|:------:|:--------:|:------:|:-------:|:--------:|:-----:|
+| sendfile | 2.54 ± 0.27s | 42.6 ± 4.9 | 1,550 ± 91 | 0 | 71.0 ± 4.3 | 155K ± 17K |
+| rdma | 3.97 ± 0.22s | 27.9 ± 1.8 | 571 ± 22 | 65.3 ± 3.6 | 192.7 ± 6.5 | 101K ± 6K |
 
-| 数据量 | libfabric tcp | 原生 TCP socket | libfabric verbs (RXE) |
-|---|---:|---:|---:|
-| 100 MB | 34.1 MB/s | 44.5 MB/s | 7.4 MB/s |
-| 1 GB | 54.3 MB/s | 52.4 MB/s | 7.3 MB/s |
+**稳定性:** sendfile WALL 范围 2.17–2.74s（CV=10.6%），首轮出现 2.17s 峰值。rdma WALL 首轮 4.30s → 后续稳定 3.75–3.79s（冷缓存效应），NET_MB/s 始终 185–203 MB/s（**CV=3.4%**，无 TCP 拥塞抖动）。
 
-> **分析:** 100MB 时 libfabric tcp 比原生 socket 慢 23%，但 1GB 时两者持平（54.3 vs 52.4 MB/s，差异在误差内）。verbs 始终被 RXE 的 CQ 轮询锁定在 ~7.4 MB/s，与数据量无关。跨 VM 上限 ~54 MB/s，受 VMware 虚拟网卡带宽限制。
+**规模效应:**
 
-### 5c. 本地 vs 跨 VM 汇总
+| | 50K sendfile | 50K rdma | 400K sendfile | 400K rdma |
+|------|:----:|:----:|:-----:|:----:|
+| TOT_MB/s | 24.8 | 5.2 | 42.6 | 27.9 |
+| NET_MB/s | 65.9 | 191.7 | 71.0 | 192.7 |
+| rdma/sendfile E2E 比 | — | 0.21× | — | 0.66× |
+| 网络时间占比 | 38% | 3% | 61% | 14% |
 
-| 传输层 | 本地 localhost | 跨 VM |
-|---|---|---|
-| **原生 TCP socket** | 180–200 MB/s | 44–52 MB/s |
-| **libfabric tcp** | 175–190 MB/s | 34–54 MB/s |
-| **libfabric verbs (RXE)** | 不可用 (accept 超时) | ~7.4 MB/s |
-| **kvstore 全量同步 (优化前)** | ~20 MB/s* | — |
+> 数据量越大，RDMA 固定成本摊销越充分（E2E 比从 0.21× → 0.66×）。sendfile 网络占 61% 为瓶颈，rdma 仅 14% 瓶颈在 MR+CM。
 
-> \*优化前数据（tcp provider, 63k entries × 512B value），瓶颈在逐条序列化+解析+dict_add，与传输层无关。
-
-### 5d. kvstore 全量同步实测 — 优化后
-
-**测试时间:** 2026-07-22 | **工具:** `tools/fullsync_bench.sh`
-**Provider:** tcp | **数据:** 200K keys × 512B value, ~103 MB wire data
-**优化项:** 预计算 hash (v2 wire format) + entry arena + 发送双缓冲 + Phase 1/2 分离
-
-#### 本地 localhost
-
-| 指标 | 数值 |
-|---|---|
-| End-to-end | 10.32 MB/s (10,143 ms) |
-| Recv 吞吐 | **32.54 MB/s** (62,154 entries/s) |
-| 数据完整性 | 200,000 / 200,000 ✓ |
-
-> Recv 吞吐从优化前 ~20 MB/s 提升到 32.54 MB/s (+63%)，端到端受 connect + `rdb_rebuild_all_encodings` 拖累（~9s 固定开销）。
-
-#### 跨 VM — tcp provider (192.168.30.135 ↔ 192.168.30.136)
-
-| 轮次 | End-to-end | Recv 吞吐 | Entries/s |
-|:---:|---:|---:|---:|
-| 1 | 13.38 MB/s (7,762 ms) | 56.99 MB/s | 109,756 |
-| 2 | **16.43 MB/s** (6,320 ms) | **180.21 MB/s** | 347,037 |
-| 3 | 15.77 MB/s (6,585 ms) | 159.96 MB/s | 308,049 |
-| **平均** | **15.19 MB/s** | **132.39 MB/s** | 254,947 |
-
-> Recv 吞吐波动较大（57–180 MB/s），受跨 VM 网络抖动影响。端到端稳定在 13–16 MB/s，瓶颈为 `rdb_rebuild_all_encodings`（遍历全部 entry 重建编码）约 4–5s。
-
-#### 跨 VM — verbs provider (RXE, 192.168.30.135 ↔ 192.168.30.136)
-
-**测试时间:** 2026-07-23 | **Provider:** verbs (RXE SoftRoCE) | **优化项:** 同上 + 显式 MR 注册 + recv 预 post
-
-| Keys | 轮次 | End-to-end | Recv 吞吐 | Entries/s | Arena |
-|:---:|:---:|---:|---:|---:|---:|
-| 200K | 1 | 4.56 MB/s (22,960 ms) | **215.98 MB/s** | 412,516 | 116.9 MB |
-| 400K | 1 | 5.24 MB/s (39,949 ms) | 204.82 MB/s | 391,209 | 233.7 MB |
-| 400K | 2 | 5.84 MB/s (35,834 ms) | **254.49 MB/s** | 486,074 | 233.7 MB |
-| 400K | 3 | 5.87 MB/s (35,678 ms) | 206.15 MB/s | 393,738 | 233.7 MB |
-
-> **Recv 吞吐 200–255 MB/s，是 tcp provider 的 4–5 倍，远超 VM 网卡物理上限 54 MB/s。** verbs 通过内核旁路 + RDMA 语义消除了 TCP 协议栈拷贝开销。端到端 4–6 MB/s 受 `rdb_rebuild_all_encodings` 固定开销拖累（35–40s 端到端中 rebuild 占 ~30s），数据路径本身仅 1–2s。
-
-### 5e. Redis 全量同步对比
-
-**测试时间:** 2026-07-22 | **环境:** 本地 localhost, Redis 7.0.15
-**数据:** 2M keys × 512B value, 内存占用 1,358 MB
-
-| 指标 | 数值 |
-|---|---|
-| RDB 文件大小 | 50,900,100 bytes (**48.5 MB**) |
-| 压缩比 | 1,358 MB → 48.5 MB (**28:1**) |
-| 同步耗时 (2 轮) | 3,785 ms / 5,065 ms |
-| 同步吞吐 | **12.82 MB/s** / 9.58 MB/s (基于 RDB 大小) |
-| 有效吞吐 | ~359 MB/s (基于原始内存数据 1,358 MB / 3.785s) |
-
-> Redis RDB 使用紧凑二进制编码（整数压缩、ziplist、LZF）+ fork COW 快照。RDB 文件仅 48.5 MB，远小于 kvstore 线格式 103 MB（200K entries）。但 Redis 将 1,358 MB 原始内存数据压缩到 48.5 MB 后传输，等效有效吞吐 ~359 MB/s。
-
-### 5f. 完整性能金字塔
+### 5c. kvstore 时间分解（400K 端到端）
 
 ```
-                    场景                  吞吐
-                    ────────              ──────
-原生 TCP (localhost)                       196 MB/s   ████████████████████
-libfabric tcp (localhost)                  186 MB/s   ███████████████████
-kvstore recv (localhost, 优化后)            32 MB/s   ███
-Redis diskless (localhost, 有效吞吐)       359 MB/s   ████████████████████████████████████
-Redis diskless (localhost, RDB 大小算)      12 MB/s   █
-
-原生 TCP (cross-VM, 1GB)                   52 MB/s   █████
-libfabric tcp (cross-VM, 1GB)              54 MB/s   █████
-kvstore recv verbs (cross-VM, 400K×512B)  255 MB/s   █████████████████████████
-kvstore recv tcp   (cross-VM, 200K×512B)  132 MB/s   █████████████
-kvstore e2e  verbs (cross-VM, 400K×512B)    6 MB/s   █
-kvstore e2e  tcp   (cross-VM, 200K×512B)   15 MB/s   █
-libfabric raw verbs RXE (cross-VM)           7 MB/s   █
+sendfile (2.54s): |████████████████ 1.55s 网络 |████████ 0.99s 其他 (RDB load + fork + accept)|
+rdma     (3.97s): |██ 0.57s 网络 | 0.07s prep |████████████████████████████ 3.33s 其他 (MR+CM+load)|
 ```
+
+- **sendfile**: 网络占 61%，`sendfile()` 零拷贝发送预建 RDB，非网络开销 ~1s
+- **rdma**: 网络仅占 14%，非网络占 86%（slave 2GB MR 注册 `ibv_reg_mr` + RDMA_CM QP 建链 + 8×256MB ring buffer buf_info 交换 + stream load）
+
+### 5d. Redis 全量同步测试
+
+**测试时间:** 2026-08-11 | **脚本:** `test/bench/redis_fullsync_bench.sh` | **Redis:** 7.0.15
+**配置:** `rdbcompression no`（禁用 LZF 与 kvstore RDB 对齐）, `save ""`, `appendonly no`
+**数据:** 400K keys × 256B, RDB 105.29 MB, 与 kvstore 同一套数据生成逻辑
+
+> **计时对齐:** E2E = SLAVEOF → slave DBSIZE 就绪 (↔ kvstore WALL), SYNC = BGSAVE 开始 → 同步完成 (↔ kvstore NET)。每模式 1 warmup + 3 次 × 3 轮 = 9 次。
+
+**三轮汇总（均值 ± σ）:**
+
+| 模式 | E2E_SEC | SYNC_SEC | E2E_MB/s | SYNC_MB/s | ENT/s |
+|------|:------:|:------:|:------:|:------:|:-----:|
+| disk | 6.51 ± 0.30s | 2.73 ± 0.10s | 16.2 ± 0.8 | 38.7 ± 1.4 | 61.6K ± 2.8K |
+| diskless | 5.42 ± 0.50s | 1.79 ± 0.10s | 19.6 ± 1.4 | 59.1 ± 3.1 | 74.3K ± 5.4K |
+| **diskless 优势** | **16.7%** | **34.4%** | **20.7%** | **52.7%** | **20.6%** |
+
+> diskless 快于 disk 是预期内的——省去了 BGSAVE 子进程写磁盘步骤。SYNC 阶段差距 34%，E2E 收窄至 17%（slave RDB 加载 ~3.7s 两者一致）。
+
+### 5e. 全量同步网络层性能对比总表
+
+**测试环境:** 同一 VM (Ubuntu 24.04, Kernel 6.8.0-137), localhost, 400K keys × 256B, RDB ~105 MB
+
+| 同步架构方案 | 底层传输机制 | 纯网络传输耗时 | 极限吞吐量 | 相对性能比率 (以 Redis diskless 为基准) |
+|:---|:---|:---:|:---:|:---:|
+| **kvstore — RDMA** | RoCEv2 (RDMA_WRITE + IMM_DONE) | **570 ms** | **192.7 MB/s** | **326% (3.26×)** |
+| **kvstore — Sendfile** | TCP `sendfile()` 零拷贝 | 1,550 ms | 71.0 MB/s | 120% (1.20×) |
+| Redis 7.0 — Diskless | TCP Stream (无盘) | 1,790 ms | 59.1 MB/s | 100% (基准) |
+| Redis 7.0 — Disk | TCP/Disk (有盘) | 2,730 ms | 38.7 MB/s | 65% (0.65×) |
+
+> **计时口径:** 纯网络传输 = 不含 slave 进程启动/握手/RDB 加载，仅计数据从 master 发出到 slave 收完的核心传输阶段。kvstore NET_MS ↔ Redis SYNC_SEC。
+>
+> **RDB 大小对齐:** Redis 默认 LZF 压缩可将重复二进制 value 压至 1/5（22 MB），测试中已通过 `rdbcompression no` 禁用，确保对比在同一数据量（~105 MB）上进行。
+
+### 5f. 端到端（E2E）性能对比总表
+
+含 slave 启动、握手、RDB 加载的完整端到端耗时：
+
+| 同步架构方案 | E2E 总耗时 | E2E 吞吐量 | 纯传输占比 | 瓶颈所在 |
+|:---|:---:|:---:|:---:|:---|
+| **kvstore — Sendfile** | **2.54s** | 42.6 MB/s | 61% | 网络 (~1.5s) |
+| **kvstore — RDMA** | 3.97s | 27.9 MB/s | 14% | MR注册+CM建链 (~3.3s) |
+| Redis 7.0 — Diskless | 5.42s | 19.6 MB/s | 33% | Slave RDB加载 (~3.6s) |
+| Redis 7.0 — Disk | 6.51s | 16.2 MB/s | 42% | RDB生成写盘+加载 (~3.8s) |
 
 ### 5g. 结论
 
-1. **传输层：tcp 稳定，verbs 极致。** tcp provider 与原生 socket 持平（54 vs 52 MB/s），零学习成本。verbs provider 在软件 RXE 下 recv 可达 255 MB/s（4–5× tcp），但需要显式 MR 管理 + recv 预 post + RDMA_CM 地址配置
-2. **verbs 瓶颈已从传输转移到 CPU。** recv 255 MB/s 远超 VM 网卡上限 54 MB/s，传输不再是瓶颈。当前瓶颈为 `rdb_rebuild_all_encodings`（遍历全部 entry 重建编码，200K→~10s，400K→~30s）
-3. **kvstore 优化效果显著。** Recv 吞吐从 ~20 → 32.5 MB/s (tcp localhost), 132→255 MB/s (verbs cross-VM)。端到端受 rebuild_encodings 拖累严重
-4. **kvstore vs Redis：差距在数据模型。** Redis RDB 将 1,358 MB 压缩到 48.5 MB 后传输（28:1 压缩比），等效 359 MB/s 有效吞吐。kvstore 传输原始 109–219 MB，缺少紧凑编码和压缩
-5. **下一优化方向：消除 `rdb_rebuild_all_encodings`**。该函数在 fullsync 场景下是冗余的——wire format 加载的 entry 编码已经是最优的。去掉后端到端可提升至接近 recv 吞吐
-6. **软件 RXE 下 verbs 有实际价值**，与之前结论不同——修复 MR + recv 时序后，软件模拟 RDMA 性能远超 tcp
+1. **RDMA 纯网络吞吐碾压一切：193 MB/s，是 Redis diskless 的 3.26×。** RoCEv2 内核旁路 + 单边 RDMA_WRITE + 零拷贝消除了 TCP 协议栈和 COW 序列化双重开销
+
+2. **kvstore sendfile（71 MB/s）的纯传输也快于 Redis diskless（59 MB/s）：** fork + COW + RDB 序列化的开销 > TCP 协议栈开销
+
+3. **RDMA 端到端受 ~3.3s 固定冷启动成本拖累**（2GB MR 注册 + CM 建链），数据量越大摊销越充分，当前 400K 规模 sendfile 更实用
+
+4. **Redis 的瓶颈不在网络而在数据模型：** slave RDB 加载 ~3.7s 是最大单项开销，disk/diskless 共享同一份 RDB 加载路径
+
+5. **数据完整性 100%：** kvstore 9 次 + Redis 9 次，slave DBSIZE 精确匹配，无丢 key 或数据损坏
+
+6. **选型建议：** ≤500MB 用 kvstore sendfile（最快 E2E、零配置）；追求极致网络吞吐用 kvstore RDMA；需 Redis 兼容时 diskless 优于 disk
 
 ---
 

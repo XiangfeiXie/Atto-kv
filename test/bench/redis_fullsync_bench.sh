@@ -26,7 +26,7 @@ shopt -s nullglob
 
 # ── 默认参数 ────────────────────────────────────────────────────────────────
 
-KEYS=60000
+KEYS=400000
 VSIZE=256
 ITERATIONS=3
 PORT=8400
@@ -56,8 +56,6 @@ calc_entps() {
         echo "0"
     fi
 }
-export -f _fmt calc_mbps calc_entps
-
 C_BLD=$'\033[1m';   C_DIM=$'\033[2m'
 C_RED=$'\033[31m';  C_GRN=$'\033[32m';  C_YEL=$'\033[33m'
 C_CYN=$'\033[36m';  C_RST=$'\033[0m'
@@ -126,7 +124,7 @@ redkill() {
     redis-cli -p "$PORT" SHUTDOWN NOSAVE 2>/dev/null || true
     redis-cli -p "$SLAVE_PORT" SHUTDOWN NOSAVE 2>/dev/null || true
     pkill -9 -x redis-server 2>/dev/null || true
-    # 等待端口释放
+    wait 2>/dev/null || true
     local i
     for ((i=0; i<30; i++)); do
         if ! ss -tlnp 2>/dev/null | grep -qE ":($PORT|$SLAVE_PORT)\b"; then
@@ -173,6 +171,8 @@ await_log() {
 
 # ── Phase 1: 数据填充 ──────────────────────────────────────────────────────
 
+# 单次 Python 流式生成 RESP 数据, 直接管道送入 redis-cli --pipe
+# 避免每批 spawn Python (原来 40× 次冷启动) → 大幅提速
 populate_redis() {
     step "Phase 1: 填充测试数据 ($KEYS 条 × ${VSIZE} B)"
 
@@ -185,50 +185,47 @@ populate_redis() {
         --logfile "${LOG_DIR}/populate.log" \
         --save "" --appendonly no >/dev/null 2>&1
     sleep 1
-    redis-cli -p "$PORT" PING >/dev/null 2>&1 || die "Redis 填充实例启动失败"
 
-    # 分批 pipe 写入, 避免单次超大 pipe 超时丢失数据
-    # 使用与 kvstore 脚本完全相同的数据生成方式 (确定性二进制 value)
-    local batch=10000 start=1 end keys=0
-    while [ "$start" -le "$KEYS" ]; do
-        end=$((start + batch - 1))
-        [ "$end" -gt "$KEYS" ] && end=$KEYS
+    if ! redis-cli -p "$PORT" PING >/dev/null 2>&1; then
+        die "Redis 填充实例启动失败 (检查 ${LOG_DIR}/populate.log)"
+    fi
 
-        python3 -c "
+    # 流式生成 RESP → redis-cli --pipe (单次 Python 调用, 内存 O(1))
+    info "  生成并写入 $KEYS keys (streaming → redis-cli --pipe)..."
+    local pop_start; pop_start=$(date +%s.%N)
+    python3 -c "
 import sys, struct
 
-start = $start
-end = $end
 vsize = $VSIZE
-buf = bytearray()
-
-for i in range(start, end + 1):
+for i in range(1, $KEYS + 1):
     k = f'key:{i:012d}'.encode()
     unit = struct.pack('>Q', i)
     rep = (vsize + 7) // 8
     v = (unit * rep)[:vsize]
-    buf.extend(f'*3\r\n\$3\r\nSET\r\n\${len(k)}\r\n'.encode())
-    buf.extend(k)
-    buf.extend(f'\r\n\${len(v)}\r\n'.encode())
-    buf.extend(v)
-    buf.extend(b'\r\n')
+    sys.stdout.buffer.write(f'*3\r\n\$3\r\nSET\r\n\${len(k)}\r\n'.encode())
+    sys.stdout.buffer.write(k)
+    sys.stdout.buffer.write(f'\r\n\${len(v)}\r\n'.encode())
+    sys.stdout.buffer.write(v)
+    sys.stdout.buffer.write(b'\r\n')
+" 2>/dev/null | timeout 300 redis-cli -p "$PORT" --pipe >"${LOG_DIR}/pipe_out.txt" 2>&1
 
-sys.stdout.buffer.write(bytes(buf))
-sys.stdout.buffer.flush()
-" 2>/dev/null | timeout 120 redis-cli -p "$PORT" --pipe >/dev/null 2>&1
+    local pop_end; pop_end=$(date +%s.%N)
+    local pop_sec; pop_sec=$(echo "$pop_end - $pop_start" | bc)
 
-        keys=$(redis-cli -p "$PORT" DBSIZE 2>/dev/null || echo 0)
-        printf "  ${C_DIM}批 %d-%d/%d: %d keys${C_RST}\r" "$start" "$end" "$KEYS" "$keys" >&2
-        start=$((end + 1))
-    done
-    echo "" >&2
-
+    local keys
+    keys=$(redis-cli -p "$PORT" DBSIZE 2>/dev/null || echo 0)
     if [ "$keys" -ne "$KEYS" ]; then
         warn "填充 key 数量不匹配: 期望 $KEYS, 实际 $keys"
+        warn "  pipe 输出: $(head -3 "${LOG_DIR}/pipe_out.txt" 2>/dev/null)"
         redkill; return 1
     fi
 
-    # SAVE 获取 RDB 文件大小 — 这是统一的基准数据量
+    local pop_rate; pop_rate=$(calc_entps "$KEYS" "$pop_sec")
+    info "  写入完成: $keys keys in ${pop_sec}s (${pop_rate} keys/s)"
+
+    # SAVE 获取 RDB 文件大小 — 统一的基准数据量
+    # rdbcompression no: 禁用 LZF 压缩, 与 kvstore RDB 格式对齐, 确保可比性
+    redis-cli -p "$PORT" CONFIG SET rdbcompression no >/dev/null 2>&1
     redis-cli -p "$PORT" SAVE >/dev/null 2>&1
     sleep 1
     REDIS_RDB_PATH="${mdir}/dump.rdb"
@@ -256,18 +253,18 @@ run_disk() {
     # 复制填充好的 RDB 到 master dir, master 启动时自动加载
     cp "$REDIS_RDB_PATH" "$mdir/dump.rdb"
 
-    # Master: 有盘同步模式
-    # --save "" 关闭自动 SAVE (避免干扰)
-    # --repl-diskless-sync no 强制有盘传输
+    # Master: 有盘同步模式 (--daemonize → 无法用 $!, 改用 DBSIZE 检查活性)
     redis-server --port "$PORT" --daemonize yes \
         --dir "$mdir" --dbfilename dump.rdb \
         --logfile "$mlog" --save "" --appendonly no \
+        --rdbcompression no \
         --repl-diskless-sync no >/dev/null 2>&1
     sleep 1
 
     local mkeys; mkeys=$(redis-cli -p "$PORT" DBSIZE 2>/dev/null || echo 0)
     if [ "$mkeys" -ne "$KEYS" ]; then
         warn "[disk #$iteration] master RDB 加载失败: 期望 $KEYS, 实际 $mkeys"
+        tail -3 "$mlog" >&2 2>/dev/null
         redkill; return 1
     fi
 
@@ -277,35 +274,46 @@ run_disk() {
         --logfile "$slog" --save "" --appendonly no >/dev/null 2>&1
     sleep 1
 
-    # 触发全量同步
+    if ! redis-cli -p "$SLAVE_PORT" PING >/dev/null 2>&1; then
+        warn "[disk #$iteration] slave 启动失败"
+        tail -3 "$slog" >&2 2>/dev/null
+        redkill; return 1
+    fi
+
+    # ── 双层计时 (对标 kvstore) ──
+    # E2E (WALL): SLAVEOF 命令发出 → slave 加载完成 (对标 kvstore slave 启动→ready)
+    # SYNC (NET):  BGSAVE 开始 → 同步完成        (对标 kvstore 纯网络传输)
+    local e2e_t0; e2e_t0=$(date +%s.%N)
     redis-cli -p "$SLAVE_PORT" SLAVEOF 127.0.0.1 "$PORT" >/dev/null 2>&1
 
-    # ── 计时: "Starting BGSAVE for SYNC" → "Synchronization succeeded" ──
-    local t0; t0=$(await_log "$mlog" "Starting BGSAVE for SYNC")
-    if [ -z "$t0" ]; then
+    local sync_t0; sync_t0=$(await_log "$mlog" "Starting BGSAVE for SYNC")
+    if [ -z "$sync_t0" ]; then
         warn "[disk #$iteration] 超时: 未检测到 BGSAVE 开始"
         redkill; return 1
     fi
 
-    local t1; t1=$(await_log "$mlog" "Synchronization with replica .* succeeded")
-    if [ -z "$t1" ]; then
+    local sync_t1; sync_t1=$(await_log "$mlog" "Synchronization with replica .* succeeded")
+    if [ -z "$sync_t1" ]; then
         warn "[disk #$iteration] 超时: 同步未完成"
         redkill; return 1
     fi
 
-    local total_sec; total_sec=$(echo "$t1 - $t0" | bc)
-
     # 等待 slave 退出 LOADING 状态 (有盘模式下 RDB 加载可能滞后于同步完成)
     local skeys; skeys=$(await_loaded "$SLAVE_PORT" 60)
+    local e2e_t1; e2e_t1=$(date +%s.%N)
     if [ "$skeys" -ne "$KEYS" ]; then
         warn "[disk #$iteration] slave 数据不完整: 期望 $KEYS, 实际 $skeys"
     fi
 
-    local total_mbps; total_mbps=$(calc_mbps "$REDIS_RDB_SIZE" "$total_sec")
-    local ent_sec; ent_sec=$(calc_entps "$KEYS" "$total_sec")
+    local e2e_sec; e2e_sec=$(echo "$e2e_t1 - $e2e_t0" | bc)
+    local sync_sec; sync_sec=$(echo "$sync_t1 - $sync_t0" | bc)
+
+    local e2e_mbps; e2e_mbps=$(calc_mbps "$REDIS_RDB_SIZE" "$e2e_sec")
+    local sync_mbps; sync_mbps=$(calc_mbps "$REDIS_RDB_SIZE" "$sync_sec")
+    local ent_sec; ent_sec=$(calc_entps "$KEYS" "$e2e_sec")
 
     redkill
-    echo "disk $iteration $skeys $REDIS_RDB_SIZE $REDIS_RDB_MB $total_sec $total_mbps $ent_sec"
+    echo "disk $iteration $skeys $REDIS_RDB_SIZE $REDIS_RDB_MB $e2e_sec $sync_sec $e2e_mbps $sync_mbps $ent_sec"
 }
 
 # ── 单轮测试: 无盘 (diskless) ──────────────────────────────────────────────
@@ -320,12 +328,11 @@ run_diskless() {
     # 复用同一个 RDB 文件 — 确保有盘/无盘传输完全等量的数据
     cp "$REDIS_RDB_PATH" "$mdir/dump.rdb"
 
-    # Master: 无盘同步模式
-    # --repl-diskless-sync yes 强制无盘传输
-    # --repl-diskless-sync-delay 0 立即开始, 不等待更多 replica
+    # Master: 无盘同步模式 (--daemonize → 无法用 $!, 改用 DBSIZE 检查活性)
     redis-server --port "$PORT" --daemonize yes \
         --dir "$mdir" --dbfilename dump.rdb \
         --logfile "$mlog" --save "" --appendonly no \
+        --rdbcompression no \
         --repl-diskless-sync yes \
         --repl-diskless-sync-delay 0 >/dev/null 2>&1
     sleep 1
@@ -333,6 +340,7 @@ run_diskless() {
     local mkeys; mkeys=$(redis-cli -p "$PORT" DBSIZE 2>/dev/null || echo 0)
     if [ "$mkeys" -ne "$KEYS" ]; then
         warn "[diskless #$iteration] master RDB 加载失败: 期望 $KEYS, 实际 $mkeys"
+        tail -3 "$mlog" >&2 2>/dev/null
         redkill; return 1
     fi
 
@@ -342,73 +350,95 @@ run_diskless() {
         --logfile "$slog" --save "" --appendonly no >/dev/null 2>&1
     sleep 1
 
-    # 触发全量同步
+    if ! redis-cli -p "$SLAVE_PORT" PING >/dev/null 2>&1; then
+        warn "[diskless #$iteration] slave 启动失败"
+        tail -3 "$slog" >&2 2>/dev/null
+        redkill; return 1
+    fi
+
+    # ── 双层计时 (对标 kvstore) ──
+    # E2E (WALL): SLAVEOF 命令发出 → slave 加载完成 (对标 kvstore slave 启动→ready)
+    # SYNC (NET):  BGSAVE 开始 → 同步完成        (对标 kvstore 纯网络传输)
+    local e2e_t0; e2e_t0=$(date +%s.%N)
     redis-cli -p "$SLAVE_PORT" SLAVEOF 127.0.0.1 "$PORT" >/dev/null 2>&1
 
-    # ── 计时: 同 disk 模式的计时方式, 从日志提取 ──
-    local t0; t0=$(await_log "$mlog" "Starting BGSAVE for SYNC")
-    if [ -z "$t0" ]; then
+    local sync_t0; sync_t0=$(await_log "$mlog" "Starting BGSAVE for SYNC")
+    if [ -z "$sync_t0" ]; then
         warn "[diskless #$iteration] 超时: 未检测到 BGSAVE 开始"
         redkill; return 1
     fi
 
-    local t1; t1=$(await_log "$mlog" "Synchronization with replica .* succeeded")
-    if [ -z "$t1" ]; then
+    local sync_t1; sync_t1=$(await_log "$mlog" "Synchronization with replica .* succeeded")
+    if [ -z "$sync_t1" ]; then
         warn "[diskless #$iteration] 超时: 同步未完成"
         redkill; return 1
     fi
 
-    local total_sec; total_sec=$(echo "$t1 - $t0" | bc)
-
     # 验证 (diskless 模式也可能有短暂的 LOADING 窗口)
     local skeys; skeys=$(await_loaded "$SLAVE_PORT" 60)
+    local e2e_t1; e2e_t1=$(date +%s.%N)
     if [ "$skeys" -ne "$KEYS" ]; then
         warn "[diskless #$iteration] slave 数据不完整: 期望 $KEYS, 实际 $skeys"
     fi
 
-    local total_mbps; total_mbps=$(calc_mbps "$REDIS_RDB_SIZE" "$total_sec")
-    local ent_sec; ent_sec=$(calc_entps "$KEYS" "$total_sec")
+    local e2e_sec; e2e_sec=$(echo "$e2e_t1 - $e2e_t0" | bc)
+    local sync_sec; sync_sec=$(echo "$sync_t1 - $sync_t0" | bc)
+
+    local e2e_mbps; e2e_mbps=$(calc_mbps "$REDIS_RDB_SIZE" "$e2e_sec")
+    local sync_mbps; sync_mbps=$(calc_mbps "$REDIS_RDB_SIZE" "$sync_sec")
+    local ent_sec; ent_sec=$(calc_entps "$KEYS" "$e2e_sec")
 
     redkill
-    echo "diskless $iteration $skeys $REDIS_RDB_SIZE $REDIS_RDB_MB $total_sec $total_mbps $ent_sec"
+    echo "diskless $iteration $skeys $REDIS_RDB_SIZE $REDIS_RDB_MB $e2e_sec $sync_sec $e2e_mbps $sync_mbps $ent_sec"
 }
 
 # ── 统计计算 ────────────────────────────────────────────────────────────────
 
 calc_stats() {
     local mode=$1
-    local total_sec_sum=0 total_mbps_sum=0 ent_sec_sum=0 count=0
-    local min_total_mbps="" max_total_mbps=""
+    local e2e_sec_sum=0 sync_sec_sum=0 e2e_mbps_sum=0 sync_mbps_sum=0 ent_sec_sum=0 count=0
+    local min_e2e_mbps="" max_e2e_mbps=""
+    local min_sync_mbps="" max_sync_mbps=""
     local keys="" rdb_mb=""
 
-    while IFS=' ' read -r _mode _iter _skeys _rdb_sz _rdb_mb _total_sec _total_mbps _ent_sec; do
+    while IFS=' ' read -r _mode _iter _skeys _rdb_sz _rdb_mb _e2e_sec _sync_sec _e2e_mbps _sync_mbps _ent_sec; do
         [ "$_mode" != "$mode" ] && continue
         count=$((count + 1))
         keys=$_skeys; rdb_mb=$_rdb_mb
 
-        total_sec_sum=$(echo "$total_sec_sum + $_total_sec" | bc)
-        total_mbps_sum=$(echo "$total_mbps_sum + $_total_mbps" | bc)
+        e2e_sec_sum=$(echo "$e2e_sec_sum + $_e2e_sec" | bc)
+        sync_sec_sum=$(echo "$sync_sec_sum + $_sync_sec" | bc)
+        e2e_mbps_sum=$(echo "$e2e_mbps_sum + $_e2e_mbps" | bc)
+        sync_mbps_sum=$(echo "$sync_mbps_sum + $_sync_mbps" | bc)
         ent_sec_sum=$(echo "$ent_sec_sum + $_ent_sec" | bc)
 
-        if [ -z "$min_total_mbps" ] || [ "$(echo "$_total_mbps < $min_total_mbps" | bc)" = 1 ]; then
-            min_total_mbps=$_total_mbps
+        if [ -z "$min_e2e_mbps" ] || [ "$(echo "$_e2e_mbps < $min_e2e_mbps" | bc)" = 1 ]; then
+            min_e2e_mbps=$_e2e_mbps
         fi
-        if [ -z "$max_total_mbps" ] || [ "$(echo "$_total_mbps > $max_total_mbps" | bc)" = 1 ]; then
-            max_total_mbps=$_total_mbps
+        if [ -z "$max_e2e_mbps" ] || [ "$(echo "$_e2e_mbps > $max_e2e_mbps" | bc)" = 1 ]; then
+            max_e2e_mbps=$_e2e_mbps
+        fi
+        if [ -z "$min_sync_mbps" ] || [ "$(echo "$_sync_mbps < $min_sync_mbps" | bc)" = 1 ]; then
+            min_sync_mbps=$_sync_mbps
+        fi
+        if [ -z "$max_sync_mbps" ] || [ "$(echo "$_sync_mbps > $max_sync_mbps" | bc)" = 1 ]; then
+            max_sync_mbps=$_sync_mbps
         fi
     done < "${LOG_DIR}/results.txt"
 
     if [ "$count" -eq 0 ]; then
-        echo "0 0 0 0 0 0 0 0"
+        echo "0 0 0 0 0 0 0 0 0 0 0 0"
         return
     fi
 
-    local avg_total_sec avg_total_mbps avg_ent_sec
-    avg_total_sec=$(_fmt "$(echo "scale=3; $total_sec_sum / $count" | bc)")
-    avg_total_mbps=$(_fmt "$(echo "scale=2; $total_mbps_sum / $count" | bc)")
+    local avg_e2e_sec avg_sync_sec avg_e2e_mbps avg_sync_mbps avg_ent_sec
+    avg_e2e_sec=$(_fmt "$(echo "scale=3; $e2e_sec_sum / $count" | bc)")
+    avg_sync_sec=$(_fmt "$(echo "scale=3; $sync_sec_sum / $count" | bc)")
+    avg_e2e_mbps=$(_fmt "$(echo "scale=2; $e2e_mbps_sum / $count" | bc)")
+    avg_sync_mbps=$(_fmt "$(echo "scale=2; $sync_mbps_sum / $count" | bc)")
     avg_ent_sec=$(echo "scale=0; $ent_sec_sum / $count" | bc)
 
-    echo "$keys $rdb_mb $count $avg_total_sec $min_total_mbps $avg_total_mbps $max_total_mbps $avg_ent_sec"
+    echo "$keys $rdb_mb $count $avg_e2e_sec $avg_sync_sec $min_e2e_mbps $avg_e2e_mbps $max_e2e_mbps $min_sync_mbps $avg_sync_mbps $max_sync_mbps $avg_ent_sec"
 }
 
 # ── 报告 ────────────────────────────────────────────────────────────────────
@@ -422,10 +452,11 @@ print_report() {
     echo "══════════════════════════════════════════════════════════════════════"
     echo "  ${C_BLD}Redis Fullsync Benchmark${C_RST} — ${C_YEL}KEYS=$KEYS  VSIZE=$VSIZE B${C_RST}"
     echo "  RDB Size: $REDIS_RDB_MB MB ($REDIS_RDB_SIZE bytes)  Port: $PORT"
+    echo "  ${C_DIM}rdbcompression=no  (与 kvstore RDB 对齐, 禁用 LZF)${C_RST}"
     echo "══════════════════════════════════════════════════════════════════════"
     echo ""
-    printf "  %-10s %6s %8s %10s %11s %8s\n" \
-        "MODE" "KEYS" "RDB_MB" "TOTAL_SEC" "TOTAL_MB/s" "ENT/s"
+    printf "  %-10s %6s %8s %8s %8s %10s %10s %8s\n" \
+        "MODE" "KEYS" "RDB_MB" "E2E_SEC" "SYNC_SEC" "E2E_MB/s" "SYNC_MB/s" "ENT/s"
     print_sep
 
     for mode in disk diskless; do
@@ -433,24 +464,23 @@ print_report() {
             continue
         fi
 
-        while IFS=' ' read -r _mode _iter _skeys _rdb_sz _rdb_mb _total_sec _total_mbps _ent_sec; do
+        while IFS=' ' read -r _mode _iter _skeys _rdb_sz _rdb_mb _e2e_sec _sync_sec _e2e_mbps _sync_mbps _ent_sec; do
             [ "$_mode" != "$mode" ] && continue
-            printf "  %-10s %6s %8s %10.3f %11s %8s\n" \
-                "$_mode" "$_skeys" "$_rdb_mb" "$_total_sec" "$_total_mbps" "$_ent_sec"
+            printf "  %-10s %6s %8s %8.3f %8.3f %10s %10s %8s\n" \
+                "$_mode" "$_skeys" "$_rdb_mb" "$_e2e_sec" "$_sync_sec" "$_e2e_mbps" "$_sync_mbps" "$_ent_sec"
         done < "${LOG_DIR}/results.txt"
 
         local stats; stats=$(calc_stats "$mode")
-        read keys rdb_mb cnt avg_ts min_tmbps avg_tmbps max_tmbps avg_es <<<"$stats"
+        read keys rdb_mb cnt avg_e2e avg_sync min_e2e avg_e2e_mbps max_e2e min_sync avg_sync_mbps max_sync avg_es <<<"$stats"
 
         if [ "$cnt" -gt 0 ]; then
             print_sep
-            printf "  ${C_CYN}%-10s${C_RST} ${C_DIM}(avg)${C_RST} %4s %8s ${C_DIM}%10.3f${C_RST} ${C_BLD}%11s${C_RST} ${C_DIM}%8s${C_RST}\n" \
-                "$mode" "" "$rdb_mb" "$avg_ts" "$avg_tmbps" "$avg_es"
-            printf "  ${C_DIM}%-10s (min) %55s %11s${C_RST}\n" \
-                "" "$min_tmbps"
-            printf "  ${C_DIM}%-10s (max) %55s %11s${C_RST}\n" \
-                "" "$max_tmbps"
-            [ "$cnt" -gt 1 ] && printf "  ${C_DIM}%-10s (n=%d)${C_RST}\n" "" "$cnt"
+            printf "  ${C_CYN}%-10s${C_RST} ${C_DIM}(avg n=$cnt)${C_RST} %8.3f %8.3f ${C_BLD}%10s${C_RST} ${C_BLD}%10s${C_RST} %8s\n" \
+                "$mode" "$avg_e2e" "$avg_sync" "$avg_e2e_mbps" "$avg_sync_mbps" "$avg_es"
+            printf "  ${C_DIM}%-10s (e2e range) %45s %10s–%-10s${C_RST}\n" \
+                "" "$min_e2e" "$max_e2e"
+            printf "  ${C_DIM}%-10s (sync range)%45s %10s–%-10s${C_RST}\n" \
+                "" "$min_sync" "$max_sync"
         fi
     done
 
@@ -461,22 +491,23 @@ print_report() {
         echo "══════════════════════════════════════════════════════════════════════"
         echo "  ${C_BLD}Cross-mode Comparison${C_RST} (avg of $ITERATIONS runs each)"
         echo "══════════════════════════════════════════════════════════════════════"
-        printf "  %-10s %11s %11s %8s\n" \
-            "MODE" "TOTAL_MB/s" "TOTAL_SEC" "ENT/s"
+        printf "  %-10s %11s %11s %11s %8s\n" \
+            "MODE" "E2E_MB/s" "SYNC_MB/s" "E2E_SEC" "ENT/s"
         print_sep
         for mode in disk diskless; do
             local stats; stats=$(calc_stats "$mode")
-            read keys rdb_mb cnt avg_ts min_tmbps avg_tmbps max_tmbps avg_es <<<"$stats"
+            read keys rdb_mb cnt avg_e2e avg_sync min_e2e avg_e2e_mbps max_e2e min_sync avg_sync_mbps max_sync avg_es <<<"$stats"
             if [ "$cnt" -gt 0 ]; then
-                printf "  ${C_BLD}%-10s${C_RST} %11s %11s %8s\n" \
-                    "$mode" "$avg_tmbps" "$avg_ts" "$avg_es"
+                printf "  ${C_BLD}%-10s${C_RST} %11s %11s %11s %8s\n" \
+                    "$mode" "$avg_e2e_mbps" "$avg_sync_mbps" "$avg_e2e" "$avg_es"
             fi
         done
         echo "══════════════════════════════════════════════════════════════════════"
     fi
 
     echo ""
-    echo "  ${C_DIM}统一速率标准: Throughput = RDB文件大小 / (BGSAVE开始→同步完成)${C_RST}"
+    echo "  ${C_DIM}E2E  = SLAVEOF 命令 → slave 加载完成  (对标 kvstore WALL)${C_RST}"
+    echo "  ${C_DIM}SYNC = BGSAVE 开始  → 同步完成        (对标 kvstore NET)${C_RST}"
     echo "  ${C_DIM}对比: kvstore sendfile ↔ Redis disk | kvstore RDMA ↔ Redis diskless${C_RST}"
     echo ""
 }
@@ -528,9 +559,9 @@ for mode in disk diskless; do
         echo "$result" >> "${LOG_DIR}/results.txt"
         ok=$((ok + 1))
 
-        read _m _i skeys rdb_sz rdb_mb total_sec tmbps es <<<"$result"
-        printf "    ${C_DIM}total=%.3fs  mb/s=%s  ent/s=%s  keys=%s${C_RST}\n" \
-            "$total_sec" "$tmbps" "$es" "$skeys"
+        read _m _i skeys rdb_sz rdb_mb e2e_sec sync_sec e2e_mbps sync_mbps es <<<"$result"
+        printf "    ${C_DIM}e2e=%.3fs  sync=%.3fs  e2e_mb/s=%s  sync_mb/s=%s  keys=%s${C_RST}\n" \
+            "$e2e_sec" "$sync_sec" "$e2e_mbps" "$sync_mbps" "$skeys"
         cleanup
     done
     info "  $mode: $ok passed, $fail failed"

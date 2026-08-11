@@ -29,15 +29,15 @@ add_custom_target(xdp_filter_bpf DEPENDS ${BPF_OBJ})
 
 set(SRCS
     main.c
+    xdp_loader.c
     xdp_reasm.c
-    tcp_sender.c
 )
 
 set(HEADERS
     config.h
     xdp_common.h
+    xdp_loader.h
     xdp_reasm.h
-    tcp_sender.h
 )
 
 add_executable(kvstore-incr-sync ${SRCS} ${HEADERS})
@@ -47,7 +47,6 @@ target_include_directories(kvstore-incr-sync PRIVATE
 )
 target_link_libraries(kvstore-incr-sync PRIVATE
     ${LIBBPF_LIBRARIES}
-    pthread
     elf
 )
 add_dependencies(kvstore-incr-sync xdp_filter_bpf)

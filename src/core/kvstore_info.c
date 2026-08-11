@@ -213,7 +213,8 @@ dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) {
                        kvs_config.rdma_listen_ip, kvs_config.rdma_listen_port);
             else {
                 APPEND("master_host:%s\r\n", kvs_config.rdma_master_ip);
-                APPEND("master_port:%d\r\n", kvs_config.rdma_master_port);
+                APPEND("master_port:%d\r\n", kvs_config.master_port);
+                APPEND("rdma_master_port:%d\r\n", kvs_config.rdma_master_port);
             }
         }
         APPEND("connected_slaves:0\r\n");

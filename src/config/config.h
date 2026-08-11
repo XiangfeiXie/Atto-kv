@@ -42,11 +42,17 @@ typedef struct {
     /* 传输方式: "sendfile" (TCP sendfile 零拷贝) | "rdma" (RDMA verbs) */
     char fullsync_transport[16];
 
-    /* Slave listens on this IP:port; Master connects to it */
+    /* Master's TCP service port — slave sends FULLSYNC here.
+     * Separated from rdma_* so handshake and data use different ports. */
+    int  master_port;
+
+    /* Master RDMA CM listener: rdma_listen_ip:rdma_listen_port */
     char rdma_listen_ip[64];
     int  rdma_listen_port;
 
-    /* (保留字段，兼容旧配置) */
+    /* Slave RDMA data path: rdma_master_ip:rdma_master_port
+     * (TCP sendfile uses rdma_master_port + 1).
+     * FULLSYNC handshake uses rdma_master_ip + master_port (separate). */
     char rdma_master_ip[64];
     int  rdma_master_port;
 

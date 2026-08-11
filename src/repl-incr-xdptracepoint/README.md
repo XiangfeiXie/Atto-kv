@@ -12,45 +12,39 @@
 └──────────────────────┬──────────────────────────────┘
                        │ ringbuf (8MB)
 ┌──────────────────────▼──────────────────────────────┐
-│ 用户态主线程                                          │
-│   xdp_reasm_on_event()                              │
-│     → 分桶哈希表 (256 桶, 每桶独立锁)                 │
+│ 用户态单线程 (无锁)                                    │
+│   ring_buffer__poll() → xdp_reasm_on_event()         │
+│     → 分桶哈希表 (256 桶, 锁无关)                     │
 │     → TCP seq 去重/排序 (OOO 链表)                   │
 │     → 环形缓冲区 (摊销 O(1) 写入)                     │
 │     → RESP 协议解析 + 写命令过滤                      │
-│     → cmdq_push() → 命令队列                         │
+│     → on_write() → 直接追加 slave 写缓冲              │
+│   poll 返回后 → send(slave_fd, MSG_DONTWAIT)         │
 └──────────────────────┬──────────────────────────────┘
-                       │ 命令队列 (mutex + condvar)
-┌──────────────────────▼──────────────────────────────┐
-│ Writer 线程                                          │
-│   → 批量取出命令                                      │
-│   → pipeline send (每 64 条 drain 一次)              │
-│   → 断线自动重连                                      │
-└──────────────────────┬──────────────────────────────┘
-                       │ TCP
+                       │ TCP (非阻塞 send)
                    Slave Redis
 ```
 
 ## 数据流
 
 1. **XDP 抓包**: 客户端→master 的 TCP 包在网卡 XDP hook 被拷贝，payload + 四元组 + seq 提交到 ringbuf
-2. **TCP 重组**: 用户态按 `(saddr, sport)` 建立连接状态，seq 去重、乱序排队，保序写入环形缓冲区
+2. **TCP 重组**: 单线程无锁处理，按 `(saddr, sport)` 建立连接状态，seq 去重、乱序排队，保序写入环形缓冲区
 3. **RESP 解析**: 从环形缓冲区扫描完整 RESP 命令
 4. **写命令过滤**: 识别 SET/DEL/INCR/LPUSH/SADD/ZADD/HSET 等 13 类写命令，忽略只读命令
-5. **转发**: 通过命令队列缓冲，writer 线程批量发送到 slave
+5. **发送**: 写命令直接追加到 slave 写缓冲区，poll 返回后非阻塞 send 到 slave
 
 ## 文件结构
 
 ```
 repl-incr-xdptracepoint/
-├── config.h           # 所有配置宏 (编译期确定)
-├── xdp_common.h       # BPF/用户态共享结构体
-├── xdp_filter.bpf.c   # XDP BPF 内核程序
-├── xdp_reasm.h        # TCP 重组 + RESP 解析 API
-├── xdp_reasm.c        # 核心实现 (分桶锁、环形缓冲、解析器)
-├── tcp_sender.h        # 命令队列 + Writer 线程 API
-├── tcp_sender.c        # 队列/发送/重连实现
-├── main.c              # 主入口 (初始化、主循环、关闭)
+├── config.h           # 所有配置宏 + likely/unlikely 分支预测提示
+├── xdp_common.h       # BPF/用户态共享结构体 (ringbuf event)
+├── xdp_filter.bpf.c   # XDP BPF 内核程序 (纯旁路抓包, XDP_PASS)
+├── xdp_loader.h       # XDP BPF 加载/卸载 API
+├── xdp_loader.c       # XDP BPF 加载实现 (bpf_link + netlink 双模式)
+├── xdp_reasm.h        # TCP 重组 + RESP 解析 API (无锁)
+├── xdp_reasm.c        # 核心实现: 哈希表、环形缓冲、RESP解析、OOO池
+├── main.c             # 主入口: slave连接管理、非阻塞发送、主循环
 └── CMakeLists.txt      # 构建配置
 ```
 
@@ -75,8 +69,7 @@ cmake .. -DCMAKE_C_FLAGS="\
   -DSLAVE_PORT=6380 \
   -DXDP_IFACE=\\\"eth0\\\" \
   -DCONN_MAX=8192 \
-  -DCMD_QUEUE_SIZE=32768 \
-  -DWRITER_BATCH_SIZE=128"
+  -DSLAVE_WB_HIGH_WATER=8388608"
 make
 ```
 
@@ -91,10 +84,13 @@ make
 | `CONN_HASH_BITS` | 8 | 哈希桶位数 (2^8=256) |
 | `CONN_MAX` | 4096 | 最大连接数 |
 | `CONN_GC_TIMEOUT` | 30 | 连接空闲超时 (秒) |
-| `CMD_QUEUE_SIZE` | 16384 | 命令队列最大长度 |
-| `WRITER_BATCH_SIZE` | 64 | 批量发送条数 |
 | `OOO_MAX_SEGMENTS` | 64 | 每连接最大乱序段数 |
 | `CMD_BUF_CAP_MAX` | 4MB | 单连接缓冲区上限 |
+| `SLAVE_WB_HIGH_WATER` | 4MB | Slave 写缓冲高水位 (触发丢弃) |
+| `SLAVE_WB_LOW_WATER` | 1MB | Slave 写缓冲低水位 (恢复) |
+| `SLAVE_RECONNECT_S` | 3 | 重连退避间隔 (秒) |
+| `SLAVE_POLL_FAST_MS` | 5 | 有积压时 poll 超时 (ms) |
+| `SLAVE_POLL_IDLE_MS` | 100 | 空闲时 poll 超时 (ms) |
 
 ## 运行
 
@@ -118,14 +114,26 @@ XDP_MODE=generic ./kvstore-incr-sync
 
 ## 设计要点
 
-### 分桶锁
-256 个哈希桶，每条 TCP 连接按 `(src_ip, src_port)` 哈希到固定桶。每个桶有独立 mutex，竞争概率 1/256，多核环境下接近无锁。
+### 无锁分桶哈希表
+256 个哈希桶，每条 TCP 连接按 `(src_ip, src_port)` 哈希到固定桶。单线程运行，无需任何锁。保留分桶结构以便将来扩展到多线程（libbpf ringbuf 多消费者模式）。
 
 ### 环形缓冲区
 替代线性 buffer + memmove。读写指针单调递增，取模访问。读完命令后只移动读指针，无需 memmove。空闲时自动缩容，大块空闲内存及时回收。
 
-### 反压路径
-命令队列满 → `cmdq_push` 返回 -1 → 丢包 → BPF ringbuf 不被消费 → BPF Ringbuf 满 → `bpf_ringbuf_reserve` 返回 NULL → BPF 静默丢弃。整条链路无阻塞。
+### 直接反压路径
+Slave 写缓冲达到高水位 (SLAVE_WB_HIGH_WATER, 4MB) → `on_write` 返回 -1 → 丢包（`send_dropped` 计数）→ BPF ringbuf 继续被消费 → BPF Ringbuf 满 → `bpf_ringbuf_reserve` 返回 NULL → BPF 静默丢弃。整条链路无阻塞、无锁。
+
+### OOO 数据缓冲池
+预分配 256 个 4KB 数据缓冲，OOO 段插入时从池中获取，释放时归还。热路径零 malloc：数据缓冲复用，仅 24 字节 `ooo_seg_t` 结构体需 malloc。合并场景自动降级为 heap 分配，池缓冲归还。
+
+### 写命令查表
+`is_write_command_buf` 用 `switch ((c0<<8)|c1)` 替代 12 个链式 if-else。编译器生成密集跳转表（jump table），O(1) 常数时间匹配，无需逐条比较。
+
+### 分支预测提示
+热路径使用 `likely()`/`unlikely()` 宏（`__builtin_expect`）提示 CPU 分支预测器：顺序到达包、命令完整解析、写缓冲不超水位判为 likely；SYN/FIN/RST、协议错误、缓冲满、连接断开判为 unlikely。减少流水线冲刷。
+
+### 自适应 poll
+有未发送数据时用 5ms 快速超时重试 send，空闲时用 100ms 超时省 CPU。
 
 ### TCP 流还原
 - 纯被动观测，只处理客户端→master 单向流量
@@ -139,8 +147,9 @@ XDP_MODE=generic ./kvstore-incr-sync
 
 ### 可靠性边界
 - **纯旁路不修改原流量** — 转发失败不影响 master
-- 队列满时 **丢弃而非阻塞** — 反压到 BPF 层，不拖慢抓包线程
-- Writer 断线 **自动重连** — 已入队的命令会保留并重放
+- 写缓冲满时 **丢弃而非阻塞** — 反压到 BPF 层
+- 断线 **非阻塞自动重连** — 3 秒退避
+- 关闭时 **阻塞冲刷** — 确保已解析的命令发送到 slave
 - 性能瓶颈在用户态 **TCP 重组和 RESP 解析**，而非 XDP 传输层
 
 ## XDP 模式

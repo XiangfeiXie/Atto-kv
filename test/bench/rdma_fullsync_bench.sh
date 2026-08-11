@@ -202,6 +202,7 @@ maxclients 100
 persistence none
 rdma_sync on
 rdma_role slave
+master_port ${PORT}
 rdma_master_ip ${RDMA_IP}
 rdma_master_port ${PORT}
 fullsync_transport ${transport}

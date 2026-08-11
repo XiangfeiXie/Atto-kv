@@ -103,7 +103,8 @@ int rdma_repl_master_trigger_sync(void) {
         _exit(0);
     }
     close(pipefd[1]);
-    char ready; read(pipefd[0], &ready, 1);
+    char ready;
+    if (read(pipefd[0], &ready, 1) < 0) perror("read pipe");
     close(pipefd[0]);
 
     session_add(pid);
@@ -115,7 +116,7 @@ int rdma_repl_master_trigger_sync(void) {
 /* 通过 TCP 向 Master Redis 端口发送 FULLSYNC 命令，等 +OK 响应 */
 static int slave_send_fullsync_cmd(void) {
     const char *ip   = kvs_config.rdma_master_ip;
-    int         port = kvs_config.rdma_master_port;  /* Master TCP/RDMA 端口 */
+    int         port = kvs_config.master_port;        /* Master TCP service port */
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);
 

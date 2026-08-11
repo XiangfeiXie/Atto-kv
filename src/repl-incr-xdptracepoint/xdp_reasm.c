@@ -1,10 +1,12 @@
-/* xdp_reasm.c — TCP reassembly + RESP extraction + XDP loader
+/* xdp_reasm.c — TCP reassembly + RESP extraction
+ *
+ * Single-threaded, lock-free architecture.
  *
  * Data pipeline:
- *   XDP ringbuf → xdp_reasm_on_event() → per-bucket lock
- *     → conn lookup/create → seq dedup/order
+ *   XDP ringbuf → xdp_reasm_on_event()
+ *     → conn lookup/create → seq dedup/ordering
  *     → circular buffer → RESP scan → write-command filter
- *     → on_write callback
+ *     → on_write callback (returns 0=ok, -1=drop/backpressure)
  */
 
 #define _GNU_SOURCE
@@ -13,19 +15,47 @@
 #include "config.h"
 
 #include <arpa/inet.h>
-#include <bpf/bpf.h>
-#include <bpf/libbpf.h>
-#include <errno.h>
-#include <linux/if_link.h>
-#include <net/if.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
-/* ── Circular buffer ──────────────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════════
+ * OOO data-buffer pool (avoids malloc in the hot path)
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * Each pre-allocated buffer is XDP_MAX_PAYLOAD (4096) bytes.  The pool
+ * is a simple stack of pointers.  On ooo_insert we pop a buffer; on free
+ * we push it back.  When the pool is exhausted we fall back to malloc.
+ *
+ * Merging: when two pool-backed segments are merged, we can't realloc()
+ * the pool buffer (it's part of a larger block).  Instead we malloc a
+ * fresh heap buffer for the merged result and return the displaced pool
+ * buffers to the pool.                                       */
+
+static struct {
+    uint8_t *bufs[OOO_DBUF_POOL_SIZE];
+    int      count;          /* free buffers available */
+} g_dbuf_pool;
+
+/* Try to get a buffer from the pool; returns NULL if pool is empty */
+static inline uint8_t *dbuf_pool_get(void) {
+    if (likely(g_dbuf_pool.count > 0))
+        return g_dbuf_pool.bufs[--g_dbuf_pool.count];
+    return NULL;
+}
+
+/* Return a buffer to the pool */
+static inline void dbuf_pool_put(uint8_t *buf) {
+    if (likely(g_dbuf_pool.count < OOO_DBUF_POOL_SIZE))
+        g_dbuf_pool.bufs[g_dbuf_pool.count++] = buf;
+    else
+        free(buf);  /* pool full (shouldn't happen) — fallback free */
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Circular buffer
+ * ══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
     uint8_t *data;
@@ -57,12 +87,12 @@ static void circ_consume(circ_buf_t *cb, uint32_t n) {
 
 /* Copy len bytes starting at rd into dst (linearized) */
 static void circ_copyout(const circ_buf_t *cb, uint8_t *dst, uint32_t len) {
-    uint32_t pos = cb->rd & cb->mask;
+    uint32_t pos   = cb->rd & cb->mask;
     uint32_t first = len;
-    if (pos + first > cb->cap)
+    if (unlikely(pos + first > cb->cap))
         first = cb->cap - pos;
     memcpy(dst, cb->data + pos, first);
-    if (len > first)
+    if (unlikely(len > first))
         memcpy(dst + first, cb->data, len - first);
 }
 
@@ -70,7 +100,7 @@ static void circ_copyout(const circ_buf_t *cb, uint8_t *dst, uint32_t len) {
  * Linearizes data so rd=0, wr=used. */
 static int circ_expand(circ_buf_t *cb, uint32_t new_cap) {
     uint8_t *nd = malloc(new_cap);
-    if (!nd) return -1;
+    if (unlikely(!nd)) return -1;
     uint32_t used = circ_used(cb);
     circ_copyout(cb, nd, used);
     free(cb->data);
@@ -82,18 +112,18 @@ static int circ_expand(circ_buf_t *cb, uint32_t new_cap) {
     return 0;
 }
 
-/* Ensure at least need bytes free. Expands if necessary.
+/* Ensure at least `need` bytes free. Expands if necessary.
  * Returns 0 on success, -1 if expansion fails or cap exceeded. */
 static int circ_reserve(circ_buf_t *cb, uint32_t need) {
     /* Initial allocation */
-    if (!cb->data) {
+    if (unlikely(!cb->data)) {
         uint32_t cap = CMD_BUF_CAP_MIN;
         while (cap - 1 < need) {
-            if (cap >= CMD_BUF_CAP_MAX) return -1;
+            if (unlikely(cap >= CMD_BUF_CAP_MAX)) return -1;
             cap *= 2;
         }
         cb->data = malloc(cap);
-        if (!cb->data) return -1;
+        if (unlikely(!cb->data)) return -1;
         cb->cap  = cap;
         cb->mask = cap - 1;
         cb->rd   = 0;
@@ -101,11 +131,11 @@ static int circ_reserve(circ_buf_t *cb, uint32_t need) {
         return 0;
     }
     /* Already allocated — check free space */
-    if (circ_free(cb) >= need)
+    if (likely(circ_free(cb) >= need))
         return 0;
     uint32_t new_cap = cb->cap;
     while (new_cap - circ_used(cb) - 1 < need) {
-        if (new_cap >= CMD_BUF_CAP_MAX)
+        if (unlikely(new_cap >= CMD_BUF_CAP_MAX))
             return -1;
         new_cap *= 2;
     }
@@ -116,14 +146,14 @@ static int circ_reserve(circ_buf_t *cb, uint32_t need) {
  * Returns 0 on success, -1 if buffer full and cannot expand. */
 static int circ_write(circ_buf_t *cb, const uint8_t *src, uint32_t len) {
     if (len == 0) return 0;
-    if (circ_reserve(cb, len) != 0)
+    if (unlikely(circ_reserve(cb, len) != 0))
         return -1;
-    uint32_t pos = cb->wr & cb->mask;
+    uint32_t pos   = cb->wr & cb->mask;
     uint32_t first = len;
-    if (pos + first > cb->cap)
+    if (unlikely(pos + first > cb->cap))
         first = cb->cap - pos;
     memcpy(cb->data + pos, src, first);
-    if (len > first)
+    if (unlikely(len > first))
         memcpy(cb->data, src + first, len - first);
     cb->wr += len;
     return 0;
@@ -141,122 +171,145 @@ static void circ_shrink(circ_buf_t *cb) {
     }
 }
 
-/* ── OOO segment list ─────────────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════════
+ * OOO segment list
+ * ══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct ooo_seg {
     uint32_t        seq;
     uint32_t        len;
-    uint8_t        *data;
+    uint8_t        *data;       /* pool buffer or heap buffer */
     struct ooo_seg *next;
+    int             from_pool;  /* 1 → data came from dbuf pool */
 } ooo_seg_t;
 
-/* ── RESP parser (works on circular buffer) ───────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════════
+ * RESP parser (operates on circular buffer)
+ * ══════════════════════════════════════════════════════════════════════════ */
 
 /* Returns: >0 = complete command length, 0 = incomplete, -1 = protocol error */
 static int resp_scan(const circ_buf_t *cb) {
     uint32_t avail = circ_used(cb);
-    if (avail < 4) return 0;
-    if (circ_peek(cb, 0) != '*') return -1;
+    if (unlikely(avail < 4)) return 0;
+    if (unlikely(circ_peek(cb, 0) != '*')) return -1;
 
     uint32_t i = 1;
     int argc = 0;
-    while (i < avail) {
+    while (likely(i < avail)) {
         uint8_t c = circ_peek(cb, i);
-        if (c >= '0' && c <= '9') {
+        if (likely(c >= '0' && c <= '9')) {
             argc = argc * 10 + (c - '0');
-            if (argc > 64) return -1;
+            if (unlikely(argc > 64)) return -1;
             i++;
         } else {
             break;
         }
     }
-    if (i == 1) return -1;
-    if (i + 1 >= avail) return 0;
-    if (circ_peek(cb, i) != '\r' || circ_peek(cb, i + 1) != '\n') return -1;
+    if (unlikely(i == 1)) return -1;
+    if (unlikely(i + 1 >= avail)) return 0;
+    if (unlikely(circ_peek(cb, i) != '\r' || circ_peek(cb, i + 1) != '\n'))
+        return -1;
     i += 2;
 
     for (int arg = 0; arg < argc; arg++) {
-        if (i >= avail) return 0;
-        if (circ_peek(cb, i) != '$') return -1;
+        if (unlikely(i >= avail)) return 0;
+        if (unlikely(circ_peek(cb, i) != '$')) return -1;
         i++;
 
         int arg_len = 0;
-        while (i < avail) {
+        while (likely(i < avail)) {
             uint8_t c = circ_peek(cb, i);
-            if (c >= '0' && c <= '9') {
+            if (likely(c >= '0' && c <= '9')) {
                 arg_len = arg_len * 10 + (c - '0');
-                if (arg_len > RESP_CMD_MAX_LEN) return -1;
+                if (unlikely(arg_len > RESP_CMD_MAX_LEN)) return -1;
                 i++;
             } else {
                 break;
             }
         }
-        if (i + 1 >= avail) return 0;
-        if (circ_peek(cb, i) != '\r' || circ_peek(cb, i + 1) != '\n') return -1;
+        if (unlikely(i + 1 >= avail)) return 0;
+        if (unlikely(circ_peek(cb, i) != '\r' ||
+                     circ_peek(cb, i + 1) != '\n')) return -1;
         i += 2;
 
-        if (i + (uint32_t)arg_len + 2 > avail) return 0;
+        if (unlikely(i + (uint32_t)arg_len + 2 > avail)) return 0;
         i += (uint32_t)arg_len + 2;
     }
 
     return (int)i;
 }
 
-/* Check if a complete RESP command (at cb->rd, length cmd_len) is a write.
- * Uses same 3-char prefix matching as the original. */
+/* ── Write-command filter ────────────────────────────────────────────────
+ *
+ * Matches 13 Redis write-command families.  Uses a switch on the first
+ * two uppercase characters; the compiler emits a dense jump table.
+ *
+ * Commands recognized:
+ *   SET DEL DECR INCR LPUSH RPUSH SADD SREM ZADD ZREM
+ *   HSET HDEL APPEND MSET FLUSH(DB|ALL)                         */
+
 static int is_write_command_buf(const circ_buf_t *cb, uint32_t cmd_len) {
-    if (cmd_len < 12) return 0;
+    /* Need at least: *1\r\n$3\r\nXXX — i.e. a 3-char command name */
+    if (unlikely(cmd_len < 12)) return 0;
 
     /* Skip *N\r\n */
     uint32_t i = 1;
-    while (i < cmd_len) {
+    while (likely(i < cmd_len)) {
         uint8_t c = circ_peek(cb, i);
-        if (c >= '0' && c <= '9') i++;
+        if (likely(c >= '0' && c <= '9')) i++;
         else break;
     }
-    if (i + 1 >= cmd_len || circ_peek(cb, i) != '\r' || circ_peek(cb, i + 1) != '\n') return 0;
+    if (unlikely(i + 1 >= cmd_len ||
+                 circ_peek(cb, i) != '\r' ||
+                 circ_peek(cb, i + 1) != '\n')) return 0;
     i += 2;
 
     /* Skip $L\r\n to reach command name */
-    if (i >= cmd_len || circ_peek(cb, i) != '$') return 0;
+    if (unlikely(i >= cmd_len || circ_peek(cb, i) != '$')) return 0;
     i++;
-    while (i < cmd_len) {
+    while (likely(i < cmd_len)) {
         uint8_t c = circ_peek(cb, i);
-        if (c >= '0' && c <= '9') i++;
+        if (likely(c >= '0' && c <= '9')) i++;
         else break;
     }
-    if (i + 1 >= cmd_len || circ_peek(cb, i) != '\r' || circ_peek(cb, i + 1) != '\n') return 0;
+    if (unlikely(i + 1 >= cmd_len ||
+                 circ_peek(cb, i) != '\r' ||
+                 circ_peek(cb, i + 1) != '\n')) return 0;
     i += 2;
 
-    if (i + 2 >= cmd_len) return 0;
+    if (unlikely(i + 2 >= cmd_len)) return 0;
 
     /* Uppercase first 3 chars of command name */
-    char c0 = (char)circ_peek(cb, i);
-    char c1 = (char)circ_peek(cb, i + 1);
-    char c2 = (char)circ_peek(cb, i + 2);
-    if (c0 >= 'a' && c0 <= 'z') c0 -= 32;
-    if (c1 >= 'a' && c1 <= 'z') c1 -= 32;
-    if (c2 >= 'a' && c2 <= 'z') c2 -= 32;
+    uint8_t c0 = circ_peek(cb, i);
+    uint8_t c1 = circ_peek(cb, i + 1);
+    uint8_t c2 = circ_peek(cb, i + 2);
+    if (c0 >= 'a') c0 -= 32;
+    if (c1 >= 'a') c1 -= 32;
+    if (c2 >= 'a') c2 -= 32;
 
-    /* SET, DEL, DECR, INCR, LPUSH/RPUSH, SADD/SREM, ZADD/ZREM,
-     * HSET/HDEL, APPEND, MSET, FLUSH(DB/ALL) */
-    if (c0 == 'S' && c1 == 'E' && c2 == 'T') return 1;
-    if (c0 == 'D' && c1 == 'E' && c2 == 'L') return 1;
-    if (c0 == 'D' && c1 == 'E' && c2 == 'C') return 1;
-    if (c0 == 'L' && c1 == 'P')               return 1;
-    if (c0 == 'R' && c1 == 'P')               return 1;
-    if (c0 == 'H' && (c1 == 'S' || c1 == 'D')) return 1;
-    if (c0 == 'S' && (c1 == 'A' || c1 == 'R')) return 1;
-    if (c0 == 'Z' && (c1 == 'A' || c1 == 'R')) return 1;
-    if (c0 == 'I' && c1 == 'N' && c2 == 'C') return 1;
-    if (c0 == 'A' && c1 == 'P' && c2 == 'P') return 1;
-    if (c0 == 'M' && c1 == 'S' && c2 == 'E') return 1;
-    if (c0 == 'F' && c1 == 'L' && c2 == 'U') return 1;
-
-    return 0;
+    /* Two-char key for the jump table */
+    switch (((uint16_t)c0 << 8) | c1) {
+    case ('S'<<8)|'E': return c2 == 'T';              /* SET */
+    case ('D'<<8)|'E': return c2 == 'L' || c2 == 'C'; /* DEL, DECR */
+    case ('L'<<8)|'P': return 1;                       /* LPUSH */
+    case ('R'<<8)|'P': return 1;                       /* RPUSH */
+    case ('H'<<8)|'S': return 1;                       /* HSET */
+    case ('H'<<8)|'D': return 1;                       /* HDEL */
+    case ('S'<<8)|'A': return 1;                       /* SADD */
+    case ('S'<<8)|'R': return 1;                       /* SREM */
+    case ('Z'<<8)|'A': return 1;                       /* ZADD */
+    case ('Z'<<8)|'R': return 1;                       /* ZREM */
+    case ('I'<<8)|'N': return c2 == 'C';              /* INCR */
+    case ('A'<<8)|'P': return c2 == 'P';              /* APPEND */
+    case ('M'<<8)|'S': return c2 == 'E';              /* MSET */
+    case ('F'<<8)|'L': return c2 == 'U';              /* FLUSH */
+    default:          return 0;
+    }
 }
 
-/* ── Connection ────────────────────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════════
+ * Connection
+ * ══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct xdp_conn {
     uint32_t         saddr;        /* network byte order */
@@ -276,20 +329,24 @@ typedef struct xdp_conn {
     struct xdp_conn *next;         /* hash chain */
 } xdp_conn_t;
 
-/* ── Bucket ────────────────────────────────────────────────────────────── */
-
-typedef struct {
-    pthread_mutex_t mutex;
-    xdp_conn_t    *head;
-} conn_bucket_t;
-
-/* ── Global state ──────────────────────────────────────────────────────── */
+/* ── Global state ────────────────────────────────────────────────────────
+ *
+ * Connections are stored in a flat array of chained hash buckets.
+ * No bucket wrapper struct — the mutex was removed in Plan A.
+ *
+ * A one-entry lookup cache (g_lk_conn / g_lk_key) exploits the fact that
+ * consecutive ringbuf events almost always belong to the same TCP stream
+ * (the kernel delivers batches).                             */
 
 static struct {
-    conn_bucket_t       buckets[CONN_HASH_SIZE];
-    int                 count;           /* current connections (unlocked, approximate) */
-    xdp_reasm_write_cb  on_write;
+    xdp_conn_t          *buckets[CONN_HASH_SIZE];
+    int                  count;
+    xdp_reasm_write_cb   on_write;
     struct xdp_reasm_stats stats;
+
+    /* One-entry lookup cache */
+    xdp_conn_t          *lk_conn;
+    uint64_t             lk_key;   /* (uint64_t)sport << 32 | saddr */
 } g_xdp;
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
@@ -299,27 +356,48 @@ static inline uint32_t conn_hash_idx(uint32_t saddr, uint16_t sport) {
     return h & (CONN_HASH_SIZE - 1);
 }
 
-static uint32_t seq_to_host(uint32_t net_seq) {
+static inline uint64_t conn_key(uint32_t saddr, uint16_t sport) {
+    return ((uint64_t)sport << 32) | saddr;
+}
+
+static inline uint32_t seq_to_host(uint32_t net_seq) {
     return ntohl(net_seq);
 }
 
-/* Must be called with bucket lock held */
-static xdp_conn_t *conn_lookup_locked(conn_bucket_t *bkt,
-                                      uint32_t saddr, uint16_t sport) {
-    for (xdp_conn_t *c = bkt->head; c; c = c->next)
-        if (c->saddr == saddr && c->sport == sport)
-            return c;
-    return NULL;
+/* Free a connection's resources (OOO segments, circular buffer, conn struct).
+ * Caller must have already unlinked the conn from its hash chain. */
+static void conn_free_resources(xdp_conn_t *c) {
+    ooo_seg_t *seg = c->ooo_head;
+    while (seg) {
+        ooo_seg_t *nx = seg->next;
+        if (seg->from_pool)
+            dbuf_pool_put(seg->data);
+        else
+            free(seg->data);
+        free(seg);
+        seg = nx;
+    }
+    free(c->buf.data);
+    free(c);
 }
 
-/* Must be called with bucket lock held.
- * On failure (count exceeded), returns NULL. */
-static xdp_conn_t *conn_create_locked(conn_bucket_t *bkt,
-                                      uint32_t saddr, uint16_t sport) {
-    if (g_xdp.count >= CONN_MAX) {
-        /* Try to evict the stalest connection in this bucket */
-        xdp_conn_t *stale = NULL, *prev = NULL, *sprev = NULL;
-        for (xdp_conn_t *c = bkt->head, *p = NULL; c; p = c, c = c->next) {
+/* Invalidate the one-entry lookup cache if it points to a freed connection. */
+static void conn_cache_inval(xdp_conn_t *victim) {
+    if (g_xdp.lk_conn == victim)
+        g_xdp.lk_conn = NULL;
+}
+
+/* Create a new connection. On failure (count exceeded), evicts an idle or
+ * stale connection from the target bucket. Returns NULL if no slot. */
+static xdp_conn_t *conn_create(uint32_t idx,
+                               uint32_t saddr, uint16_t sport) {
+    xdp_conn_t **head = &g_xdp.buckets[idx];
+
+    if (unlikely(g_xdp.count >= CONN_MAX)) {
+        /* Try to evict an idle-closed connection, or the stalest */
+        xdp_conn_t *stale = NULL, *sprev = NULL;
+        for (xdp_conn_t *c = *head, *p = NULL; likely(c);
+             p = c, c = c->next) {
             if (c->closing && c->buf.rd == c->buf.wr && !c->ooo_head) {
                 stale = c; sprev = p; break;
             }
@@ -328,14 +406,10 @@ static xdp_conn_t *conn_create_locked(conn_bucket_t *bkt,
             }
         }
         if (stale) {
-            /* Remove stale from list */
             if (sprev) sprev->next = stale->next;
-            else bkt->head = stale->next;
-            /* Free stale resources */
-            ooo_seg_t *seg = stale->ooo_head;
-            while (seg) { ooo_seg_t *nx = seg->next; free(seg->data); free(seg); seg = nx; }
-            free(stale->buf.data);
-            free(stale);
+            else       *head       = stale->next;
+            conn_cache_inval(stale);
+            conn_free_resources(stale);
             g_xdp.count--;
         } else {
             return NULL;
@@ -343,41 +417,76 @@ static xdp_conn_t *conn_create_locked(conn_bucket_t *bkt,
     }
 
     xdp_conn_t *c = calloc(1, sizeof(*c));
-    if (!c) return NULL;
+    if (unlikely(!c)) return NULL;
 
     c->saddr       = saddr;
     c->sport       = sport;
     c->last_active = time(NULL);
-    c->next        = bkt->head;
-    bkt->head      = c;
+    c->next        = *head;
+    *head          = c;
     g_xdp.count++;
     return c;
 }
 
-/* ── OOO segment management ────────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════════
+ * OOO segment management
+ * ══════════════════════════════════════════════════════════════════════════ */
 
-/* Insert segment into OOO list sorted by seq, merging adjacent/overlapping.
- * Must be called with bucket lock held. */
+/* Allocate a new OOO segment with a copy of [data, data+len).
+ * Uses the pre-allocated dbuf pool in the common case, falls back
+ * to malloc when the pool is exhausted. */
+static ooo_seg_t *ooo_seg_alloc(const uint8_t *data, uint32_t len) {
+    ooo_seg_t *seg = malloc(sizeof(*seg));
+    if (unlikely(!seg)) return NULL;
+
+    seg->len       = len;
+    seg->next      = NULL;
+    seg->from_pool = 0;
+
+    uint8_t *buf = dbuf_pool_get();
+    if (buf) {
+        seg->data      = buf;
+        seg->from_pool = 1;
+    } else {
+        seg->data = malloc(len);
+        if (unlikely(!seg->data)) {
+            free(seg);
+            return NULL;
+        }
+    }
+    memcpy(seg->data, data, len);
+    return seg;
+}
+
+/* Free an OOO segment, returning its data buffer to the pool if applicable. */
+static void ooo_seg_free(ooo_seg_t *seg) {
+    if (seg->from_pool)
+        dbuf_pool_put(seg->data);
+    else
+        free(seg->data);
+    free(seg);
+}
+
+/* Insert segment into OOO list sorted by seq, merging adjacent/overlapping. */
 static void ooo_insert(xdp_conn_t *c, uint32_t seq,
                        const uint8_t *data, uint32_t len) {
-    if (c->ooo_count >= OOO_MAX_SEGMENTS) {
+    if (unlikely(c->ooo_count >= OOO_MAX_SEGMENTS)) {
         /* Too many OOO segments — connection likely corrupt, reset */
         ooo_seg_t *seg = c->ooo_head;
-        while (seg) { ooo_seg_t *nx = seg->next; free(seg->data); free(seg); seg = nx; }
-        c->ooo_head = NULL;
+        while (seg) {
+            ooo_seg_t *nx = seg->next;
+            ooo_seg_free(seg);
+            seg = nx;
+        }
+        c->ooo_head  = NULL;
         c->ooo_count = 0;
         return;
     }
 
-    ooo_seg_t *ns = malloc(sizeof(*ns));
-    if (!ns) return;
-    ns->seq  = seq;
-    ns->len  = len;
-    ns->data = malloc(len);
-    if (!ns->data) { free(ns); return; }
-    memcpy(ns->data, data, len);
-    ns->next = NULL;
+    ooo_seg_t *ns = ooo_seg_alloc(data, len);
+    if (unlikely(!ns)) return;
 
+    ns->seq = seq;
     c->ooo_count++;
     g_xdp.stats.ooo_segments++;
 
@@ -388,23 +497,37 @@ static void ooo_insert(xdp_conn_t *c, uint32_t seq,
         cur  = cur->next;
     }
 
-    /* Merge with predecessor */
+    /* ── Merge with predecessor ─────────────────────────────────────── */
     if (prev) {
         uint32_t prev_end = prev->seq + prev->len;
         if (prev_end >= ns->seq) {
             if (ns->seq + ns->len > prev_end) {
-                uint32_t extend = ns->seq + ns->len - prev_end;
+                uint32_t extend  = ns->seq + ns->len - prev_end;
                 uint32_t new_len = prev->len + extend;
-                uint8_t *nd = realloc(prev->data, new_len);
-                if (nd) {
-                    prev->data = nd;
-                    memcpy(prev->data + prev->len,
-                           ns->data + (prev_end - ns->seq), extend);
-                    prev->len = new_len;
+
+                if (prev->from_pool) {
+                    /* Can't realloc pool buffer — allocate heap copy */
+                    uint8_t *nd = malloc(new_len);
+                    if (likely(nd)) {
+                        memcpy(nd, prev->data, prev->len);
+                        memcpy(nd + prev->len,
+                               ns->data + (prev_end - ns->seq), extend);
+                        dbuf_pool_put(prev->data);
+                        prev->data      = nd;
+                        prev->from_pool = 0;
+                        prev->len       = new_len;
+                    }
+                } else {
+                    uint8_t *nd = realloc(prev->data, new_len);
+                    if (likely(nd)) {
+                        prev->data = nd;
+                        memcpy(prev->data + prev->len,
+                               ns->data + (prev_end - ns->seq), extend);
+                        prev->len = new_len;
+                    }
                 }
             }
-            free(ns->data);
-            free(ns);
+            ooo_seg_free(ns);
             g_xdp.stats.ooo_segments--;
             c->ooo_count--;
             ns = NULL;
@@ -413,41 +536,55 @@ static void ooo_insert(xdp_conn_t *c, uint32_t seq,
 
     if (!ns) return;
 
-    /* Insert */
+    /* ── Insert into list ───────────────────────────────────────────── */
     ns->next = cur;
     if (prev) prev->next = ns;
     else      c->ooo_head = ns;
     prev = ns;
 
-    /* Merge forward */
+    /* ── Merge forward ──────────────────────────────────────────────── */
     while (cur) {
         uint32_t prev_end = prev->seq + prev->len;
-        if (prev_end >= cur->seq) {
-            if (cur->seq + cur->len > prev_end) {
-                uint32_t extend = cur->seq + cur->len - prev_end;
-                uint32_t new_len = prev->len + extend;
+        if (unlikely(prev_end < cur->seq))
+            break;
+
+        if (cur->seq + cur->len > prev_end) {
+            uint32_t extend  = cur->seq + cur->len - prev_end;
+            uint32_t new_len = prev->len + extend;
+
+            if (prev->from_pool) {
+                uint8_t *nd = malloc(new_len);
+                if (likely(nd)) {
+                    memcpy(nd, prev->data, prev->len);
+                    memcpy(nd + prev->len,
+                           cur->data + (prev_end - cur->seq), extend);
+                    dbuf_pool_put(prev->data);
+                    prev->data      = nd;
+                    prev->from_pool = 0;
+                    prev->len       = new_len;
+                }
+            } else {
                 uint8_t *nd = realloc(prev->data, new_len);
-                if (nd) {
+                if (likely(nd)) {
                     prev->data = nd;
                     memcpy(prev->data + prev->len,
                            cur->data + (prev_end - cur->seq), extend);
                     prev->len = new_len;
                 }
             }
-            prev->next = cur->next;
-            free(cur->data);
-            free(cur);
-            g_xdp.stats.ooo_segments--;
-            c->ooo_count--;
-            cur = prev->next;
-        } else {
-            break;
         }
+
+        prev->next = cur->next;
+        ooo_seg_free(cur);
+        g_xdp.stats.ooo_segments--;
+        c->ooo_count--;
+        cur = prev->next;
     }
 }
 
 /* Drain OOO segments that are now contiguous with rcv_nxt */
-static void consume_ordered(xdp_conn_t *c, const uint8_t *data, uint32_t len);
+static void consume_ordered(xdp_conn_t *c,
+                            const uint8_t *data, uint32_t len);
 
 static void ooo_drain(xdp_conn_t *c) {
     while (c->ooo_head) {
@@ -464,34 +601,38 @@ static void ooo_drain(xdp_conn_t *c) {
         }
 
         c->ooo_head = seg->next;
-        free(seg->data);
-        free(seg);
+        ooo_seg_free(seg);
         g_xdp.stats.ooo_segments--;
         c->ooo_count--;
     }
 }
 
-/* ── Ordered data consumer ─────────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════════
+ * Ordered data consumer
+ * ══════════════════════════════════════════════════════════════════════════ */
 
-static void consume_ordered(xdp_conn_t *c, const uint8_t *data, uint32_t len) {
+static void consume_ordered(xdp_conn_t *c,
+                            const uint8_t *data, uint32_t len) {
     if (len == 0) return;
 
     g_xdp.stats.bytes_ordered += len;
 
-    if (circ_write(&c->buf, data, len) != 0) {
-        /* Buffer overflow — reset (likely garbage) */
+    if (unlikely(circ_write(&c->buf, data, len) != 0)) {
+        /* Buffer overflow — reset (likely garbage data) */
         c->buf.rd = c->buf.wr = 0;
         circ_shrink(&c->buf);
         return;
     }
 
-    /* Extract complete RESP commands */
-    uint8_t scratch[4096];   /* stack buffer for linearization */
+    /* Extract complete RESP commands.
+     * 4096-byte stack buffer handles >99% of commands; oversize
+     * commands fall back to a heap allocation. */
+    uint8_t scratch[4096];
 
     for (;;) {
         int cmd_len = resp_scan(&c->buf);
         if (cmd_len <= 0) {
-            if (cmd_len < 0 && circ_used(&c->buf) > CMD_BUF_CAP_MAX) {
+            if (unlikely(cmd_len < 0 && circ_used(&c->buf) > CMD_BUF_CAP_MAX)) {
                 /* Stale/unparseable data, reset */
                 c->buf.rd = c->buf.wr = 0;
                 circ_shrink(&c->buf);
@@ -504,17 +645,22 @@ static void consume_ordered(xdp_conn_t *c, const uint8_t *data, uint32_t len) {
         if (is_write_command_buf(&c->buf, (uint32_t)cmd_len)) {
             g_xdp.stats.cmds_written++;
             if (g_xdp.on_write) {
-                if ((uint32_t)cmd_len <= sizeof(scratch)) {
+                int rc;
+                if (likely((uint32_t)cmd_len <= sizeof(scratch))) {
                     circ_copyout(&c->buf, scratch, (uint32_t)cmd_len);
-                    g_xdp.on_write(scratch, (uint32_t)cmd_len);
+                    rc = g_xdp.on_write(scratch, (uint32_t)cmd_len);
                 } else {
                     uint8_t *tmp = malloc((uint32_t)cmd_len);
-                    if (tmp) {
+                    if (likely(tmp)) {
                         circ_copyout(&c->buf, tmp, (uint32_t)cmd_len);
-                        g_xdp.on_write(tmp, (uint32_t)cmd_len);
+                        rc = g_xdp.on_write(tmp, (uint32_t)cmd_len);
                         free(tmp);
+                    } else {
+                        rc = -1;
                     }
                 }
+                if (unlikely(rc < 0))
+                    g_xdp.stats.send_dropped++;
             }
         }
 
@@ -524,7 +670,9 @@ static void consume_ordered(xdp_conn_t *c, const uint8_t *data, uint32_t len) {
     circ_shrink(&c->buf);
 }
 
-/* ── Packet processing (seq logic) ─────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════════
+ * Packet processing (seq logic)
+ * ══════════════════════════════════════════════════════════════════════════ */
 
 static void process_packet(xdp_conn_t *c,
                            uint32_t seq_h, const uint8_t *data, uint32_t len) {
@@ -533,21 +681,21 @@ static void process_packet(xdp_conn_t *c,
     uint32_t seg_end = seq_h + len;
 
     /* Completely duplicate (fully before rcv_nxt) */
-    if (seg_end <= c->rcv_nxt) {
+    if (unlikely(seg_end <= c->rcv_nxt)) {
         g_xdp.stats.dup_discarded++;
         return;
     }
 
-    /* Partial overlap (starts before rcv_nxt) */
-    if (seq_h < c->rcv_nxt) {
+    /* Partial overlap (starts before rcv_nxt but extends past it) */
+    if (unlikely(seq_h < c->rcv_nxt)) {
         uint32_t skip = c->rcv_nxt - seq_h;
         data  += skip;
         len   -= skip;
         seq_h  = c->rcv_nxt;
     }
 
-    /* In-order */
-    if (seq_h == c->rcv_nxt) {
+    /* In-order: most common case */
+    if (likely(seq_h == c->rcv_nxt)) {
         consume_ordered(c, data, len);
         c->rcv_nxt += len;
         ooo_drain(c);
@@ -558,34 +706,48 @@ static void process_packet(xdp_conn_t *c,
     ooo_insert(c, seq_h, data, len);
 }
 
-/* ── Ringbuf callback ──────────────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════════
+ * Ringbuf callback
+ * ══════════════════════════════════════════════════════════════════════════ */
 
 int xdp_reasm_on_event(void *ctx, void *data, size_t data_sz) {
     (void)ctx;
     (void)data_sz;
 
     struct xdp_repl_event *e = (struct xdp_repl_event *)data;
+    g_xdp.stats.events_total++;
 
-    /* Count in global stats (atomic increment via relaxed store) */
-    __atomic_add_fetch(&g_xdp.stats.events_total, 1, __ATOMIC_RELAXED);
+    /* ── Connection lookup (with one-entry cache) ──────────────────────
+     * Consecutive ringbuf events almost always belong to the same TCP
+     * stream — the kernel delivers batches.  A single comparison saves
+     * a hash computation and chain walk on every cache hit.          */
+    uint64_t    key = conn_key(e->saddr, e->sport);
+    xdp_conn_t *c;
 
-    uint32_t idx = conn_hash_idx(e->saddr, e->sport);
-    conn_bucket_t *bkt = &g_xdp.buckets[idx];
-
-    pthread_mutex_lock(&bkt->mutex);
-
-    xdp_conn_t *c = conn_lookup_locked(bkt, e->saddr, e->sport);
+    if (likely(g_xdp.lk_conn && g_xdp.lk_key == key)) {
+        c = g_xdp.lk_conn;                    /* cache hit */
+    } else {
+        uint32_t idx = conn_hash_idx(e->saddr, e->sport);
+        for (c = g_xdp.buckets[idx]; c; c = c->next)
+            if (c->saddr == e->saddr && c->sport == e->sport)
+                break;
+        g_xdp.lk_conn = c;
+        g_xdp.lk_key  = key;
+    }
 
     /* ── Handle SYN ────────────────────────────────────────────────── */
-    if (e->flags & XDP_FLAG_SYN) {
-        __atomic_add_fetch(&g_xdp.stats.events_syn, 1, __ATOMIC_RELAXED);
+    if (unlikely(e->flags & XDP_FLAG_SYN)) {
+        g_xdp.stats.events_syn++;
         if (!c) {
-            c = conn_create_locked(bkt, e->saddr, e->sport);
-            if (!c) { pthread_mutex_unlock(&bkt->mutex); return 0; }
+            uint32_t idx = conn_hash_idx(e->saddr, e->sport);
+            c = conn_create(idx, e->saddr, e->sport);
+            if (unlikely(!c)) return 0;
+            g_xdp.lk_conn = c;
+            g_xdp.lk_key  = key;
         }
         if (!c->isn_known) {
-            c->isn      = seq_to_host(e->seq);
-            c->rcv_nxt  = c->isn + 1;
+            c->isn       = seq_to_host(e->seq);
+            c->rcv_nxt   = c->isn + 1;
             c->isn_known = 1;
             c->closing   = 0;
         }
@@ -594,14 +756,16 @@ int xdp_reasm_on_event(void *ctx, void *data, size_t data_sz) {
             process_packet(c, seq_to_host(e->seq) + 1,
                            e->data, e->data_len);
         }
-        pthread_mutex_unlock(&bkt->mutex);
         return 0;
     }
 
     /* Connection must exist for non-SYN */
-    if (!c) {
-        c = conn_create_locked(bkt, e->saddr, e->sport);
-        if (!c) { pthread_mutex_unlock(&bkt->mutex); return 0; }
+    if (unlikely(!c)) {
+        uint32_t idx = conn_hash_idx(e->saddr, e->sport);
+        c = conn_create(idx, e->saddr, e->sport);
+        if (unlikely(!c)) return 0;
+        g_xdp.lk_conn = c;
+        g_xdp.lk_key  = key;
         /* Lame connection: estimate ISN = seq - 1 */
         c->isn       = seq_to_host(e->seq) - 1;
         c->rcv_nxt   = c->isn + 1;
@@ -609,8 +773,8 @@ int xdp_reasm_on_event(void *ctx, void *data, size_t data_sz) {
     }
 
     /* ── Handle FIN/RST ────────────────────────────────────────────── */
-    if (e->flags & (XDP_FLAG_FIN | XDP_FLAG_RST)) {
-        __atomic_add_fetch(&g_xdp.stats.events_fin_rst, 1, __ATOMIC_RELAXED);
+    if (unlikely(e->flags & (XDP_FLAG_FIN | XDP_FLAG_RST))) {
+        g_xdp.stats.events_fin_rst++;
         c->closing = 1;
         uint32_t data_seq = seq_to_host(e->seq);
         if (e->data_len > 0)
@@ -620,52 +784,50 @@ int xdp_reasm_on_event(void *ctx, void *data, size_t data_sz) {
             process_packet(c, data_seq + e->data_len, &fin_byte, 1);
         }
         c->last_active = time(NULL);
-        pthread_mutex_unlock(&bkt->mutex);
         return 0;
     }
 
     /* ── Handle data ───────────────────────────────────────────────── */
-    if (e->data_len > 0) {
-        __atomic_add_fetch(&g_xdp.stats.events_data, 1, __ATOMIC_RELAXED);
+    if (likely(e->data_len > 0)) {
+        g_xdp.stats.events_data++;
         c->last_active = time(NULL);
         process_packet(c, seq_to_host(e->seq), e->data, e->data_len);
     }
 
     /* Count fragment events */
-    if (e->flags & XDP_FLAG_FRAG)
-        __atomic_add_fetch(&g_xdp.stats.fragment_events, 1, __ATOMIC_RELAXED);
+    if (unlikely(e->flags & XDP_FLAG_FRAG))
+        g_xdp.stats.fragment_events++;
 
-    pthread_mutex_unlock(&bkt->mutex);
     return 0;
 }
 
-/* ── Garbage collection ────────────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════════
+ * Garbage collection
+ * ══════════════════════════════════════════════════════════════════════════ */
 
 void xdp_reasm_gc(void) {
     time_t now = time(NULL);
 
-    for (int i = 0; i < CONN_HASH_SIZE; i++) {
-        conn_bucket_t *bkt = &g_xdp.buckets[i];
-        pthread_mutex_lock(&bkt->mutex);
-
-        xdp_conn_t *prev = NULL, *c = bkt->head;
+    for (uint32_t i = 0; i < CONN_HASH_SIZE; i++) {
+        xdp_conn_t *prev = NULL, *c = g_xdp.buckets[i];
         while (c) {
-            int gc = 0;
-            if (now - c->last_active > CONN_GC_TIMEOUT)
-                gc = 1;
-            if (c->closing && !c->ooo_head && circ_used(&c->buf) == 0)
-                gc = 1;
+            int gc = (now - c->last_active > CONN_GC_TIMEOUT) ||
+                     (c->closing && !c->ooo_head &&
+                      circ_used(&c->buf) == 0);
 
-            if (gc) {
+            if (unlikely(gc)) {
                 xdp_conn_t *victim = c;
                 if (prev) prev->next = c->next;
-                else      bkt->head  = c->next;
+                else      g_xdp.buckets[i] = c->next;
                 c = c->next;
 
+                conn_cache_inval(victim);
+
+                /* Return OOO data buffers to pool */
                 ooo_seg_t *seg = victim->ooo_head;
                 while (seg) {
                     ooo_seg_t *nx = seg->next;
-                    free(seg->data); free(seg);
+                    ooo_seg_free(seg);
                     g_xdp.stats.ooo_segments--;
                     seg = nx;
                 }
@@ -674,224 +836,66 @@ void xdp_reasm_gc(void) {
                 g_xdp.count--;
             } else {
                 prev = c;
-                c = c->next;
+                c    = c->next;
             }
         }
-
-        pthread_mutex_unlock(&bkt->mutex);
     }
 
-    __atomic_store_n(&g_xdp.stats.conns_active, g_xdp.count, __ATOMIC_RELAXED);
+    g_xdp.stats.conns_active = g_xdp.count;
 }
 
-/* ── Public API ────────────────────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════════
+ * Public API
+ * ══════════════════════════════════════════════════════════════════════════ */
 
 int xdp_reasm_init(xdp_reasm_write_cb on_write) {
     memset(&g_xdp, 0, sizeof(g_xdp));
     g_xdp.on_write = on_write;
 
-    for (int i = 0; i < CONN_HASH_SIZE; i++) {
-        if (pthread_mutex_init(&g_xdp.buckets[i].mutex, NULL) != 0) {
-            fprintf(stderr, "[XDP-REASM] mutex_init[%d] failed\n", i);
-            /* Destroy already-initialized mutexes */
-            for (int j = 0; j < i; j++)
-                pthread_mutex_destroy(&g_xdp.buckets[j].mutex);
-            return -1;
-        }
+    /* Pre-allocate OOO data buffer pool */
+    g_dbuf_pool.count = 0;
+    for (int i = 0; i < OOO_DBUF_POOL_SIZE; i++) {
+        g_dbuf_pool.bufs[i] = malloc(XDP_MAX_PAYLOAD);
+        if (g_dbuf_pool.bufs[i])
+            g_dbuf_pool.count++;
     }
 
-    printf("[XDP-REASM] init OK: %d buckets, max %d conns\n",
-           CONN_HASH_SIZE, CONN_MAX);
+    printf("[XDP-REASM] init OK: %d buckets, max %d conns, "
+           "ooo dbuf pool %d/%d (single-threaded)\n",
+           CONN_HASH_SIZE, CONN_MAX,
+           g_dbuf_pool.count, OOO_DBUF_POOL_SIZE);
     return 0;
 }
 
 void xdp_reasm_shutdown(void) {
-    for (int i = 0; i < CONN_HASH_SIZE; i++) {
-        conn_bucket_t *bkt = &g_xdp.buckets[i];
-        pthread_mutex_lock(&bkt->mutex);
-
-        xdp_conn_t *c = bkt->head;
+    for (uint32_t i = 0; i < CONN_HASH_SIZE; i++) {
+        xdp_conn_t *c = g_xdp.buckets[i];
         while (c) {
             xdp_conn_t *next = c->next;
-            ooo_seg_t *seg = c->ooo_head;
+            ooo_seg_t  *seg  = c->ooo_head;
             while (seg) {
                 ooo_seg_t *nx = seg->next;
-                free(seg->data); free(seg);
+                ooo_seg_free(seg);
                 seg = nx;
             }
             free(c->buf.data);
             free(c);
             c = next;
         }
-        bkt->head = NULL;
-
-        pthread_mutex_unlock(&bkt->mutex);
-        pthread_mutex_destroy(&bkt->mutex);
+        g_xdp.buckets[i] = NULL;
     }
 
     g_xdp.count = 0;
+
+    /* Free OOO data buffer pool */
+    for (int i = 0; i < g_dbuf_pool.count; i++)
+        free(g_dbuf_pool.bufs[i]);
+    g_dbuf_pool.count = 0;
+
     printf("[XDP-REASM] shutdown complete\n");
 }
 
 void xdp_reasm_get_stats(struct xdp_reasm_stats *st) {
     memcpy(st, &g_xdp.stats, sizeof(*st));
     st->conns_active = g_xdp.count;
-}
-
-/* ── XDP BPF loader ────────────────────────────────────────────────────── */
-
-void xdp_detach(xdp_attach_t *a) {
-    if (!a) return;
-    if (a->use_netlink) {
-        if (a->prog_fd >= 0 && a->ifindex > 0)
-            bpf_xdp_detach(a->ifindex, 0, NULL);
-    } else {
-        if (a->link)
-            bpf_link__destroy(a->link);
-    }
-    a->link   = NULL;
-    a->prog_fd = -1;
-}
-
-int xdp_load_bpf(uint16_t kv_port, const char *iface_name,
-                 ring_buffer_sample_fn ringbuf_cb,
-                 struct bpf_object **out_obj,
-                 struct ring_buffer **out_rb,
-                 xdp_attach_t *out_att)
-{
-    memset(out_att, 0, sizeof(*out_att));
-    out_att->prog_fd = -1;
-    *out_obj = NULL;
-    *out_rb  = NULL;
-
-    if (!iface_name || !*iface_name)
-        iface_name = XDP_IFACE;
-
-    /* Resolve interface */
-    out_att->ifindex = if_nametoindex(iface_name);
-    if (out_att->ifindex == 0) {
-        fprintf(stderr, "[XDP-LOAD] interface not found: '%s'\n", iface_name);
-        fprintf(stderr, "[XDP-LOAD] set XDP_IFACE. Available:\n");
-        for (int i = 1; i <= 10; i++) {
-            char name[IF_NAMESIZE];
-            if (if_indextoname(i, name))
-                fprintf(stderr, "[XDP-LOAD]   %s\n", name);
-        }
-        return -1;
-    }
-
-    /* Find BPF object file */
-    char obj_path[512];
-    const char *build_dir = getenv("BUILD_DIR");
-    if (build_dir) {
-        snprintf(obj_path, sizeof(obj_path), "%s/xdp_filter.bpf.o", build_dir);
-    } else {
-        char self[256];
-        ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
-        if (n > 0) {
-            self[n] = '\0';
-            char *slash = strrchr(self, '/');
-            if (slash) *slash = '\0';
-            snprintf(obj_path, sizeof(obj_path), "%s/xdp_filter.bpf.o", self);
-            if (access(obj_path, R_OK) != 0)
-                snprintf(obj_path, sizeof(obj_path), "build/xdp_filter.bpf.o");
-        } else {
-            snprintf(obj_path, sizeof(obj_path), "build/xdp_filter.bpf.o");
-        }
-    }
-
-    if (access(obj_path, R_OK) != 0) {
-        fprintf(stderr, "[XDP-LOAD] BPF object not found: %s\n", obj_path);
-        return -1;
-    }
-
-    /* Open and load */
-    struct bpf_object *obj = bpf_object__open_file(obj_path, NULL);
-    if (!obj) {
-        fprintf(stderr, "[XDP-LOAD] bpf_object__open_file: %s\n", strerror(errno));
-        return -1;
-    }
-    if (bpf_object__load(obj) != 0) {
-        fprintf(stderr, "[XDP-LOAD] bpf_object__load: %s\n", strerror(errno));
-        bpf_object__close(obj);
-        return -1;
-    }
-
-    /* Set kvstore port */
-    struct bpf_map *cfg_map = bpf_object__find_map_by_name(obj, "repl_config");
-    if (cfg_map) {
-        uint32_t key = 0, val = (uint32_t)kv_port;
-        bpf_map__update_elem(cfg_map, &key, sizeof(key), &val, sizeof(val), BPF_ANY);
-    }
-
-    /* Find XDP program */
-    struct bpf_program *prog =
-        bpf_object__find_program_by_name(obj, "xdp_repl_sniff");
-    if (!prog) {
-        fprintf(stderr, "[XDP-LOAD] program 'xdp_repl_sniff' not found\n");
-        bpf_object__close(obj);
-        return -1;
-    }
-
-    /* Attach XDP */
-    const char *mode_str = getenv("XDP_MODE");
-    const char *mode_label = "auto";
-
-    if (!mode_str || strcmp(mode_str, "auto") == 0) {
-        out_att->link = bpf_program__attach_xdp(prog, out_att->ifindex);
-        if (!out_att->link) {
-            fprintf(stderr, "[XDP-LOAD] attach to '%s' failed: %s\n",
-                    iface_name, strerror(errno));
-            bpf_object__close(obj);
-            return -1;
-        }
-        out_att->use_netlink = 0;
-    } else {
-        uint32_t flags = 0;
-        if (strcmp(mode_str, "generic") == 0) {
-            flags = XDP_FLAGS_SKB_MODE;
-            mode_label = "generic(SKB)";
-        } else if (strcmp(mode_str, "native") == 0) {
-            flags = XDP_FLAGS_DRV_MODE;
-            mode_label = "native(DRV)";
-        } else {
-            fprintf(stderr, "[XDP-LOAD] unknown XDP_MODE '%s' "
-                    "(valid: auto, generic, native)\n", mode_str);
-            bpf_object__close(obj);
-            return -1;
-        }
-        out_att->prog_fd = bpf_program__fd(prog);
-        if (bpf_xdp_attach(out_att->ifindex, out_att->prog_fd, flags, NULL) != 0) {
-            fprintf(stderr, "[XDP-LOAD] XDP %s attach to '%s' failed: %s\n",
-                    mode_label, iface_name, strerror(errno));
-            bpf_object__close(obj);
-            return -1;
-        }
-        out_att->use_netlink = 1;
-    }
-
-    /* Create ringbuf consumer */
-    struct bpf_map *rb_map = bpf_object__find_map_by_name(obj, "repl_ringbuf");
-    if (!rb_map) {
-        fprintf(stderr, "[XDP-LOAD] ringbuf map not found\n");
-        xdp_detach(out_att);
-        bpf_object__close(obj);
-        return -1;
-    }
-
-    struct ring_buffer *rb = ring_buffer__new(bpf_map__fd(rb_map),
-                                              ringbuf_cb, NULL, NULL);
-    if (!rb) {
-        fprintf(stderr, "[XDP-LOAD] ring_buffer__new failed\n");
-        xdp_detach(out_att);
-        bpf_object__close(obj);
-        return -1;
-    }
-
-    *out_obj = obj;
-    *out_rb  = rb;
-
-    printf("[XDP-LOAD] attached '%s' (ifindex=%d, %s), port %u\n",
-           iface_name, out_att->ifindex, mode_label, kv_port);
-    return 0;
 }

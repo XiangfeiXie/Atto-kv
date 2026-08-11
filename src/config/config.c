@@ -23,6 +23,7 @@ static void config_default(void) {
 
     kvs_config.rdma_sync_enabled = 0;
     kvs_config.rdma_role         = ROLE_MASTER;
+    kvs_config.master_port       = 6379;  /* same default as port */
     kvs_config.rdma_listen_port  = 2101;
     kvs_config.rdma_master_port  = 2101;
 
@@ -191,6 +192,9 @@ int config_load(const char *path) {
         } else if (strcasecmp(key, "rdma_master_port") == 0) {
             parse_int(val, lineno, "rdma_master_port", 1, 65535, &kvs_config.rdma_master_port);
 
+        } else if (strcasecmp(key, "master_port") == 0) {
+            parse_int(val, lineno, "master_port", 1, 65535, &kvs_config.master_port);
+
         } else if (strcasecmp(key, "fullsync_timeout") == 0) {
             parse_int(val, lineno, "fullsync_timeout", 1000, 7200000, &kvs_config.fullsync_timeout);
 
@@ -243,15 +247,20 @@ void config_print(void) {
                "  Replication [DISABLED]\n");
     } else {
         printf("\n"
-               "  Replication [%s]\n"
-               "    RDMA fullsync (verbs/RoCE) : %s:%d\n",
-               role,
-               (kvs_config.rdma_role == ROLE_MASTER)
-                   ? kvs_config.rdma_listen_ip
-                   : kvs_config.rdma_master_ip,
-               (kvs_config.rdma_role == ROLE_MASTER)
-                   ? kvs_config.rdma_listen_port
-                   : kvs_config.rdma_master_port);
+               "  Replication [%s]\n",
+               role);
+        if (kvs_config.rdma_role == ROLE_MASTER) {
+            printf("    RDMA listen   : %s:%d\n",
+                   kvs_config.rdma_listen_ip,
+                   kvs_config.rdma_listen_port);
+        } else {
+            printf("    Master (FULLSYNC) : %s:%d\n"
+                   "    RDMA data    : %s:%d\n",
+                   kvs_config.rdma_master_ip,
+                   kvs_config.master_port,
+                   kvs_config.rdma_master_ip,
+                   kvs_config.rdma_master_port);
+        }
     }
 
     if (kvs_config.latency_histogram_enabled)

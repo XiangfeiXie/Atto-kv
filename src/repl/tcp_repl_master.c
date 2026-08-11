@@ -37,7 +37,7 @@ int tcp_master_fullsync_child(uint64_t base_seq, int ready_fd) {
     }
     if (listen(lfd, 1) < 0) { perror("listen"); close(lfd); return -1; }
     printf("[tcp-master] listening :%d\n", port);
-    if (ready_fd >= 0) { char r=1; (void)write(ready_fd, &r, 1); close(ready_fd); }
+    if (ready_fd >= 0) { char r=1; ssize_t _wr = write(ready_fd, &r, 1); (void)_wr; close(ready_fd); }
 
     /* 2. accept slave */
     int cfd = accept(lfd, NULL, NULL);

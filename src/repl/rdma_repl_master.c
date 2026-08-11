@@ -191,7 +191,7 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
     if (rdma_create_ep(&listen_id, res, NULL, &qa)) die("rdma_create_ep");
     rdma_freeaddrinfo(res);
     if (rdma_listen(listen_id, 1)) die("rdma_listen");
-    if (ready_fd >= 0) { char r = 1; (void)write(ready_fd, &r, 1); close(ready_fd); }
+    if (ready_fd >= 0) { char r = 1; ssize_t _wr = write(ready_fd, &r, 1); (void)_wr; close(ready_fd); }
 
     /* ── accept ── */
     struct rdma_cm_id *id;

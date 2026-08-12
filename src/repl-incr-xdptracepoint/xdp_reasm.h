@@ -50,6 +50,8 @@ struct xdp_reasm_stats {
     uint64_t dup_discarded;      /* duplicate bytes discarded */
     uint64_t send_dropped;       /* commands dropped (slave wb full) */
     uint64_t fragment_events;    /* IP fragment events */
+    uint64_t buf_resets;         /* circ_write failure → buffer reset */
+    uint64_t parse_errors;       /* resp_scan returned -1 (non-RESP) */
     uint32_t conns_active;       /* current connection count */
 };
 

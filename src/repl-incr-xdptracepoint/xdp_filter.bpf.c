@@ -39,6 +39,15 @@ struct {
     __uint(max_entries, XDP_RINGBUF_SZ);
 } repl_ringbuf SEC(".maps");
 
+/* Debug counters: ringbuf reservation failures.
+ * Uses XDP_CNT_* enum from xdp_common.h. */
+struct {
+    __uint(type,        BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, XDP_CNT_NUM);
+    __type(key,         __u32);
+    __type(value,       __u64);
+} repl_stats SEC(".maps");
+
 /* ── XDP program ─────────────────────────────────────────────────────── */
 
 SEC("xdp")
@@ -96,8 +105,13 @@ int xdp_repl_sniff(struct xdp_md *ctx)
 
     struct xdp_repl_event *e =
         bpf_ringbuf_reserve(&repl_ringbuf, sizeof(*e), 0);
-    if (!e)
+    if (!e) {
+        /* Ringbuf full — data silently dropped! */
+        __u32 cnt_key = XDP_CNT_RINGBUF_FULL;
+        __u64 *cnt = bpf_map_lookup_elem(&repl_stats, &cnt_key);
+        if (cnt) (*cnt)++;
         return XDP_PASS;
+    }
 
     e->saddr    = iph->saddr;
     e->daddr    = iph->daddr;
@@ -114,10 +128,23 @@ int xdp_repl_sniff(struct xdp_md *ctx)
     if (is_frag)   e->flags |= XDP_FLAG_FRAG;
 
     if (bpf_probe_read_kernel(e->data, (__u32)payload_len, payload) != 0) {
+        __u32 cnt_key2 = XDP_CNT_PROBE_FAIL;
+        __u64 *cnt2 = bpf_map_lookup_elem(&repl_stats, &cnt_key2);
+        if (cnt2) (*cnt2)++;
         bpf_ringbuf_discard(e, 0);
         return XDP_PASS;
     }
 
     bpf_ringbuf_submit(e, 0);
+    {
+        __u32 cnt_key3 = XDP_CNT_SUBMITTED;
+        __u64 *cnt3 = bpf_map_lookup_elem(&repl_stats, &cnt_key3);
+        if (cnt3) (*cnt3)++;
+    }
+    {
+        __u32 cnt_key4 = XDP_CNT_TOTAL;
+        __u64 *cnt4 = bpf_map_lookup_elem(&repl_stats, &cnt_key4);
+        if (cnt4) (*cnt4)++;
+    }
     return XDP_PASS;
 }

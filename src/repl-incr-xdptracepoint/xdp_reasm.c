@@ -24,7 +24,7 @@
  * OOO data-buffer pool (avoids malloc in the hot path)
  * ══════════════════════════════════════════════════════════════════════════
  *
- * Each pre-allocated buffer is XDP_MAX_PAYLOAD (4096) bytes.  The pool
+ * Each pre-allocated buffer is XDP_MAX_PAYLOAD bytes.  The pool
  * is a simple stack of pointers.  On ooo_insert we pop a buffer; on free
  * we push it back.  When the pool is exhausted we fall back to malloc.
  *
@@ -619,23 +619,27 @@ static void consume_ordered(xdp_conn_t *c,
 
     if (unlikely(circ_write(&c->buf, data, len) != 0)) {
         /* Buffer overflow — reset (likely garbage data) */
+        g_xdp.stats.buf_resets++;
         c->buf.rd = c->buf.wr = 0;
         circ_shrink(&c->buf);
         return;
     }
 
     /* Extract complete RESP commands.
-     * 4096-byte stack buffer handles >99% of commands; oversize
-     * commands fall back to a heap allocation. */
+     * Stack buffer handles typical commands; oversize
+     * commands (rare) fall back to a heap allocation. */
     uint8_t scratch[4096];
 
     for (;;) {
         int cmd_len = resp_scan(&c->buf);
         if (cmd_len <= 0) {
-            if (unlikely(cmd_len < 0 && circ_used(&c->buf) > CMD_BUF_CAP_MAX)) {
-                /* Stale/unparseable data, reset */
-                c->buf.rd = c->buf.wr = 0;
-                circ_shrink(&c->buf);
+            if (unlikely(cmd_len < 0)) {
+                g_xdp.stats.parse_errors++;
+                if (circ_used(&c->buf) > CMD_BUF_CAP_MAX) {
+                    /* Stale/unparseable data, reset */
+                    c->buf.rd = c->buf.wr = 0;
+                    circ_shrink(&c->buf);
+                }
             }
             break;
         }

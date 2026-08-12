@@ -318,14 +318,17 @@ int main(void) {
             uint64_t rate = (st.events_total - g_events_last)
                           / (uint64_t)(now - last_stats);
             printf("[MAIN] events=%lu (%.0f/s) written=%lu conns=%u "
-                   "ooo=%lu wb=%d send_drop=%lu\n",
+                   "ooo=%lu wb=%d send_drop=%lu "
+                   "buf_reset=%lu parse_err=%lu\n",
                    (unsigned long)st.events_total,
                    (double)rate,
                    (unsigned long)st.cmds_written,
                    (unsigned)st.conns_active,
                    (unsigned long)st.ooo_segments,
                    g_slave_wb.len,
-                   (unsigned long)st.send_dropped);
+                   (unsigned long)st.send_dropped,
+                   (unsigned long)st.buf_resets,
+                   (unsigned long)st.parse_errors);
             g_events_last = st.events_total;
             last_stats    = now;
         }
@@ -333,7 +336,27 @@ int main(void) {
 
     /* ── Shutdown ──────────────────────────────────────────────────── */
 
+    /* Print final stats for diagnostics */
+    {
+        struct xdp_reasm_stats st;
+        xdp_reasm_get_stats(&st);
+        printf("[MAIN] FINAL: events=%lu written=%lu conns=%u "
+               "ooo=%lu wb=%d send_drop=%lu "
+               "buf_reset=%lu parse_err=%lu\n",
+               (unsigned long)st.events_total,
+               (unsigned long)st.cmds_written,
+               (unsigned)st.conns_active,
+               (unsigned long)st.ooo_segments,
+               g_slave_wb.len,
+               (unsigned long)st.send_dropped,
+               (unsigned long)st.buf_resets,
+               (unsigned long)st.parse_errors);
+    }
+
     printf("[MAIN] shutting down...\n");
+
+    /* Print BPF-side stats (ringbuf drops etc.) */
+    xdp_print_bpf_stats(bpf_obj);
 
     /* Detach XDP first — stop producing new events */
     xdp_cleanup(&xdp_att, bpf_obj, ringbuf);

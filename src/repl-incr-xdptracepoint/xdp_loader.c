@@ -7,6 +7,7 @@
 
 #define _GNU_SOURCE
 #include "xdp_loader.h"
+#include "xdp_common.h"
 #include "config.h"
 
 #include <bpf/bpf.h>
@@ -196,4 +197,42 @@ int xdp_load_bpf(uint16_t kv_port, const char *iface_name,
     printf("[XDP-LOAD] attached '%s' (ifindex=%d, %s), port %u\n",
            iface_name, out_att->ifindex, mode_label, kv_port);
     return 0;
+}
+
+/* Read BPF-side statistics counters from the "repl_stats" percpu array.
+ * Must be called before bpf_object__close(). */
+void xdp_print_bpf_stats(struct bpf_object *obj) {
+    if (!obj) return;
+
+    struct bpf_map *map = bpf_object__find_map_by_name(obj, "repl_stats");
+    if (!map) return;
+
+    /* Read percpu array — aggregate across all CPUs */
+    uint64_t total = 0, submitted = 0, full = 0, probe_fail = 0;
+    int fd = bpf_map__fd(map);
+    int ncpus = libbpf_num_possible_cpus();
+    if (ncpus <= 0) ncpus = 1;
+
+    for (int i = 0; i < XDP_CNT_NUM; i++) {
+        uint64_t sum = 0;
+        uint32_t key = (uint32_t)i;
+        /* Read per-CPU values and sum them */
+        uint64_t vals[ncpus];
+        memset(vals, 0, sizeof(vals));
+        if (bpf_map_lookup_elem(fd, &key, vals) == 0) {
+            for (int cpu = 0; cpu < ncpus; cpu++)
+                sum += vals[cpu];
+        }
+        switch (i) {
+        case XDP_CNT_SUBMITTED:    submitted   = sum; break;
+        case XDP_CNT_RINGBUF_FULL: full        = sum; break;
+        case XDP_CNT_PROBE_FAIL:   probe_fail  = sum; break;
+        case XDP_CNT_TOTAL:        total       = sum; break;
+        }
+    }
+    printf("[XDP-BPF] total=%lu submitted=%lu ringbuf_full=%lu probe_fail=%lu\n",
+           (unsigned long)total,
+           (unsigned long)submitted,
+           (unsigned long)full,
+           (unsigned long)probe_fail);
 }

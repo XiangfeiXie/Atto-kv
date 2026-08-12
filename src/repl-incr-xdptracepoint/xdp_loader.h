@@ -43,6 +43,9 @@ int  xdp_load_bpf(uint16_t kv_port, const char *iface_name,
 /* Detach XDP program. Idempotent (safe to call multiple times). */
 void xdp_detach(xdp_attach_t *a);
 
+/* Read and print BPF-side statistics counters (ringbuf drops etc.) */
+void xdp_print_bpf_stats(struct bpf_object *obj);
+
 /* Convenience: detach XDP + free ringbuf + close bpf_object. */
 static inline void xdp_cleanup(xdp_attach_t *a,
                                struct bpf_object *obj,

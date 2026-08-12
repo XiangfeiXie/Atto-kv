@@ -15,22 +15,31 @@
 /* ── Constants ────────────────────────────────────────────────────────── */
 
 /* Max TCP payload per XDP event.
- * Standard MTU 1500 → max TCP payload ~1460 bytes.
- * With GRO in generic XDP mode: up to 64KB coalesced.
- * 4096 covers jumbo frames and moderate GRO coalescing. */
-#define XDP_MAX_PAYLOAD     4096
+ * Set to 65536 to handle GRO/TSO coalesced segments on both
+ * loopback (up to 64KB) and physical NICs with GRO enabled.
+ * Previously 4096 caused silent truncation of large segments. */
+#define XDP_MAX_PAYLOAD     65536
 
-/* Total event size: header (20) + payload (4096) = 4116 */
+/* Total event size: header (20) + payload (65536) = 65556 */
 #define XDP_EVENT_SIZE      (20 + XDP_MAX_PAYLOAD)
 
-/* Ringbuf size — 8 MB */
-#define XDP_RINGBUF_SZ      (8 * 1024 * 1024)
+/* Ringbuf size — 16 MB (doubled for 16× larger events) */
+#define XDP_RINGBUF_SZ      (16 * 1024 * 1024)
 
 /* Flags for xdp_repl_event.flags */
 #define XDP_FLAG_SYN        0x01
 #define XDP_FLAG_FIN        0x02
 #define XDP_FLAG_RST        0x04
 #define XDP_FLAG_FRAG       0x08    /* IPv4 fragment (MF=1 or offset>0) */
+
+/* BPF stats counter indices — shared between BPF program and userspace */
+enum {
+    XDP_CNT_SUBMITTED = 0,
+    XDP_CNT_RINGBUF_FULL,
+    XDP_CNT_PROBE_FAIL,
+    XDP_CNT_TOTAL,
+    XDP_CNT_NUM
+};
 
 /* ── Ringbuf event ────────────────────────────────────────────────────── */
 

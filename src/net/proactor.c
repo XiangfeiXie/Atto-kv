@@ -21,7 +21,9 @@
 
 #define ENTRIES_LENGTH   2048
 #define CQE_BATCH_SIZE   128
-#define SQPOLL_IDLE_MS   2000    /* SQPOLL kernel thread idle timeout (ms) */
+#define SQPOLL_IDLE_MS   500     /* SQPOLL kernel thread idle timeout (ms)
+                                   Lower = more responsive to new SQEs,
+                                   higher = less CPU burn when truly idle */
 
 #define EVENT_ACCEPT     0
 #define EVENT_READ       1
@@ -141,7 +143,20 @@ static int arm_recv(struct io_uring *ring, conn_t *c) {
     size_t tail = (size_t)(c->r_off + rb->len);
     size_t avail = (size_t)rb->cap - tail;
 
-    /* Grow buffer if needed (rare — 64KB initial) */
+    /* Try compaction before growing — reclaim consumed space at buf[0..r_off).
+     * Safe because arm_recv is called before drain (no inflight recv yet).
+     * Without this, arm-before-drain causes r_off to advance monotonically
+     * until avail < 4096 triggers realloc, doubling the buffer each time
+     * until KVS_NET_BUF_MAX is hit and arm_recv fails → QPS drops to 0. */
+    if (avail < 4096 && c->r_off > 0) {
+        if (rb->len > 0)
+            memmove(rb->buf, rb->buf + c->r_off, (size_t)rb->len);
+        tail    = (size_t)rb->len;
+        c->r_off = 0;
+        avail   = (size_t)rb->cap - tail;
+    }
+
+    /* Grow buffer only if compaction wasn't enough */
     if (avail < 4096) {
         size_t new_cap = rb->cap ? (size_t)rb->cap * 2 : KVS_NET_BUF_INIT;
         if (new_cap > KVS_NET_BUF_MAX) return -1;
@@ -297,9 +312,12 @@ static void handle_read(proactor_worker_t *w, struct io_uring_cqe *cqe,
 
     if (res > 0) {
         /* Data was placed directly into read_buf by io_uring_prep_recv.
-         * Reset r_off when the buffer was empty so data starts at 0. */
-        if (rb->len == 0)
-            c->r_off = 0;
+         * DO NOT reset r_off here: arm_recv placed new data at offset
+         * (c->r_off + rb->len), which may be > 0 if a previous drain
+         * consumed data but left r_off non-zero.  Resetting prematurely
+         * causes the parser to re-scan stale buffer contents at buf[0]
+         * while the new data sits unseen at a higher offset.
+         * r_off is reset after kvs_drain_resp_commands_off (below). */
         rb->len += res;
     }
 
@@ -317,9 +335,38 @@ static void handle_read(proactor_worker_t *w, struct io_uring_cqe *cqe,
         return;
     }
 
+    /* ── Pipeline IO and CPU: arm next recv BEFORE draining ─────────
+     * The SQE target is buf + r_off + rb->len (current tail).
+     * kvs_drain_resp_commands_off maintains the invariant
+     *   new_r_off + new_rb_len == old_r_off + old_rb_len == tail_ptr
+     * so the kernel writes data contiguously after the unprocessed
+     * remainder.  With SQPOLL actively polling, the kernel thread
+     * picks up the SQE within microseconds — while the main thread
+     * is still draining current commands below.  Compaction is
+     * suppressed in protocol.c when recv_armed is set.              */
+    arm_recv(ring, c);
+
     kvs_drain_resp_commands_off(rb, &c->r_off, wb, c);
 
+    /* Reset r_off when the buffer is fully consumed so that the next
+     * arm_recv targets buf[0], matching where the parser will start.
+     * Must be AFTER the drain — resetting before it (as was done
+     * previously when res > 0 and rb->len == 0) would cause the
+     * parser to re-scan stale data while new data sits at the old
+     * r_off offset.  Matches reactor.c:209 pattern.
+     *
+     * With arm-before-drain, a recv may be in flight (c->recv_armed==1)
+     * targeting the current tail.  Resetting r_off to 0 while the
+     * kernel is writing to buf[old_tail] desynchronizes the parser:
+     * the next rb->len += res appends to a reset parser position,
+     * causing it to read stale data at buf[0..old_tail) while the
+     * real new data sits unseen at the old tail offset. */
+    if (rb->len == 0 && !c->recv_armed)
+        c->r_off = 0;
+
     if (c->status) {
+        /* Recv already armed above; stale-CQE gen check will ignore
+         * any late-arriving CQE after conn_release. */
         if (wb->len > 0) {
             if (flush_write_buf(ring, c) == 0)
                 conn_release(fd);
@@ -328,21 +375,18 @@ static void handle_read(proactor_worker_t *w, struct io_uring_cqe *cqe,
             conn_release(fd);
         }
     } else if (wb->len > 0) {
-        /* Inline flush: try non-blocking send() first.  On success
-         * we skip the SQE→submit→CQE→handle_write round-trip and
-         * re-arm recv immediately — equivalent to reactor's inline
-         * flush at reactor.c:448-452. */
+        /* Inline flush: try non-blocking send() first.  recv is
+         * already armed, so the kernel may complete the next recv
+         * while we flush — no need to re-arm after send. */
         int ret = flush_write_buf(ring, c);
         if (ret == 0) {
-            /* Fully sent inline — keep the pipeline moving */
-            if (arm_recv(ring, c) != 0) conn_release(fd);
+            /* Fully sent inline — recv already armed, nothing to do */
         } else if (ret < 0) {
             conn_release(fd);
         }
-        /* ret > 0: async send armed, recv re-armed in handle_write */
-    } else {
-        if (arm_recv(ring, c) != 0) conn_release(fd);
+        /* ret > 0: async send armed, recv already armed above */
     }
+    /* else: wb empty, recv already armed above */
 }
 
 static void handle_write(proactor_worker_t *w, int fd,
@@ -440,11 +484,26 @@ static void proactor_loop(proactor_worker_t *w) {
         int nready = io_uring_peek_batch_cqe(ring, cqes, CQE_BATCH_SIZE);
 
         if (nready == 0) {
-            /* Idle: wake SQPOLL for any queued SQEs, then micro-sleep */
+            /* Idle: wake SQPOLL so it sees any queued SQEs.
+             *
+             * With arm-before-drain, the kernel recv is already in
+             * flight while we were draining.  CQEs often arrive within
+             * a few microseconds — spin briefly before committing to
+             * sleep.  If the SQPOLL thread hasn't finished yet, sleep
+             * for 10 us (vs the old 100 us) and try again. */
             io_uring_submit(ring);
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000L };
-            nanosleep(&ts, NULL);
-            continue;
+            for (int spin = 0; spin < 80; spin++) {
+                nready = io_uring_peek_batch_cqe(ring, cqes,
+                                                  CQE_BATCH_SIZE);
+                if (nready > 0) break;
+            }
+            if (nready == 0) {
+                struct timespec ts = { .tv_sec = 0,
+                                       .tv_nsec = 10000L };
+                nanosleep(&ts, NULL);
+                continue;
+            }
+            /* CQEs arrived during spin — fall through to process */
         }
 
         /* Process all completed CQEs in one batch */

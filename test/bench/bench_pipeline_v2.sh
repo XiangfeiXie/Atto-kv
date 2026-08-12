@@ -27,28 +27,45 @@ readonly BLD='\033[1m'     NC='\033[0m'
 # ── 默认参数 ────────────────────────────────────────────────────────────
 CONF="kvstore-none.conf"
 PROACTOR=0
+REALISTIC=0            # 0=理想模式(顺序key) 1=真实模式(随机key, -r)
 BENCH_N=1000000        # 压测请求数
 BENCH_C=50             # 并发连接
-WARMUP_MULT=2          # 预热倍数: warmup = BENCH_N * WARMUP_MULT（确保 GET 命中率）
+WARMUP_MULT=3          # 预热倍数: warmup = BENCH_N * WARMUP_MULT
+                       # 理想模式: 顺序写 0..WARMUP_N-1，GET 100% 命中
+                       # 真实模式: 随机写 [-r BENCH_N] WARMUP_N 次 → ~95% 命中
 DATA_SIZE=16           # value 字节
-SERVER_CPU="0,2"
-CLIENT_CPU="4"
+SERVER_CPU="0,2"      # kvstore 服务器 CPU (proactor 时主线程+SQPOLL共享)
+REDIS_CPU="6"          # Redis 服务器 CPU (单线程，独立核避免干扰 kvstore)
+CLIENT_CPU="4,5"       # 至少 2 个核：1 个跑 redis-benchmark + 1 个处理网络 IRQ/softirq
 TIMEOUT=180            # 单次压测超时秒
+#
+# 两种测试模式:
+#   默认(ideal):  不加 -r，顺序 key，GET 100% 命中，客户端无随机开销
+#                 适合观察 pipeline 深度→QPS 的缩放曲线（服务端瓶颈）
+#   --realistic:  加 -r，随机 key，GET ~63% 命中率（生日悖论），客户端有 RNG 开销
+#                 适合评估真实负载下的性能（客户端容易先成为瓶颈）
 
 PIPELINES=(1 4 8 16 20 40 80 160)
 
 # ── 参数解析 ────────────────────────────────────────────────────────────
+# Collect non-flag arguments as pipeline values (flags can appear anywhere)
+USER_PIPELINES=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --small)    BENCH_N=100000; BENCH_C=30; WARMUP_MULT=1;
-                    PIPELINES=(1 4 8 20 80); shift ;;
+                    USER_PIPELINES=(1 4 8 20 80); shift ;;
         --proactor) PROACTOR=1; shift ;;
+        --realistic) REALISTIC=1; shift ;;
         --n)        BENCH_N="$2"; shift 2 ;;
         --c)        BENCH_C="$2"; shift 2 ;;
         --d)        DATA_SIZE="$2"; shift 2 ;;
-        *)          PIPELINES=("$@"); break ;;
+        -*)         echo "Unknown option: $1" >&2; exit 1 ;;
+        *)          USER_PIPELINES+=("$1"); shift ;;
     esac
 done
+if [ ${#USER_PIPELINES[@]} -gt 0 ]; then
+    PIPELINES=("${USER_PIPELINES[@]}")
+fi
 
 WARMUP_N=$((BENCH_N * WARMUP_MULT))
 
@@ -119,14 +136,22 @@ _preflight() {
 
 # ═══════════════════════════════════════════════════════════════════════════
 
-_stop_all() {
+_stop_kvs() {
     pkill -x kvstore 2>/dev/null || true
     for ((i = 0; i < 40; i++)); do
         ss -tlnp 2>/dev/null | grep -q ":${KVS_PORT} " || break
         sleep 0.1
     done
+}
+
+_stop_redis() {
     pkill -x redis-server 2>/dev/null || true
     sleep 0.5
+}
+
+_stop_all() {
+    _stop_kvs
+    _stop_redis
 }
 
 _start_kvs() {
@@ -155,7 +180,7 @@ _start_redis() {
 
     local rpid
     rpid=$(pgrep -x redis-server | head -1)
-    [ -n "$rpid" ] && taskset -pc "$SERVER_CPU" "$rpid" >/dev/null 2>&1 || true
+    [ -n "$rpid" ] && taskset -pc "$REDIS_CPU" "$rpid" >/dev/null 2>&1 || true
 
     redis-cli -p $REDIS_PORT CONFIG SET save ""          >/dev/null 2>&1
     redis-cli -p $REDIS_PORT CONFIG SET appendonly no     >/dev/null 2>&1
@@ -178,11 +203,13 @@ _run_bench() {
         #   "test","rps","avg_latency_ms",...
         #   "SET","12345.67",...
         # tail -1 取数据行 (跳过 header)
+        local r_flag=""
+        [ "$REALISTIC" -eq 1 ] && r_flag="-r $BENCH_N"
         line=$(timeout "$TIMEOUT" \
             taskset -c "$CLIENT_CPU" \
             redis-benchmark -h "$host" -p "$port" -t "$test" \
                 -n "$BENCH_N" -c "$BENCH_C" -P "$P" -d "$DATA_SIZE" \
-                -r "$BENCH_N" --csv 2>/dev/null \
+                $r_flag --csv 2>/dev/null \
             | tail -1)
 
         if [ -n "$line" ]; then
@@ -208,12 +235,14 @@ declare -A K_SET R_SET K_GET R_GET
 _print_header() {
     local netmode="reactor"
     [ "$PROACTOR" -eq 1 ] && netmode="proactor"
+    local keymode="ideal"
+    [ "$REALISTIC" -eq 1 ] && keymode="realistic(-r$BENCH_N)"
     cat > "$RESULT_FILE" <<-HEADER
 # Pipeline 性能对比 — kvstore vs Redis
 # 时间: $(date '+%Y-%m-%d %H:%M:%S')
-# 网络模型: $netmode
+# 网络模型: $netmode  键模式: $keymode
 # 参数: n=$BENCH_N  c=$BENCH_C  d=$DATA_SIZE  warmup=$WARMUP_N
-# CPU:  server=$SERVER_CPU  client=$CLIENT_CPU
+# CPU:  kvstore=$SERVER_CPU  redis=$REDIS_CPU  client=$CLIENT_CPU
 # Pipeline: ${PIPELINES[*]}
 
 HEADER
@@ -282,61 +311,98 @@ main() {
     _preflight
     _stop_all
 
+    local netmode="reactor"
+    [ "$PROACTOR" -eq 1 ] && netmode="proactor"
+    local keymode="ideal"
+    [ "$REALISTIC" -eq 1 ] && keymode="realistic(-r$BENCH_N)"
+
     info "Pipeline 压测 — n=$BENCH_N c=$BENCH_C d=$DATA_SIZE"
+    info "网络模型: $netmode  键模式: $keymode"
     info "Pipeline 深度: ${PIPELINES[*]}"
-    info "网络模型: $( [ "$PROACTOR" -eq 1 ] && echo proactor || echo reactor)"
+    info "CPU: kvstore=$SERVER_CPU  redis=$REDIS_CPU  client=$CLIENT_CPU"
     info "预热: $WARMUP_N keys (${WARMUP_MULT}x benchn)"
     _print_header
+
+    local wflag="" wdesc="顺序key 100%命中"
+    [ "$REALISTIC" -eq 1 ] && { wflag="-r $BENCH_N"; wdesc="随机key ~63%命中"; }
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 1: kvstore — 所有 pipeline 深度
+    # ═══════════════════════════════════════════════════════════════════
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║  Phase 1: kvstore ($netmode) — CPU $SERVER_CPU          ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
 
     for P in "${PIPELINES[@]}"; do
         echo ""
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        step "Pipeline=$P  (n=$BENCH_N c=$BENCH_C)"
+        step "kvstore Pipeline=$P  (n=$BENCH_N c=$BENCH_C)"
 
-        _stop_all
+        _stop_kvs
         _start_kvs
-        _start_redis
 
         # ── SET ───────────────────────────────────
         printf "  %-20s" "SET → kvstore ..."
-        K_SET[$P]=$(_run_bench 127.0.0.1 "$KVS_PORT"  set "$P")
+        K_SET[$P]=$(_run_bench 127.0.0.1 "$KVS_PORT" set "$P")
         echo -e "${GRN}$(printf '%12s' "${K_SET[$P]}") req/s${NC}"
 
+        # ── 预热 ──────────────────────────────────
+        printf "  %-20s" "预热 ($wdesc) ..."
+        taskset -c "$CLIENT_CPU" redis-benchmark -h 127.0.0.1 -p "$KVS_PORT" \
+            -t set -n "$WARMUP_N" -c 50 -P 100 -d "$DATA_SIZE" \
+            $wflag -q >/dev/null 2>&1
+        echo "done  ($WARMUP_N 次写入)"
+
+        # ── GET ───────────────────────────────────
+        printf "  %-20s" "GET → kvstore ..."
+        K_GET[$P]=$(_run_bench 127.0.0.1 "$KVS_PORT" get "$P")
+        echo -e "${GRN}$(printf '%12s' "${K_GET[$P]}") req/s${NC}"
+
+        _append_raw "P=$P  SET  kvstore=${K_SET[$P]}"
+        _append_raw "P=$P  GET  kvstore=${K_GET[$P]}"
+    done
+    _stop_kvs
+    info "kvstore 测试完成"
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Phase 2: Redis — 所有 pipeline 深度
+    # ═══════════════════════════════════════════════════════════════════
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║  Phase 2: Redis — CPU $REDIS_CPU                         ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+
+    for P in "${PIPELINES[@]}"; do
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        step "Redis  Pipeline=$P  (n=$BENCH_N c=$BENCH_C)"
+
+        _stop_redis
+        _start_redis
+
+        # ── SET ───────────────────────────────────
         printf "  %-20s" "SET → Redis ..."
         R_SET[$P]=$(_run_bench 127.0.0.1 "$REDIS_PORT" set "$P")
         echo -e "${GRN}$(printf '%12s' "${R_SET[$P]}") req/s${NC}"
 
-        local rs; rs=$(_ratio "${K_SET[$P]}" "${R_SET[$P]}")
-        echo -e "  ${YLW}SET 倍率: $rs${NC}"
-
-        # ── 预热 (kvstore + redis 并行) ────────
-        printf "  %-20s" "预热 keys ..."
-        taskset -c "$CLIENT_CPU" redis-benchmark -h 127.0.0.1 -p "$KVS_PORT" \
-            -t set -n "$WARMUP_N" -c 50 -P 100 -d "$DATA_SIZE" \
-            -r "$WARMUP_N" -q >/dev/null 2>&1 &
-        local wp1=$!
+        # ── 预热 ──────────────────────────────────
+        printf "  %-20s" "预热 ($wdesc) ..."
         taskset -c "$CLIENT_CPU" redis-benchmark -h 127.0.0.1 -p "$REDIS_PORT" \
             -t set -n "$WARMUP_N" -c 50 -P 100 -d "$DATA_SIZE" \
-            -r "$WARMUP_N" -q >/dev/null 2>&1 &
-        local wp2=$!
-        wait $wp1 $wp2 2>/dev/null || true
-        echo "done  ($WARMUP_N keys)"
+            $wflag -q >/dev/null 2>&1
+        echo "done  ($WARMUP_N 次写入)"
 
         # ── GET ───────────────────────────────────
-        printf "  %-20s" "GET → kvstore ..."
-        K_GET[$P]=$(_run_bench 127.0.0.1 "$KVS_PORT"  get "$P")
-        echo -e "${GRN}$(printf '%12s' "${K_GET[$P]}") req/s${NC}"
-
         printf "  %-20s" "GET → Redis ..."
         R_GET[$P]=$(_run_bench 127.0.0.1 "$REDIS_PORT" get "$P")
         echo -e "${GRN}$(printf '%12s' "${R_GET[$P]}") req/s${NC}"
 
-        local rg; rg=$(_ratio "${K_GET[$P]}" "${R_GET[$P]}")
-        echo -e "  ${YLW}GET 倍率: $rg${NC}"
-
-        _append_raw "P=$P  SET  kvstore=${K_SET[$P]}  redis=${R_SET[$P]}  ratio=$rs"
-        _append_raw "P=$P  GET  kvstore=${K_GET[$P]}  redis=${R_GET[$P]}  ratio=$rg"
+        _append_raw "P=$P  SET  redis=${R_SET[$P]}"
+        _append_raw "P=$P  GET  redis=${R_GET[$P]}"
     done
+    _stop_redis
+    info "Redis  测试完成"
 
     _print_table
 }

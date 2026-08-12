@@ -90,7 +90,7 @@ int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn 
             const char *p = rb->buf + off;
             const char *end = p + remaining;
             const char *ln = memchr(p, '\n', (size_t)(end - p));
-            if (!ln || p == ln) break;  /* no complete line yet */
+            if (!ln || p == ln) { cmd_len = 0; break; }  /* incomplete line */
 
             /* Tokenise by spaces.  Replace \r\n with \0\0 for strtok_r. */
             char line[256];
@@ -111,9 +111,14 @@ int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn 
                 tok = strtok_r(NULL, " ", &saveptr);
             }
             if (argc == 0) {
-                dynbuf_cat(wb, RESP_ERR_INV, RESP_ERR_INV_LEN);
-                if (c) c->status = 1;
-                ncmd = -1; break;
+                /* Empty line (e.g. leading \r\n from redis-cli --pipe
+                 * synchronization marker).  Consume silently and
+                 * advance off/remaining directly — continue would
+                 * restart the loop without updating either. */
+                int consumed = (int)(ln + 1 - p);
+                off       += consumed;
+                remaining -= consumed;
+                continue;
             }
 
             cmd_len = (int)(ln + 1 - p); /* bytes consumed including \n */
@@ -135,8 +140,12 @@ int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn 
         if (r == DISPATCH_CLOSE) { if (c) c->status = 1; break; }
     }
 
-    /* Compact if r_off exceeds half capacity (rare with 64KB+ buffers) */
-    if (off > rb->cap / KVS_RB_COMPACT_RATIO && remaining > 0 && remaining < off) {
+    /* Compact if r_off exceeds half capacity (rare with 64KB+ buffers).
+     * Skip compaction when a recv is in flight (proactor arm-before-drain):
+     * the in-flight SQE targets the old physical address and compaction
+     * would move the data out from under it, causing buffer corruption. */
+    if (off > rb->cap / KVS_RB_COMPACT_RATIO && remaining > 0 && remaining < off
+        && !(c && c->recv_armed)) {
         memmove(rb->buf, rb->buf + off, (size_t)remaining);
         off = 0;
     }

@@ -17,6 +17,7 @@
 #include "rdma_repl.h"
 #include "wal_persist.h"
 #include "persistence.h"
+#include "repl_incr.h"
 
 /* ── Global state ───────────────────────────────────────────────────── */
 
@@ -259,6 +260,20 @@ int main(int argc, char *argv[]) {
             rdma_repl_slave_start();
     } else {
         printf("[RDMA-REPL] rdma replication disabled by config\n");
+    }
+
+    /* ── Incremental replication ── */
+    if (kvs_config.incr_sync_enabled) {
+        if (kvs_config.rdma_role == ROLE_MASTER) {
+            repl_backlog_init();
+            repl_incr_master_start(kvs_config.incr_repl_port);
+        } else if (kvs_config.rdma_role == ROLE_SLAVE) {
+            int r = repl_incr_slave_start(kvs_config.rdma_master_ip,
+                                           kvs_config.incr_repl_port);
+            if (r < 0 && r != -2) {
+                fprintf(stderr, "[INCR-REPL] slave init failed\n");
+            }
+        }
     }
 
     if (kvs_config.network_model == NET_REACTOR)

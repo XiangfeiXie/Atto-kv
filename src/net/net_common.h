@@ -10,6 +10,15 @@ typedef struct client {
     struct conn *conn;
 } client_t;
 
+/* ── Connection role — lets the network engine dispatch events to the
+ *   correct handler (client vs replication) without a hardcoded fd list. ── */
+typedef enum {
+    CONN_KIND_CLIENT = 0,     /* normal client connection */
+    CONN_KIND_REPL_LISTEN,    /* master's incremental-replication listen socket */
+    CONN_KIND_REPL_SLAVE,     /* master-side accepted slave link */
+    CONN_KIND_REPL_MASTER,    /* slave-side outbound link to master */
+} conn_kind_t;
+
 /* ── Per-connection state (shared by reactor and proactor) ── */
 typedef struct conn {
     int fd;
@@ -18,11 +27,13 @@ typedef struct conn {
     int r_off, w_off;
     int active;
     int status;             /* close-after-flush */
+    conn_kind_t kind;       /* dispatch role (see conn_kind_t) */
 
     /* ── Proactor ── */
     int recv_armed;
     int send_armed;
     uint32_t gen;           /* stale-CQE detection */
+    uint32_t repl_poll_mask;/* repl: currently-armed POLL_ADD mask (0 = none) */
 
     /* ── Reactor ── */
     uint32_t cur_events;    /* epoll cached mask */

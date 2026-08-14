@@ -31,6 +31,18 @@ static inline void kvs_write_journal_append(const char *msg, int length) {
     if (ENABLE_AOF) kvs_wal_persist_append_raw(msg, (uint32_t)length);
 }
 
+/* Incremental replication hook — called on every successful write command.
+ * Appends to repl_backlog and propagates to streaming slaves.
+ * Defined here so it can be called from the same sites as
+ * kvs_write_journal_append(). */
+#include "repl_incr.h"
+static inline void kvs_repl_incr_hook(const char *msg, int length) {
+    extern int g_in_reload;
+    if (!msg || length <= 0 || g_in_reload) return;
+    repl_backlog_append(msg, length);
+    repl_incr_propagate(msg, length);
+}
+
 /* ── from kvstore_expire.c ── */
 
 _Atomic uint64_t *kvs_expired_keys_ptr(void);

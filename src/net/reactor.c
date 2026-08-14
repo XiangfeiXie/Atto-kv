@@ -8,6 +8,8 @@
 #include <sys/epoll.h>
 #include <sys/time.h>
 #include <stdlib.h>
+#include "repl_incr.h"
+#include "config.h"
 #include <fcntl.h>
 
 #include "server.h"
@@ -105,6 +107,81 @@ static void conn_release(int fd) {
 
     /* Zero out the connection slot */
     memset(c, 0, sizeof(*c));
+}
+
+/* ── Replication fd integration ────────────────────────────────────────
+ *
+ * Replication fds are registered into the same epoll and dispatched by the
+ * same loop as client fds.  The conn slot carries the role (conn->kind) and
+ * the per-role callbacks; repl_incr keeps only its protocol state machine.
+ * These three functions are the engine side of repl_engine_* hooks. */
+
+static int reactor_register_repl(int fd, conn_kind_t kind) {
+    if (fd < 0 || fd >= conn_pool_size) {
+        fprintf(stderr, "[reactor] repl fd %d exceeds maxclients %d\n",
+                fd, conn_pool_size);
+        return -1;
+    }
+
+    struct conn *c = &conn_pool[fd];
+    c->fd     = fd;
+    c->active = 1;
+    c->kind   = kind;
+    c->status = 0;
+    c->client = NULL;
+    c->r_off  = c->w_off = 0;
+
+    if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1)
+        perror("[reactor] repl fcntl O_NONBLOCK");
+
+    switch (kind) {
+      case CONN_KIND_REPL_LISTEN:
+        c->r_action.accept_callback = repl_incr_master_accept;
+        c->send_callback            = NULL;
+        break;
+      case CONN_KIND_REPL_SLAVE:
+        c->r_action.recv_callback   = repl_incr_master_read;
+        c->send_callback            = repl_incr_master_write;
+        break;
+      case CONN_KIND_REPL_MASTER:
+        c->r_action.recv_callback   = repl_incr_slave_read;
+        c->send_callback            = NULL;
+        break;
+      default:
+        return -1;
+    }
+
+    c->cur_events = EPOLLIN;
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = fd;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        fprintf(stderr, "[reactor] repl epoll ADD fd=%d failed: %s\n",
+                fd, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static void reactor_repl_writable(int fd, int on) {
+    if (fd < 0 || fd >= conn_pool_size) return;
+    struct conn *c = &conn_pool[fd];
+    if (!c->active) return;
+
+    uint32_t want = EPOLLIN | (on ? EPOLLOUT : 0);
+    if (want == c->cur_events)
+        return;                      /* no change — skip syscall */
+    c->cur_events = want;
+
+    struct epoll_event ev;
+    ev.events = want;
+    ev.data.fd = fd;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+}
+
+static void reactor_repl_close(int fd) {
+    if (fd >= 0 && fd < conn_pool_size)
+        conn_release(fd);
 }
 
 int accept_cb(int fd) {
@@ -388,6 +465,14 @@ int reactor_start(unsigned short port, msg_handler handler) {
 
     printf("[reactor] listening on port %d (epoll level-triggered mode)\n", port);
 
+    /* Attach incremental-replication fds into the same epoll loop. */
+    if (kvs_config.incr_sync_enabled) {
+        repl_engine_register = reactor_register_repl;
+        repl_engine_writable = reactor_repl_writable;
+        repl_engine_close    = reactor_repl_close;
+        repl_incr_attach();
+    }
+
     /* Main event loop */
     struct epoll_event events[1024];
 
@@ -409,8 +494,18 @@ int reactor_start(unsigned short port, msg_handler handler) {
 
             /* Handle errors */
             if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                if (connfd >= 0 && connfd < conn_pool_size && connfd != sockfd)
-                    conn_release(connfd);
+                if (connfd >= 0 && connfd < conn_pool_size && connfd != sockfd) {
+                    switch (conn_pool[connfd].kind) {
+                      case CONN_KIND_REPL_SLAVE:
+                        repl_incr_master_close(connfd);
+                        break;
+                      case CONN_KIND_REPL_MASTER:
+                        repl_incr_slave_close(connfd);
+                        break;
+                      default:
+                        conn_release(connfd);
+                    }
+                }
                 continue;
             }
 
@@ -421,8 +516,9 @@ int reactor_start(unsigned short port, msg_handler handler) {
             if (!c->active)
                 continue;
 
-            /* Handle accept on listen socket */
-            if (connfd == sockfd) {
+            /* Handle accept on the client listen socket or the repl listen
+             * socket — both are distinguished by conn->kind. */
+            if (connfd == sockfd || c->kind == CONN_KIND_REPL_LISTEN) {
                 c->r_action.accept_callback(connfd);
                 continue;
             }
@@ -433,6 +529,14 @@ int reactor_start(unsigned short port, msg_handler handler) {
                 /* Connection might be closed in recv_cb */
                 if (!conn_pool[connfd].active)
                     continue;
+            }
+
+            /* Write flush.  Repl slave conns carry their pending bytes in
+             * repl_slave_t.write_buf and flush through the repl write
+             * callback (idempotent — no-op when nothing is pending). */
+            if (c->kind == CONN_KIND_REPL_SLAVE) {
+                repl_incr_master_write(connfd);
+                continue;
             }
 
             /* Inline flush: send responses in the same epoll iteration

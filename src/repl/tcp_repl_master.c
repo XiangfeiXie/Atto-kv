@@ -20,8 +20,8 @@
 #include <fcntl.h>
 #include <sys/time.h>
 
-int tcp_master_fullsync_child(uint64_t base_seq, int ready_fd) {
-    (void)base_seq;
+int tcp_master_fullsync_child(uint64_t repl_offset, int ready_fd) {
+    (void)repl_offset;
     setlinebuf(stdout); setlinebuf(stderr);
     int port = kvs_config.rdma_listen_port + 1;
 

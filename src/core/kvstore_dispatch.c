@@ -89,6 +89,7 @@ static inline int u2a(char *dst, uint32_t v) {
         wb_write((wb), RESP_OK, RESP_OK_LEN); \
         if (!g_in_reload) { \
             kvs_write_journal_append((msg_raw), (msg_len)); \
+            kvs_repl_incr_hook((msg_raw), (msg_len)); \
         } \
     } else { \
         string_cmd((tokens)[0], (entry), (hash), (tokens) + 1, (argc) - 1, \
@@ -223,8 +224,10 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         dict_iter_free(iter);
         dict_clear(&g_dict);
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-        if (!g_in_reload)
+        if (!g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
+            kvs_repl_incr_hook(msg_raw, msg_len);
+        }
         return DISPATCH_OK;
     }
 
@@ -281,8 +284,10 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                                   0, 0, kh, ke);
         }
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-        if (!g_in_reload)
+        if (!g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
+            kvs_repl_incr_hook(msg_raw, msg_len);
+        }
         return DISPATCH_OK;
     }
 
@@ -303,8 +308,10 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                 ndel++;
         }
         reply_integer(wb, ndel);
-        if (ndel > 0 && !g_in_reload)
+        if (ndel > 0 && !g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
+            kvs_repl_incr_hook(msg_raw, msg_len);
+        }
         return DISPATCH_OK;
     }
 
@@ -398,7 +405,10 @@ single_key:
         if (!entry) { reply_integer(wb, 0); return DISPATCH_OK; }
         entry->expire = get_time_now() + secs * 1000;
         reply_integer(wb, 1);
-        if (!g_in_reload) kvs_write_journal_append(msg_raw, msg_len);
+        if (!g_in_reload) {
+            kvs_write_journal_append(msg_raw, msg_len);
+            kvs_repl_incr_hook(msg_raw, msg_len);
+        }
         return DISPATCH_OK;
     }
 
@@ -417,7 +427,10 @@ single_key:
         }
         entry->expire = 0;
         reply_integer(wb, 1);
-        if (!g_in_reload) kvs_write_journal_append(msg_raw, msg_len);
+        if (!g_in_reload) {
+            kvs_write_journal_append(msg_raw, msg_len);
+            kvs_repl_incr_hook(msg_raw, msg_len);
+        }
         return DISPATCH_OK;
     }
 
@@ -430,8 +443,10 @@ single_key:
         int rlen = wb->len - pre_len;
         int ok = (rlen > 0 && resp[0] != '-' &&
                   !(rlen >= 5 && memcmp(resp, "$-1\r\n", 5) == 0));
-        if (ok && !g_in_reload)
+        if (ok && !g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
+            kvs_repl_incr_hook(msg_raw, msg_len);
+        }
     }
 
     return DISPATCH_OK;

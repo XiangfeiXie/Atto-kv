@@ -7,6 +7,7 @@
 #include "rdma_repl.h"
 #include "tcp_repl.h"
 #include "kvstore.h"
+#include "repl_incr.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,9 +98,9 @@ int rdma_repl_master_trigger_sync(void) {
     if (pid == 0) {
         close(pipefd[0]);
         if (is_tcp())
-            _exit(tcp_master_fullsync_child(0, pipefd[1]));
+            _exit(tcp_master_fullsync_child(repl_backlog_offset(), pipefd[1]));
         else
-            master_fullsync_child(0, pipefd[1]);
+            master_fullsync_child(repl_backlog_offset(), pipefd[1]);
         _exit(0);
     }
     close(pipefd[1]);

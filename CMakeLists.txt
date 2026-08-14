@@ -101,6 +101,9 @@ set(REPL_SRCS
     src/repl/rdma_transport.c
     src/repl/tcp_repl_master.c
     src/repl/tcp_repl_slave.c
+    src/repl-incr/repl_incr.c
+    src/repl-incr/repl_incr_master.c
+    src/repl-incr/repl_incr_slave.c
 )
 
 set(KVSTORE_SRCS
@@ -128,6 +131,7 @@ target_include_directories(kvstore PRIVATE
     src/net
     src/persist
     src/repl
+    src/repl-incr
     ${NTYCO_DIR}/core
     ${URING_INCLUDE_DIRS}
     ${JEMALLOC_INCLUDE_DIRS}

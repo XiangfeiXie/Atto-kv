@@ -67,6 +67,10 @@ typedef struct {
      * in conf to eliminate all expire-related overhead — useful for
      * clean pipeline benchmarks where no keys carry a TTL. */
     int  expire_enabled;
+
+    /* --- Incremental replication --- */
+    int  incr_sync_enabled;      /* incr_sync on|off */
+    int  incr_repl_port;         /* dedicated port for incremental sync, default 2001 */
 } KvsConfig;
 
 extern KvsConfig kvs_config;

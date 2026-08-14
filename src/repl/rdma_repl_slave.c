@@ -14,6 +14,7 @@
 #include "kvstore.h"
 #include "kv_dict.h"
 #include "persistence.h"
+#include "repl_incr.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,8 @@ static int load_rdb_batch(const char *data, uint32_t data_len,
             fprintf(stderr, "[slave] bad magic 0x%x\n", ntohl(bh->magic));
             return -1;
         }
+        /* Store snapshot offset for incremental sync bridge */
+        g_repl_snapshot_offset = be64toh(bh->repl_offset);
         kvs_flush_all();   /* clears dict + frees old arena */
         data     += sizeof(*bh);
         data_len -= sizeof(*bh);

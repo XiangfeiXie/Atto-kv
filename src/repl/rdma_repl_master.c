@@ -168,7 +168,7 @@ static size_t send_rdb_batches(rdma_xport_t *xport, struct ibv_mr *buf_mr,
 
 /* ═════════════════════════════════════════════════════════════════════ */
 
-int master_fullsync_child(uint64_t base_seq, int ready_fd) {
+int master_fullsync_child(uint64_t repl_offset, int ready_fd) {
     setlinebuf(stdout); setlinebuf(stderr);
     const char *ip = kvs_config.rdma_listen_ip;
     if (!strcmp(ip, "0.0.0.0")) ip = NULL;
@@ -234,7 +234,7 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
         .magic   = htonl(FULLSYNC_MAGIC),
         .version = htons(FULLSYNC_VERSION),
         .flags   = 0,
-        .base_seq = htobe64(base_seq)
+        .repl_offset = htobe64(repl_offset)
     };
 
     /* ── 分批推送 ── */
@@ -248,12 +248,7 @@ int master_fullsync_child(uint64_t base_seq, int ready_fd) {
                                           &bh, &nr_batch,
                                           &prep_ns, &xfer_end_ns);
 
-    /*
-     * inazuma-kv 对齐: 分离 Data Prep (序列化) 与 Pure Network Transfer。
-     * prep_ms  = rdb_serialize_next() 累计时间
-     * xfer_ms  = 从第一个 WRITE 投递到最后一个 send CQE 的时间窗口
-     * total_ms = prep_ms + xfer_ms（近似：prep 和 write+flush 在同一循环里交替）
-     */
+
     uint64_t t1_ns = (uint64_t)t1.tv_sec * 1000000000ULL
                    + (uint64_t)t1.tv_nsec;
     uint64_t wall_ns = (xfer_end_ns > t1_ns) ? (xfer_end_ns - t1_ns) : 0;

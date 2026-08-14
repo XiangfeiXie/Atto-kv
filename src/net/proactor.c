@@ -8,11 +8,13 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <liburing.h>
 
 #include "server.h"
 #include "kvstore.h"
 #include "config.h"
+#include "repl_incr.h"
 #include "protocol.h"
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -28,6 +30,7 @@
 #define EVENT_ACCEPT     0
 #define EVENT_READ       1
 #define EVENT_WRITE      2
+#define EVENT_REPL_POLL  3
 
 typedef struct {
     int             listen_fd;
@@ -242,6 +245,133 @@ static int arm_accept(struct io_uring *ring, int listen_fd) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ *  Replication engine hooks (callback model)
+ *
+ *  The repl module's callbacks (nonblocking accept/recv/send) are
+ *  readiness-based, while proactor is completion-based.  IORING_OP_POLL_ADD
+ *  bridges the two: each repl fd arms a poll for exactly the readiness mask
+ *  it needs right now, and the resulting CQE dispatches back into the repl
+ *  module.  An idle streaming slave arms nothing (mask 0), so no busy loop.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static int repl_desired_mask(conn_t *c) {
+    switch (c->kind) {
+    case CONN_KIND_REPL_LISTEN: return POLLIN;                     /* accept */
+    case CONN_KIND_REPL_MASTER: return POLLIN;                     /* cmd stream */
+    case CONN_KIND_REPL_SLAVE:  return repl_incr_master_poll_mask(c->fd);
+    default:                    return 0;
+    }
+}
+
+static void repl_poll_update(conn_t *c) {
+    if (!c->active) return;
+
+    int desired = repl_desired_mask(c);
+
+    if (desired == 0) {
+        /* Nothing to wait on: drop the arm and invalidate any in-flight
+         * poll so its late CQE is treated as stale. */
+        if (c->repl_poll_mask != 0) {
+            c->repl_poll_mask = 0;
+            c->gen = next_conn_gen();
+        }
+        return;
+    }
+
+    if (c->repl_poll_mask == (uint32_t)desired)
+        return;  /* already armed for this exact mask */
+
+    /* Mask changed while a poll is in flight: bump gen so the old CQE is
+     * discarded, then arm the new mask. */
+    if (c->repl_poll_mask != 0)
+        c->gen = next_conn_gen();
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&g_worker.ring);
+    if (!sqe) return;
+    io_uring_prep_poll_add(sqe, c->fd, (unsigned)desired);
+    sqe->user_data = conn_info_pack(c->fd, EVENT_REPL_POLL, c->gen);
+    c->repl_poll_mask = (uint32_t)desired;
+}
+
+static int proactor_repl_register(int fd, conn_kind_t kind) {
+    if (fd < 0 || fd >= conn_pool_size) return -1;
+
+    conn_t *c = &conn_pool[fd];
+
+    /* Reset the slot, preserving pre-allocated buffers + client pointer. */
+    client_t *cli = c->client;
+    char *rb = c->read_buf.buf, *wb = c->write_buf.buf;
+    int   rc = c->read_buf.cap,  wc = c->write_buf.cap;
+    memset(c, 0, sizeof(*c));
+    c->client       = cli;
+    c->read_buf.buf = rb;  c->read_buf.cap = rc;
+    c->write_buf.buf = wb; c->write_buf.cap = wc;
+
+    c->fd     = fd;
+    c->active = 1;
+    c->kind   = kind;
+    c->gen    = next_conn_gen();
+
+    repl_poll_update(c);
+    return 0;
+}
+
+static void proactor_repl_writable(int fd, int on) {
+    (void)on;  /* repl_poll_update recomputes the mask from repl state */
+    if (fd < 0 || fd >= conn_pool_size) return;
+    conn_t *c = &conn_pool[fd];
+    repl_poll_update(c);
+}
+
+static void proactor_repl_close(int fd) {
+    if (fd < 0 || fd >= conn_pool_size) return;
+    conn_t *c = &conn_pool[fd];
+
+    if (c->client)
+        memset(c->client, 0, sizeof(client_t));
+
+    /* NOTE: unlike conn_release, do NOT decrement g_kvs_connected_clients —
+     * repl conns never went through handle_accept and so never incremented
+     * it. */
+
+    client_t *cli = c->client;
+    char *rb = c->read_buf.buf, *wb = c->write_buf.buf;
+    int   rc = c->read_buf.cap,  wc = c->write_buf.cap;
+
+    memset(c, 0, sizeof(*c));
+    c->client       = cli;
+    c->read_buf.buf = rb;  c->read_buf.cap = rc;
+    c->write_buf.buf = wb; c->write_buf.cap = wc;
+    close(fd);
+}
+
+static void handle_repl_poll(int fd, uint32_t gen, int res) {
+    if (fd < 0 || fd >= conn_pool_size) return;
+    conn_t *c = &conn_pool[fd];
+    if (!c->active) return;
+    if (gen != (c->gen & 0xFFFFFFu)) return;  /* stale CQE */
+
+    c->repl_poll_mask = 0;  /* poll consumed; re-armed below */
+
+    switch (c->kind) {
+    case CONN_KIND_REPL_LISTEN:
+        repl_incr_master_accept(fd);
+        break;
+    case CONN_KIND_REPL_SLAVE:
+        if (res & POLLIN)  repl_incr_master_read(fd);
+        if (res & POLLOUT) repl_incr_master_write(fd);
+        break;
+    case CONN_KIND_REPL_MASTER:
+        repl_incr_slave_read(fd);
+        break;
+    default:
+        break;
+    }
+
+    repl_poll_update(c);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  *  CQE handlers (always drain, no deferred processing)
  * ═══════════════════════════════════════════════════════════════════════ */
 
@@ -448,6 +578,9 @@ static void handle_cqe(proactor_worker_t *w, struct io_uring_cqe *cqe) {
     case EVENT_WRITE:
         handle_write(w, fd, gen, cqe->res);
         break;
+    case EVENT_REPL_POLL:
+        handle_repl_poll(fd, gen, cqe->res);
+        break;
     }
 }
 
@@ -610,6 +743,15 @@ int proactor_start(unsigned short port, msg_handler handler) {
         close(g_worker.listen_fd);
         conn_pool_destroy();
         return -1;
+    }
+
+    /* Wire replication hooks — unify repl fds into the io_uring loop.
+     * Must run after the ring is ready (repl_incr_attach arms POLL_ADD). */
+    if (kvs_config.incr_sync_enabled) {
+        repl_engine_register = proactor_repl_register;
+        repl_engine_writable = proactor_repl_writable;
+        repl_engine_close    = proactor_repl_close;
+        repl_incr_attach();
     }
 
     printf("[proactor] single-threaded SQPOLL on port %u (sq_cpu=%u)\n",

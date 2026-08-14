@@ -38,7 +38,7 @@ struct batch_hdr {
     uint32_t magic;
     uint16_t version;
     uint16_t flags;
-    uint64_t base_seq;
+    uint64_t repl_offset;
 } __attribute__((packed));
 
 struct ack_msg {
@@ -53,7 +53,7 @@ int  rdma_repl_master_trigger_sync(void);
 int  rdma_repl_slave_start(void);
 void session_add(pid_t pid);
 void session_kill_all(void);
-int  master_fullsync_child(uint64_t base_seq, int ready_fd);
+int  master_fullsync_child(uint64_t repl_offset, int ready_fd);
 int  rdma_repl_slave_fullsync(void);
 
 #endif

@@ -5,9 +5,9 @@
 # 方法论与 bench_incr_sync.sh 完全对齐，用来对照排除“脚本测量方法”本身的影响：
 #   1. 默认单 key（不加 -r）：把命令路径压到最便宜，让同步开销占比最大
 #      （redis-benchmark 不加 -r 时所有请求打到同一个字面量 key:__rand_int__）
-#   2. 每个测量点跑 REPS 次取中位数（默认 3）
+#   2. 每个测量点只测一轮（直接取该轮数据，反映单轮波动）
 #   3. 每个 P 内 baseline→with-repl 背靠背测，最小化时间漂移
-#   4. 测前预热（ramp CPU 频率 + 预填 key）
+#   4. 测前预热（预填 key / 暖缓存）
 #   5. 单核绑定（master/slave/client 各占一个核，避免迁移抖动）
 #   6. 额外记录 master 的 CPU 时间/请求（读 /proc/<pid>/stat，免 root、不依赖 perf）
 #
@@ -21,7 +21,7 @@
 #   ./test/bench/bench_incr_sync_redis.sh --realistic     # 随机 key 模式（-r）
 #
 # 可调环境变量:
-#   BENCH_N BENCH_C BENCH_D  WARMUP_MULT  REPS
+#   BENCH_N BENCH_C BENCH_D  WARMUP_MULT
 #   MASTER_CORE SLAVE_CORE CLIENT_CORE
 #
 # 前置条件:
@@ -68,7 +68,6 @@ BENCH_N=${BENCH_N:-1000000}
 BENCH_C=${BENCH_C:-50}
 BENCH_D=${BENCH_D:-16}
 WARMUP_MULT=${WARMUP_MULT:-2}
-REPS=${REPS:-3}
 WARMUP_N=$((BENCH_N * WARMUP_MULT))
 
 # Key mode: 默认单 key（不加 -r，压到最便宜的命令路径以暴露同步开销）；
@@ -216,23 +215,6 @@ run_bench_redis() {
     echo "0"
 }
 
-median() {
-    printf '%s\n' "$@" | sort -n | awk 'NF { a[++n]=$1 } END { if (n==0) print 0; else print a[int((n+1)/2)] }'
-}
-
-# ---- 重复 REPS 次取中位数 ----
-run_bench_reps() {
-    local host=$1 port=$2 test_type=$3 P=$4
-    local -a vals=()
-    local i v
-    for ((i=0; i<REPS; i++)); do
-        v=$(run_bench_redis "$host" "$port" "$test_type" "$P")
-        vals+=("$v")
-    done
-    echo -e "      ${test_type} reps=[${vals[*]}]" >&2
-    median "${vals[@]}"
-}
-
 warmup() {
     local host=$1 port=$2
     taskset -c "$CLIENT_CORE" redis-benchmark -h "$host" -p "$port" \
@@ -294,19 +276,19 @@ measure_scenario() {
     # 预热
     warmup 127.0.0.1 "$MASTER_PORT"
 
-    # SET（取中位数 + 测量 master CPU 时间）
+    # SET（单轮 + 测量 master CPU 时间）
     t0=$(cpu_ticks "$mpid")
-    set_qps=$(run_bench_reps 127.0.0.1 "$MASTER_PORT" set "$P")
+    set_qps=$(run_bench_redis 127.0.0.1 "$MASTER_PORT" set "$P")
     t1=$(cpu_ticks "$mpid")
-    set_cpu=$(cpu_ns_per_req $((t1 - t0)) $((REPS * BENCH_N)))
+    set_cpu=$(cpu_ns_per_req $((t1 - t0)) "$BENCH_N")
     record_result "P${P}-SET" "$scenario" "$set_qps"
     record_raw "  P${P}-SET ${scenario} cpu_ns/req=${set_cpu}"
 
-    # GET（取中位数 + 测量 master CPU 时间）
+    # GET（单轮 + 测量 master CPU 时间）
     t0=$(cpu_ticks "$mpid")
-    get_qps=$(run_bench_reps 127.0.0.1 "$MASTER_PORT" get "$P")
+    get_qps=$(run_bench_redis 127.0.0.1 "$MASTER_PORT" get "$P")
     t1=$(cpu_ticks "$mpid")
-    get_cpu=$(cpu_ns_per_req $((t1 - t0)) $((REPS * BENCH_N)))
+    get_cpu=$(cpu_ns_per_req $((t1 - t0)) "$BENCH_N")
     record_result "P${P}-GET" "$scenario" "$get_qps"
     record_raw "  P${P}-GET ${scenario} cpu_ns/req=${get_cpu}"
 
@@ -329,7 +311,7 @@ measure_scenario() {
 echo ""
 step "Redis 主从增量同步性能影响测试（方法对齐 bench_incr_sync.sh）"
 log "Pipeline: ${PIPELINES[*]}  |  n=${BENCH_N} c=${BENCH_C} d=${BENCH_D}"
-log "键模式: ${KEY_DESC}  |  每点 REPS=${REPS}（中位数）  |  预热=${WARMUP_N}"
+log "键模式: ${KEY_DESC}  |  单轮测量  |  预热=${WARMUP_N}"
 log "CPU: master=${MASTER_CORE} slave=${SLAVE_CORE} client=${CLIENT_CORE}"
 echo ""
 
@@ -340,7 +322,7 @@ full_cleanup
     echo "# Redis 主从增量同步性能影响测试 — $(date '+%Y-%m-%d %H:%M:%S')"
     echo "# 场景: baseline(master 单独) / with-repl(master+slave 异步复制)"
     echo "# Pipeline: ${PIPELINES[*]}  n=${BENCH_N} c=${BENCH_C} d=${BENCH_D}"
-    echo "# 键模式: ${KEY_DESC}  每点 REPS=${REPS}(中位数)  预热=${WARMUP_N}"
+    echo "# 键模式: ${KEY_DESC}  单轮测量  预热=${WARMUP_N}"
     echo "# CPU: master=${MASTER_CORE} slave=${SLAVE_CORE} client=${CLIENT_CORE}"
     echo "# Redis: $(redis-server --version 2>&1 | head -1)"
     echo ""

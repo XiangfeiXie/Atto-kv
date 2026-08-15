@@ -16,6 +16,7 @@
 #include "config.h"
 #include "repl_incr.h"
 #include "protocol.h"
+#include "engine_xdp.h"
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  Types & Constants
@@ -611,6 +612,11 @@ static void proactor_loop(proactor_worker_t *w) {
 
     while (!g_kvs_stop) {
         update_cached_time();
+
+        /* Drain any XDP-delivered write commands (slave replay).  The idle
+         * path below spins+naps at 10us granularity, so this is naturally
+         * low-latency without shortening any sleep. */
+        xdp_engine_poll();
 
         /* Peek completed CQEs — shared-memory, no syscall */
         struct io_uring_cqe *cqes[CQE_BATCH_SIZE];

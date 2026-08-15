@@ -36,9 +36,16 @@ static inline void kvs_write_journal_append(const char *msg, int length) {
  * Defined here so it can be called from the same sites as
  * kvs_write_journal_append(). */
 #include "repl_incr.h"
+#include "engine_xdp.h"
 static inline void kvs_repl_incr_hook(const char *msg, int length) {
     extern int g_in_reload;
     if (!msg || length <= 0 || g_in_reload) return;
+    /* Kernel-bypass path is independent of the TCP incr path — it can run
+     * with incr_sync off.  Only the master enqueues to the gateway; on the
+     * slave the same queue is the *receive* path (drained by xdp_engine_poll),
+     * so re-enqueueing a direct write there would double-execute it. */
+    if (kvs_config.xdp_sync_enabled && kvs_config.rdma_role == ROLE_MASTER)
+        xdp_engine_enqueue(msg, length);
     /* The backlog/propagation only exist to serve incremental sync.  When
      * incr_sync is off there is no replication listener and no slave can
      * connect, so maintaining the backlog is pure waste on the write hot

@@ -611,15 +611,57 @@ rdma     (3.97s): |██ 0.57s 网络 | 0.07s prep |█████████
 
 ## 6. 增量同步性能影响
 
-**测试时间:** 2026-05-27 | **脚本:** `bench_incremental_impact.sh`
-**参数:** 500K requests, 50 clients, 1KB value, 本地 loopback
+**测试时间:** 2026-08-15 | **脚本:** `bench_xdpkcp.sh` | **数据:** `test/bench/results_xdpkcp{,_1,_2}.txt`（三轮，取中位数）
+**参数:** 1M requests, 50 clients, 16B value, single-key（不加 -r）, proactor, expire=off, persistence=none
+**环境:** Ubuntu 24.04, Kernel 6.8.0-137, VMware 虚拟机, veth 对（vxdp0↔vxdp1）供两网关二层互联
 
-| 场景 | QPS | 平均延迟 | P50 | P95 | P99 | 影响 |
-|------|-----|----------|-----|-----|-----|------|
-| baseline (无 slave) | 17,910 | 1.786ms | 1.735ms | 2.831ms | 3.871ms | - |
-| with slave (增量同步) | 17,095 | 1.626ms | 1.535ms | 2.799ms | 3.791ms | **-4.00%** |
+> **三种场景对比同一台 master 的 SET/GET 吞吐（相对 baseline 的百分比即同步开销）：**
+> - **baseline** — master 单独运行（无任何同步）
+> - **epoll** — 内置 repl_incr（写命令在主线程 memcpy 到 backlog + slave 写缓冲，EPOLLOUT 冲刷）
+> - **xdpkcp** — AF_XDP+KCP 内核旁路（独立网关进程 + /dev/shm 无锁 SPSC，同步流量走 veth 网卡）
+>
+> **方法学（对齐 bench_incr_sync.sh）：** 单 key 把命令路径压到最便宜、放大同步开销占比；每测量点单轮；测前预热 200 万 + 单核绑定（master=0 / slave=2 / client=1 / 两网关=4,5）；xdpkcp 场景额外记录网关 drop 计数。
+>
+> ⚠️ **噪声：** 单轮测量 + 未锁 CPU 频率，噪声地板约 ±10%，>100% 读数均为抖动（同步不可能加速）。
 
-**结论:** 增量同步对写入 QPS 的影响约 4%，属于轻微影响（< 5%）。延迟无明显变化。eBPF + KCP 增量同步的 CPU 开销可接受。
+### 6a. SET 吞吐（写命令，含同步开销，三轮中位数）
+
+| P | baseline | epoll | epoll% | xdpkcp | xdpkcp% |
+|---|---------:|------:|-------:|-------:|--------:|
+| 1   | 19,733 | 19,599 | 99.3% | 20,554 | 104.2% |
+| 5   | 96,219 | 96,469 | 100.3% | 98,697 | 102.6% |
+| 10  | 194,628 | 192,012 | 98.7% | 179,662 | 92.3% |
+| 20  | 347,343 | 333,667 | 96.1% | 334,001 | 96.2% |
+| 40  | 582,072 | 531,350 | 91.3% | 545,256 | 93.7% |
+| 80  | 949,668 | 741,840 | 78.1% | 867,303 | 91.3% |
+| 160 | 1,129,944 | 746,269 | 66.0% | 1,057,083 | 93.6% |
+
+### 6b. GET 吞吐（读命令，不传播，应与 baseline 持平，三轮中位数）
+
+| P | baseline | epoll | epoll% | xdpkcp | xdpkcp% |
+|---|---------:|------:|-------:|-------:|--------:|
+| 1   | 19,536 | 20,365 | 104.2% | 21,459 | 109.8% |
+| 5   | 98,155 | 103,961 | 105.9% | 102,260 | 104.2% |
+| 10  | 196,696 | 203,957 | 103.7% | 188,608 | 95.9% |
+| 20  | 358,809 | 364,564 | 101.6% | 362,188 | 100.9% |
+| 40  | 605,327 | 613,497 | 101.3% | 654,022 | 108.0% |
+| 80  | 1,049,318 | 999,001 | 95.2% | 1,069,519 | 101.9% |
+| 160 | 1,358,696 | 1,385,042 | 101.9% | 1,501,502 | 110.5% |
+
+### 6c. 结论
+
+1. **GET 三场景持平，读路径零同步开销。** GET 均在 baseline 的 ±10% 内（95.2%~110.5%），无系统性差异；>100% 为单轮噪声。
+
+2. **epoll SET 随 pipeline 深度恶化，P160 掉到 66%。** P≤10 几乎无影响（98.7%~100.3%），P≥40 开始下滑，P160 仅 66.0%（-34%）。根因是写命令在主线程内串行 memcpy 到 backlog + 冲刷 slave，pipeline 越深串行化越成瓶颈——epoll SET 从 P80 的 74.2 万到 P160 的 74.6 万几乎零增长，而 baseline 同期从 95 万涨到 113 万。
+
+3. **xdpkcp SET 几乎无影响，全程 92.3%~104.2%。** 把同步从主线程卸到独立网关进程后，master 热路径只多一次无锁 SPSC 入队（memcpy ≤8KB + 两原子操作），不再承担传输/ACK 串行化，故高 P 依然稳定（P80 91.3%、P160 93.6%）。
+
+4. **xdpkcp 相对 epoll 的收益随 P 增大而扩大。** P160 SET：93.6% vs 66.0%（+27.6pp）；P80：91.3% vs 78.1%（+13.2pp）；低 P（≤20）两者相当。
+
+5. **KCP+AF_XDP 传输无丢包。** 三轮所有 P 的网关 drop 均为 0（master-drops=0 / slave-drops=0），瓶颈不在传输层而在 CPU/内存带宽。
+
+6. **方法说明。** 单轮 + 不锁频使噪声地板约 ±10%；第 2 轮 P80 出现 GET 掉 30~40% 的机器级噪声（疑似 busy-poll 网关内存带宽争用 + DVFS），三轮取中位数已抗掉该离群值。若需分辨 ~5% 量级的真实开销，建议锁频后复测。
+
 
 ---
 
@@ -734,7 +776,9 @@ sudo ./test/bench/bench_bgsave.sh
 sudo ./test/bench/bench_bgsave_redis.sh
 
 # 增量同步性能影响
-./test/bench/bench_incremental_impact.sh
+sudo ./test/bench/bench_xdpkcp.sh            # AF_XDP+KCP vs epoll（需 root 建 veth/挂 XDP）
+sudo ./test/bench/bench_incr_sync.sh         # epoll vs ebpf 增量同步
+./test/bench/bench_incr_sync_redis.sh        # Redis 主从对照
 
 # RDMA 全量同步
 sudo ./test/bench/bench_rdma_provider.sh --payload <bytes> --master-ip <ip>

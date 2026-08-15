@@ -18,6 +18,7 @@
 #include "wal_persist.h"
 #include "persistence.h"
 #include "repl_incr.h"
+#include "engine_xdp.h"
 
 /* ── Global state ───────────────────────────────────────────────────── */
 
@@ -276,6 +277,14 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* ── AF_XDP + KCP kernel-bypass incremental sync ── */
+    if (kvs_config.xdp_sync_enabled) {
+        if (kvs_config.rdma_role == ROLE_MASTER)
+            xdp_engine_master_init();
+        else if (kvs_config.rdma_role == ROLE_SLAVE)
+            xdp_engine_slave_init();
+    }
+
     if (kvs_config.network_model == NET_REACTOR)
         reactor_start(kvs_config.port, kvs_protocol_batch);
     else if (kvs_config.network_model == NET_PROACTOR)
@@ -283,6 +292,7 @@ int main(int argc, char *argv[]) {
     else if (kvs_config.network_model == NET_NTYCO)
         ntyco_start(kvs_config.port, kvs_protocol_batch);
 
+    xdp_engine_shutdown();
     kvs_wal_persist_stop();
     dest_kvengine();
     return 0;

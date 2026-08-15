@@ -16,6 +16,7 @@
 #include "kvstore.h"
 #include "protocol.h"
 #include "config.h"
+#include "engine_xdp.h"
 
 
 /* ── Global epoll fd — must be declared before conn_set_events ── */
@@ -480,8 +481,14 @@ int reactor_start(unsigned short port, msg_handler handler) {
         /* Update cached time for commands */
         update_cached_time();
 
-        /* 100ms timeout for responsive shutdown */
-        int nready = epoll_wait(epfd, events, 1024, 100);
+        /* Drain any XDP-delivered write commands (slave replay). */
+        xdp_engine_poll();
+
+        /* Shrink the idle timeout when the XDP slave path is live so
+         * gateway-delivered commands aren't delayed by the full 100ms idle
+         * poll (1ms ≈ 1 extra epoll_wait syscall per ms when idle). */
+        int timeout_ms = xdp_engine_slave_active() ? 1 : 100;
+        int nready = epoll_wait(epfd, events, 1024, timeout_ms);
         if (nready < 0) {
             if (errno == EINTR) continue;  /* Signal received — rely on g_kvs_stop to exit */
             fprintf(stderr, "[reactor] epoll_wait error: %s\n", strerror(errno));

@@ -42,6 +42,8 @@ static void config_default(void) {
 
     kvs_config.incr_sync_enabled = 0;
     kvs_config.incr_repl_port    = 2001;
+
+    kvs_config.xdp_sync_enabled  = 0;
 }
 
 /* Resolve sentinel values and emit sanity warnings.  Called once after
@@ -220,6 +222,11 @@ int config_load(const char *path) {
         } else if (strcasecmp(key, "incr_repl_port") == 0) {
             parse_int(val, lineno, "incr_repl_port", 1, 65535, &kvs_config.incr_repl_port);
 
+        /* ---- Kernel-bypass incremental sync ---- */
+        } else if (strcasecmp(key, "xdp_sync") == 0) {
+            int v = parse_bool(val, lineno, "xdp_sync");
+            if (v >= 0) kvs_config.xdp_sync_enabled = v;
+
         } else {
             printf("[CONFIG] line %d: unknown key '%s'\n", lineno, key);
         }
@@ -282,6 +289,8 @@ void config_print(void) {
         printf("  Incr Repl     : on (port %d)\n", kvs_config.incr_repl_port);
     else
         printf("  Incr Repl     : off\n");
+    printf("  XDP Sync      : %s\n",
+           kvs_config.xdp_sync_enabled ? "on (AF_XDP + KCP gateway)" : "off");
     printf("  Workers       : 1 (single-thread proactor)\n");
     printf("  CPU pin       : off (single-threaded mode)\n");
     printf("========================================\n\n");

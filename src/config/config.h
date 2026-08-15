@@ -71,6 +71,9 @@ typedef struct {
     /* --- Incremental replication --- */
     int  incr_sync_enabled;      /* incr_sync on|off */
     int  incr_repl_port;         /* dedicated port for incremental sync, default 2001 */
+
+    /* --- Kernel-bypass incremental sync (AF_XDP + KCP gateway) --- */
+    int  xdp_sync_enabled;       /* xdp_sync on|off — write cmds → SHM → gateway */
 } KvsConfig;
 
 extern KvsConfig kvs_config;

@@ -11,9 +11,9 @@
 #   - 默认单 key（不加 -r）：把命令路径压到最便宜，让同步开销占比最大
 #     （redis-benchmark 不加 -r 时所有请求打到同一个字面量 key:__rand_int__）
 #     （用 --realistic 切回随机 key，此时应关注绝对 QPS 下降而非百分比）
-#   - 每个测量点跑 REPS 次取中位数（默认 3）
+#   - 每个测量点只测一轮（直接取该轮数据，反映单轮波动）
 #   - 每个 P 内 baseline→epoll→ebpf 背靠背测，最小化时间漂移
-#   - 测前预热（ramp CPU 频率 + 预填 key）
+#   - 测前预热（预填 key / 暖缓存）
 #   - 单核绑定（master/slave/client/daemon 各占一个核，避免迁移抖动）
 #   - 同步完整性由功能校验脚本负责，本脚本只记录 ebpf 的 ringbuf_full/ooo/send_drop 计数
 #
@@ -23,7 +23,7 @@
 #   sudo ./test/bench/bench_incr_sync.sh --realistic     # 随机 key 模式（-r）
 #
 # 可调环境变量:
-#   BENCH_N BENCH_C BENCH_D  WARMUP_MULT  REPS  NET_MODEL
+#   BENCH_N BENCH_C BENCH_D  WARMUP_MULT  NET_MODEL
 #   MASTER_CORE SLAVE_CORE CLIENT_CORE SYNC_CORE
 #
 # 前置条件:
@@ -32,7 +32,6 @@
 #   - redis-cli, redis-benchmark, bc, bpftool 可用
 #   - root 权限（XDP attach）
 #   - config.h 中 XDP_IFACE=lo、SLAVE_IP=127.0.0.1（本机回环压测）
-#   - 建议先锁 CPU 频率: sudo cpupower frequency-set -g performance
 #
 # 输出:  test/bench/results_incr_sync.txt
 # =============================================================================
@@ -74,12 +73,11 @@ BENCH_N=${BENCH_N:-1000000}
 BENCH_C=${BENCH_C:-50}
 BENCH_D=${BENCH_D:-16}
 WARMUP_MULT=${WARMUP_MULT:-2}     # 预热请求数 = WARMUP_MULT × BENCH_N
-REPS=${REPS:-3}                   # 每个测量点重复次数（取中位数）
 WARMUP_N=$((BENCH_N * WARMUP_MULT))
 
 # 所有场景统一使用 reactor(epoll) 引擎，保证“传统 epoll 同步”与“eBPF 同步”
 # 的 master 运行在相同网络模型下，唯一变量是同步机制。
-NET_MODEL=${NET_MODEL:-"proactor"}
+NET_MODEL=${NET_MODEL:-"reactor"}
 
 # Key mode: 默认单 key（不加 -r，压到最便宜的命令路径以暴露同步开销）；
 # --realistic 切随机 key（-r，真实插入负载，同步开销占比小）。
@@ -335,25 +333,7 @@ run_bench_incr() {
     echo "0"
 }
 
-# ---- 中位数 ----
-median() {
-    printf '%s\n' "$@" | sort -n | awk 'NF { a[++n]=$1 } END { if (n==0) print 0; else print a[int((n+1)/2)] }'
-}
-
-# ---- 重复 REPS 次取中位数 ----
-run_bench_reps() {
-    local host=$1 port=$2 test_type=$3 P=$4
-    local -a vals=()
-    local i v
-    for ((i=0; i<REPS; i++)); do
-        v=$(run_bench_incr "$host" "$port" "$test_type" "$P")
-        vals+=("$v")
-    done
-    echo -e "      ${test_type} reps=[${vals[*]}]" >&2
-    median "${vals[@]}"
-}
-
-# ---- 预热（ramp CPU 频率 + 预填 key）----
+# ---- 预热（预填 key / 暖缓存）----
 warmup() {
     local host=$1 port=$2
     taskset -c "$CLIENT_CORE" redis-benchmark -h "$host" -p "$port" \
@@ -448,12 +428,12 @@ measure_scenario() {
     # 预热
     warmup 127.0.0.1 "$MASTER_PORT"
 
-    # SET（取中位数）
-    set_qps=$(run_bench_reps 127.0.0.1 "$MASTER_PORT" set "$P")
+    # SET（单轮）
+    set_qps=$(run_bench_incr 127.0.0.1 "$MASTER_PORT" set "$P")
     record_result "P${P}-SET" "$scenario" "$set_qps"
 
-    # GET（取中位数）
-    get_qps=$(run_bench_reps 127.0.0.1 "$MASTER_PORT" get "$P")
+    # GET（单轮）
+    get_qps=$(run_bench_incr 127.0.0.1 "$MASTER_PORT" get "$P")
     record_result "P${P}-GET" "$scenario" "$get_qps"
 
     case "$scenario" in
@@ -474,7 +454,7 @@ measure_scenario() {
 echo ""
 step "增量同步性能影响对比（epoll 内置同步 vs eBPF 组件）"
 log "Pipeline: ${PIPELINES[*]}  |  n=${BENCH_N} c=${BENCH_C} d=${BENCH_D}  |  net=${NET_MODEL}"
-log "键模式: ${KEY_DESC}  |  每点 REPS=${REPS}（中位数）  |  预热=${WARMUP_N}"
+log "键模式: ${KEY_DESC}  |  单轮测量  |  预热=${WARMUP_N}"
 log "CPU: master=${MASTER_CORE} slave=${SLAVE_CORE} client=${CLIENT_CORE} sync=${SYNC_CORE}"
 echo ""
 
@@ -486,7 +466,7 @@ full_cleanup
     echo "# 增量同步性能影响对比 — $(date '+%Y-%m-%d %H:%M:%S')"
     echo "# 场景: baseline(无同步) / epoll(内置 repl_incr) / ebpf(XDP 组件)"
     echo "# Pipeline: ${PIPELINES[*]}  n=${BENCH_N} c=${BENCH_C} d=${BENCH_D}  net=${NET_MODEL}"
-    echo "# 键模式: ${KEY_DESC}  每点 REPS=${REPS}(中位数)  预热=${WARMUP_N}"
+    echo "# 键模式: ${KEY_DESC}  单轮测量  预热=${WARMUP_N}"
     echo "# CPU: master=${MASTER_CORE} slave=${SLAVE_CORE} client=${CLIENT_CORE} sync=${SYNC_CORE}"
     echo "# ports: master=${MASTER_PORT} slave=${SLAVE_PORT} incr_repl=${INCR_REPL_PORT}"
     echo ""
@@ -577,7 +557,7 @@ done
     echo "          并触发 EPOLLOUT 冲刷；读命令不传播，故 GET 应与 baseline 持平。"
     echo "  - ebpf : XDP 旁路抓包 + 用户态 seq 重组 + verbatim 回放，不占用 master 线程；"
     echo "          但每个命中的包都要过一次 XDP BPF（读/写均如此），故 GET 也有固定开销。"
-    echo "  - 每个数字为 REPS=${REPS} 次的中位数；ebpf 场景额外记录回放/丢包统计。"
+    echo "  - 每个数字为单轮测量结果；ebpf 场景额外记录回放/丢包统计。"
 } >> "$RESULT_FILE"
 
 # =============================================================================

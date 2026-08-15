@@ -29,6 +29,7 @@ if(USE_JEMALLOC)
     add_compile_definitions(USE_JEMALLOC)
 endif()
 pkg_check_modules(ZLIB     REQUIRED zlib)
+pkg_check_modules(LIBBPF   REQUIRED libbpf)
 
 # RDMA: libibverbs (pkg-config) + librdmacm (find_library — dev pkg not installed)
 pkg_check_modules(IBVERBS  REQUIRED libibverbs)
@@ -106,6 +107,13 @@ set(REPL_SRCS
     src/repl-incr/repl_incr_slave.c
 )
 
+# Kernel-bypass (AF_XDP + KCP) engine-side sources.  shm_ipc.c is shared with
+# the gateway binary; engine_xdp.c is the engine↔SHM glue.
+set(XDPKCP_ENGINE_SRCS
+    src/repl-incr-xdpkcp/engine_xdp.c
+    src/repl-incr-xdpkcp/shm_ipc.c
+)
+
 set(KVSTORE_SRCS
     ${UTIL_SRCS}
     ${CORE_SRCS}
@@ -116,6 +124,7 @@ set(KVSTORE_SRCS
     ${NET_SRCS}
     ${PERSIST_SRCS}
     ${REPL_SRCS}
+    ${XDPKCP_ENGINE_SRCS}
 )
 
 # ── kvstore target ────────────────────────────────────────────────────
@@ -132,6 +141,7 @@ target_include_directories(kvstore PRIVATE
     src/persist
     src/repl
     src/repl-incr
+    src/repl-incr-xdpkcp
     ${NTYCO_DIR}/core
     ${URING_INCLUDE_DIRS}
     ${JEMALLOC_INCLUDE_DIRS}
@@ -152,6 +162,44 @@ target_link_libraries(kvstore PRIVATE
 )
 
 add_dependencies(kvstore ntyco)
+
+# ── AF_XDP + KCP gateway ──────────────────────────────────────────────
+# Two binaries per machine: the engine (kvstore, above) and this gateway,
+# which owns the busy-poll AF_XDP + KCP datapath and talks to the engine via
+# /dev/shm.  The BPF program redirects UDP:sync_port into the XSK.
+
+set(XDPKCP_BPF_SRC ${CMAKE_SOURCE_DIR}/src/repl-incr-xdpkcp/xdp_kcp.bpf.c)
+set(XDPKCP_BPF_OBJ ${CMAKE_BINARY_DIR}/xdp_kcp.bpf.o)
+
+add_custom_command(
+    OUTPUT ${XDPKCP_BPF_OBJ}
+    COMMAND clang -O2 -g -target bpf
+            -I${CMAKE_SOURCE_DIR}/src/repl-incr-xdpkcp
+            -I/usr/include/x86_64-linux-gnu
+            -c ${XDPKCP_BPF_SRC}
+            -o ${XDPKCP_BPF_OBJ}
+    DEPENDS ${XDPKCP_BPF_SRC}
+    COMMENT "Compiling xdp_kcp.bpf.c (XDP BPF)"
+)
+add_custom_target(xdp_kcp_bpf DEPENDS ${XDPKCP_BPF_OBJ})
+
+set(XDPKCP_GW_SRCS
+    src/repl-incr-xdpkcp/gateway.c
+    src/repl-incr-xdpkcp/af_xdp.c
+    src/repl-incr-xdpkcp/kcp_transport.c
+    src/repl-incr-xdpkcp/shm_ipc.c
+    src/repl-incr-xdpkcp/ikcp.c
+)
+add_executable(kvstore-xdp-gateway ${XDPKCP_GW_SRCS})
+target_include_directories(kvstore-xdp-gateway PRIVATE
+    src/repl-incr-xdpkcp
+    ${LIBBPF_INCLUDE_DIRS}
+)
+target_link_libraries(kvstore-xdp-gateway PRIVATE
+    ${LIBBPF_LIBRARIES}
+    elf
+)
+add_dependencies(kvstore-xdp-gateway xdp_kcp_bpf)
 
 # ── Set capabilities for eBPF (requires libcap) ───────────────────────
 # This allows kvstore to load eBPF programs without running as root

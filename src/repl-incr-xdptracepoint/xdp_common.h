@@ -1,12 +1,14 @@
 /* xdp_common.h — Shared structures between XDP BPF and user-space
  *
  * This file defines the ringbuf event format and constants used by both
- * the BPF XDP program (xdp_filter.bpf.c) and the user-space
- * reassembly module (xdp_reasm.c).
+ * the BPF XDP program (xdp_filter.bpf.c) and the user-space daemon
+ * (stream.c / replay.c).
  *
- * The #ifdef __BPF__ guard ensures each side sees the correct types:
- *   BPF side:    __u32, __u16, __u8 from bpf_helper_defs.h
- *   User-space:  uint32_t, uint16_t, uint8_t from stdint.h
+ * The event uses a flexible-array payload (`data[]`).  bpf_ringbuf_reserve()
+ * requires a compile-time-constant size on this kernel, so the BPF program
+ * reserves a fixed `sizeof(header) + XDP_MAX_PAYLOAD` slot per event and
+ * only fills `data_len` bytes; the consumer reads `data_len` and ignores
+ * the trailing padding.
  */
 
 #ifndef XDP_COMMON_H
@@ -14,23 +16,36 @@
 
 /* ── Constants ────────────────────────────────────────────────────────── */
 
-/* Max TCP payload per XDP event.
- * Set to 65536 to handle GRO/TSO coalesced segments on both
- * loopback (up to 64KB) and physical NICs with GRO enabled.
- * Previously 4096 caused silent truncation of large segments. */
+/* Absolute ceiling on the TCP payload we will ever capture in one event.
+ * 65536 covers loopback's 64KB MTU and IPv4 GRO (which is capped at 64KB).
+ 4096 native */
 #define XDP_MAX_PAYLOAD     65536
 
-/* Total event size: header (20) + payload (65536) = 65556 */
-#define XDP_EVENT_SIZE      (20 + XDP_MAX_PAYLOAD)
+/* Bytes reserved per ringbuf event.  This — not XDP_MAX_PAYLOAD — is what
+ * determines ringbuf capacity:
+ *     XDP_RINGBUF_SZ / (sizeof(header) + XDP_RESERVE_PAYLOAD)
+ *
+ * bpf_ringbuf_reserve() requires a compile-time-constant size, so reserve
+ * matches the deployment: on a real NIC in native-XDP mode (wire segments
+ * ~1460 bytes) set this to 4096 to hold ~8x more events; on loopback /
+ * generic-XDP the segments can reach 64KB so it must stay at 65536.
+ * Must be <= XDP_MAX_PAYLOAD. */
+#ifndef XDP_RESERVE_PAYLOAD
+#define XDP_RESERVE_PAYLOAD XDP_MAX_PAYLOAD
+#endif
 
-/* Ringbuf size — 16 MB (doubled for 16× larger events) */
+/* Effective capture ceiling: we can never store more than we reserve. */
+#define XDP_CAPTURE_PAYLOAD \
+    ((XDP_MAX_PAYLOAD) < (XDP_RESERVE_PAYLOAD) ? (XDP_MAX_PAYLOAD) : (XDP_RESERVE_PAYLOAD))
+
+/* Ringbuf size. */
 #define XDP_RINGBUF_SZ      (16 * 1024 * 1024)
 
 /* Flags for xdp_repl_event.flags */
 #define XDP_FLAG_SYN        0x01
 #define XDP_FLAG_FIN        0x02
 #define XDP_FLAG_RST        0x04
-#define XDP_FLAG_FRAG       0x08    /* IPv4 fragment (MF=1 or offset>0) */
+#define XDP_FLAG_FRAG       0x08    /* IPv4 first-fragment (MF=1) */
 
 /* BPF stats counter indices — shared between BPF program and userspace */
 enum {
@@ -45,7 +60,6 @@ enum {
 
 #ifdef __BPF__
 
-/* BPF side: use __u32 etc from bpf_helper_defs.h */
 struct xdp_repl_event {
     __u32 saddr;        /* source IPv4 address  (network byte order) */
     __u32 daddr;        /* dest IPv4 address    (network byte order) */
@@ -55,12 +69,11 @@ struct xdp_repl_event {
     __u16 data_len;     /* actual payload length (0..XDP_MAX_PAYLOAD) */
     __u8  flags;        /* XDP_FLAG_SYN | FIN | RST | FRAG */
     __u8  pad;          /* alignment */
-    __u8  data[XDP_MAX_PAYLOAD];
+    __u8  data[];       /* variable-length payload (data_len bytes) */
 };
 
 #else
 
-/* User-space side: use stdint types */
 #include <stdint.h>
 
 struct xdp_repl_event {
@@ -72,7 +85,7 @@ struct xdp_repl_event {
     uint16_t data_len;
     uint8_t  flags;
     uint8_t  pad;
-    uint8_t  data[XDP_MAX_PAYLOAD];
+    uint8_t  data[];
 };
 
 #endif /* __BPF__ */

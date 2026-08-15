@@ -5,12 +5,13 @@
  * Data path:    XDP_PASS (kernel TCP stack processes normally)
  *
  * This is a PURE OBSERVER — it copies data, never drops or modifies.
- * The kernel TCP stack handles retransmission, reordering, and
- * reassembly as usual.  User-space does seq-based dedup + ordering
- * and RESP command extraction.
+ * The kernel TCP stack handles retransmission, reordering, and reassembly
+ * as usual.  User-space does seq-based dedup/ordering and verbatim replay
+ * to the slave.
  *
- * Fragment handling: IPv4 fragments (MF=1 or offset>0) are tagged with
- * XDP_FLAG_FRAG and forwarded to user-space for reassembly.
+ * Fragment handling: non-first IPv4 fragments (offset > 0) carry no TCP
+ * header and are skipped; only the first fragment (which contains the TCP
+ * header) is captured.  The XDP_FLAG_FRAG tag is kept for observability.
  */
 
 #include <linux/bpf.h>
@@ -39,8 +40,7 @@ struct {
     __uint(max_entries, XDP_RINGBUF_SZ);
 } repl_ringbuf SEC(".maps");
 
-/* Debug counters: ringbuf reservation failures.
- * Uses XDP_CNT_* enum from xdp_common.h. */
+/* Debug counters: ringbuf reservation failures. */
 struct {
     __uint(type,        BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, XDP_CNT_NUM);
@@ -76,7 +76,13 @@ int xdp_repl_sniff(struct xdp_md *ctx)
 
     /* Detect IPv4 fragments: MF (bit 13) or offset > 0 (bits 0-12).
      * 0x3FFF = MF(0x2000) | OFFSET_MASK(0x1FFF). */
-    int is_frag = (iph->frag_off & __constant_htons(0x3FFF)) != 0;
+    __u16 frag_off = iph->frag_off;
+    int is_frag = (frag_off & __constant_htons(0x3FFF)) != 0;
+
+    /* Non-first fragment (offset > 0): no TCP header in this segment.
+     * Skip it — only the first fragment carries the TCP header. */
+    if ((frag_off & __constant_htons(0x1FFF)) != 0)
+        return XDP_PASS;
 
     struct tcphdr *tcph = (void *)iph + ip_hdr_len;
     if ((void *)(tcph + 1) > data_end)
@@ -100,11 +106,16 @@ int xdp_repl_sniff(struct xdp_md *ctx)
     if (payload_len <= 0)
         return XDP_PASS;
 
-    if (payload_len > XDP_MAX_PAYLOAD)
-        payload_len = XDP_MAX_PAYLOAD;
+    if (payload_len > XDP_CAPTURE_PAYLOAD)
+        payload_len = XDP_CAPTURE_PAYLOAD;
 
+    /* bpf_ringbuf_reserve() requires a compile-time-constant size, so we
+     * reserve a fixed XDP_RESERVE_PAYLOAD slot and only fill data_len bytes.
+     * The consumer reads data_len (not the reserved size) to skip padding.
+     * (A true variable-size reserve is not verifiable on this kernel.) */
+    __u64 ev_sz = (__u64)sizeof(struct xdp_repl_event) + (__u64)XDP_RESERVE_PAYLOAD;
     struct xdp_repl_event *e =
-        bpf_ringbuf_reserve(&repl_ringbuf, sizeof(*e), 0);
+        bpf_ringbuf_reserve(&repl_ringbuf, ev_sz, 0);
     if (!e) {
         /* Ringbuf full — data silently dropped! */
         __u32 cnt_key = XDP_CNT_RINGBUF_FULL;

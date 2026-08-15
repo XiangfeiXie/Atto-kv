@@ -39,6 +39,11 @@ static inline void kvs_write_journal_append(const char *msg, int length) {
 static inline void kvs_repl_incr_hook(const char *msg, int length) {
     extern int g_in_reload;
     if (!msg || length <= 0 || g_in_reload) return;
+    /* The backlog/propagation only exist to serve incremental sync.  When
+     * incr_sync is off there is no replication listener and no slave can
+     * connect, so maintaining the backlog is pure waste on the write hot
+     * path.  Gate it out so the "no sync" baseline is genuinely sync-free. */
+    if (!kvs_config.incr_sync_enabled) return;
     repl_backlog_append(msg, length);
     repl_incr_propagate(msg, length);
 }

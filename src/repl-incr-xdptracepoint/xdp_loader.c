@@ -134,34 +134,43 @@ int xdp_load_bpf(uint16_t kv_port, const char *iface_name,
     /* ── Attach XDP ─────────────────────────────────────────────────── */
 
     const char *mode_str = getenv("XDP_MODE");
-    const char *mode_label = "auto";
+    const char *mode_label = "unknown";
+    uint32_t flags = 0;
+    int use_auto = (!mode_str || strcmp(mode_str, "auto") == 0);
 
-    if (!mode_str || strcmp(mode_str, "auto") == 0) {
-        out_att->link = bpf_program__attach_xdp(prog, out_att->ifindex);
-        if (unlikely(!out_att->link)) {
-            fprintf(stderr, "[XDP-LOAD] attach to '%s' failed: %s\n",
-                    iface_name, strerror(errno));
+    out_att->prog_fd = bpf_program__fd(prog);
+
+    if (use_auto) {
+        /* Try native (DRV) first, fall back to generic (SKB).  Loopback and
+         * many virtual NICs only support generic, so fallback is normal. */
+        if (bpf_xdp_attach(out_att->ifindex, out_att->prog_fd,
+                           XDP_FLAGS_DRV_MODE, NULL) == 0) {
+            mode_label = "native(DRV)";
+            out_att->use_netlink = 1;
+        } else if (bpf_xdp_attach(out_att->ifindex, out_att->prog_fd,
+                                  XDP_FLAGS_SKB_MODE, NULL) == 0) {
+            mode_label = "generic(SKB)";
+            out_att->use_netlink = 1;
+        } else {
+            fprintf(stderr, "[XDP-LOAD] auto attach to '%s' failed "
+                    "(native and generic): %s\n", iface_name, strerror(errno));
             bpf_object__close(obj);
             return -1;
         }
-        out_att->use_netlink = 0;
     } else {
-        uint32_t flags = 0;
-        if (strcmp(mode_str, "generic") == 0) {
-            flags = XDP_FLAGS_SKB_MODE;
-            mode_label = "generic(SKB)";
-        } else if (strcmp(mode_str, "native") == 0) {
+        if (strcmp(mode_str, "native") == 0) {
             flags = XDP_FLAGS_DRV_MODE;
             mode_label = "native(DRV)";
+        } else if (strcmp(mode_str, "generic") == 0) {
+            flags = XDP_FLAGS_SKB_MODE;
+            mode_label = "generic(SKB)";
         } else {
             fprintf(stderr, "[XDP-LOAD] unknown XDP_MODE '%s' "
                     "(valid: auto, generic, native)\n", mode_str);
             bpf_object__close(obj);
             return -1;
         }
-        out_att->prog_fd = bpf_program__fd(prog);
-        if (unlikely(bpf_xdp_attach(out_att->ifindex,
-                                     out_att->prog_fd,
+        if (unlikely(bpf_xdp_attach(out_att->ifindex, out_att->prog_fd,
                                      flags, NULL) != 0)) {
             fprintf(stderr, "[XDP-LOAD] XDP %s attach to '%s' failed: %s\n",
                     mode_label, iface_name, strerror(errno));

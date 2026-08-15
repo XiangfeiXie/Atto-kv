@@ -1,8 +1,6 @@
 # repl-incr-xdpkcp — AF_XDP + KCP 内核旁路增量同步
 
 把增量同步的底层传输从 TCP 换成 **AF_XDP（内核旁路）+ KCP（可靠 UDP）**，
-架构上参照 inazuma-kv 的「独立网关进程 + 共享内存」模型，但用成熟的 KCP
-替换 inazuma 手搓的 seq/ACK/NACK/AIMD/OOO 可靠协议。
 
 **范围：仅热路径**（写命令 → KCP → AF_XDP → 从机回放），不含 PSYNC / backlog 补发。
 

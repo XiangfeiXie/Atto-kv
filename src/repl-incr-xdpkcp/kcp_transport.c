@@ -100,7 +100,7 @@ static int send_kcp_datagram(kcp_transport_t *t, const void *datagram, size_t dl
     wr16(udp + 0, (uint16_t)t->sync_port);
     wr16(udp + 2, (uint16_t)t->sync_port);
     wr16(udp + 4, (uint16_t)(UDP_HDR + dlen));
-    wr16(udp + 6, 0);                   /* checksum 0 (same as inazuma) */
+    wr16(udp + 6, 0);                   
 
     memcpy(udp + UDP_HDR, datagram, dlen);
 

@@ -6,6 +6,9 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/utsname.h>
+#ifndef USE_JEMALLOC
+#include <malloc.h>   /* mallinfo2() — glibc live in-use chunk counter */
+#endif
 
 #include "persistence.h"
 
@@ -95,9 +98,13 @@ dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) {
             allocated = 0;
         allocator = "jemalloc";
 #else
-        struct rusage ru;
-        if (getrusage(RUSAGE_SELF, &ru) == 0)
-            allocated = (size_t)ru.ru_maxrss * 1024;
+        /* glibc: mallinfo2() splits accounting between the sbrk heap
+         * (uordblks = in-use chunk bytes) and mmap'd regions (hblkhd) —
+         * allocations > M_MMAP_THRESHOLD (128KB), e.g. the hash bucket
+         * array, bypass the heap and land in hblkhd.  Sum both to mirror
+         * jemalloc's stats.allocated (which counts everything). */
+        struct mallinfo2 mi = mallinfo2();
+        allocated = (size_t)(mi.uordblks + mi.hblkhd);
 #endif
         APPEND("# Memory\r\n");
         APPEND("used_memory:%zu\r\n", allocated);

@@ -45,12 +45,17 @@ void active_expire_cycle(void) {
         for (int i = 0; i < sample; i++) {
             /* Check time budget every 16 keys */
             if ((i & 0xF) == 0) {
-                if (get_time_now_real() - start > EXPIRE_TIME_BUDGET_MS)
+                if (get_time_now_real() - start > EXPIRE_TIME_BUDGET_MS) {
+                    total_expired += expired;  /* count this round's deletions */
                     goto done;
+                }
             }
 
             kv_entry_t *e = dict_get_random_key(dict);
-            if (!e) goto done;                 /* dict is empty */
+            if (!e) {
+                total_expired += expired;      /* count this round's deletions */
+                goto done;                     /* dict is empty */
+            }
 
             if (e->expire && get_time_now() > e->expire) {
                 /* Key is inline in entry allocation — save pointers

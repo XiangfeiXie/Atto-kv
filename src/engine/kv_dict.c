@@ -249,8 +249,10 @@ static int dict_maybe_expand(kv_dict_t *d) {
     /* Lazy initialise */
     if (size == 0) return ht_alloc(&d->ht[0], DICT_INIT_SIZE);
 
-    /* Expand when load factor > 1 and haven't hit max */
-    if (size < DICT_MAX_SIZE && used > size) {
+    /* Expand when load factor >= 1 (Redis-style: grow before the table
+     * fills, so new_size = next_pow2(used*2) = 2*size — a 2x jump, not the
+     * 4x jump `used > size` produced). */
+    if (size < DICT_MAX_SIZE && used >= size) {
         uint32_t new_size = next_pow2(used * 2);
         if (new_size > DICT_MAX_SIZE) new_size = DICT_MAX_SIZE;
         if (new_size <= size) return 0;  /* already at max */
@@ -289,11 +291,7 @@ kv_entry_t *dict_find(kv_dict_t *d, const char *key, uint32_t key_len,
     if (d->ht[0].size == 0 && d->rehash_idx < 0)
         return NULL;
 
-    /* Search ht[0] — inazuma-kv style: key_len + memcmp only.
-     * The hash comparison (e->hash == hash) is redundant when
-     * hash distribution is good (collision chains are short).
-     * For well-distributed tables, every chain has ≤1 entry,
-     * so the extra hash cmp is 100% wasted. */
+
     {
         uint32_t idx = (uint32_t)(hash & d->ht[0].size_mask);
         kv_entry_t *e = d->ht[0].buckets[idx];

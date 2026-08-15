@@ -24,9 +24,6 @@ static inline void wb_ensure(DynBuf *wb, int need) {
         dynbuf_reserve(wb, wb->len + need + 4096);
 }
 
-/* ── Key resolution helper — shared by inline GET/SET and single-key path ──
- * Hash + lookup.  No lazy-expire on the hot path — active_expire_cycle()
- * handles cleanup asynchronously (inazuma-kv pattern). */
 
 static inline kv_entry_t *dispatch_resolve(kvs_token_t key_tok,
                                             uint64_t *hash_out, int is_write) {

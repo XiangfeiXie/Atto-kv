@@ -1,7 +1,5 @@
 /* gateway.c — the kernel-bypass gateway process (AF_XDP + KCP + SHM).
  *
- * Separate process from the kvstore engine, inazuma-style: the busy-poll
- * datapath lives here so it never contends with the engine's event loop.
  *
  *   master gateway: SHM (engine→gateway) dequeue → ikcp_send → AF_XDP Tx
  *   slave  gateway: AF_XDP Rx → ikcp_input → ikcp_recv → SHM (gateway→engine)
@@ -190,7 +188,6 @@ int main(int argc, char **argv)
             last_stats = now;
         }
 
-        /* Yield when idle to avoid pinning a core at 100% (same as inazuma). */
         if (idle > 64) {
             usleep(1);
             idle = 0;

@@ -1,9 +1,10 @@
-/* af_xdp.h — raw AF_XDP transport (no libxdp / libbpf xsk.h dependency).
+/* af_xdp.h — AF_XDP transport (libxdp xsk.h for UMEM/socket/rings).
  *
  * Implements the minimal kernel-bypass datapath the gateway needs:
- *   - UMEM allocation + Fill/Completion/Rx/Tx ring setup via <linux/if_xdp.h>
+ *   - UMEM + Fill/Completion/Rx/Tx ring setup via libxdp's xsk.h
+ *     (xsk_umem__create / xsk_socket__create)
  *   - load & attach the XDP program (xdp_kcp.bpf.o) that redirects
- *     UDP:sync_port into the XSK via the XSKMAP
+ *     UDP:sync_port into the XSK via the XSKMAP (libbpf attach)
  *   - af_xdp_send_frame()   — copy a raw Ethernet frame into a UMEM frame and
  *                             submit it on the Tx ring
  *   - af_xdp_poll_rx()      — drain the Rx ring, hand each frame to a callback

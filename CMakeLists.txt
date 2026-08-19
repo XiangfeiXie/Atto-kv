@@ -30,6 +30,7 @@ if(USE_JEMALLOC)
 endif()
 pkg_check_modules(ZLIB     REQUIRED zlib)
 pkg_check_modules(LIBBPF   REQUIRED libbpf)
+pkg_check_modules(LIBXDP   REQUIRED libxdp)
 
 # RDMA: libibverbs (pkg-config) + librdmacm (find_library — dev pkg not installed)
 pkg_check_modules(IBVERBS  REQUIRED libibverbs)
@@ -194,8 +195,10 @@ add_executable(kvstore-xdp-gateway ${XDPKCP_GW_SRCS})
 target_include_directories(kvstore-xdp-gateway PRIVATE
     src/repl-incr-xdpkcp
     ${LIBBPF_INCLUDE_DIRS}
+    ${LIBXDP_INCLUDE_DIRS}
 )
 target_link_libraries(kvstore-xdp-gateway PRIVATE
+    ${LIBXDP_LIBRARIES}
     ${LIBBPF_LIBRARIES}
     elf
 )

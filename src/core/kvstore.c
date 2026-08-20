@@ -15,7 +15,7 @@
 #include <ctype.h>
 
 #include "rdma_repl.h"
-#include "wal_persist.h"
+#include "persist_wal.h"
 #include "persistence.h"
 #include "repl_incr.h"
 #include "engine_xdp.h"

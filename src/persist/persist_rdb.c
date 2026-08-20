@@ -5,13 +5,12 @@
  * Public API (declared in persistence.h):
  *   rdb_save_sync / rdb_save_async_uring / rdb_bgsave_in_progress
  *   rdb_load_mmap / rdb_load_from_buf / rdb_load_stream_*
- *   rdb_serialize_to_buf / serialize_entry_to_buf
+ *   rdb_serialize_to_buf / rdb_serialize_begin/next/end
  *   rdb_rebuild_all_encodings
  * ========================================================= */
 
 #include "persistence.h"
 #include "kvstore.h"
-#include "protocol.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,13 +18,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <pthread.h>
 #include <signal.h>
-#include <stdatomic.h>
-#include <inttypes.h>
 #include <liburing.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 
 /* ── RDB tmp path ── */
@@ -49,7 +44,6 @@ static const char *mread(const char *p, const char *end, void *out, size_t n);
 static volatile pid_t g_rdb_child_pid    = 0;
 
 /* ── BGSAVE three-layer defense ── */
-#define BGSAVE_COOLDOWN_MIN_SEC  1
 #define BGSAVE_COOLDOWN_MULT     5   /* cooldown = max(MIN, duration * MULT) */
 
 static int      g_bgsave_pending             = 0;
@@ -85,6 +79,21 @@ static void rdb_buf_reserve(rdb_buf_t *b, size_t need) {
 
     b->buf = (char *)realloc(b->buf, ncap);
     b->cap = ncap;
+}
+
+/* ── RDB on-disk format constants ── */
+#define RDB_MAGIC    0x524442
+#define RDB_VERSION  2
+
+/* Write the 16-byte RDB header (magic, version, db_num, key_count). */
+static void rdb_write_header(char *dst, int key_count) {
+    int magic   = RDB_MAGIC;
+    int version = RDB_VERSION;
+    int db_num  = 0;
+    memcpy(dst,      &magic,     sizeof(int));
+    memcpy(dst + 4,  &version,   sizeof(int));
+    memcpy(dst + 8,  &db_num,    sizeof(int));
+    memcpy(dst + 12, &key_count, sizeof(int));
 }
 
 /* =========================================================================
@@ -265,128 +274,39 @@ static const char *mread(const char *p, const char *end, void *out, size_t n) {
     return p + n;
 }
 
-/* ── RDB entry payload accessor ── */
-int rdb_entry_payload(kv_entry_t *e, const char **data, int *dlen) {
-    if (!e) return -1;
-    *data = entry_payload(e);
-    *dlen = (int)entry_payload_len(e);
-    return 0;
-}
+/* ── RDB entry serialization helpers ── */
 
-/* Extract serializable data from an entry. Handles hash dict flattening.
- * Returns 0 on success; *owned is set when the caller must free it. */
+/* Extract serializable data from an entry into out-params.
+ * Returns 0 on success. */
 static int rdb_entry_extract(kv_entry_t *e,
-                              const char **key, int *klen,
-                              const char **data, int *dlen,
-                              long long *expire,
-                              char **owned) {
-    *owned = NULL;
+                             const char **key, int *klen,
+                             const char **data, int *dlen,
+                             long long *expire) {
     if (!e) return -1;
-
-    if (rdb_entry_payload(e, data, dlen) != 0) {
-        return -1;
-    }
-
     *key    = entry_key(e);
     *klen   = (int)e->key_len;
+    *data   = entry_payload(e);
+    *dlen   = (int)entry_payload_len(e);
     *expire = e->expire;
     return 0;
 }
 
-/* ── Serialization callbacks ── */
-
-/* Single-entry serialize into rdb_buf_t (used by rdb_save_sync).
- * Format: [klen:4][key:klen][dlen:4][data:dlen][expire:8] */
-static void rdb_save_callback_buf(kv_entry_t *e, void *priv) {
-    const char *key, *data;
-    int klen, dlen;
-    long long expire;
-    char *owned = NULL;
-
-    if (rdb_entry_extract(e, &key, &klen, &data, &dlen, &expire, &owned) != 0)
-        return;
-
-    rdb_buf_t *b = (rdb_buf_t *)priv;
-    size_t total = sizeof(int) + (size_t)klen + sizeof(int)
-                 + (size_t)dlen + sizeof(long long);
-    rdb_buf_reserve(b, total);
-    char *dst = b->buf + b->len;
-    memcpy(dst, &klen,   sizeof(int));   dst += sizeof(int);
-    memcpy(dst, key,     (size_t)klen);  dst += klen;
-    memcpy(dst, &dlen,   sizeof(int));   dst += sizeof(int);
-    memcpy(dst, data,    (size_t)dlen);  dst += dlen;
-    memcpy(dst, &expire, sizeof(long long));
-    b->len += total;
-
-    free(owned);
-}
-
-/* Single-entry serialize into DynBuf (RDB per-entry format).
- * Same binary format as rdb_save_callback_buf. */
-static void serialize_entry_to_buf(DynBuf *out, kv_entry_t *e) {
-    const char *key, *data;
-    int klen, dlen;
-    long long expire;
-    char *owned = NULL;
-
-    if (rdb_entry_extract(e, &key, &klen, &data, &dlen, &expire, &owned) != 0)
-        return;
-
-    size_t total = sizeof(int) + (size_t)klen + sizeof(int)
-                 + (size_t)dlen + sizeof(long long);
-    dynbuf_reserve(out, out->len + (int)total);
-    char *dst = out->buf + out->len;
-    memcpy(dst, &klen,   sizeof(int));   dst += sizeof(int);
-    memcpy(dst, key,     (size_t)klen);  dst += klen;
-    memcpy(dst, &dlen,   sizeof(int));   dst += sizeof(int);
-    memcpy(dst, data,    (size_t)dlen);  dst += dlen;
-    memcpy(dst, &expire, sizeof(long long));
-    out->len += (int)total;
-
-    free(owned);
-}
-
-/* DynBuf serialization callback (for RDMA fullsync). */
-static void rdb_serialize_cb_dynbuf(kv_entry_t *e, void *priv) {
-    if (!e) return;
-    serialize_entry_to_buf((DynBuf *)priv, e);
-}
-
-void rdb_serialize_to_buf(DynBuf *out) {
-    int magic     = 0x524442;
-    int version   = 2;
-    int db_num    = 0;
-    int key_count = (int)dict_count(&g_dict);
-
-    dynbuf_reserve(out, 16 + key_count * 64);
-
-    dynbuf_append(out, (const char *)&magic,     sizeof(int));
-    dynbuf_append(out, (const char *)&version,   sizeof(int));
-    dynbuf_append(out, (const char *)&db_num,    sizeof(int));
-    dynbuf_append(out, (const char *)&key_count, sizeof(int));
-
-    store_scan(rdb_serialize_cb_dynbuf, out);
-}
-
-/* ── Incremental RDB serialiser (RDMA fullsync master) ────────────────── */
-
 /* Serialised size of one entry (RDB per-entry format):
- *   [klen:4][key:klen][dlen:4][data:dlen][expire:8]                        */
+ *   [klen:4][key:klen][dlen:4][data:dlen][expire:8] */
 static inline size_t entry_serialized_size(kv_entry_t *e) {
     return sizeof(int) + (size_t)e->key_len
          + sizeof(int) + (size_t)entry_payload_len(e)
          + sizeof(long long);
 }
 
-/* Write one entry into a raw buffer pointer (no DynBuf overhead).
- * Returns the number of bytes written.                                    */
+/* Write one entry into a raw buffer pointer (no container overhead).
+ * Returns the number of bytes written. */
 static size_t serialize_entry_to_ptr(char *dst, kv_entry_t *e) {
     const char *key, *data;
     int klen, dlen;
     long long expire;
-    char *owned = NULL;
 
-    if (rdb_entry_extract(e, &key, &klen, &data, &dlen, &expire, &owned) != 0)
+    if (rdb_entry_extract(e, &key, &klen, &data, &dlen, &expire) != 0)
         return 0;
 
     size_t total = entry_serialized_size(e);
@@ -396,10 +316,48 @@ static size_t serialize_entry_to_ptr(char *dst, kv_entry_t *e) {
     memcpy(p, &dlen,   sizeof(int));   p += sizeof(int);
     memcpy(p, data,    (size_t)dlen);  p += dlen;
     memcpy(p, &expire, sizeof(long long));
-
-    free(owned);
     return total;
 }
+
+/* Single-entry serialize into DynBuf (RDB per-entry format). */
+static void serialize_entry_to_buf(DynBuf *out, kv_entry_t *e) {
+    if (!e) return;
+    size_t total = entry_serialized_size(e);
+    dynbuf_reserve(out, out->len + (int)total);
+    serialize_entry_to_ptr(out->buf + out->len, e);
+    out->len += (int)total;
+}
+
+/* Single-entry serialize into rdb_buf_t (used by rdb_save_sync).
+ * Same binary format as serialize_entry_to_buf. */
+static void rdb_save_callback_buf(kv_entry_t *e, void *priv) {
+    if (!e) return;
+    rdb_buf_t *b = (rdb_buf_t *)priv;
+    size_t total = entry_serialized_size(e);
+    rdb_buf_reserve(b, total);
+    serialize_entry_to_ptr(b->buf + b->len, e);
+    b->len += total;
+}
+
+/* DynBuf serialization callback (for RDMA fullsync). */
+static void rdb_serialize_cb_dynbuf(kv_entry_t *e, void *priv) {
+    if (!e) return;
+    serialize_entry_to_buf((DynBuf *)priv, e);
+}
+
+void rdb_serialize_to_buf(DynBuf *out) {
+    int key_count = (int)dict_count(&g_dict);
+
+    dynbuf_reserve(out, 16 + key_count * 64);
+
+    char hdr[16];
+    rdb_write_header(hdr, key_count);
+    dynbuf_append(out, hdr, 16);
+
+    store_scan(rdb_serialize_cb_dynbuf, out);
+}
+
+/* ── Incremental RDB serialiser (RDMA fullsync master) ────────────────── */
 
 void rdb_serialize_begin(rdb_serializer_t *rs) {
     rs->iter        = dict_iter_new(&g_dict, 1);
@@ -421,15 +379,8 @@ size_t rdb_serialize_next(rdb_serializer_t *rs, char *dst,
     if (!rs->header_sent) {
         if (max_bytes < 16) return 0;  /* need at least header room */
 
-        int magic     = 0x524442;
-        int version   = 2;
-        int db_num    = 0;
         int key_count = (int)dict_count(&g_dict);
-
-        memcpy(dst,       &magic,     sizeof(int));
-        memcpy(dst + 4,   &version,   sizeof(int));
-        memcpy(dst + 8,   &db_num,    sizeof(int));
-        memcpy(dst + 12,  &key_count, sizeof(int));
+        rdb_write_header(dst, key_count);
         written    += 16;
         dst        += 16;
         max_bytes  -= 16;
@@ -478,20 +429,9 @@ void rdb_save_sync(void) {
     /* Reserve estimate: 16-byte header + ~64 bytes per key */
     rdb_buf_reserve(&b, 16 + (size_t)key_count * 64);
 
-    /* Write header */
-    int magic   = 0x524442;
-    int version = 2;
-    int db_num  = 0;
-    {
-        size_t hl  = sizeof(int) * 4;
-        rdb_buf_reserve(&b, hl);
-        char *dst = b.buf + b.len;
-        memcpy(dst, &magic,     sizeof(int)); dst += sizeof(int);
-        memcpy(dst, &version,   sizeof(int)); dst += sizeof(int);
-        memcpy(dst, &db_num,    sizeof(int)); dst += sizeof(int);
-        memcpy(dst, &key_count, sizeof(int));
-        b.len += hl;
-    }
+    /* Write 16-byte header */
+    rdb_write_header(b.buf + b.len, key_count);
+    b.len += 16;
 
     /* Single-pass: serialize all entries */
     store_scan(rdb_save_callback_buf, &b);
@@ -608,7 +548,7 @@ int rdb_load_stream_begin(const char *buf, size_t len) {
     if (!(p = mread(p, end, &db_num,    sizeof(int)))) return -1;
     if (!(p = mread(p, end, &key_count, sizeof(int)))) return -1;
 
-    if (magic != 0x524442) {
+    if (magic != RDB_MAGIC) {
         printf("[RDB] stream load: magic mismatch (0x%x)\n", magic);
         return -1;
     }
@@ -700,47 +640,22 @@ int rdb_load_from_buf(const char *buf, size_t len) {
 }
 
 void rdb_load_mmap(void) {
-    int fd = open(persist_path(RDB_REL), O_RDONLY);
-    if (fd < 0) {
+    char *base = NULL;
+    size_t fsz = 0;
+    int use_mmap = 0;
+
+    int rc = file_read_full(persist_path(RDB_REL), &base, &fsz, &use_mmap, "RDB");
+    if (rc == FILE_READ_OPEN_FAIL) {
         printf("[RDB] open failed\n");
         return;
     }
-    struct stat st;
-    if (fstat(fd, &st) < 0 || st.st_size <= 0) {
-        close(fd);
-        return;
-    }
-    size_t fsz = (size_t)st.st_size;
-    char *base = (char *)mmap(NULL, fsz, PROT_READ, MAP_PRIVATE, fd, 0);
-
-    if (base == MAP_FAILED) {
-        printf("[RDB] mmap failed: %s, falling back to read()\n", strerror(errno));
-
-        char *buf = malloc(fsz);
-        if (!buf) { close(fd); return; }
-
-        lseek(fd, 0, SEEK_SET);
-        size_t total_read = 0;
-        while (total_read < fsz) {
-            ssize_t n = read(fd, buf + total_read, fsz - total_read);
-            if (n <= 0) break;
-            total_read += n;
-        }
-        close(fd);
-
-        if (total_read == fsz) {
-            rdb_load_from_buf(buf, fsz);
-        } else {
-            printf("[RDB] read failed: only read %zu/%zu bytes\n", total_read, fsz);
-        }
-        free(buf);
-        return;
-    }
-
-    close(fd);
-    madvise(base, fsz, MADV_SEQUENTIAL);
+    if (rc != FILE_READ_OK) return;
 
     rdb_load_from_buf(base, fsz);
 
-    munmap(base, fsz);
+    if (use_mmap) {
+        munmap(base, fsz);
+    } else {
+        free(base);
+    }
 }

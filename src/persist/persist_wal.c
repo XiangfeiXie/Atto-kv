@@ -1,7 +1,12 @@
 /* =========================================================
- * wal_persist.c — WAL 增量持久化（单线程无锁异步 io_uring 落盘）
+ * persist_wal.c — WAL 落盘与重放
  *
- * 设计要点（对齐 kvs_persist.c 的单线程模型）:
+ * 职责：
+ *   - 增量写：单线程无锁异步 io_uring 落盘（环形缓冲）
+ *   - AOF 重写：fork 子进程压缩全量数据（BGREWRITEAOF）
+ *   - 启动重载：aof_reload_mmap 用 mmap 重放 raw RESP 命令
+ *
+ * 增量写设计要点（对齐 kvs_persist.c 的单线程模型）:
  *   - 静态预分配环形缓冲，无锁访问（proactor 单线程保证）
  *   - 阈值驱动提交（512KB），生产者直接提交 io_uring write SQE
  *   - 异步 reap：wal_flush_current_slot 时顺便收割已完成 CQE
@@ -13,9 +18,10 @@
  *   kvs_wal_persist_start / stop / append_raw / set_fsync_policy
  *   kvs_wal_periodic          — call from event loop (idle maintenance)
  *   kvs_wal_reap_completions  — reap in-flight write CQEs
+ *   aof_reload_mmap           — startup replay (declared in persistence.h)
  * ========================================================= */
 
-#include "wal_persist.h"
+#include "persist_wal.h"
 #include "persistence.h"
 #include "kvstore.h"     /* get_time_now (cached clock) */
 
@@ -26,14 +32,19 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <liburing.h>
 
 /* ── Tunables ── */
 #define AOF_RING_SIZE           16
 #define AOF_SLOT_SIZE           (512 * 1024 + 4096)
-#define AOF_FLUSH_THRESHOLD     (512 * 1024)
 #define WAL_URING_DEPTH         256
+
+/* AOF rewrite (BGREWRITEAOF) tunables */
+#define AOF_REWRITE_MIN_SIZE     ((off_t)64 * 1024 * 1024)   /* 64 MB  */
+#define AOF_REWRITE_PERC_DEF     100                          /* 100%    */
+#define AOF_REWRITE_COOLDOWN_SEC 5
 
 /* ── Ring slot ── */
 typedef struct {
@@ -53,13 +64,16 @@ static int              g_wal_ring_ok = 0;
 static int              g_wal_fd      = -1;
 static off_t            g_aof_offset  = 0;
 
-/* fsync state */
-static int      g_fsync_always    = 0;
-static int      g_fsync_in_flight = 0;
-static time_t   g_last_fsync      = 0;
+/* fsync policy — FSYNC_ALWAYS / FSYNC_EVERYSEC / FSYNC_NO */
+typedef enum {
+    FSYNC_NO = 0,
+    FSYNC_EVERYSEC = 1,
+    FSYNC_ALWAYS = 2,
+} fsync_mode_t;
 
-/* idle flush tracking — counter-based (single-threaded, no atomic needed) */
-static int g_append_count = 0;
+static fsync_mode_t g_fsync_mode      = FSYNC_EVERYSEC;
+static int          g_fsync_in_flight = 0;
+static time_t       g_last_fsync      = 0;
 
 /* ── AOF rewrite state ── */
 static pid_t  g_aof_rewrite_pid   = 0;
@@ -74,6 +88,20 @@ static void wal_submit_fsync(void);
  * io_uring helpers
  * ========================================================================= */
 
+/* Update WAL state for one completed CQE.  The CQE's data carries either a
+ * slot index (>= 0) or -1 for an fsync completion. */
+static void wal_handle_cqe(struct io_uring_cqe *cqe) {
+    int idx = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
+    if (idx == -1) {
+        g_fsync_in_flight = 0;
+    } else if (idx >= 0 && idx < AOF_RING_SIZE) {
+        if (g_ring[idx].in_flight) {
+            g_ring[idx].in_flight = 0;
+            g_inflight_count--;
+        }
+    }
+}
+
 /* Reap all ready CQEs.  Called from wal_flush_current_slot (threshold flush)
  * and from kvs_wal_periodic (idle maintenance). */
 void kvs_wal_reap_completions(void) {
@@ -85,16 +113,11 @@ void kvs_wal_reap_completions(void) {
 
     io_uring_for_each_cqe(&g_wal_ring, head, cqe) {
         int slot_idx = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
+        wal_handle_cqe(cqe);
         if (slot_idx == -1) {
-            /* fsync completion */
-            g_fsync_in_flight = 0;
             if (cqe->res < 0 && cqe->res != -ECANCELED)
                 fprintf(stderr, "[WAL] fsync error: %s\n", strerror(-cqe->res));
         } else if (slot_idx >= 0 && slot_idx < AOF_RING_SIZE) {
-            if (g_ring[slot_idx].in_flight) {
-                g_ring[slot_idx].in_flight = 0;
-                g_inflight_count--;
-            }
             if (cqe->res < 0 && cqe->res != -ECANCELED) {
                 fprintf(stderr, "[WAL] write error slot=%d: %s\n",
                         slot_idx, strerror(-cqe->res));
@@ -121,15 +144,7 @@ static struct io_uring_sqe *wal_get_sqe(void) {
     /* Layer 2: block-wait for one CQE */
     struct io_uring_cqe *cqe = NULL;
     if (io_uring_wait_cqe(&g_wal_ring, &cqe) == 0 && cqe) {
-        int slot_idx = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
-        if (slot_idx == -1) {
-            g_fsync_in_flight = 0;
-        } else if (slot_idx >= 0 && slot_idx < AOF_RING_SIZE) {
-            if (g_ring[slot_idx].in_flight) {
-                g_ring[slot_idx].in_flight = 0;
-                g_inflight_count--;
-            }
-        }
+        wal_handle_cqe(cqe);
         io_uring_cqe_seen(&g_wal_ring, cqe);
     }
     sqe = io_uring_get_sqe(&g_wal_ring);
@@ -176,15 +191,22 @@ static void wal_submit_fsync(void) {
 
 /* Check and possibly submit async fsync (non-blocking). */
 static void wal_fsync_check(void) {
-    if (g_fsync_always) {
-        /* always mode: submit fsync after every slot flush */
+    switch (g_fsync_mode) {
+    case FSYNC_ALWAYS:
+        /* always mode: fsync on every periodic tick */
         wal_submit_fsync();
-        return;
+        break;
+    case FSYNC_EVERYSEC: {
+        time_t now = time(NULL);
+        if (now > g_last_fsync && !g_fsync_in_flight)
+            wal_submit_fsync();
+        break;
     }
-
-    time_t now = time(NULL);
-    if (now > g_last_fsync && !g_fsync_in_flight)
-        wal_submit_fsync();
+    case FSYNC_NO:
+    default:
+        /* no runtime fsync — rely on the OS page cache */
+        break;
+    }
 }
 
 /* =========================================================================
@@ -215,14 +237,7 @@ static void wal_flush_current_slot(void) {
             while (slot->in_flight) {
                 struct io_uring_cqe *cqe = NULL;
                 if (io_uring_wait_cqe(&g_wal_ring, &cqe) == 0 && cqe) {
-                    int idx = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
-                    if (idx == -1) g_fsync_in_flight = 0;
-                    else if (idx >= 0 && idx < AOF_RING_SIZE) {
-                        if (g_ring[idx].in_flight) {
-                            g_ring[idx].in_flight = 0;
-                            g_inflight_count--;
-                        }
-                    }
+                    wal_handle_cqe(cqe);
                     io_uring_cqe_seen(&g_wal_ring, cqe);
                 }
             }
@@ -276,13 +291,6 @@ static int rw_u2a(char *dst, uint32_t v) {
     int n = (int)(p - tmp);
     for (int i = 0; i < n; i++) dst[i] = tmp[n - 1 - i];
     return n;
-}
-
-/* Little-endian uint32 read (safe for unaligned) */
-static inline uint32_t rw_pk_u32(const char *p) {
-    uint32_t v;
-    memcpy(&v, p, sizeof(v));
-    return v;
 }
 
 static void rw_flush(rewrite_ctx_t *ctx) {
@@ -552,14 +560,14 @@ void kvs_wal_periodic(void) {
 void kvs_wal_set_fsync_policy(const char *policy) {
     if (!policy) return;
     if (strcmp(policy, "always") == 0) {
-        g_fsync_always = 1;
+        g_fsync_mode = FSYNC_ALWAYS;
         printf("[WAL] fsync: always\n");
-    } else if (strcmp(policy, "everysec") == 0) {
-        g_fsync_always = 0;
-        printf("[WAL] fsync: everysec\n");
-    } else {
-        g_fsync_always = 0;
+    } else if (strcmp(policy, "no") == 0) {
+        g_fsync_mode = FSYNC_NO;
         printf("[WAL] fsync: no\n");
+    } else {
+        g_fsync_mode = FSYNC_EVERYSEC;
+        printf("[WAL] fsync: everysec\n");
     }
 }
 
@@ -583,7 +591,6 @@ int kvs_wal_persist_start(void) {
     g_inflight_count  = 0;
     g_fsync_in_flight = 0;
     g_last_fsync      = time(NULL);
-    g_append_count = 0;
 
     printf("[WAL] lock-free ring ready (%d slots x %d KB)\n",
            AOF_RING_SIZE, AOF_SLOT_SIZE / 1024);
@@ -606,9 +613,6 @@ int kvs_wal_persist_append_raw(const char *payload, uint32_t len) {
     memcpy(g_ring[g_prod_idx].data + g_prod_pos, payload, len);
     g_prod_pos += len;
 
-    /* Update append counter for idle detection (every N appends) */
-    g_append_count++;
-
     return 0;
 }
 
@@ -625,14 +629,7 @@ void kvs_wal_persist_stop(void) {
             int ret = io_uring_wait_cqe(&g_wal_ring, &cqe);
             if (ret < 0) break;
             if (cqe) {
-                int idx = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
-                if (idx == -1) g_fsync_in_flight = 0;
-                else if (idx >= 0 && idx < AOF_RING_SIZE) {
-                    if (g_ring[idx].in_flight) {
-                        g_ring[idx].in_flight = 0;
-                        g_inflight_count--;
-                    }
-                }
+                wal_handle_cqe(cqe);
                 io_uring_cqe_seen(&g_wal_ring, cqe);
             }
         }
@@ -662,4 +659,52 @@ void kvs_wal_persist_stop(void) {
     }
 
     printf("[WAL] stopped safely\n");
+}
+
+/* =========================================================================
+ * WAL/AOF reload — startup replay of raw RESP commands (mmap + read fallback)
+ * ========================================================================= */
+
+void aof_reload_mmap(void) {
+    char *base = NULL;
+    size_t fsz = 0;
+    int use_mmap = 0;
+
+    int rc = file_read_full(persist_path(WAL_REL), &base, &fsz, &use_mmap, "AOF");
+    if (rc == FILE_READ_OPEN_FAIL)
+        rc = file_read_full(persist_path(AOF_REL), &base, &fsz, &use_mmap, "AOF");
+    if (rc != FILE_READ_OK) return;
+
+    printf("[AOF] load start, size=%zu\n", fsz);
+
+    g_in_reload = 1;
+    DynBuf wb;
+    dynbuf_init(&wb, BUF_INIT_CAP);
+    kvs_token_t tokens[KVS_MAX_TOKENS];
+    int loaded = 0;
+
+    const char *p = base;
+    long remaining = (long)fsz;
+    while (remaining > 0) {
+        int argc = 0;
+        int cmd_len = resp_parse_slices(p, (int)remaining,
+                                        tokens, KVS_MAX_TOKENS, &argc);
+        if (cmd_len <= 0) break;
+        dynbuf_clear(&wb);
+        kvs_dispatch(tokens, argc, p, cmd_len, &wb, NULL);
+        p += cmd_len;
+        remaining -= cmd_len;
+        loaded++;
+    }
+
+    dynbuf_free(&wb);
+
+    if (use_mmap) {
+        munmap(base, fsz);
+    } else {
+        free(base);
+    }
+
+    g_in_reload = 0;
+    printf("[AOF] load finished, %d commands replayed\n", loaded);
 }

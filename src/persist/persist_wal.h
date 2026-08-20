@@ -1,14 +1,10 @@
-#ifndef KVS_WAL_PERSIST_H
-#define KVS_WAL_PERSIST_H
+#ifndef KVS_PERSIST_WAL_H
+#define KVS_PERSIST_WAL_H
 
 #include <stdint.h>
-#include <string.h>
 
 /* ── Tunables ── */
 #define KVS_JOURNAL_MAX_PAYLOAD  (1024u * 1024u)
-#define AOF_REWRITE_MIN_SIZE     ((off_t)64 * 1024 * 1024)   /* 64 MB  */
-#define AOF_REWRITE_PERC_DEF     100                          /* 100%    */
-#define AOF_REWRITE_COOLDOWN_SEC 5
 
 /* ── Public API ── */
 

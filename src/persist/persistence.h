@@ -1,5 +1,5 @@
-#ifndef __PERSISTENCE_H__
-#define __PERSISTENCE_H__
+#ifndef KVS_PERSISTENCE_H
+#define KVS_PERSISTENCE_H
 
 #include <stddef.h>
 #include "server.h"
@@ -10,7 +10,7 @@
 /* =========================================================
  * 持久化模块：WAL io_uring 落盘 + RDB fork 保存 + mmap 加载
  *
- * - kvs_wal_persist_*：后台线程 + io_uring 增量写 WAL
+ * - kvs_wal_persist_*：单线程无锁 + io_uring 增量写 WAL
  * - rdb_save_async_uring：主线程 fork，子进程用 io_uring 批量写 RDB
  * - rdb_load_mmap / aof_reload_mmap：mmap 加载
  * - persist_set_basedir：设置项目根目录
@@ -24,6 +24,14 @@ void persist_set_basedir(const char *argv0);
 #define WAL_REL  "build/incr.wal"
 
 const char *persist_path(const char *rel);
+
+/* Internal: whole-file read helper (mmap with read() fallback), shared by
+ * aof_reload_mmap / rdb_load_mmap. */
+#define FILE_READ_OK          0
+#define FILE_READ_OPEN_FAIL  -1   /* open() failed — caller may try an alt path */
+#define FILE_READ_EMPTY      -2   /* fstat failed or file is empty */
+int file_read_full(const char *path, char **buf, size_t *size,
+                   int *is_mmap, const char *tag);
 
 /* RDB：同步 io_uring 写 */
 void rdb_save_sync(void);

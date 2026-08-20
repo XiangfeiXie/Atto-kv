@@ -11,7 +11,7 @@
 
 #include "kvstore.h"
 #include "kv_type_string.h"
-#include "wal_persist.h"
+#include "persist_wal.h"
 
 /* ── RDB changes counter (defined in persist_rdb.c) ── */
 extern uint64_t g_rdb_changes;

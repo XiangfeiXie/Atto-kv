@@ -2,8 +2,7 @@
  * persistence.c — project root resolution & path utilities.
  *
  * All persistence I/O logic lives in the sub-modules:
- *   wal_persist.c  — WAL incremental write (background consumer)
- *   persist_aof.c  — WAL/AOF reload (mmap replay)
+ *   persist_wal.c  — WAL write + AOF rewrite + WAL/AOF reload
  *   persist_rdb.c  — RDB save (fork + io_uring) and load (mmap)
  * ========================================================= */
 
@@ -14,6 +13,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <libgen.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 
 /* ── Project root directory — set once by persist_set_basedir ── */
@@ -52,25 +54,68 @@ void persist_set_basedir(const char *argv0) {
         if (n > 0) binpath[n] = '\0';
     }
 
-    /* 2) Get the binary's parent directory */
-    char *d = dirname(binpath);
+    /* 2) Binary's directory (dirname() may truncate binpath in place) */
+    char *dir = dirname(binpath);
 
-    char dircopy[1024];
-    strncpy(dircopy, binpath, sizeof(dircopy) - 1);
-    dircopy[sizeof(dircopy) - 1] = '\0';
-    char *dd = dirname(dircopy);
-    char *dn = strrchr(dd, '/');
-    if (dn) dn++; else dn = dd;
+    /* 3) If the binary lives in <root>/build/, strip /build to get <root> */
+    char *slash = strrchr(dir, '/');
+    char *base  = slash ? slash + 1 : dir;
+    if (strcmp(base, "build") == 0 && slash)
+        *slash = '\0';
 
-    /* If binary is in .../build/, set root to the parent of build */
-    if (strcmp(dn, "build") == 0) {
-        char *last = strrchr(dd, '/');
-        if (last) *last = '\0';
-        strncpy(g_basedir, dd, sizeof(g_basedir) - 1);
-    } else {
-        strncpy(g_basedir, dd, sizeof(g_basedir) - 1);
-    }
-
+    strncpy(g_basedir, dir, sizeof(g_basedir) - 1);
     g_basedir[sizeof(g_basedir) - 1] = '\0';
     g_basedir_set = 1;
+}
+
+/* Read a whole file into memory, preferring mmap (with a read() fallback).
+ *
+ * On success returns FILE_READ_OK with *buf and *size set; *is_mmap==1 means
+ * the caller must munmap(*buf, *size), otherwise it must free(*buf).
+ * `tag` is used only for log-prefix consistency ("AOF" / "RDB"). */
+int file_read_full(const char *path, char **buf, size_t *size,
+                   int *is_mmap, const char *tag) {
+    *buf = NULL; *size = 0; *is_mmap = 0;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return FILE_READ_OPEN_FAIL;
+
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size <= 0) {
+        close(fd);
+        return FILE_READ_EMPTY;
+    }
+    size_t fsz = (size_t)st.st_size;
+
+    char *base = (char *)mmap(NULL, fsz, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (base != MAP_FAILED) {
+        close(fd);
+        madvise(base, fsz, MADV_SEQUENTIAL);
+        *buf = base; *size = fsz; *is_mmap = 1;
+        return FILE_READ_OK;
+    }
+
+    printf("[%s] mmap failed: %s, falling back to read()\n", tag, strerror(errno));
+
+    base = malloc(fsz);
+    if (!base) { close(fd); return FILE_READ_EMPTY; }
+
+    lseek(fd, 0, SEEK_SET);
+    size_t total_read = 0;
+    while (total_read < fsz) {
+        ssize_t n = read(fd, base + total_read, fsz - total_read);
+        if (n <= 0) break;
+        total_read += n;
+    }
+    close(fd);
+
+    if (total_read != fsz) {
+        printf("[%s] read failed: only read %zu/%zu bytes\n",
+               tag, total_read, fsz);
+        free(base);
+        return FILE_READ_EMPTY;
+    }
+
+    *buf = base; *size = fsz; *is_mmap = 0;
+    return FILE_READ_OK;
 }

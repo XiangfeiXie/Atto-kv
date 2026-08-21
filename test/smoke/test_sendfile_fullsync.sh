@@ -31,7 +31,7 @@ FULLSYNC_PORT="${3:-${FULLSYNC_PORT:-7710}}"   # sendfile 数据走 FULLSYNC_POR
 KVSTORE_BIN="${KVSTORE_BIN:-${ROOT_DIR}/build/kvstore}"
 HOST="${HOST:-127.0.0.1}"
 N="${N:-15000}"                                # 数据量，>10000
-NETWORK="${NETWORK:-reactor}"                  # 网络引擎: reactor | proactor
+NETWORK="${NETWORK:-proactor}"                  # 网络引擎: reactor | proactor
 
 MASTER_CONF=$(mktemp)
 SLAVE_CONF=$(mktemp)

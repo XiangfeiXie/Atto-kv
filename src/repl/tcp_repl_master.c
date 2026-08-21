@@ -18,6 +18,7 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <sys/time.h>
 
 int tcp_master_fullsync_child(uint64_t repl_offset, int ready_fd) {
@@ -61,19 +62,31 @@ int tcp_master_fullsync_child(uint64_t repl_offset, int ready_fd) {
     uint64_t file_size = (uint64_t)st.st_size;
     printf("[tcp-master] RDB: %lu bytes\n", (unsigned long)file_size);
 
-    /* 5. sendfile: size(8B) + data */
+    /* 5. sendfile: size(8B) + data。sendfile 可能只部分返回，必须循环发完，
+     *      否则大 RDB（或跨机）下对端 recv 到一半遇到 EOF，slave 加载失败。 */
     uint64_t sz_be = htobe64(file_size);
     if (send(cfd, &sz_be, 8, 0) != 8) { perror("send size"); goto out; }
 
     off_t off = 0;
-    ssize_t sent = sendfile(cfd, fd, &off, (size_t)file_size);
+    size_t remaining = (size_t)file_size;
+    size_t sent = 0;
+    while (remaining > 0) {
+        ssize_t n = sendfile(cfd, fd, &off, remaining);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            perror("sendfile");
+            break;
+        }
+        if (n == 0) break;  /* 对端关闭或无法继续 */
+        sent      += (size_t)n;
+        remaining -= (size_t)n;
+    }
 
     clock_gettime(CLOCK_MONOTONIC, &t2);
 
-    if (sent < 0) { perror("sendfile"); sent = 0; }
     double ms = (t2.tv_sec-t1.tv_sec)*1000.0 + (t2.tv_nsec-t1.tv_nsec)/1e6;
     double mbps = (ms>0) ? ((double)sent / (ms/1000.0) / (1024.0*1024.0)) : 0;
-    printf("[tcp-master] xfer-end: bytes=%zd ms=%.1f mbps=%.2f\n", sent, ms, mbps);
+    printf("[tcp-master] xfer-end: bytes=%zu ms=%.1f mbps=%.2f\n", sent, ms, mbps);
 
 out:
     close(fd); close(cfd); close(lfd);

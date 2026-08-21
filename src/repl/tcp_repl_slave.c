@@ -22,18 +22,25 @@
 #include <fcntl.h>
 #include <sys/time.h>
 
-/* recv 全量字节到文件 fd */
-static int recv_all(int sfd, int dfd, size_t total) {
+/* recv 全量字节到文件 fd；返回实际收到的字节数，或 -1（真实错误）。
+ * EOF（对端提前关闭）返回 < total，由调用方判定并报错。 */
+static ssize_t recv_all(int sfd, int dfd, size_t total) {
     char buf[65536];
     size_t left = total;
+    size_t got = 0;
     while (left > 0) {
         size_t chunk = left < sizeof(buf) ? left : sizeof(buf);
         ssize_t n = recv(sfd, buf, chunk, MSG_WAITALL);
-        if (n <= 0) return -1;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) break;  /* EOF：连接提前关闭，数据不完整 */
         if (write(dfd, buf, (size_t)n) != n) return -1;
         left -= (size_t)n;
+        got  += (size_t)n;
     }
-    return 0;
+    return (ssize_t)got;
 }
 
 int tcp_slave_fullsync(void) {
@@ -74,10 +81,15 @@ int tcp_slave_fullsync(void) {
     if (tfd < 0) { perror("open tmp"); close(fd); return -1; }
 
     struct timespec t1, t2; clock_gettime(CLOCK_MONOTONIC, &t1);
-    int rc = recv_all(fd, tfd, (size_t)fsz);
+    ssize_t got = recv_all(fd, tfd, (size_t)fsz);
     clock_gettime(CLOCK_MONOTONIC, &t2);
     close(fd); close(tfd);
-    if (rc < 0) { perror("recv data"); return -1; }
+    if (got < 0) { perror("recv data"); return -1; }
+    if ((size_t)got != fsz) {
+        fprintf(stderr, "[tcp-slave] connection closed early: got %zd/%lu bytes\n",
+                got, (unsigned long)fsz);
+        return -1;
+    }
 
     double ms = (t2.tv_sec-t1.tv_sec)*1000.0 + (t2.tv_nsec-t1.tv_nsec)/1e6;
     double mbps = (ms>0) ? ((double)fsz / (ms/1000.0) / (1024.0*1024.0)) : 0;

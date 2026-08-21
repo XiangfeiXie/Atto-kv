@@ -23,6 +23,10 @@ static const char *shm_name(void) {
     return n ? n : SHM_NAME;
 }
 
+const char *shm_region_name(void) {
+    return shm_name();
+}
+
 shm_region_t *shm_region_create(void) {
     const char *name = shm_name();
     int fd = shm_open(name, O_CREAT | O_RDWR, 0600);
@@ -55,11 +59,8 @@ shm_region_t *shm_region_create(void) {
 shm_region_t *shm_region_attach(void) {
     const char *name = shm_name();
     int fd = shm_open(name, O_RDWR, 0600);
-    if (fd < 0) {
-        fprintf(stderr, "[SHM] shm_open(%s) attach failed: %s\n",
-                name, strerror(errno));
-        return NULL;
-    }
+    if (fd < 0)
+        return NULL;   /* not created yet — caller decides messaging */
 
     shm_region_t *r = mmap(NULL, sizeof(shm_region_t),
                            PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);

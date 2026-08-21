@@ -238,3 +238,14 @@ void kcp_poll(kcp_transport_t *t, uint64_t now_ms)
     ikcp_update(t->kcp, (IUINT32)now_ms);
     af_xdp_poll_tx(t->xsk);
 }
+
+void kcp_transport_stats(const kcp_transport_t *t, kcp_transport_stats_t *out)
+{
+    if (!t || !out)
+        return;
+    out->kcp_sent   = t->kcp_sent;
+    out->kcp_recv   = t->kcp_recv;
+    out->tx_fail    = t->tx_fail;
+    out->rx_invalid = t->rx_invalid;
+    af_xdp_stats(t->xsk, &out->xdp);
+}

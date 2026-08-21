@@ -61,6 +61,9 @@ shm_region_t *shm_region_create(void);
  * region does not exist yet — start the engine first. */
 shm_region_t *shm_region_attach(void);
 
+/* Name of the region in use (respects XDPKCP_SHM_NAME).  For diagnostics. */
+const char *shm_region_name(void);
+
 /* Unmap and (for the creator) unlink.  Safe to call with NULL. */
 void shm_region_destroy(shm_region_t *r, int creator);
 

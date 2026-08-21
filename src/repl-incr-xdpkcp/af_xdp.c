@@ -321,3 +321,13 @@ int af_xdp_ifindex(af_xdp_ctx_t *ctx)
 {
     return ctx ? ctx->ifindex : -1;
 }
+
+void af_xdp_stats(const af_xdp_ctx_t *ctx, af_xdp_stats_t *out)
+{
+    if (!ctx || !out)
+        return;
+    out->rx_pkts        = ctx->rx_pkts;
+    out->tx_pkts        = ctx->tx_pkts;
+    out->tx_drops       = ctx->tx_drops;
+    out->rx_refill_fail = ctx->rx_refill_fail;
+}

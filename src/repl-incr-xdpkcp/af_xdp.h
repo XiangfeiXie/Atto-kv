@@ -44,4 +44,14 @@ void af_xdp_poll_tx(af_xdp_ctx_t *ctx);
 int  af_xdp_local_mac(af_xdp_ctx_t *ctx, uint8_t out[6]);
 int  af_xdp_ifindex(af_xdp_ctx_t *ctx);
 
+/* Snapshot of datapath counters, for diagnostics / shutdown summary. */
+typedef struct {
+    uint64_t rx_pkts;          /* frames received from the kernel */
+    uint64_t tx_pkts;          /* frames submitted to the kernel */
+    uint64_t tx_drops;         /* frames dropped: no free Tx frame / full ring */
+    uint64_t rx_refill_fail;   /* Rx frames not returned to the fill ring */
+} af_xdp_stats_t;
+
+void af_xdp_stats(const af_xdp_ctx_t *ctx, af_xdp_stats_t *out);
+
 #endif /* AF_XDP_H */

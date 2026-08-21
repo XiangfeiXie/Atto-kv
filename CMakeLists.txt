@@ -228,8 +228,6 @@ add_custom_target(set-caps
     VERBATIM
 )
 
-# ── testcase target ───────────────────────────────────────────────────
-add_executable(testcase test/testcase.c)
 
 # ── Phase 8.1 — smoke / sanitizer-smoke targets ──────────────────────
 # Run as:

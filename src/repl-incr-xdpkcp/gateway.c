@@ -26,6 +26,10 @@
 #include <arpa/inet.h>
 #include <x86intrin.h>
 
+/* How long the gateway waits (ms) for the engine to create the SHM region
+ * before giving up.  The engine must be started first. */
+#define SHM_WAIT_TIMEOUT_MS  30000
+
 static volatile sig_atomic_t g_stop = 0;
 
 static void on_signal(int sig)
@@ -107,14 +111,29 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    /* The engine creates the SHM region; retry until it appears. */
+    /* The engine creates the SHM region.  Announce once, then poll silently
+     * (the missing region is the normal "engine not up yet" state). */
     shm_region_t *shm = NULL;
-    while (!g_stop && !(shm = shm_region_attach())) {
-        fprintf(stderr, "[GW] waiting for engine SHM region...\n");
-        sleep(1);
+    {
+        uint64_t wait_start = get_ms();
+        int announced = 0;
+        while (!g_stop && !(shm = shm_region_attach())) {
+            if (!announced) {
+                fprintf(stderr, "[GW] waiting for engine SHM region (%s)...\n",
+                        shm_region_name());
+                announced = 1;
+            }
+            if (get_ms() - wait_start > SHM_WAIT_TIMEOUT_MS) {
+                fprintf(stderr, "[GW] timeout: SHM region (%s) never appeared — "
+                        "start the kvstore engine (xdp_sync on) first\n",
+                        shm_region_name());
+                return 1;
+            }
+            sleep(1);
+        }
+        if (!shm)
+            return 1;
     }
-    if (!shm)
-        return 1;
 
     kcp_transport_t *t = kcp_transport_init(&cfg);
     if (!t) {
@@ -122,30 +141,37 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    printf("[GW] %s gateway running (port %u)\n",
-           is_master ? "master" : "slave", sync_port);
+    printf("[GW] %s gateway: iface=%s bpf=%s local=%s peer=%s:%u shm=%s\n",
+           is_master ? "master" : "slave", iface, bpf, local_ip, peer_ip,
+           sync_port, shm_region_name());
 
-    /* Slave-side pending buffer: KCP ordered bytes awaiting SHM space. */
+    /* Slave-side pending buffer: KCP ordered bytes awaiting SHM space.
+     * Master-side: one dequeued item held across passes when KCP is busy. */
     enum { PENDING_CAP = 1 << 20 };
     static char pending[PENDING_CAP];
     int pending_len = 0;
 
-    uint64_t last_stats = get_ms();
-    uint64_t shm_tx = 0, shm_rx = 0, drops = 0;
+    char     mbuf[SHM_MAX_PAYLOAD];
+    uint32_t mlen = 0;
+    int      have = 0;
+
+    uint64_t shm_rx = 0, shm_tx = 0, drops = 0;
     int      idle = 0;
 
     while (!g_stop) {
         uint64_t now = get_ms();
 
         if (is_master) {
-            char buf[SHM_MAX_PAYLOAD];
-            uint32_t len;
             int drained = 0;
-            while (drained < 256 && spsc_dequeue(&shm->q, buf, &len) == 0) {
-                if (kcp_send_stream(t, buf, len) != 0) {
-                    drops++;
-                    break;               /* KCP window full — retry next pass */
+            while (drained < 256) {
+                if (!have) {
+                    if (spsc_dequeue(&shm->q, mbuf, &mlen) != 0)
+                        break;               /* SHM empty */
+                    have = 1;
                 }
+                if (kcp_send_stream(t, mbuf, mlen) != 0)
+                    break;                   /* KCP busy — keep item, retry next pass */
+                have = 0;
                 shm_rx++;
                 drained++;
             }
@@ -178,16 +204,6 @@ int main(int argc, char **argv)
 
         kcp_poll(t, now);
 
-        if (now - last_stats >= 1000) {
-            printf("[GW] role=%s shm_in=%llu shm_out=%llu drops=%llu\n",
-                   is_master ? "master" : "slave",
-                   (unsigned long long)shm_rx,
-                   (unsigned long long)shm_tx,
-                   (unsigned long long)drops);
-            shm_rx = shm_tx = 0;
-            last_stats = now;
-        }
-
         if (idle > 64) {
             usleep(1);
             idle = 0;
@@ -197,7 +213,25 @@ int main(int argc, char **argv)
         }
     }
 
-    printf("[GW] shutting down\n");
+    printf("[GW] shutting down: shm_in=%llu shm_out=%llu drops=%llu\n",
+           (unsigned long long)shm_rx,
+           (unsigned long long)shm_tx,
+           (unsigned long long)drops);
+    {
+        kcp_transport_stats_t ks;
+        kcp_transport_stats(t, &ks);
+        printf("[GW] kcp: sent=%llu recv=%llu tx_fail=%llu rx_invalid=%llu\n",
+               (unsigned long long)ks.kcp_sent,
+               (unsigned long long)ks.kcp_recv,
+               (unsigned long long)ks.tx_fail,
+               (unsigned long long)ks.rx_invalid);
+        printf("[GW] af_xdp: tx_pkts=%llu tx_drops=%llu rx_pkts=%llu rx_refill_fail=%llu\n",
+               (unsigned long long)ks.xdp.tx_pkts,
+               (unsigned long long)ks.xdp.tx_drops,
+               (unsigned long long)ks.xdp.rx_pkts,
+               (unsigned long long)ks.xdp.rx_refill_fail);
+    }
+
     kcp_transport_destroy(t);
     shm_region_destroy(shm, 0);
     return 0;

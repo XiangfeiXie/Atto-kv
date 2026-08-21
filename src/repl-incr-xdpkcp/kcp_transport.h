@@ -13,6 +13,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "af_xdp.h"
+
 typedef struct kcp_transport kcp_transport_t;
 
 typedef struct {
@@ -39,5 +41,16 @@ int kcp_recv_stream(kcp_transport_t *t, void *buf, size_t cap);
  * ikcp_update (drives ACKs / retransmit via ikcp_output), then recycle Tx
  * completions.  `now_ms` is a monotonic millisecond clock. */
 void kcp_poll(kcp_transport_t *t, uint64_t now_ms);
+
+/* Snapshot of transport + datapath counters, for diagnostics. */
+typedef struct {
+    uint64_t kcp_sent;      /* bytes pushed into the KCP stream */
+    uint64_t kcp_recv;      /* bytes pulled from the KCP stream */
+    uint64_t tx_fail;       /* datagrams that failed to reach the wire */
+    uint64_t rx_invalid;    /* frames that were not our UDP:sync_port */
+    af_xdp_stats_t xdp;     /* underlying AF_XDP ring counters */
+} kcp_transport_stats_t;
+
+void kcp_transport_stats(const kcp_transport_t *t, kcp_transport_stats_t *out);
 
 #endif /* KCP_TRANSPORT_H */

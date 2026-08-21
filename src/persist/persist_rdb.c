@@ -362,7 +362,9 @@ void rdb_serialize_to_buf(DynBuf *out) {
 void rdb_serialize_begin(rdb_serializer_t *rs) {
     rs->iter        = dict_iter_new(&g_dict, 1);
     rs->header_sent = 0;
-    rs->exhausted   = (dict_iter_peek(rs->iter) == NULL);
+    /* 空库也必须发出 RDB header（key_count=0），否则 RDMA 全量同步会因
+     * exhausted 提前置位而 0 batch 收尾，slave 收不到 IMM_DONE 卡死。 */
+    rs->exhausted   = 0;
 }
 
 size_t rdb_serialize_next(rdb_serializer_t *rs, char *dst,

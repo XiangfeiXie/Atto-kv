@@ -67,7 +67,9 @@ int repl_backlog_valid(size_t offset) {
         earliest = 0;
     else
         earliest = g_backlog.head - REPL_BACKLOG_SIZE;
-    return (offset >= earliest && offset < g_backlog.head) ? 1 : 0;
+    /* offset == head 是"已追平"（全量快照刚做完、期间无新写入）的合法位置，
+     * 应回 +CONTINUE 进入 streaming 而非 +FULLRESYNC，故用 <= 包含右边界。 */
+    return (offset >= earliest && offset <= g_backlog.head) ? 1 : 0;
 }
 
 /* ── Backlog fetch (scan RESP boundaries) ──────────────────────────────

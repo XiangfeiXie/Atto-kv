@@ -169,12 +169,13 @@ int main(int argc, char **argv)
                         break;               /* SHM empty */
                     have = 1;
                 }
-                if (kcp_send_stream(t, mbuf, mlen) != 0)
-                    break;                   /* KCP busy — keep item, retry next pass */
+                if (kcp_send_queue(t, mbuf, mlen) != 0)
+                    break;                   /* KCP queue full — keep item, retry next pass */
                 have = 0;
                 shm_rx++;
                 drained++;
             }
+            kcp_flush(t);                    /* one flush per drain batch */
         } else {
             char buf[65536];
             int n = kcp_recv_stream(t, buf, sizeof(buf));

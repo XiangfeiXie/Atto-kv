@@ -30,8 +30,14 @@ typedef struct {
 kcp_transport_t *kcp_transport_init(const kcp_transport_cfg_t *cfg);
 void kcp_transport_destroy(kcp_transport_t *t);
 
-/* Master: push `len` bytes into the reliable stream (flushed immediately). */
-int kcp_send_stream(kcp_transport_t *t, const void *data, size_t len);
+/* Master: append `len` bytes to the KCP send queue (no flush yet).  Call
+ * kcp_flush() once after a batch so adjacent commands coalesce into full MTU
+ * segments instead of emitting one datagram per command.  Returns 0 on
+ * success, -1 if KCP cannot accept the data (queue full / OOM). */
+int kcp_send_queue(kcp_transport_t *t, const void *data, size_t len);
+
+/* Master: flush the queued KCP data to the wire (ikcp_flush). */
+void kcp_flush(kcp_transport_t *t);
 
 /* Slave: drain up to `cap` bytes of the ordered stream into buf.
  * Returns bytes copied (>0), 0 if nothing ready, -1 on error. */

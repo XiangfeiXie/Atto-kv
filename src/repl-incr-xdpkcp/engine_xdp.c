@@ -14,11 +14,19 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sched.h>
 
 static shm_region_t *g_shm = NULL;
 static int           g_slave_active = 0;
 static DynBuf        g_rx_buf = {0};     /* slave: reassembly buffer */
-static uint64_t      g_enqueue_drops = 0;
+
+/* Shutdown diagnostics.  These are the only counters that make the engine's
+ * copy of the pipeline visible (the gateway's own counters are printed in
+ * gateway.c). */
+static uint64_t      g_enqueue_total = 0; /* master: commands handed to gateway */
+static uint64_t      g_rx_bytes      = 0; /* slave:  bytes drained from the gateway */
+static uint64_t      g_replayed      = 0; /* slave:  commands replayed via kvs_dispatch */
+static int           g_warned_full   = 0; /* one-shot "ring full" backpressure notice */
 
 /* ── Slave: replay complete commands buffered in g_rx_buf ────────────── */
 
@@ -45,6 +53,7 @@ static void engine_replay_pending(void)
         kvs_dispatch(tokens, argc, g_rx_buf.buf + off, cmd_len,
                      &dummy_wb, NULL);
         g_in_reload = 0;
+        g_replayed++;
 
         off += cmd_len;
     }
@@ -85,12 +94,27 @@ void xdp_engine_enqueue(const char *data, int len)
 {
     if (!g_shm || !data || len <= 0)
         return;
-    if (len > SHM_MAX_PAYLOAD) {
-        g_enqueue_drops++;
-        return;
+
+    /* Chunk oversized commands into ≤SHM_MAX_PAYLOAD slices; the slave
+     * reassembles the byte stream, so arbitrary boundaries are fine.  When
+     * the ring is full we back off and retry (lossless backpressure) instead
+     * of dropping — a replication path must never silently lose commands. */
+    int off = 0;
+    while (off < len) {
+        int chunk = len - off;
+        if (chunk > SHM_MAX_PAYLOAD)
+            chunk = SHM_MAX_PAYLOAD;
+
+        while (spsc_enqueue(&g_shm->q, data + off, (uint32_t)chunk) != 0) {
+            if (!g_warned_full) {
+                printf("[XDP-ENGINE] SHM ring full, waiting for gateway...\n");
+                g_warned_full = 1;
+            }
+            sched_yield();
+        }
+        off += chunk;
     }
-    if (spsc_enqueue(&g_shm->q, data, (uint32_t)len) != 0)
-        g_enqueue_drops++;               /* gateway fell behind — drop (hot path) */
+    g_enqueue_total++;
 }
 
 void xdp_engine_poll(void)
@@ -105,6 +129,7 @@ void xdp_engine_poll(void)
         dynbuf_reserve(&g_rx_buf, g_rx_buf.len + (int)len);
         memcpy(g_rx_buf.buf + g_rx_buf.len, buf, len);
         g_rx_buf.len += (int)len;
+        g_rx_bytes += len;
         drained++;
     }
 
@@ -121,6 +146,19 @@ void xdp_engine_shutdown(void)
 {
     if (!g_shm)
         return;
+
+    /* One-line shutdown summary for diagnosing replication data loss.
+     *   master: enqueued must equal the gateway's shm_in.
+     *   slave:  rx_bytes must equal the gateway's shm_out; replayed must equal
+     *           the number of commands written; rx_left > 0 means the replay
+     *           stalled on an unparseable command and the rest never applied. */
+    printf("[XDP-ENGINE] shutdown: enqueued=%llu rx_bytes=%llu "
+           "replayed=%llu rx_left=%d\n",
+           (unsigned long long)g_enqueue_total,
+           (unsigned long long)g_rx_bytes,
+           (unsigned long long)g_replayed,
+           g_rx_buf.len);
+
     dynbuf_free(&g_rx_buf);
     shm_region_destroy(g_shm, 1);
     g_shm = NULL;

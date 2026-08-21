@@ -201,14 +201,18 @@ void kcp_transport_destroy(kcp_transport_t *t)
     free(t);
 }
 
-int kcp_send_stream(kcp_transport_t *t, const void *data, size_t len)
+int kcp_send_queue(kcp_transport_t *t, const void *data, size_t len)
 {
     int r = ikcp_send(t->kcp, data, (int)len);
     if (r < 0)
         return -1;
-    ikcp_flush(t->kcp);                  /* output callback fires now */
-    t->kcp_sent += len;
+    t->kcp_sent += (uint64_t)len;
     return 0;
+}
+
+void kcp_flush(kcp_transport_t *t)
+{
+    ikcp_flush(t->kcp);                  /* output callback fires now */
 }
 
 int kcp_recv_stream(kcp_transport_t *t, void *buf, size_t cap)

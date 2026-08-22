@@ -16,6 +16,11 @@
  * the write hot path; no-ops if the SHM region is absent. */
 void xdp_engine_enqueue(const char *data, int len);
 
+/* Master: flush the pending batch of write commands to the gateway.  Called
+ * from the event loop so a partial batch drains promptly instead of waiting
+ * for the buffer to fill.  no-ops if the batch is empty. */
+void xdp_engine_flush(void);
+
 /* Slave: drain gateway-delivered bytes and replay complete commands.  Called
  * from the event loop; no-ops unless the slave SHM region is active. */
 void xdp_engine_poll(void);

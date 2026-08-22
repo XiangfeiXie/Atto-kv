@@ -43,9 +43,11 @@ void kcp_flush(kcp_transport_t *t);
  * Returns bytes copied (>0), 0 if nothing ready, -1 on error. */
 int kcp_recv_stream(kcp_transport_t *t, void *buf, size_t cap);
 
-/* Both roles, every loop iteration: poll AF_XDP Rx → ikcp_input, then
- * ikcp_update (drives ACKs / retransmit via ikcp_output), then recycle Tx
- * completions.  `now_ms` is a monotonic millisecond clock. */
+/* Both roles, every loop iteration: advance the KCP clock, poll AF_XDP Rx
+ * (ikcp_input), flush pending ACKs immediately, then recycle Tx completions.
+ * The immediate flush (rather than waiting for ikcp_update's `interval` tick)
+ * is what keeps the peer's send window advancing at RTT speed.  `now_ms` is a
+ * monotonic millisecond clock. */
 void kcp_poll(kcp_transport_t *t, uint64_t now_ms);
 
 /* Snapshot of transport + datapath counters, for diagnostics. */

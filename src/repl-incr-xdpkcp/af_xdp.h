@@ -5,8 +5,9 @@
  *     (xsk_umem__create / xsk_socket__create)
  *   - load & attach the XDP program (xdp_kcp.bpf.o) that redirects
  *     UDP:sync_port into the XSK via the XSKMAP (libbpf attach)
- *   - af_xdp_send_frame()   — copy a raw Ethernet frame into a UMEM frame and
- *                             submit it on the Tx ring
+ *   - af_xdp_tx_acquire()   — reserve a Tx frame, return its UMEM pointer
+ *   - af_xdp_tx_commit()    — submit the reserved frame to the Tx ring
+ *   - af_xdp_tx_kick()      — wake the kernel once to drain committed frames
  *   - af_xdp_poll_rx()      — drain the Rx ring, hand each frame to a callback
  *   - af_xdp_poll_tx()      — recycle completed Tx frames back into the Fill ring
  *
@@ -28,9 +29,19 @@ af_xdp_ctx_t *af_xdp_init(const char *ifname, const char *bpf_obj_path);
 
 void af_xdp_destroy(af_xdp_ctx_t *ctx);
 
-/* Send one pre-assembled Ethernet frame.  0 on success, -1 on failure (no
- * free Tx frame, oversized, or empty ring). */
-int af_xdp_send_frame(af_xdp_ctx_t *ctx, const void *frame, size_t len);
+/* Reserve a Tx frame and return a writable pointer into UMEM.  *addr receives
+ * the frame's UMEM address (needed for af_xdp_tx_commit).  Returns NULL if no
+ * free Tx frame is available. */
+void *af_xdp_tx_acquire(af_xdp_ctx_t *ctx, uint64_t *addr);
+
+/* Commit a previously acquired Tx frame (addr from af_xdp_tx_acquire) of `len`
+ * bytes to the Tx ring.  Does NOT wake the kernel — call af_xdp_tx_kick() once
+ * after a batch to amortise the wakeup syscall.  0 on success, -1 on failure. */
+int af_xdp_tx_commit(af_xdp_ctx_t *ctx, uint64_t addr, size_t len);
+
+/* Wake the kernel (sendto) so it drains all committed Tx frames.  Cheap when
+ * the ring needs no wakeup. */
+void af_xdp_tx_kick(af_xdp_ctx_t *ctx);
 
 /* Drain up to `max_frames` received frames, invoking cb(frame, len, arg) for
  * each.  Returns the number of frames delivered. */

@@ -145,10 +145,11 @@ typedef struct IKCPSEG IKCPSEG;
 
 static void* (*ikcp_malloc_hook)(size_t) = NULL;
 static void (*ikcp_free_hook)(void *) = NULL;
+static void* (*ikcp_realloc_hook)(void *, size_t) = NULL;
 
 // internal malloc
 static void* ikcp_malloc(size_t size) {
-	if (ikcp_malloc_hook) 
+	if (ikcp_malloc_hook)
 		return ikcp_malloc_hook(size);
 	return malloc(size);
 }
@@ -160,6 +161,13 @@ static void ikcp_free(void *ptr) {
 	}	else {
 		free(ptr);
 	}
+}
+
+// internal realloc (for in-place segment append)
+static void* ikcp_realloc(void *ptr, size_t size) {
+	if (ikcp_realloc_hook)
+		return ikcp_realloc_hook(ptr, size);
+	return realloc(ptr, size);
 }
 
 // redefine allocator
@@ -486,24 +494,30 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 		if (!iqueue_is_empty(&kcp->snd_queue)) {
 			IKCPSEG *old = iqueue_entry(kcp->snd_queue.prev, IKCPSEG, node);
 			if (old->len < kcp->mss) {
-				int capacity = kcp->mss - old->len;
+				int oldlen = old->len;
+				int capacity = kcp->mss - oldlen;
 				int extend = (len < capacity)? len : capacity;
-				seg = ikcp_segment_new(kcp, old->len + extend);
-				assert(seg);
+				/* In-place grow of the tail segment.  The original
+				 * allocate-new + memcpy-old + free-old pattern turns a burst
+				 * of small stream writes into O(n²) copying + malloc/free
+				 * churn; realloc amortises this to O(n). */
+				seg = (IKCPSEG*)ikcp_realloc(old, sizeof(IKCPSEG) + oldlen + extend);
 				if (seg == NULL) {
 					return -2;
 				}
-				iqueue_add_tail(&seg->node, &kcp->snd_queue);
-				memcpy(seg->data, old->data, old->len);
+				if (seg != old) {
+					/* realloc relocated the node: re-link the neighbours that
+					 * still point at the old address. */
+					seg->node.prev->next = &seg->node;
+					seg->node.next->prev = &seg->node;
+				}
 				if (buffer) {
-					memcpy(seg->data + old->len, buffer, extend);
+					memcpy(seg->data + oldlen, buffer, extend);
 					buffer += extend;
 				}
-				seg->len = old->len + extend;
+				seg->len = oldlen + extend;
 				seg->frg = 0;
 				len -= extend;
-				iqueue_del_init(&old->node);
-				ikcp_segment_delete(kcp, old);
 				sent = extend;
 			}
 		}

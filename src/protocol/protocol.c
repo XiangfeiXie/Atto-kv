@@ -41,7 +41,13 @@ int resp_parse_slices(const char *buf, int buflen,
         if (argc > max_tokens) return -1;
         p++;
     }
-    if (p + 1 >= end || *p != '\r' || p[1] != '\n') return (p >= end) ? 0 : -1;
+    /* A truncated "\r\n" (only '\r' present, '\n' not yet received) is
+     * *incomplete* data, not a protocol error — the next recv will supply
+     * the missing byte.  Returning -1 here would send the parser into the
+     * inline-command fallback, which would mis-parse the RESP array header
+     * ("*3\r\n") as a standalone inline command and corrupt the stream. */
+    if (p + 1 >= end) return 0;
+    if (*p != '\r' || p[1] != '\n') return -1;
     if (argc <= 0) return -1;
     p += 2;  /* skip \r\n */
 
@@ -57,7 +63,10 @@ int resp_parse_slices(const char *buf, int buflen,
             if (slen > KVS_MAX_BULK_LEN) return -1;
             p++;
         }
-        if (p + 1 >= end || *p != '\r' || p[1] != '\n') return (p >= end) ? 0 : -1;
+        /* Same incomplete-vs-error distinction as the argc header above:
+         * "$L\r" (only '\r' present) is incomplete, not a protocol error. */
+        if (p + 1 >= end) return 0;
+        if (*p != '\r' || p[1] != '\n') return -1;
         p += 2;
 
         if (p + slen + 2 > end) return 0;

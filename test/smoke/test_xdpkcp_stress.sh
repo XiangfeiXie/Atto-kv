@@ -210,7 +210,7 @@ section "Start kvstore master & slave"
 
 cat > "$MASTER_CONF" <<EOF
 port ${MASTER_PORT}
-network reactor
+network proactor
 maxclients 200
 loglevel info
 persistence none
@@ -223,7 +223,7 @@ EOF
 
 cat > "$SLAVE_CONF" <<EOF
 port ${SLAVE_PORT}
-network reactor
+network proactor
 maxclients 200
 loglevel info
 persistence none

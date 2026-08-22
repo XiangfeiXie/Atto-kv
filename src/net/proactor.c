@@ -618,6 +618,11 @@ static void proactor_loop(proactor_worker_t *w) {
          * low-latency without shortening any sleep. */
         xdp_engine_poll();
 
+        /* Flush the master's batched write commands to the gateway so a
+         * partial batch drains promptly (idle path runs at 10us granularity,
+         * so this bounds replication latency without any extra sleep). */
+        xdp_engine_flush();
+
         /* Peek completed CQEs — shared-memory, no syscall */
         struct io_uring_cqe *cqes[CQE_BATCH_SIZE];
         int nready = io_uring_peek_batch_cqe(ring, cqes, CQE_BATCH_SIZE);

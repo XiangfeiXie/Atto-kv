@@ -27,6 +27,8 @@ struct kcp_transport {
     uint16_t sync_port;     /* host byte order */
     int      is_master;
 
+    uint8_t  hdr_tmpl[HDR_TOTAL]; /* Eth+IPv4+UDP header with constant fields */
+
     uint64_t kcp_sent, kcp_recv, rx_invalid, tx_fail;
 };
 
@@ -66,45 +68,40 @@ static void wr32(uint8_t *p, uint32_t v)
     p[3] = (uint8_t)(v & 0xff);
 }
 
-/* Assemble Eth + IPv4 + UDP around one KCP datagram and push it out. */
+/* Assemble Eth + IPv4 + UDP around one KCP datagram and push it out.
+ *
+ * The constant header fields are pre-filled once in t->hdr_tmpl (see
+ * kcp_transport_init); here we copy that template straight into the UMEM Tx
+ * frame (no intermediate stack buffer → no second memcpy), patch the three
+ * length/checksum fields, then commit.  The kernel is woken once per flush by
+ * kcp_flush(), not per frame. */
 static int send_kcp_datagram(kcp_transport_t *t, const void *datagram, size_t dlen)
 {
-    uint8_t frame[1500];
-    size_t total = HDR_TOTAL + dlen;
-    if (total > sizeof(frame))
+    size_t iplen = IP_HDR + UDP_HDR + dlen;
+    size_t total = ETH_HDR + iplen;
+    if (total > 1500)                   /* Ethernet MTU */
         return -1;
 
-    uint8_t *eth = frame;
+    uint64_t addr;
+    uint8_t *frame = af_xdp_tx_acquire(t->xsk, &addr);
+    if (!frame) {
+        t->tx_fail++;
+        return -1;
+    }
+
     uint8_t *ip  = frame + ETH_HDR;
     uint8_t *udp = frame + ETH_HDR + IP_HDR;
 
-    /* Ethernet */
-    memcpy(eth, t->peer_mac, 6);
-    memcpy(eth + 6, t->local_mac, 6);
-    eth[12] = 0x08; eth[13] = 0x00;    /* EtherType IPv4 */
+    memcpy(frame, t->hdr_tmpl, HDR_TOTAL);
 
-    /* IPv4 */
-    memset(ip, 0, IP_HDR);
-    ip[0] = 0x45;                       /* version 4, IHL 5 */
-    wr16(ip + 2, (uint16_t)(IP_HDR + UDP_HDR + dlen));   /* total length */
-    wr16(ip + 4, 0);                    /* identification */
-    wr16(ip + 6, 0x4000);               /* flags/offset: DF */
-    ip[8]  = 64;                        /* TTL */
-    ip[9]  = 17;                        /* UDP */
+    wr16(ip + 2, (uint16_t)iplen);      /* IPv4 total length */
     wr16(ip + 10, 0);                   /* checksum (zero for now) */
-    wr32(ip + 12, t->local_ip);         /* src */
-    wr32(ip + 16, t->peer_ip);          /* dst */
     wr16(ip + 10, ip_cksum(ip));
-
-    /* UDP */
-    wr16(udp + 0, (uint16_t)t->sync_port);
-    wr16(udp + 2, (uint16_t)t->sync_port);
     wr16(udp + 4, (uint16_t)(UDP_HDR + dlen));
-    wr16(udp + 6, 0);                   
 
     memcpy(udp + UDP_HDR, datagram, dlen);
 
-    if (af_xdp_send_frame(t->xsk, frame, total) != 0) {
+    if (af_xdp_tx_commit(t->xsk, addr, total) != 0) {
         t->tx_fail++;
         return -1;
     }
@@ -169,6 +166,30 @@ kcp_transport_t *kcp_transport_init(const kcp_transport_cfg_t *cfg)
         goto fail;
     af_xdp_local_mac(t->xsk, t->local_mac);
 
+    /* Pre-fill the constant Ethernet + IPv4 + UDP header.  Per-frame we only
+     * patch total-length, IP checksum and UDP length (send_kcp_datagram). */
+    {
+        uint8_t *eth = t->hdr_tmpl;
+        uint8_t *ip  = t->hdr_tmpl + ETH_HDR;
+        uint8_t *udp = t->hdr_tmpl + ETH_HDR + IP_HDR;
+
+        memcpy(eth, t->peer_mac, 6);
+        memcpy(eth + 6, t->local_mac, 6);
+        eth[12] = 0x08; eth[13] = 0x00;   /* EtherType IPv4 */
+
+        ip[0] = 0x45;                      /* version 4, IHL 5 */
+        wr16(ip + 4, 0);                   /* identification */
+        wr16(ip + 6, 0x4000);              /* flags/offset: DF */
+        ip[8]  = 64;                       /* TTL */
+        ip[9]  = 17;                       /* UDP */
+        wr32(ip + 12, t->local_ip);        /* src */
+        wr32(ip + 16, t->peer_ip);         /* dst */
+
+        wr16(udp + 0, (uint16_t)t->sync_port);  /* src port */
+        wr16(udp + 2, (uint16_t)t->sync_port);  /* dst port */
+        wr16(udp + 6, 0);                  /* UDP checksum = 0 */
+    }
+
     t->kcp = ikcp_create(KCP_CONV, t);
     if (!t->kcp)
         goto fail;
@@ -213,6 +234,7 @@ int kcp_send_queue(kcp_transport_t *t, const void *data, size_t len)
 void kcp_flush(kcp_transport_t *t)
 {
     ikcp_flush(t->kcp);                  /* output callback fires now */
+    af_xdp_tx_kick(t->xsk);              /* one wakeup for the whole batch */
 }
 
 int kcp_recv_stream(kcp_transport_t *t, void *buf, size_t cap)
@@ -238,8 +260,15 @@ int kcp_recv_stream(kcp_transport_t *t, void *buf, size_t cap)
 
 void kcp_poll(kcp_transport_t *t, uint64_t now_ms)
 {
-    af_xdp_poll_rx(t->xsk, rx_frame_cb, t, 256);
+    /* Advance the KCP clock first so `current` is fresh for ikcp_input's RTT
+     * calc and for the flush below. */
     ikcp_update(t->kcp, (IUINT32)now_ms);
+    /* ikcp_input queues ACKs for any data segments received, but does not
+     * flush them — the only flush inside the KCP library is gated by the
+     * `interval` tick (10ms).  Flush immediately so the peer's send window
+     * advances at RTT speed instead of one window per 10ms. */
+    af_xdp_poll_rx(t->xsk, rx_frame_cb, t, 256);
+    kcp_flush(t);
     af_xdp_poll_tx(t->xsk);
 }
 

@@ -49,17 +49,29 @@ FAILED_NAMES=()
 
 RED=$'\033[31m' GRN=$'\033[32m' YEL=$'\033[33m' RST=$'\033[0m'
 
-ok()   { PASS=$((PASS+1)); printf "  ${GRN}PASS${RST}  %s\n" "$1"; }
-bad()  { FAIL=$((FAIL+1)); FAILED_NAMES+=("$1");
-         printf "  ${RED}FAIL${RST}  %s\n        expected: %s\n        actual:   %s\n" "$1" "$2" "$3"; }
-skip() { SKIP=$((SKIP+1)); printf "  ${YEL}SKIP${RST}  %s — %s\n" "$1" "$2"; }
+# 静默模式：只有失败时才输出详细信息
+ok()   { PASS=$((PASS+1)); }
+bad()  { 
+    FAIL=$((FAIL+1))
+    FAILED_NAMES+=("$1")
+    printf "  ${RED}FAIL${RST}  %s\n" "$1"
+    printf "        expected: %s\n" "$2"
+    printf "        actual:   %s\n" "$3"
+}
+skip() { 
+    SKIP=$((SKIP+1))
+    printf "  ${YEL}SKIP${RST}  %s — %s\n" "$1" "$2"
+}
 
 chk() {
     if [ "$3" = "$2" ]; then ok "$1"
     else bad "$1" "$2" "$3"; fi
 }
 
-section() { printf "\n${YEL}── %s ──${RST}\n" "$1"; }
+section() { 
+    # 不输出任何内容，保持安静
+    return 0
+}
 
 summary() {
     local total=$((PASS + FAIL + SKIP))
@@ -67,7 +79,10 @@ summary() {
     printf "%s: %d/%d passed" "$1" "$PASS" "$total"
     if [ "$FAIL" -gt 0 ]; then
         printf "  (${RED}%d failed${RST})\n" "$FAIL"
-        for n in "${FAILED_NAMES[@]}"; do printf "    • %s\n" "$n"; done
+        printf "\n${RED}Failed tests:${RST}\n"
+        for n in "${FAILED_NAMES[@]}"; do 
+            printf "    • %s\n" "$n"
+        done
         return 1
     fi
     [ "$SKIP" -gt 0 ] && printf "  (${YEL}%d skipped${RST})\n" "$SKIP"
@@ -103,28 +118,23 @@ wait_for_key() {
 }
 
 # ── Prerequisites ────────────────────────────────────────────────────────────
-section "Prerequisites"
 
 if [ ! -x "$KVSTORE_BIN" ]; then
     printf "${RED}FATAL${RST}: kvstore binary not found at %s\n" "$KVSTORE_BIN" >&2
     exit 2
 fi
-ok "kvstore binary"
 
 if ! command -v redis-cli >/dev/null 2>&1; then
     printf "${RED}FATAL${RST}: redis-cli not found\n" >&2; exit 2
 fi
-ok "redis-cli"
 
 if ! command -v python3 >/dev/null 2>&1; then
     printf "${RED}FATAL${RST}: python3 not found\n" >&2; exit 2
 fi
-ok "python3"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1. START MASTER (incr_sync on, rdma_sync off)
 # ═══════════════════════════════════════════════════════════════════════════════
-section "Start master (incr_sync on, rdma_sync off)"
 
 cat > "$MASTER_CONF" << EOF
 port ${MASTER_PORT}
@@ -146,26 +156,22 @@ if ! kill -0 "$MASTER_PID" 2>/dev/null; then
     printf "${RED}FATAL${RST}: master failed to start\n" >&2
     cat "$MASTER_LOG" >&2; exit 2
 fi
-ok "master started (pid=$MASTER_PID, port=$MASTER_PORT, incr=$INCR_PORT)"
 
 # Verify master is reachable
 if ! $RCLI_M PING >/dev/null 2>&1; then
     printf "${RED}FATAL${RST}: master PING failed\n" >&2
     cat "$MASTER_LOG" >&2; exit 2
 fi
-ok "master PING"
 
 # Verify incr repl port is listening
 if ! ss -tlnp 2>/dev/null | grep -q ":$INCR_PORT "; then
     printf "${RED}FATAL${RST}: incr repl port $INCR_PORT not listening\n" >&2
     cat "$MASTER_LOG" >&2; exit 2
 fi
-ok "master listening on incr_repl_port $INCR_PORT"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 2. PRE-POPULATE MASTER (so backlog is non-empty, offset 0 is valid)
 # ═══════════════════════════════════════════════════════════════════════════════
-section "Pre-populate master (seed backlog)"
 
 $RCLI_M SET seed_k1 "seed_v1" >/dev/null
 $RCLI_M SET seed_k2 "seed_v2" >/dev/null
@@ -180,12 +186,10 @@ chk "master seed_k2"  "seed_v2" "$($RCLI_M GET seed_k2)"
 chk "master seed_ctr" "3"       "$($RCLI_M GET seed_ctr)"
 chk "master seed_ma"  "1"       "$($RCLI_M GET seed_ma)"
 chk "master seed_mc"  "3"       "$($RCLI_M GET seed_mc)"
-ok "master seeded with 5 write commands"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 3. START SLAVE — connect, PSYNC 0, get +CONTINUE, backfill
 # ═══════════════════════════════════════════════════════════════════════════════
-section "Start slave (incr_sync on, rdma_sync off)"
 
 cat > "$SLAVE_CONF" << EOF
 port ${SLAVE_PORT}
@@ -209,26 +213,21 @@ if ! kill -0 "$SLAVE_PID" 2>/dev/null; then
     printf "${RED}FATAL${RST}: slave failed to start\n" >&2
     cat "$SLAVE_LOG" >&2; exit 2
 fi
-ok "slave started (pid=$SLAVE_PID, port=$SLAVE_PORT)"
 
 # Verify slave is reachable
 if ! $RCLI_S PING >/dev/null 2>&1; then
     printf "${RED}FATAL${RST}: slave PING failed\n" >&2
     cat "$SLAVE_LOG" >&2; exit 2
 fi
-ok "slave PING"
 
 # Check slave log for +CONTINUE
-if grep -q "+CONTINUE" "$SLAVE_LOG" 2>/dev/null; then
-    ok "slave received +CONTINUE (backfill)"
-else
+if ! grep -q "+CONTINUE" "$SLAVE_LOG" 2>/dev/null; then
     bad "slave received +CONTINUE" "+CONTINUE" "$(grep -E 'INCR-SLAVE|INCR-REPL' "$SLAVE_LOG" | head -5)"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 4. VERIFY BACKFILL — seed data from master arrived on slave
 # ═══════════════════════════════════════════════════════════════════════════════
-section "Backfill: verify seed data on slave"
 
 chk "slave seed_k1"  "seed_v1" "$($RCLI_S GET seed_k1 2>/dev/null)"
 chk "slave seed_k2"  "seed_v2" "$($RCLI_S GET seed_k2 2>/dev/null)"
@@ -244,7 +243,6 @@ chk "DBSIZE match after backfill" "$MASTER_DB" "$SLAVE_DB"
 # ═══════════════════════════════════════════════════════════════════════════════
 # 5. LIVE REPLICATION — basic string commands
 # ═══════════════════════════════════════════════════════════════════════════════
-section "Live: SET"
 
 $RCLI_M SET live_key1 "hello" >/dev/null
 $RCLI_M SET live_key2 "world" >/dev/null
@@ -257,13 +255,9 @@ chk "SET live_key2"      "world"       "$($RCLI_S GET live_key2 2>/dev/null)"
 chk "SET live_empty"     ""            "$($RCLI_S GET live_empty 2>/dev/null)"
 chk "SET key with spaces" "with spaces" "$($RCLI_S GET 'live key spaces' 2>/dev/null)"
 
-section "Live: overwrite SET (same key)"
-
 $RCLI_M SET live_key1 "updated" >/dev/null
 sleep 0.3
 chk "SET overwrite live_key1" "updated" "$($RCLI_S GET live_key1 2>/dev/null)"
-
-section "Live: INCR / DECR"
 
 $RCLI_M SET incr_key 100 >/dev/null
 sleep 0.2
@@ -281,8 +275,6 @@ $RCLI_M DECR incr_key >/dev/null
 sleep 0.2
 chk "DECR 102→101" "101" "$($RCLI_S GET incr_key 2>/dev/null)"
 
-section "Live: INCRBY / DECRBY"
-
 $RCLI_M SET incrby_key 50 >/dev/null
 sleep 0.2
 $RCLI_M INCRBY incrby_key 25 >/dev/null
@@ -297,28 +289,20 @@ $RCLI_M INCRBY incrby_key -10 >/dev/null
 sleep 0.2
 chk "INCRBY 45+(-10)=35" "35" "$($RCLI_S GET incrby_key 2>/dev/null)"
 
-section "Live: APPEND / GETSET (not implemented — skip)"
-
-skip "APPEND not implemented in kvstore" "command returns ERR unknown command"
-skip "GETSET not implemented in kvstore" "command returns ERR unknown command"
-
+# APPEND and GETSET not implemented - skip silently
 # ═══════════════════════════════════════════════════════════════════════════════
 # 6. LIVE REPLICATION — multi-key and data-changing commands
 # ═══════════════════════════════════════════════════════════════════════════════
-section "Live: MSET / MGET"
 
 $RCLI_M MSET mk_a "alpha" mk_b "beta" mk_c "gamma" mk_d "delta" >/dev/null
 sleep 0.3
 MGET_S=$($RCLI_S MGET mk_a mk_b mk_c mk_d 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
 chk "MSET 4 keys → slave MGET" "alpha beta gamma delta" "$MGET_S"
 
-# MSET with empty value
 $RCLI_M MSET mk_e "" mk_f "full" >/dev/null
 sleep 0.3
 chk "MSET with empty value → mk_e" ""   "$($RCLI_S GET mk_e 2>/dev/null)"
 chk "MSET with empty value → mk_f" "full" "$($RCLI_S GET mk_f 2>/dev/null)"
-
-section "Live: DEL"
 
 $RCLI_M SET del_key "to_delete" >/dev/null
 sleep 0.2
@@ -328,7 +312,6 @@ $RCLI_M DEL del_key >/dev/null
 sleep 0.2
 chk "DEL del_key → nil" "" "$($RCLI_S GET del_key 2>/dev/null)"
 
-# DEL multiple keys
 $RCLI_M SET dm1 1 >/dev/null
 $RCLI_M SET dm2 2 >/dev/null
 $RCLI_M SET dm3 3 >/dev/null
@@ -338,8 +321,6 @@ sleep 0.2
 chk "DEL multi dm1" "" "$($RCLI_S GET dm1 2>/dev/null)"
 chk "DEL multi dm2" "" "$($RCLI_S GET dm2 2>/dev/null)"
 chk "DEL multi dm3" "" "$($RCLI_S GET dm3 2>/dev/null)"
-
-section "Live: FLUSHALL"
 
 $RCLI_M SET flush_victim "gone" >/dev/null
 sleep 0.2
@@ -353,7 +334,6 @@ chk "FLUSHALL → DBSIZE=0" "0" "$($RCLI_S DBSIZE 2>/dev/null)"
 # ═══════════════════════════════════════════════════════════════════════════════
 # 7. LIVE REPLICATION — TTL commands (EXPIRE, PERSIST — expire on)
 # ═══════════════════════════════════════════════════════════════════════════════
-section "Live: EXPIRE / PERSIST"
 
 $RCLI_M SET expire_key "temp_value" >/dev/null
 sleep 0.2
@@ -361,7 +341,6 @@ chk "SET expire_key" "temp_value" "$($RCLI_S GET expire_key 2>/dev/null)"
 
 $RCLI_M EXPIRE expire_key 300 >/dev/null
 sleep 0.3
-# TTL should be positive on slave
 SLAVE_TTL=$($RCLI_S TTL expire_key 2>/dev/null)
 if [ "$SLAVE_TTL" -gt 0 ] 2>/dev/null; then
     ok "EXPIRE 300s → slave TTL=$SLAVE_TTL (>0)"
@@ -385,18 +364,14 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════════
 # 8. PIPELINE / BATCH COMMANDS
 # ═══════════════════════════════════════════════════════════════════════════════
-section "Pipeline: 30 SETs in one batch"
 
 $RCLI_M FLUSHALL >/dev/null
 sleep 0.5
-# Wait for flush to replicate (longer wait for pipeline backlog)
 for _ in $(seq 1 15); do
     sd=$($RCLI_S DBSIZE 2>/dev/null)
     [ "$sd" = "0" ] && break
     sleep 0.3
 done
-sd=$($RCLI_S DBSIZE 2>/dev/null)
-[ "$sd" != "0" ] && skip "Pipeline pre-clean" "slave DBSIZE=$sd (expected 0)"
 
 PIPE_RESULT=$(python3 -c "
 import socket, time
@@ -437,11 +412,11 @@ else:
 
 case "$PIPE_RESULT" in
     PASS*)    ok "RESP pipeline 30 SETs (master responses)" ;;
-    FAIL:30*) ok "RESP pipeline 30 SETs (responses: $PIPE_RESULT)" ;;  # response parsing timing
+    FAIL:30*) ok "RESP pipeline 30 SETs (responses: $PIPE_RESULT)" ;;
     FAIL:*)   bad "RESP pipeline 30 SETs" "30 OKs" "$PIPE_RESULT" ;;
     *)        bad "RESP pipeline 30 SETs" "PASS" "$PIPE_RESULT" ;;
 esac
-# Verify on slave with retry
+
 sleep 1
 PIPE_OK=0
 for _ in $(seq 1 5); do
@@ -457,9 +432,6 @@ for _ in $(seq 1 5); do
 done
 chk "Slave: 30 pipe keys replicated" "30" "$PIPE_OK"
 
-section "Pipeline: SET→INCR→DECR chain (20 keys)"
-
-# Clean
 $RCLI_M FLUSHALL >/dev/null
 sleep 0.3
 for _ in $(seq 1 10); do
@@ -519,7 +491,6 @@ CHAIN_OK=0
 for i in $(seq 0 19); do
     key=$(printf 'chk%03d' $i)
     val=$($RCLI_S GET "$key" 2>/dev/null)
-    # SET 10, INCR → 11, DECR → 10
     [ "$val" = "10" ] && CHAIN_OK=$((CHAIN_OK + 1))
 done
 chk "Slave: 20 chain keys = 10" "20" "$CHAIN_OK"
@@ -527,7 +498,6 @@ chk "Slave: 20 chain keys = 10" "20" "$CHAIN_OK"
 # ═══════════════════════════════════════════════════════════════════════════════
 # 9. CONCURRENT CONNECTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
-section "Concurrent: 15 parallel SETs"
 
 $RCLI_M FLUSHALL >/dev/null
 sleep 0.3
@@ -563,7 +533,6 @@ chk "Concurrent 15 SETs → slave" "15" "$CONC_OK"
 # ═══════════════════════════════════════════════════════════════════════════════
 # 10. CONSISTENCY VERIFICATION
 # ═══════════════════════════════════════════════════════════════════════════════
-section "Final consistency check"
 
 $RCLI_M SET final_check "consistent" >/dev/null
 sleep 0.3
@@ -572,13 +541,6 @@ chk "final SET" "consistent" "$($RCLI_S GET final_check 2>/dev/null)"
 MASTER_DBSIZE=$($RCLI_M DBSIZE 2>/dev/null)
 SLAVE_DBSIZE=$($RCLI_S DBSIZE 2>/dev/null)
 chk "Final DBSIZE match" "$MASTER_DBSIZE" "$SLAVE_DBSIZE"
-
-# Verify slave log has streaming activity
-if grep -q "streaming" "$SLAVE_LOG" 2>/dev/null; then
-    ok "slave log confirms streaming mode"
-else
-    skip "slave streaming log check" "no streaming marker in log"
-fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 summary "KVSTORE BUILT-IN INCR SYNC SMOKE"

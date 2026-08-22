@@ -20,6 +20,12 @@ static shm_region_t *g_shm = NULL;
 static int           g_slave_active = 0;
 static DynBuf        g_rx_buf = {0};     /* slave: reassembly buffer */
 
+/* Master batching: coalesce many small write commands into one SHM slot so the
+ * lock-free publish (and its cross-core cache-line ping-pong) is amortised over
+ * ~SHM_MAX_PAYLOAD bytes instead of per command.  Single-threaded, so no lock. */
+static char          g_tx_buf[SHM_MAX_PAYLOAD];
+static int           g_tx_len = 0;
+
 /* Shutdown diagnostics.  These are the only counters that make the engine's
  * copy of the pipeline visible (the gateway's own counters are printed in
  * gateway.c). */
@@ -90,31 +96,55 @@ int xdp_engine_slave_init(void)
     return 0;
 }
 
+/* Blocking publish of one ≤SHM_MAX_PAYLOAD chunk.  Lossless backpressure: the
+ * ring is full only while the gateway is slower than us, so spin/yield rather
+ * than drop — a replication path must never silently lose commands. */
+static void enqueue_chunk(const char *data, uint32_t len)
+{
+    while (spsc_enqueue(&g_shm->q, data, len) != 0) {
+        if (!g_warned_full) {
+            printf("[XDP-ENGINE] SHM ring full, waiting for gateway...\n");
+            g_warned_full = 1;
+        }
+        sched_yield();
+    }
+}
+
 void xdp_engine_enqueue(const char *data, int len)
 {
     if (!g_shm || !data || len <= 0)
         return;
 
-    /* Chunk oversized commands into ≤SHM_MAX_PAYLOAD slices; the slave
-     * reassembles the byte stream, so arbitrary boundaries are fine.  When
-     * the ring is full we back off and retry (lossless backpressure) instead
-     * of dropping — a replication path must never silently lose commands. */
-    int off = 0;
-    while (off < len) {
-        int chunk = len - off;
-        if (chunk > SHM_MAX_PAYLOAD)
-            chunk = SHM_MAX_PAYLOAD;
-
-        while (spsc_enqueue(&g_shm->q, data + off, (uint32_t)chunk) != 0) {
-            if (!g_warned_full) {
-                printf("[XDP-ENGINE] SHM ring full, waiting for gateway...\n");
-                g_warned_full = 1;
-            }
-            sched_yield();
+    /* Oversized command: flush the pending batch, then chunk it directly. */
+    if (len > SHM_MAX_PAYLOAD) {
+        xdp_engine_flush();
+        int off = 0;
+        while (off < len) {
+            int chunk = len - off;
+            if (chunk > SHM_MAX_PAYLOAD)
+                chunk = SHM_MAX_PAYLOAD;
+            enqueue_chunk(data + off, (uint32_t)chunk);
+            off += chunk;
         }
-        off += chunk;
+        g_enqueue_total++;
+        return;
     }
+
+    /* Coalesce small commands into one slot (the slave reassembles the byte
+     * stream, so command boundaries are irrelevant to the transport). */
+    if (g_tx_len + len > SHM_MAX_PAYLOAD)
+        xdp_engine_flush();
+    memcpy(g_tx_buf + g_tx_len, data, (size_t)len);
+    g_tx_len += len;
     g_enqueue_total++;
+}
+
+void xdp_engine_flush(void)
+{
+    if (!g_shm || g_tx_len <= 0)
+        return;
+    enqueue_chunk(g_tx_buf, (uint32_t)g_tx_len);
+    g_tx_len = 0;
 }
 
 void xdp_engine_poll(void)
@@ -146,6 +176,9 @@ void xdp_engine_shutdown(void)
 {
     if (!g_shm)
         return;
+
+    /* Drain any commands still sitting in the master batch buffer. */
+    xdp_engine_flush();
 
     /* One-line shutdown summary for diagnosing replication data loss.
      *   master: enqueued must equal the gateway's shm_in.

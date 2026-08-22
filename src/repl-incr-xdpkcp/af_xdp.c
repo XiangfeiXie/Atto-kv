@@ -227,21 +227,24 @@ void af_xdp_destroy(af_xdp_ctx_t *ctx)
     free(ctx);
 }
 
-int af_xdp_send_frame(af_xdp_ctx_t *ctx, const void *frame, size_t len)
+void *af_xdp_tx_acquire(af_xdp_ctx_t *ctx, uint64_t *addr)
 {
-    if (len > FRAME_SIZE)
-        return -1;
-
     if (ctx->tx_free_top == 0) {
         af_xdp_poll_tx(ctx);            /* recycle any completed frames */
         if (ctx->tx_free_top == 0) {
             ctx->tx_drops++;
-            return -1;
+            return NULL;
         }
     }
 
-    uint64_t addr = ctx->tx_free[--ctx->tx_free_top];
-    memcpy(xsk_umem__get_data(ctx->umem_area, addr), frame, len);
+    *addr = ctx->tx_free[--ctx->tx_free_top];
+    return xsk_umem__get_data(ctx->umem_area, *addr);
+}
+
+int af_xdp_tx_commit(af_xdp_ctx_t *ctx, uint64_t addr, size_t len)
+{
+    if (len > FRAME_SIZE)
+        return -1;
 
     __u32 idx;
     if (xsk_ring_prod__reserve(&ctx->tx, 1, &idx) == 0) {
@@ -256,11 +259,14 @@ int af_xdp_send_frame(af_xdp_ctx_t *ctx, const void *frame, size_t len)
     d->options = 0;
     xsk_ring_prod__submit(&ctx->tx, 1);
 
-    if (xsk_ring_prod__needs_wakeup(&ctx->tx))
-        sendto(ctx->fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
-
     ctx->tx_pkts++;
     return 0;
+}
+
+void af_xdp_tx_kick(af_xdp_ctx_t *ctx)
+{
+    if (xsk_ring_prod__needs_wakeup(&ctx->tx))
+        sendto(ctx->fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
 }
 
 void af_xdp_poll_tx(af_xdp_ctx_t *ctx)

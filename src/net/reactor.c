@@ -484,6 +484,10 @@ int reactor_start(unsigned short port, msg_handler handler) {
         /* Drain any XDP-delivered write commands (slave replay). */
         xdp_engine_poll();
 
+        /* Flush the master's batched write commands to the gateway so a
+         * partial batch drains promptly (idle loop runs at 1/100ms here). */
+        xdp_engine_flush();
+
         /* Shrink the idle timeout when the XDP slave path is live so
          * gateway-delivered commands aren't delayed by the full 100ms idle
          * poll (1ms ≈ 1 extra epoll_wait syscall per ms when idle). */

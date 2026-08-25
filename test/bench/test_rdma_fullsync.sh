@@ -33,6 +33,14 @@ info() { echo -e "${CYN}[INFO]${NC} $*"; }
 warn() { echo -e "${YEL}[WARN]${NC} $*"; }
 die()  { echo -e "${RED}[DIE]${NC} $*"; exit 1; }
 
+# 二进制安全地取 value 字节长度。本 kvstore 没有 STRLEN，改用 GET + wc -c：
+# redis-cli --raw GET 会在 value 末尾补一个 '\n'，故字节数 = 实际长度 + 1。
+val_len() {  # $1=port  $2=key  → 打印 value 字节长度（键缺失/连接失败输出 -1）
+    local n
+    n=$(redis-cli -p "$1" --raw GET "$2" 2>/dev/null | wc -c)
+    echo $((n - 1))
+}
+
 usage() {
     cat <<EOF
 Usage: $0 [options]
@@ -97,13 +105,13 @@ pass "All prerequisites met"
 
 # ── memlock ───────────────────────────────────────────────────────────────
 MEMLOCK=$(ulimit -l 2>/dev/null || echo 0)
-NEED_KB=2097152  # 2 GB for 8×256MB ring buffers
+NEED_KB=524288   # 512 MB for 8×64MB ring buffers
 if [ "$MEMLOCK" = "unlimited" ]; then
     info "memlock: unlimited ✓"
 elif [ "$MEMLOCK" -ge "$NEED_KB" ] 2>/dev/null; then
-    info "memlock: ${MEMLOCK} KB (≥2 GB) ✓"
+    info "memlock: ${MEMLOCK} KB (≥512 MB) ✓"
 else
-    warn "memlock=${MEMLOCK} KB — need ≥2 GB for RDMA buffer registration"
+    warn "memlock=${MEMLOCK} KB — need ≥512 MB for RDMA buffer registration"
     warn "Attempting to raise via sudo..."
     if echo "1234" | sudo -S prlimit --pid $$ --memlock=unlimited 2>/dev/null; then
         info "memlock raised to unlimited ✓"
@@ -237,10 +245,10 @@ if [ "$DBSIZE" != "$KEYS" ]; then
 fi
 pass "DBSIZE = $DBSIZE ✓"
 
-# Verify sample keys (use strlen to handle binary values with null bytes)
+# 校验样例 key（value 是二进制，本 kvstore 无 STRLEN，用 GET 字节长度代替）
 for i in 0 $((KEYS - 1)); do
     K="$(printf 'key:%012d' $i)"
-    VLEN=$(redis-cli -p "$PORT" STRLEN "$K" 2>/dev/null)
+    VLEN=$(val_len "$PORT" "$K")
     [ "$VLEN" = "$VSIZE" ] && pass "Master $K (${VSIZE}B) OK" || fail "Master $K: len=$VLEN expected $VSIZE"
 done
 
@@ -334,13 +342,13 @@ else
     fail "Slave DBSIZE = $SLAVE_DBSIZE (expected $KEYS)"
 fi
 
-# Verify keys at both ends and middle
+# 校验首/中/尾三个 key（GET 字节长度 + 主从一致）
 KEY_FAILS=0
 SAMPLE_KEYS=(0 $((KEYS / 2)) $((KEYS - 1)))
 for i in "${SAMPLE_KEYS[@]}"; do
     K="$(printf 'key:%012d' $i)"
-    M_VLEN=$(redis-cli -p "$PORT" STRLEN "$K" 2>/dev/null || echo 0)
-    S_VLEN=$(redis-cli -p "$SLAVE_PORT" STRLEN "$K" 2>/dev/null || echo 0)
+    M_VLEN=$(val_len "$PORT" "$K")
+    S_VLEN=$(val_len "$SLAVE_PORT" "$K")
     if [ "$M_VLEN" = "$S_VLEN" ] && [ "$S_VLEN" = "$VSIZE" ]; then
         pass "Key $i: master=slave (${VSIZE}B) OK"
     else

@@ -34,9 +34,9 @@ WARMUP_MULT=3          # 预热倍数: warmup = BENCH_N * WARMUP_MULT
                        # 理想模式: 顺序写 0..WARMUP_N-1，GET 100% 命中
                        # 真实模式: 随机写 [-r BENCH_N] WARMUP_N 次 → ~95% 命中
 DATA_SIZE=16           # value 字节
-SERVER_CPU="0,2"      # kvstore 服务器 CPU (proactor 时主线程+SQPOLL共享)
-REDIS_CPU="6"          # Redis 服务器 CPU (单线程，独立核避免干扰 kvstore)
-CLIENT_CPU="4,5"       # 至少 2 个核：1 个跑 redis-benchmark + 1 个处理网络 IRQ/softirq
+SERVER_CPU="5"      # kvstore 服务器 CPU (proactor 时主线程+SQPOLL共享)
+REDIS_CPU="0"          # Redis 服务器 CPU (单线程，独立核避免干扰 kvstore)
+CLIENT_CPU="4"       # 至少 2 个核：1 个跑 redis-benchmark + 1 个处理网络 IRQ/softirq
 TIMEOUT=180            # 单次压测超时秒
 #
 # 两种测试模式:
@@ -160,7 +160,7 @@ _start_kvs() {
     port=${port:-$KVS_PORT}
 
     rm -f "${PROJECT_DIR}/build/dump.rdb" "${PROJECT_DIR}/build/dump.rdb.tmp" \
-          "${PROJECT_DIR}/build/appendonly.aof" "${PROJECT_DIR}/build/incr.wal"
+          "${PROJECT_DIR}/build/appendonly.aof"
 
     taskset -c "$SERVER_CPU" "$KVS_BIN" "$KVSCONF_PATH" \
         > "${TMPDIR}/kvstore.log" 2>&1 &

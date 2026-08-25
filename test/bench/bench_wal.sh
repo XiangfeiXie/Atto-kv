@@ -127,9 +127,9 @@ test_t2_kvs_aof_off() {
     stop_redis
 
     for P in "${PIPELINES[@]}"; do
-        # Fresh kvstore + clean WAL for each P (isolates I/O effects)
+        # Fresh kvstore + clean AOF for each P (isolates I/O effects)
         start_kvs "kvstore-none.conf"
-        rm -f "${PROJECT_DIR}/build/incr.wal"
+        rm -f "${PROJECT_DIR}/build/appendonly.aof"
 
         # Warmup to eliminate cold-start bias (200K ops, not recorded)
         taskset -c "$CLIENT_CORES" redis-benchmark -h 127.0.0.1 -p "$KVS_PORT" -t set \
@@ -166,9 +166,9 @@ test_t3_kvs_aof_on() {
     stop_redis
 
     for P in "${PIPELINES[@]}"; do
-        # Fresh kvstore + clean WAL for each P (isolates I/O effects)
+        # Fresh kvstore + clean AOF for each P (isolates I/O effects)
         start_kvs "kvstore-aof.conf"
-        rm -f "${PROJECT_DIR}/build/incr.wal"
+        rm -f "${PROJECT_DIR}/build/appendonly.aof"
 
         # Warmup to eliminate cold-start bias (200K ops, not recorded)
         taskset -c "$CLIENT_CORES" redis-benchmark -h 127.0.0.1 -p "$KVS_PORT" -t set \

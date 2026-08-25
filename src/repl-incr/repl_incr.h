@@ -6,108 +6,107 @@
 #include "net_common.h"    /* conn_kind_t */
 
 /* =========================================================================
- * Master-Slave Incremental Replication
+ * 主从增量同步
  *
- *  Backlog: 1 MB circular buffer, stores raw RESP write commands.
- *  Protocol: simplified PSYNC (offset only, no replid).
- *  Transport: dedicated TCP port (default 2001), independent of full sync.
+ *  Backlog: 1MB 环形缓冲，存原始 RESP 写命令，供从库断线后按 offset 补发。
+ *  协议:    简化 PSYNC（只有 offset，无 replid）。
+ *  传输:    独立 TCP 端口（默认 2001），与全量同步分离。
  *
- *  fd ownership: replication fds are handed to the network engine and
- *  dispatched by it (via conn->kind + the callbacks below).  repl_incr
- *  keeps only protocol/state-machine logic; it no longer self-polls.
+ *  fd 归属: 复制 fd 交给网络引擎（conn->kind + 下面的回调）调度，本模块
+ *  只保留协议/状态机逻辑，不自轮询。
  * ========================================================================= */
 
-#define REPL_BACKLOG_SIZE  (1024 * 1024)   /* 1 MB */
+#define REPL_BACKLOG_SIZE      (1024 * 1024)   /* 1 MB */
 
-/* ── Replication backlog ────────────────────────────────────────────── */
+/* repl_incr_slave_start() 返回值 */
+#define REPL_INCR_CONTINUE     0     /* +CONTINUE，进入流式接收 */
+#define REPL_INCR_ERROR       -1     /* 连接/握手失败 */
+#define REPL_INCR_FULLRESYNC  -2     /* offset 已过期，需全量同步 */
+
+/* 快照 offset 滚出 backlog 后，重做全量同步的上限（防死循环） */
+#define REPL_FULLSYNC_MAX_RETRY 3
+
+/* ── Backlog ─────────────────────────────────────────────────────────── */
 
 typedef struct {
     char   buf[REPL_BACKLOG_SIZE];
-    size_t head;            /* absolute write offset (monotonic, never resets) */
-    size_t used;            /* bytes currently stored (<= REPL_BACKLOG_SIZE) */
+    size_t head;            /* 绝对写偏移（单调递增，不重置） */
+    size_t used;            /* 当前存量字节数（<= REPL_BACKLOG_SIZE） */
 } repl_backlog_t;
 
 void   repl_backlog_init(void);
 void   repl_backlog_append(const char *resp_data, int len);
 
-/* Copy as many complete RESP commands as fit within max_len bytes from
- * start_offset.  Returns bytes written to dst (>=0) and sets *out_end_offset
- * to the byte offset immediately after the last copied command.
- * Returns -1 if start_offset is no longer in the backlog. */
+/* 从 start_offset 起拷贝最多 max_len 字节（可能截断命令，由 slave 端重组）。
+ * 返回写入字节数，*out_end_offset 为拷贝后的新偏移；start_offset 不在
+ * 窗口内返回 -1。 */
 int    repl_backlog_fetch(size_t start_offset, char *dst, int max_len,
-                           size_t *out_end_offset);
+                          size_t *out_end_offset);
 
-size_t repl_backlog_offset(void);         /* current head (absolute) */
-int    repl_backlog_valid(size_t offset); /* offset within backlog range? */
+size_t repl_backlog_offset(void);         /* 当前 head（绝对偏移） */
+int    repl_backlog_valid(size_t offset); /* offset 是否在窗口内 */
 
-/* ── Slave connection (Master side) ──────────────────────────────────── */
+/* ── 从库连接（Master 侧）────────────────────────────────────────────── */
 
 typedef enum {
-    REPL_STATE_NONE,        /* slot unused */
-    REPL_STATE_CONNECTED,   /* just accepted, waiting for PSYNC */
-    REPL_STATE_STREAMING    /* +CONTINUE sent, pushing command stream */
+    REPL_STATE_NONE,        /* 槽位空闲 */
+    REPL_STATE_CONNECTED,   /* 已接受，等待 PSYNC */
+    REPL_STATE_STREAMING    /* 已发 +CONTINUE，推送命令流 */
 } repl_slave_state_t;
 
-#define REPL_MAX_SLAVES  8
-
-/* Dedicated replication state only — the fd and its read/write buffers
- * live in conn_t, owned by the network engine. */
+/* 仅保存复制状态——socket fd 与其原始 I/O 缓冲在引擎自己的连接结构里。
+ * 设计上只有一台从机，故为单实例而非数组。 */
 typedef struct {
-    int                fd;         /* association key into the engine's conn table */
+    int                fd;          /* 引擎连接表的索引键 */
     int                active;
     repl_slave_state_t state;
-    DynBuf             write_buf;  /* pending bytes to push to this slave */
-    size_t             repl_offset;/* PSYNC offset this slave requested */
+    DynBuf             write_buf;   /* 待推送给该从库的字节 */
 } repl_slave_t;
 
-/* ── Global repl_offset for fullsync bridge ────────────────────────────
- *
- * The fullsync protocol carries repl_offset in batch_hdr.repl_offset.
- * Slave stores it here after loading an RDB snapshot so the incremental
- * module knows where to resume.                                  */
-extern size_t g_repl_snapshot_offset;   /* 0 = no fullsync loaded yet */
+/* ── 全量同步桥接的全局 offset ─────────────────────────────────────────
+ * 全量同步协议在 batch_hdr.repl_offset 里带出快照 offset，slave 加载完
+ * RDB 后存到这里，增量模块据此续传。 */
+extern size_t g_repl_snapshot_offset;   /* 0 = 尚未全量同步 */
 
-/* ── Engine integration hooks ─────────────────────────────────────────
- *
- * Set by the active network engine before repl_incr_attach() is called.
- * NULL means "no engine attached" — repl falls back to self-managed I/O
- * (the legacy poll path used by proactor until it adopts the same model). */
+/* ── 引擎集成 hook（引擎启动时设置，repl_incr_attach 前生效）─────────── */
 extern int  (*repl_engine_register)(int fd, conn_kind_t kind);
-extern void (*repl_engine_writable)(int fd, int on);   /* arm/disarm EPOLLOUT */
-extern void (*repl_engine_close)(int fd);              /* release the conn slot */
+extern void (*repl_engine_writable)(int fd, int on);   /* 开/关 EPOLLOUT */
+extern void (*repl_engine_close)(int fd);              /* 释放连接槽 */
 
-/* ── Setup (called before the engine loop starts) ────────────────────── */
+/* ── 启动（引擎循环前调用）──────────────────────────────────────────── */
 
-int  repl_incr_master_start(int port);                    /* create listen socket */
+int  repl_incr_master_start(int port);                    /* 建监听 socket */
 int  repl_incr_slave_start(const char *master_ip, int master_port);
 
-/* Register repl fds into the engine's event loop.  Called once by the
- * engine after its epoll/io_uring is ready. */
+/* 把 repl fd 注册进引擎事件循环，引擎就绪后调用一次。 */
 void repl_incr_attach(void);
 
-/* ── Master-side event callbacks (fd already registered) ─────────────── */
+/* ── Master 侧回调（fd 已注册）──────────────────────────────────────── */
 
-int  repl_incr_master_accept(int listen_fd);   /* accept all pending slaves */
-int  repl_incr_master_read(int fd);            /* PSYNC handshake / detect drop */
-int  repl_incr_master_write(int fd);           /* flush write_buf */
-void repl_incr_master_close(int fd);           /* teardown a slave link */
+int  repl_incr_master_accept(int listen_fd);   /* 接受所有待连从库 */
+int  repl_incr_master_read(int fd);            /* PSYNC 握手 / 检测断开 */
+int  repl_incr_master_write(int fd);           /* 冲刷 write_buf */
+void repl_incr_master_close(int fd);           /* 拆除一条从库链路 */
 
-/* Poll mask the engine should wait on for a slave fd (proactor readiness
- * query): POLLIN while awaiting PSYNC, POLLOUT while streaming data is
- * pending, 0 when idle-and-streaming.  The engine re-arms its readiness
- * notification whenever this mask changes. */
+/* 引擎对该 fd 应等待的就绪事件：等待 PSYNC 时 POLLIN，有流式数据待发时
+ * POLLOUT，空闲时 0。 */
 int  repl_incr_master_poll_mask(int fd);
 
-/* ── Slave-side event callbacks ──────────────────────────────────────── */
+/* ── Slave 侧回调 ───────────────────────────────────────────────────── */
 
-int  repl_incr_slave_read(int fd);             /* read command stream, replay */
-void repl_incr_slave_close(int fd);            /* teardown the master link */
+int  repl_incr_slave_read(int fd);             /* 读命令流并回放 */
+void repl_incr_slave_close(int fd);            /* 拆除 master 链路 */
 
-/* ── Propagate (hot path, master only) ───────────────────────────────── */
+/* 断线重连：引擎主循环周期调用（有连接或已放弃时为 no-op）；全量同步
+ * 完成后调用，把续传 offset 对齐到快照 offset。 */
+void repl_incr_slave_tick(void);
+void repl_incr_slave_reset_offset(void);
+
+/* ── 写命令传播（master 热路径）─────────────────────────────────────── */
 
 void repl_incr_propagate(const char *resp_data, int len);
 
-/* ── fd getters (used by repl_incr_attach) ───────────────────────────── */
+/* ── fd getter（repl_incr_attach 用）────────────────────────────────── */
 
 int  repl_incr_master_listen_fd(void);
 int  repl_incr_slave_link_fd(void);

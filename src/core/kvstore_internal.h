@@ -10,8 +10,7 @@
 #define KVSTORE_INTERNAL_H
 
 #include "kvstore.h"
-#include "kv_type_string.h"
-#include "persist_wal.h"
+#include "persist_aof.h"
 
 /* ── RDB changes counter (defined in persist_rdb.c) ── */
 extern uint64_t g_rdb_changes;
@@ -22,13 +21,12 @@ extern uint64_t g_rdb_changes;
 int  token_to_ll(kvs_token_t t, long long *out);
 void reply_integer(DynBuf *wb, long long v);
 void reply_bulk(DynBuf *wb, const char *s, int len);
-void entry_cleanup_by_type(kv_entry_t *e);
 
 /* write journal — inline for hot-path (threshold check + single memcpy) */
 static inline void kvs_write_journal_append(const char *msg, int length) {
     if (!msg || length <= 0) return;
     if (ENABLE_RDB) g_rdb_changes++;
-    if (ENABLE_AOF) kvs_wal_persist_append_raw(msg, (uint32_t)length);
+    if (ENABLE_AOF) kvs_aof_persist_append_raw(msg, (uint32_t)length);
 }
 
 /* Incremental replication hook — called on every successful write command.
@@ -36,16 +34,9 @@ static inline void kvs_write_journal_append(const char *msg, int length) {
  * Defined here so it can be called from the same sites as
  * kvs_write_journal_append(). */
 #include "repl_incr.h"
-#include "engine_xdp.h"
 static inline void kvs_repl_incr_hook(const char *msg, int length) {
     extern int g_in_reload;
     if (!msg || length <= 0 || g_in_reload) return;
-    /* Kernel-bypass path is independent of the TCP incr path — it can run
-     * with incr_sync off.  Only the master enqueues to the gateway; on the
-     * slave the same queue is the *receive* path (drained by xdp_engine_poll),
-     * so re-enqueueing a direct write there would double-execute it. */
-    if (kvs_config.xdp_sync_enabled && kvs_config.rdma_role == ROLE_MASTER)
-        xdp_engine_enqueue(msg, length);
     /* The backlog/propagation only exist to serve incremental sync.  When
      * incr_sync is off there is no replication listener and no slave can
      * connect, so maintaining the backlog is pure waste on the write hot

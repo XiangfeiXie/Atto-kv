@@ -16,8 +16,24 @@
 #include "kvstore.h"
 #include "protocol.h"
 #include "config.h"
-#include "engine_xdp.h"
 
+
+/* ── Per-connection state (epoll engine) ── */
+struct conn {
+    int fd;
+    DynBuf read_buf;
+    DynBuf write_buf;
+    int r_off, w_off;
+    int active;
+    int status;             /* close-after-flush */
+    conn_kind_t kind;       /* dispatch role (client vs replication) */
+
+    uint32_t cur_events;    /* epoll cached mask */
+    union {
+        int (*recv_callback)(int fd);
+        int (*accept_callback)(int fd);
+    } r_action;
+};
 
 /* ── Global epoll fd — must be declared before conn_set_events ── */
 int epfd = 0;
@@ -26,12 +42,6 @@ int epfd = 0;
 static struct conn *conn_pool = NULL;
 static int          conn_pool_size = 0;
 
-/* ── LT event mask: EPOLLIN always armed (level-triggered — no re-arm
- *   needed).  EPOLLOUT toggled dynamically: added when write_buf has
- *   data, removed when empty to avoid LT write-ready storm.
- *
- *   When c->status is set (close-after-flush), EPOLLIN is suppressed
- *   so the peer cannot inject more commands after QUIT / proto error. ── */
 static void conn_set_events(int fd, struct conn *c) {
     uint32_t want = c->status ? 0 : EPOLLIN;
     if (c->write_buf.len > 0)
@@ -48,7 +58,6 @@ static void conn_set_events(int fd, struct conn *c) {
 }
 
 int recv_cb(int fd);
-int send_cb(int fd);
 
 int event_register(int fd) {
     if (fd < 0) return -1;
@@ -61,15 +70,18 @@ int event_register(int fd) {
     struct conn *c = &conn_pool[fd];
     c->fd = fd;
     c->active = 1;
+    c->kind = CONN_KIND_CLIENT;
     c->r_action.recv_callback = recv_cb;
-    c->send_callback = send_cb;
     c->status = 0;
-    c->client = NULL;
 
-    dynbuf_free(&c->read_buf);
-    dynbuf_free(&c->write_buf);
-    dynbuf_init(&c->read_buf, KVS_NET_BUF_INIT);
-    dynbuf_init(&c->write_buf, KVS_NET_BUF_INIT);
+    /* Lazily allocate buffers once and reuse across reconnects (slab reuse):
+     * only the length/offset cursors need resetting on the accept path. */
+    if (!c->read_buf.buf)
+        dynbuf_init(&c->read_buf, KVS_NET_BUF_INIT);
+    if (!c->write_buf.buf)
+        dynbuf_init(&c->write_buf, KVS_NET_BUF_INIT);
+    c->read_buf.len  = 0;
+    c->write_buf.len = 0;
     c->r_off = 0;
     c->w_off = 0;
 
@@ -88,34 +100,26 @@ int event_register(int fd) {
     return 0;
 }
 
-/* ── Release a connection slot ── */
+/* ── Release a connection slot ──
+ * The read/write buffers keep their backing allocation (slab reuse) — only
+ * the metadata and cursors are reset here.  This mirrors the proactor's
+ * conn_reset_slot and keeps the accept path free of malloc. */
 static void conn_release(int fd) {
     if (fd < 0 || fd >= conn_pool_size) return;
     struct conn *c = &conn_pool[fd];
-
-    if (c->client) {
-        free(c->client);
-        c->client = NULL;
-    }
-
-    /* Free buffers */
-    dynbuf_free(&c->read_buf);
-    dynbuf_free(&c->write_buf);
 
     /* Remove from epoll and close socket */
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
     close(fd);
 
-    /* Zero out the connection slot */
+    /* Zero the slot, preserving the two buffer allocations for reuse. */
+    char *rb = c->read_buf.buf, *wb = c->write_buf.buf;
+    int   rc = c->read_buf.cap,  wc = c->write_buf.cap;
     memset(c, 0, sizeof(*c));
+    c->read_buf.buf  = rb;  c->read_buf.cap  = rc;
+    c->write_buf.buf = wb;  c->write_buf.cap = wc;
 }
 
-/* ── Replication fd integration ────────────────────────────────────────
- *
- * Replication fds are registered into the same epoll and dispatched by the
- * same loop as client fds.  The conn slot carries the role (conn->kind) and
- * the per-role callbacks; repl_incr keeps only its protocol state machine.
- * These three functions are the engine side of repl_engine_* hooks. */
 
 static int reactor_register_repl(int fd, conn_kind_t kind) {
     if (fd < 0 || fd >= conn_pool_size) {
@@ -129,7 +133,6 @@ static int reactor_register_repl(int fd, conn_kind_t kind) {
     c->active = 1;
     c->kind   = kind;
     c->status = 0;
-    c->client = NULL;
     c->r_off  = c->w_off = 0;
 
     if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1)
@@ -138,15 +141,12 @@ static int reactor_register_repl(int fd, conn_kind_t kind) {
     switch (kind) {
       case CONN_KIND_REPL_LISTEN:
         c->r_action.accept_callback = repl_incr_master_accept;
-        c->send_callback            = NULL;
         break;
       case CONN_KIND_REPL_SLAVE:
         c->r_action.recv_callback   = repl_incr_master_read;
-        c->send_callback            = repl_incr_master_write;
         break;
       case CONN_KIND_REPL_MASTER:
         c->r_action.recv_callback   = repl_incr_slave_read;
-        c->send_callback            = NULL;
         break;
       default:
         return -1;
@@ -203,15 +203,6 @@ int accept_cb(int fd) {
             close(clientfd);
             continue;
         }
-
-        /* Allocate client state immediately (Phase 8.2 pattern) */
-        struct conn *c = &conn_pool[clientfd];
-        if (!c->client) {
-            c->client = (client_t *)calloc(1, sizeof(client_t));
-            if (c->client) {
-                c->client->conn = c;
-            }
-        }
     }
     return 0;
 }
@@ -262,13 +253,6 @@ int recv_cb(int fd) {
     }
 
 
-    /* Prefetch read buffer for protocol parsing */
-    if (__builtin_expect(c->read_buf.len > 64, 1))
-        __builtin_prefetch(c->read_buf.buf + c->r_off, 0, 3);
-
-    /* Always drain immediately.
-     * If a partial send left stale w_off, compact unsent data
-     * to buf[0] so new responses append cleanly. */
     if (c->write_buf.len > 0 && c->w_off > 0) {
         memmove(c->write_buf.buf,
                 c->write_buf.buf + c->w_off,
@@ -277,12 +261,10 @@ int recv_cb(int fd) {
     }
 
     /* Process all available commands in the buffer */
-    kvs_drain_resp_commands_off(&c->read_buf, &c->r_off, &c->write_buf, c);
+    int want_close = 0;
+    kvs_drain_resp_commands_off(&c->read_buf, &c->r_off, &c->write_buf, &want_close);
+    if (want_close) c->status = 1;
 
-    /* Reset r_off when buffer is fully consumed to prevent unbounded
-     * growth of the read offset — without this, repeated drain→empty
-     * cycles let r_off creep past cap, forcing unnecessary realloc
-     * (doubling up to 16 MB) even though the buffer is logically empty. */
     if (c->read_buf.len == 0)
         c->r_off = 0;
 
@@ -292,8 +274,6 @@ int recv_cb(int fd) {
             conn_release(fd);
             return 0;
         }
-        /* Suppress EPOLLIN, keep EPOLLOUT to drain remaining bytes.
-         * conn_set_events honours c->status and won't re-enable reads. */
         struct epoll_event ev;
         ev.events = EPOLLOUT;
         ev.data.fd = fd;
@@ -340,24 +320,6 @@ int send_cb(int fd) {
             conn_release(fd);
             return 0;
         }
-
-        /* Pending read data was deferred in recv_cb (write_buf was busy).
-         * Process it now to unblock the pipeline. */
-        if (c->read_buf.len > 0) {
-            kvs_drain_resp_commands_off(&c->read_buf, &c->r_off, &c->write_buf, c);
-            if (c->read_buf.len == 0)
-                c->r_off = 0;
-
-            /* New responses may have been generated — re-arm send if needed */
-            if (c->status) {
-                if (c->write_buf.len > 0) {
-                    conn_set_events(fd, c);
-                    return 0;
-                }
-                conn_release(fd);
-                return 0;
-            }
-        }
     }
 
     /* Update event mask based on new state */
@@ -375,9 +337,6 @@ int r_init_server(unsigned short port) {
     /* Enable SO_REUSEADDR for quick restart */
     int opt = 1;
     setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    /* Enable SO_REUSEPORT for potential multi-process support */
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
     /* Set non-blocking */
     if (fcntl(sockfd, F_SETFL, O_NONBLOCK) == -1) {
@@ -480,18 +439,9 @@ int reactor_start(unsigned short port, msg_handler handler) {
     while (!g_kvs_stop) {
         /* Update cached time for commands */
         update_cached_time();
+        repl_incr_slave_tick();   /* 断线后周期重连 */
 
-        /* Drain any XDP-delivered write commands (slave replay). */
-        xdp_engine_poll();
-
-        /* Flush the master's batched write commands to the gateway so a
-         * partial batch drains promptly (idle loop runs at 1/100ms here). */
-        xdp_engine_flush();
-
-        /* Shrink the idle timeout when the XDP slave path is live so
-         * gateway-delivered commands aren't delayed by the full 100ms idle
-         * poll (1ms ≈ 1 extra epoll_wait syscall per ms when idle). */
-        int timeout_ms = xdp_engine_slave_active() ? 1 : 100;
+        int timeout_ms = 100;
         int nready = epoll_wait(epfd, events, 1024, timeout_ms);
         if (nready < 0) {
             if (errno == EINTR) continue;  /* Signal received — rely on g_kvs_stop to exit */
@@ -542,29 +492,15 @@ int reactor_start(unsigned short port, msg_handler handler) {
                     continue;
             }
 
-            /* Write flush.  Repl slave conns carry their pending bytes in
-             * repl_slave_t.write_buf and flush through the repl write
-             * callback (idempotent — no-op when nothing is pending). */
+
             if (c->kind == CONN_KIND_REPL_SLAVE) {
                 repl_incr_master_write(connfd);
                 continue;
             }
 
-            /* Inline flush: send responses in the same epoll iteration
-             * instead of waiting for the next EPOLLOUT.  This eliminates
-             * the "batch barrier" — one extra epoll_wait round-trip per
-             * pipeline batch — that penalises low-P throughput.
-             *
-             * The first send_callback drains the current write buffer and
-             * may process deferred reads (generating new responses).  A
-             * second call flushes those new responses.  We stop at two:
-             * further sends would spin on a full TCP send buffer (EAGAIN),
-             * which is handled by the EPOLLOUT fallback in conn_set_events. */
-            if (c->write_buf.len > 0) {
-                c->send_callback(connfd);
-                if (conn_pool[connfd].active && c->write_buf.len > 0)
-                    c->send_callback(connfd);
-            }
+
+            if (c->write_buf.len > 0)
+                send_cb(connfd);
         }
     }
 

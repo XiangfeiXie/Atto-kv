@@ -1,4 +1,4 @@
-/* kvstore_config.c — CONFIG GET / SET / RESETSTAT / REWRITE */
+/* kvstore_config.c — CONFIG GET / SET */
 
 #include "kvstore_internal.h"
 
@@ -32,9 +32,6 @@ static int fmt_persistence(char *out, int cap) {
     memcpy(out, s, n);
     return n;
 }
-static int fmt_threads(char *out, int cap) {
-    return snprintf(out, cap, "%d", 1);
-}
 static int fmt_port(char *out, int cap) {
     return snprintf(out, cap, "%d", kvs_config.port);
 }
@@ -44,16 +41,6 @@ static int fmt_appendonly(char *out, int cap) {
     if (n > cap) n = cap;
     memcpy(out, s, n);
     return n;
-}
-static int fmt_save(char *out, int cap) {
-    const char *s = ENABLE_RDB ? "900 1 300 10 60 10000" : "";
-    int n = (int)strlen(s);
-    if (n > cap) n = cap;
-    memcpy(out, s, n);
-    return n;
-}
-static int fmt_cpu_pin(char *out, int cap) {
-    return snprintf(out, cap, "off");
 }
 
 /* ── SET handlers ───────────────────────────────────────────────────── */
@@ -95,11 +82,8 @@ static const struct cfg_entry g_cfg_table[] = {
     { "loglevel",     fmt_loglevel,    set_loglevel    },
     { "maxclients",   fmt_maxclients,  set_maxclients  },
     { "persistence",  fmt_persistence, NULL },
-    { "threads",      fmt_threads,     NULL },
     { "port",         fmt_port,        NULL },
     { "appendonly",   fmt_appendonly,  NULL },
-    { "save",         fmt_save,        NULL },
-    { "cpu_pin",      fmt_cpu_pin,     NULL },
 };
 static const int g_cfg_table_n =
     (int)(sizeof(g_cfg_table) / sizeof(g_cfg_table[0]));
@@ -179,24 +163,8 @@ dispatch_result_t handle_config(kvs_token_t *tokens, int argc, DynBuf *wb) {
         return DISPATCH_OK;
     }
 
-    if (sub.len == 9 && strncasecmp(sub.ptr, "RESETSTAT", 9) == 0) {
-        dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-        return DISPATCH_OK;
-    }
-
-    if (sub.len == 7 && strncasecmp(sub.ptr, "REWRITE", 7) == 0) {
-        dynbuf_cat(wb,
-            "-ERR CONFIG REWRITE not implemented "
-            "(use external config management)\r\n",
-            sizeof("-ERR CONFIG REWRITE not implemented "
-                   "(use external config management)\r\n") - 1);
-        return DISPATCH_ERROR;
-    }
-
     dynbuf_cat(wb,
-        "-ERR Unknown CONFIG subcommand "
-        "(supported: GET, SET, RESETSTAT, REWRITE)\r\n",
-        sizeof("-ERR Unknown CONFIG subcommand "
-               "(supported: GET, SET, RESETSTAT, REWRITE)\r\n") - 1);
+        "-ERR Unknown CONFIG subcommand (supported: GET, SET)\r\n",
+        sizeof("-ERR Unknown CONFIG subcommand (supported: GET, SET)\r\n") - 1);
     return DISPATCH_ERROR;
 }

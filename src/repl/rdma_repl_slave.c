@@ -3,9 +3,6 @@
  *
  * Slave 主动 connect Master，注册 N 个目标环形缓冲，
  * 边收边通过 RDB stream 解析器加载（与 sendfile 路径统一格式）。
- *
- * P1: 环形缓冲池 (≤8) 提升流水线深度；dict_reserve + dict_arena_init
- *     预分配消除 60K+ 次 rehash + malloc。
  */
 
 #define _GNU_SOURCE
@@ -44,7 +41,6 @@ static int load_rdb_batch(const char *data, uint32_t data_len,
         }
         /* Store snapshot offset for incremental sync bridge */
         g_repl_snapshot_offset = be64toh(bh->repl_offset);
-        kvs_flush_all();   /* clears dict + frees old arena */
         data     += sizeof(*bh);
         data_len -= sizeof(*bh);
 
@@ -54,9 +50,8 @@ static int load_rdb_batch(const char *data, uint32_t data_len,
         if (expected < 0) return -1;
         *stream_began = 1;
 
-        /* P1: pre-allocate dict to avoid progressive rehash + malloc
-         * during bulk insert.  ht[0] is sized for 'expected' keys;
-         * the arena carves entries from a contiguous block.            */
+        /* 批量插入前预分配：dict_reserve 消除渐进 rehash，
+         * dict_arena_init 从连续块切分 entry，避免逐条 malloc。 */
         if (expected > 0) {
             dict_reserve(&g_dict, (uint32_t)expected);
             /* ~80 bytes per entry: header(32) + avg key(12) + payload(36) */
@@ -107,13 +102,12 @@ int rdma_repl_slave_fullsync(void) {
     rdma_xport_t *xport = rdma_xport_create(id);
     if (!xport) die("rdma_xport_create");
 
-    /* Allocate N ring buffers */
+    /* 分配 N 个环形缓冲 */
     char *bufs[SLAVE_NUM_BUFS]      = {0};
     struct ibv_mr *mr[SLAVE_NUM_BUFS] = {0};
     for (int i = 0; i < SLAVE_NUM_BUFS; i++) {
         bufs[i] = malloc(FULLSYNC_BUF_SIZE);
         if (!bufs[i]) die("malloc");
-        memset(bufs[i], 0, FULLSYNC_BUF_SIZE);
         mr[i] = rdma_reg_write(id, bufs[i], FULLSYNC_BUF_SIZE);
         if (!mr[i]) die("rdma_reg_write");
     }
@@ -199,7 +193,6 @@ int rdma_repl_slave_fullsync(void) {
 
         /* 3. ACK（处理完成后才释放 buffer） */
         ack_buf.buf_idx = (uint32_t)cur;
-        ack_buf.entries = (uint32_t)(ne >= 0 ? ne : 0);
         rdma_post_send(id, NULL, &ack_buf, sizeof(ack_buf), ack_mr, IBV_SEND_SIGNALED);
         if (rdma_xport_poll_send(xport) < 0) die("poll_send(ack)");
 
@@ -217,9 +210,6 @@ int rdma_repl_slave_fullsync(void) {
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t2);
-
-    /* ── 重建编码（RDB stream load 后所有 entry 是 RAW）── */
-    rdb_rebuild_all_encodings();
 
     double ms = (t2.tv_sec - t1.tv_sec) * 1000.0
               + (t2.tv_nsec - t1.tv_nsec) / 1e6;

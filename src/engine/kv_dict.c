@@ -20,9 +20,8 @@
 #define DICT_INIT_SIZE  16          /* must be power of 2 */
 #define DICT_MAX_SIZE   (1U << 24)  /* ~16M buckets max */
 
-/* Rehash batch size — scales with ht[0].size so larger tables migrate
- * proportionally more buckets per operation, keeping rehash completion
- * roughly constant at ~60 operations regardless of table size. */
+/* Rehash batch size — scales with ht[0].size so a full migration takes a
+ * bounded number of insert/delete operations regardless of table size. */
 static inline int rehash_batch(kv_dict_t *d) {
     int n = (int)(d->ht[0].size >> 6);  /* d->ht[0].size / 64 */
     return n < 8 ? 8 : n;
@@ -37,21 +36,13 @@ static uint32_t next_pow2(uint32_t v) {
     return v + 1;
 }
 
-/* Allocate a new entry.  Key-First layout:
- *
- *   [kv_entry_t header][type:1][enc:1][key:key_len][payload:val_len-2]
- *
- * When dict has an arena, allocates from arena (bump pointer); falls back to malloc.
- *
- * The caller (dict_add) passes type+enc+payload as a contiguous buffer in `data`.
- * We split it: type+enc go at data[0..1], key at data[2..], payload at the tail.
- * This is transparent to all callers because only the accessor macros touch data[]
- * layout.                                                                */
+/* Allocate one entry: header + key + payload.  From the arena (bump pointer)
+ * when present, otherwise a single malloc. */
 static kv_entry_t *entry_alloc(kv_dict_t *d, const char *key, uint32_t key_len,
-                                const char *data, uint32_t data_len,
+                                const char *payload, uint32_t payload_len,
                                 uint64_t hash)
 {
-    uint32_t total = (uint32_t)sizeof(kv_entry_t) + data_len + key_len;
+    uint32_t total = (uint32_t)sizeof(kv_entry_t) + key_len + payload_len;
     kv_entry_t *e;
     if (d->arena && d->arena_used + total <= d->arena_cap) {
         e = (kv_entry_t *)(d->arena + d->arena_used);
@@ -65,18 +56,11 @@ static kv_entry_t *entry_alloc(kv_dict_t *d, const char *key, uint32_t key_len,
     e->hash    = hash;
     e->expire  = 0;
     e->key_len = key_len;
-    e->val_len = data_len;   /* = 2 + payload_len */
+    e->val_len = payload_len;
 
-    /* type + encoding (always 2 bytes at data[0..1]) */
-    if (data && data_len >= 2)
-        memcpy(e->data, data, 2);
-
-    /* key at data + 2 (compile-time constant offset) */
-    memcpy(e->data + 2, key, key_len);
-
-    /* payload after key (remaining data_len-2 bytes) */
-    if (data && data_len > 2)
-        memcpy(e->data + 2 + key_len, data + 2, (size_t)(data_len - 2));
+    memcpy(e->data, key, key_len);
+    if (payload && payload_len)
+        memcpy(e->data + key_len, payload, payload_len);
 
     return e;
 }
@@ -263,23 +247,6 @@ static int dict_maybe_expand(kv_dict_t *d) {
     return 0;
 }
 
-static int dict_maybe_shrink(kv_dict_t *d) {
-    if (d->rehash_idx >= 0) return 0;
-
-    uint32_t used = d->ht[0].used;
-    uint32_t size = d->ht[0].size;
-
-    /* Shrink when load factor < 0.1 and above minimum */
-    if (size > DICT_INIT_SIZE && used < size / 10) {
-        uint32_t new_size = next_pow2(used * 2);
-        if (new_size >= size) return 0;
-        if (ht_alloc(&d->ht[1], new_size) < 0) return -1;
-        d->rehash_idx = 0;
-        return 1;
-    }
-    return 0;
-}
-
 /* =====================================================================
  * Core operations
  * ===================================================================== */
@@ -339,37 +306,13 @@ use_ht0:
 }
 
 kv_entry_t *dict_add(kv_dict_t *d, const char *key, uint32_t key_len,
-                     const char *data, uint32_t data_len, uint64_t hash)
+                     const char *payload, uint32_t payload_len, uint64_t hash)
 {
     kv_ht_t *ht = dict_prepare_insert(d);
     if (!ht) return NULL;
 
-    kv_entry_t *e = entry_alloc(d, key, key_len, data, data_len, hash);
+    kv_entry_t *e = entry_alloc(d, key, key_len, payload, payload_len, hash);
     if (!e) return NULL;
-
-    uint32_t idx = (uint32_t)(hash & ht->size_mask);
-    e->next = ht->buckets[idx];
-    ht->buckets[idx] = e;
-    ht->used++;
-    return e;
-}
-
-kv_entry_t *dict_add_raw(kv_dict_t *d, const char *key, uint32_t key_len,
-                         uint8_t type, uint8_t enc,
-                         const char *payload, uint32_t payload_len,
-                         uint64_t hash)
-{
-    kv_ht_t *ht = dict_prepare_insert(d);
-    if (!ht) return NULL;
-
-    uint32_t data_len = (uint32_t)(2 + payload_len);
-    kv_entry_t *e = entry_alloc(d, key, key_len, NULL, data_len, hash);
-    if (!e) return NULL;
-
-    e->data[0] = (char)type;
-    e->data[1] = (char)enc;
-    if (payload && payload_len)
-        memcpy(entry_payload(e), payload, payload_len);
 
     uint32_t idx = (uint32_t)(hash & ht->size_mask);
     e->next = ht->buckets[idx];
@@ -411,7 +354,6 @@ int dict_delete(kv_dict_t *d, const char *key, uint32_t key_len,
                 }
                 ht->used--;
                 dict_rehash_step(d, rehash_batch(d));
-                dict_maybe_shrink(d);
                 return 0;
             }
             prev = e;
@@ -424,35 +366,33 @@ int dict_delete(kv_dict_t *d, const char *key, uint32_t key_len,
 }
 
 kv_entry_t *dict_resize_entry(kv_dict_t *d, kv_entry_t *e,
-                               uint32_t new_data_len)
+                               uint32_t new_payload_len)
 {
-    /* Also advance rehash: SET-on-existing-key is the dominant path
-     * under overwrite-heavy workloads and must not stall migration. */
+    /* Also advance rehash: overwrite is a hot path and must not stall
+     * bucket migration. */
     dict_rehash_step(d, rehash_batch(d));
 
     uint32_t old_val_len = e->val_len;
 
-    if (new_data_len == old_val_len)
+    if (new_payload_len == old_val_len)
         return e;
 
-    /* Key-First layout: key sits at data+2 (fixed), payload at data+2+key_len.
-     * Shrinking or growing only affects the trailing payload — no key memmove
-     * and no chain pointer fixup needed unless realloc moves the whole entry. */
+    /* Only the trailing payload changes size; the key at the head never
+     * moves.  Shrinking is free — just shorten val_len. */
 
-    if (new_data_len < old_val_len) {
-        /* Shrink: only the tail payload shrinks, key doesn't move */
-        e->val_len = new_data_len;
+    if (new_payload_len < old_val_len) {
+        e->val_len = new_payload_len;
         return e;
     }
 
-    /* Grow: realloc to make room for larger payload at the tail */
+    /* Grow: realloc for a larger payload at the tail */
     uint32_t old_total = (uint32_t)sizeof(kv_entry_t) + old_val_len + e->key_len;
-    uint32_t new_total = (uint32_t)sizeof(kv_entry_t) + new_data_len + e->key_len;
+    uint32_t new_total = (uint32_t)sizeof(kv_entry_t) + new_payload_len + e->key_len;
 
     kv_entry_t *ne = (kv_entry_t *)realloc(e, (size_t)new_total);
     if (!ne) return NULL;
 
-    ne->val_len = new_data_len;
+    ne->val_len = new_payload_len;
 
     /* Fix up bucket chain pointers if realloc moved the entry */
     if (ne != e) {

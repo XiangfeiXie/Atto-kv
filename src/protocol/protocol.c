@@ -83,9 +83,10 @@ int resp_parse_slices(const char *buf, int buflen,
 
 /* ── Drain loop — extract commands from read buffer into write buffer ─ */
 
-int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn *c)
+int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, int *want_close)
 {
     int off = *r_off, remaining = rb->len, ncmd = 0;
+    if (want_close) *want_close = 0;
 
     while (remaining > 0) {
         kvs_token_t tokens[KVS_MAX_TOKENS];
@@ -136,25 +137,23 @@ int kvs_drain_resp_commands_off(DynBuf *rb, int *r_off, DynBuf *wb, struct conn 
         if (cmd_len <= 0) {
             if (cmd_len == 0) break;
             dynbuf_cat(wb, RESP_ERR_INV, RESP_ERR_INV_LEN);
-            if (c) c->status = 1;
+            if (want_close) *want_close = 1;
             ncmd = -1; break;
         }
 
         dispatch_result_t r = kvs_dispatch(tokens, argc,
-                                            rb->buf + off, cmd_len, wb, c);
+                                            rb->buf + off, cmd_len, wb);
         off += cmd_len;
         remaining -= cmd_len;
         ncmd++;
 
-        if (r == DISPATCH_CLOSE) { if (c) c->status = 1; break; }
+        if (r == DISPATCH_CLOSE) { if (want_close) *want_close = 1; break; }
     }
 
-    /* Compact if r_off exceeds half capacity (rare with 64KB+ buffers).
-     * Skip compaction when a recv is in flight (proactor arm-before-drain):
-     * the in-flight SQE targets the old physical address and compaction
-     * would move the data out from under it, causing buffer corruption. */
-    if (off > rb->cap / KVS_RB_COMPACT_RATIO && remaining > 0 && remaining < off
-        && !(c && c->recv_armed)) {
+    /* Compact if the consumed prefix exceeds half capacity.  Safe to do here
+     * unconditionally: drain is only ever called with no recv in flight (the
+     * proactor disarms before draining, the reactor recv()s synchronously). */
+    if (off > rb->cap / KVS_RB_COMPACT_RATIO && remaining > 0 && remaining < off) {
         memmove(rb->buf, rb->buf + off, (size_t)remaining);
         off = 0;
     }

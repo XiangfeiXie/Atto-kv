@@ -29,8 +29,6 @@ if(USE_JEMALLOC)
     add_compile_definitions(USE_JEMALLOC)
 endif()
 pkg_check_modules(ZLIB     REQUIRED zlib)
-pkg_check_modules(LIBBPF   REQUIRED libbpf)
-pkg_check_modules(LIBXDP   REQUIRED libxdp)
 
 # RDMA: libibverbs (pkg-config) + librdmacm (find_library — dev pkg not installed)
 pkg_check_modules(IBVERBS  REQUIRED libibverbs)
@@ -79,10 +77,6 @@ set(ENGINE_SRCS
     src/engine/kv_dict.c
 )
 
-set(TYPE_SRCS
-    src/type/kv_type_string.c
-)
-
 set(NET_SRCS
     src/net/reactor.c
     src/net/proactor.c
@@ -92,7 +86,7 @@ set(NET_SRCS
 set(PERSIST_SRCS
     src/persist/persistence.c
     src/persist/persist_rdb.c
-    src/persist/persist_wal.c
+    src/persist/persist_aof.c
 )
 
 set(REPL_SRCS
@@ -107,24 +101,15 @@ set(REPL_SRCS
     src/repl-incr/repl_incr_slave.c
 )
 
-# Kernel-bypass (AF_XDP + KCP) engine-side sources.  shm_ipc.c is shared with
-# the gateway binary; engine_xdp.c is the engine↔SHM glue.
-set(XDPKCP_ENGINE_SRCS
-    src/repl-incr-xdpkcp/engine_xdp.c
-    src/repl-incr-xdpkcp/shm_ipc.c
-)
-
 set(KVSTORE_SRCS
     ${UTIL_SRCS}
     ${CORE_SRCS}
     ${CONFIG_SRCS}
     ${PROTOCOL_SRCS}
     ${ENGINE_SRCS}
-    ${TYPE_SRCS}
     ${NET_SRCS}
     ${PERSIST_SRCS}
     ${REPL_SRCS}
-    ${XDPKCP_ENGINE_SRCS}
 )
 
 # ── kvstore target ────────────────────────────────────────────────────
@@ -136,12 +121,10 @@ target_include_directories(kvstore PRIVATE
     src/config
     src/protocol
     src/engine
-    src/type
     src/net
     src/persist
     src/repl
     src/repl-incr
-    src/repl-incr-xdpkcp
     ${NTYCO_DIR}/core
     ${URING_INCLUDE_DIRS}
     ${JEMALLOC_INCLUDE_DIRS}
@@ -162,71 +145,6 @@ target_link_libraries(kvstore PRIVATE
 )
 
 add_dependencies(kvstore ntyco)
-
-# ── AF_XDP + KCP gateway ──────────────────────────────────────────────
-# Two binaries per machine: the engine (kvstore, above) and this gateway,
-# which owns the busy-poll AF_XDP + KCP datapath and talks to the engine via
-# /dev/shm.  The BPF program redirects UDP:sync_port into the XSK.
-
-set(XDPKCP_BPF_SRC ${CMAKE_SOURCE_DIR}/src/repl-incr-xdpkcp/xdp_kcp.bpf.c)
-set(XDPKCP_BPF_OBJ ${CMAKE_BINARY_DIR}/xdp_kcp.bpf.o)
-
-add_custom_command(
-    OUTPUT ${XDPKCP_BPF_OBJ}
-    COMMAND clang -O2 -g -target bpf
-            -I${CMAKE_SOURCE_DIR}/src/repl-incr-xdpkcp
-            -I/usr/include/x86_64-linux-gnu
-            -c ${XDPKCP_BPF_SRC}
-            -o ${XDPKCP_BPF_OBJ}
-    DEPENDS ${XDPKCP_BPF_SRC}
-    COMMENT "Compiling xdp_kcp.bpf.c (XDP BPF)"
-)
-add_custom_target(xdp_kcp_bpf DEPENDS ${XDPKCP_BPF_OBJ})
-
-set(XDPKCP_GW_SRCS
-    src/repl-incr-xdpkcp/gateway.c
-    src/repl-incr-xdpkcp/af_xdp.c
-    src/repl-incr-xdpkcp/kcp_transport.c
-    src/repl-incr-xdpkcp/shm_ipc.c
-    src/repl-incr-xdpkcp/ikcp.c
-)
-add_executable(kvstore-xdp-gateway ${XDPKCP_GW_SRCS})
-target_include_directories(kvstore-xdp-gateway PRIVATE
-    src/repl-incr-xdpkcp
-    ${LIBBPF_INCLUDE_DIRS}
-    ${LIBXDP_INCLUDE_DIRS}
-)
-target_link_libraries(kvstore-xdp-gateway PRIVATE
-    ${LIBXDP_LIBRARIES}
-    ${LIBBPF_LIBRARIES}
-    elf
-)
-add_dependencies(kvstore-xdp-gateway xdp_kcp_bpf)
-
-# ── Set capabilities for eBPF (requires libcap) ───────────────────────
-# This allows kvstore to load eBPF programs without running as root
-find_program(SETCAP_EXECUTABLE setcap)
-if(SETCAP_EXECUTABLE)
-    # Note: Automatic capability setting requires passwordless sudo or manual intervention
-    # To enable automatic setting, configure sudoers:
-    #   echo "$USER ALL=(ALL) NOPASSWD: /usr/sbin/setcap" | sudo tee /etc/sudoers.d/setcap-kvstore
-    # Or run manually after build:
-    #   echo "1234" | sudo -S setcap cap_bpf,cap_perfmon,cap_net_admin,cap_sys_admin+ep build/kvstore
-    message(STATUS "setcap found - you can set capabilities manually after build:")
-    message(STATUS "  echo \"1234\" | sudo -S setcap cap_bpf,cap_perfmon,cap_net_admin,cap_sys_admin+ep build/kvstore")
-else()
-    message(WARNING "setcap not found - eBPF programs will require root privileges")
-    message(WARNING "Install libcap2-bin: sudo apt-get install libcap2-bin")
-endif()
-
-# Add a custom target for setting capabilities
-add_custom_target(set-caps
-    COMMAND ${CMAKE_COMMAND} -E echo "Setting capabilities (requires sudo password)..."
-    COMMAND bash -c "echo 1234 | sudo -S setcap cap_bpf,cap_perfmon,cap_net_admin,cap_sys_admin+ep ${CMAKE_BINARY_DIR}/kvstore"
-    DEPENDS kvstore
-    COMMENT "Setting eBPF capabilities on kvstore binary"
-    VERBATIM
-)
 
 
 # ── Phase 8.1 — smoke / sanitizer-smoke targets ──────────────────────

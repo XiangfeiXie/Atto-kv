@@ -112,7 +112,7 @@ start_kvs() {
     stop_kvs
     # 清理旧持久化文件
     rm -f "${PROJECT_DIR}/build/dump.rdb" "${PROJECT_DIR}/build/dump.rdb.tmp" \
-          "${PROJECT_DIR}/build/appendonly.aof" "${PROJECT_DIR}/build/incr.wal"
+          "${PROJECT_DIR}/build/appendonly.aof"
     # 提取配置中 port 的值
     local port=$(grep '^port ' "$conf_path" | awk '{print $2}')
     port=${port:-$KVS_PORT}

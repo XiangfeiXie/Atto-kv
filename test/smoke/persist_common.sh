@@ -19,7 +19,6 @@ LOG_DIR="$(mktemp -d -t kvstore_persist.XXXXXX)"
 RDB_FILE="${PROJECT_DIR}/build/dump.rdb"
 RDB_TMP="${PROJECT_DIR}/build/dump.rdb.tmp"
 AOF_FILE="${PROJECT_DIR}/build/appendonly.aof"
-WAL_FILE="${PROJECT_DIR}/build/incr.wal"
 
 HOST="${HOST:-127.0.0.1}"
 PORT=""           # start_kvs 填充
@@ -49,7 +48,7 @@ conf_port() {
 
 # 清理旧持久化文件 (确保干净起点)
 clean_persist_files() {
-    rm -f "$RDB_FILE" "$RDB_TMP" "$AOF_FILE" "$WAL_FILE"
+    rm -f "$RDB_FILE" "$RDB_TMP" "$AOF_FILE"
 }
 
 # 等待 kvstore 响应 PING (真正就绪，而非仅端口监听)
@@ -109,7 +108,7 @@ start_kvs() {
     log "kvstore 已启动 (conf=$conf pid=$KVS_PID port=$port)"
 }
 
-# 优雅停 (SIGTERM → 触发 kvs_wal_persist_stop() flush+fsync)。
+# 优雅停 (SIGTERM → 触发 kvs_aof_persist_stop() flush+fsync)。
 # 超时未退判失败并 KILL 兜底清理 (此时持久化不可信)。
 stop_kvs_graceful() {
     local pid="${1:-$KVS_PID}"
@@ -134,7 +133,7 @@ stop_kvs_graceful() {
 
 # ---- RESP 数据填充 ----
 # 用 RESP 数组格式填充 N 条 key:<i>=value:<i> (流水线，逐条确认 +OK)。
-# 必须用 RESP 而非 redis-cli --pipe 的 inline 格式: WAL 重放走 resp_parse_slices，
+# 必须用 RESP 而非 redis-cli --pipe 的 inline 格式: AOF 重放走 resp_parse_slices，
 # 只认 *N\r\n$L\r\n 数组形式。
 # 输出: "OK <count>" (成功) 或 "FAIL <reason>" (失败)
 populate_resp() {

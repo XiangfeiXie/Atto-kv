@@ -27,7 +27,7 @@
 
 static void die(const char *msg) { perror(msg); exit(1); }
 
-/* ── Poll recv CQ, return ack slot id + slave buffer index ─────────── */
+/* Poll recv CQ，返回 ack 槽位 + slave buffer 下标 */
 
 static int poll_recv_ack(rdma_xport_t *xport, struct ack_msg *acks,
                          int *out_buf_idx) {
@@ -40,7 +40,7 @@ static int poll_recv_ack(rdma_xport_t *xport, struct ack_msg *acks,
     return (int)wc.wr_id;  /* ack slot index for re-post */
 }
 
-/* ── Free-buffer pool (tracks available slave buffers) ─────────────── */
+/* ── 空闲 buffer 池（追踪可用的 slave buffer）── */
 
 struct buf_pool {
     int  free_q[FULLSYNC_NUM_BUFS];
@@ -54,7 +54,6 @@ static void bp_init(struct buf_pool *bp, int n) {
 }
 
 static int bp_empty(struct buf_pool *bp)      { return bp->count == 0; }
-static int bp_available(struct buf_pool *bp)  { return bp->count; }
 
 static int bp_acquire(struct buf_pool *bp) {
     int idx = bp->free_q[bp->head];
@@ -112,9 +111,6 @@ static size_t send_rdb_batches(rdma_xport_t *xport, struct ibv_mr *buf_mr,
             }
             break;
         }
-
-        if (bp_empty(&bp))
-            continue;  /* wait for ACKs to free buffers */
 
         /* ── 序列化下一批，直接写入 MR buffer ── */
         int buf_idx = bp_acquire(&bp);
@@ -231,9 +227,7 @@ int master_fullsync_child(uint64_t repl_offset, int ready_fd) {
 
     /* ── 协议信封（仅首批携带）── */
     struct batch_hdr bh = {
-        .magic   = htonl(FULLSYNC_MAGIC),
-        .version = htons(FULLSYNC_VERSION),
-        .flags   = 0,
+        .magic       = htonl(FULLSYNC_MAGIC),
         .repl_offset = htobe64(repl_offset)
     };
 

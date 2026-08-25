@@ -1,19 +1,16 @@
-/* repl_incr_master.c — Master-side incremental replication
+/* repl_incr_master.c — Master 侧增量同步
  *
- *  - Creates a dedicated TCP listen socket (default port 2001)
- *  - Accepts slave connections, handles PSYNC handshake
- *  - Pushes backlog + live command stream to streaming slaves
+ *  建独立 TCP 监听（默认 2001），接受从库连接，处理 PSYNC 握手，
+ *  向 streaming 从库推送 backlog + 实时命令流。
  *
- *  fd ownership: the listen socket and each accepted slave fd are registered
- *  into the network engine's event loop.  The engine calls the accept/read/
- *  write callbacks below when the fd becomes ready; this module performs no
- *  I/O outside those callbacks (except the one-shot setup in *_start).
- *
- * Licensed under GPL-2.0 or later */
+ *  fd 归属: 监听 fd 与从库 fd 注册进引擎事件循环，引擎就绪时回调下面
+ *  的 accept/read/write。本模块除 *_start 的一次性 setup 外不自轮询。
+ *  设计上只有一台从机。 */
 
 #define _GNU_SOURCE    /* accept4 */
 
 #include "repl_incr.h"
+#include "protocol.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,22 +25,15 @@
 /* ── Module state ────────────────────────────────────────────────────── */
 
 static int          g_listen_fd = -1;
-static repl_slave_t g_slaves[REPL_MAX_SLAVES];
+static repl_slave_t g_slave;      /* 唯一从机 */
 
 /* ── Helpers ─────────────────────────────────────────────────────────── */
 
-static repl_slave_t *slave_by_fd(int fd) {
-    for (int i = 0; i < REPL_MAX_SLAVES; i++)
-        if (g_slaves[i].active && g_slaves[i].fd == fd)
-            return &g_slaves[i];
-    return NULL;
-}
-
-static void slave_close(repl_slave_t *s) {
-    int fd = s->fd;
-    dynbuf_free(&s->write_buf);
-    memset(s, 0, sizeof(*s));
-    s->fd = -1;
+static void slave_close(void) {
+    int fd = g_slave.fd;
+    dynbuf_free(&g_slave.write_buf);
+    memset(&g_slave, 0, sizeof(g_slave));
+    g_slave.fd = -1;
 
     if (fd >= 0) {
         if (repl_engine_close) repl_engine_close(fd);
@@ -51,41 +41,27 @@ static void slave_close(repl_slave_t *s) {
     }
 }
 
-static repl_slave_t *slave_alloc(void) {
-    for (int i = 0; i < REPL_MAX_SLAVES; i++) {
-        if (!g_slaves[i].active) {
-            memset(&g_slaves[i], 0, sizeof(repl_slave_t));
-            g_slaves[i].fd     = -1;
-            g_slaves[i].active = 1;
-            return &g_slaves[i];
-        }
-    }
-    return NULL;
-}
-
-/* ── Propagate to streaming slaves ───────────────────────────────────── */
+/* ── 向 streaming 从库推送写命令 ─────────────────────────────────────── */
 
 void repl_incr_propagate(const char *resp_data, int len) {
-    for (int i = 0; i < REPL_MAX_SLAVES; i++) {
-        repl_slave_t *s = &g_slaves[i];
-        if (!s->active || s->state != REPL_STATE_STREAMING)
-            continue;
-        if (s->write_buf.len + len > s->write_buf.cap)
-            dynbuf_reserve(&s->write_buf, s->write_buf.len + len + 4096);
-        memcpy(s->write_buf.buf + s->write_buf.len, resp_data, (size_t)len);
-        s->write_buf.len += len;
+    if (!g_slave.active || g_slave.state != REPL_STATE_STREAMING)
+        return;
 
-        /* Wake the engine so the pending bytes are flushed. */
-        if (repl_engine_writable)
-            repl_engine_writable(s->fd, 1);
-    }
+    if (g_slave.write_buf.len + len > g_slave.write_buf.cap)
+        dynbuf_reserve(&g_slave.write_buf, g_slave.write_buf.len + len + 4096);
+    memcpy(g_slave.write_buf.buf + g_slave.write_buf.len, resp_data, (size_t)len);
+    g_slave.write_buf.len += len;
+
+    /* 唤醒引擎，冲刷待发字节 */
+    if (repl_engine_writable)
+        repl_engine_writable(g_slave.fd, 1);
 }
 
-/* ── Flush slave write buffer (non-blocking) ──────────────────────────── */
+/* ── 冲刷从库 write_buf（非阻塞）────────────────────────────────────── */
 
 int repl_incr_master_write(int fd) {
-    repl_slave_t *s = slave_by_fd(fd);
-    if (!s || !s->active) return -1;
+    repl_slave_t *s = &g_slave;
+    if (!s->active || s->fd != fd) return -1;
     if (s->write_buf.len <= 0) return 0;
 
     ssize_t n = send(fd, s->write_buf.buf,
@@ -97,114 +73,101 @@ int repl_incr_master_write(int fd) {
         s->write_buf.len = (int)unsent;
     } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
         printf("[INCR-MASTER] slave fd=%d disconnected\n", fd);
-        slave_close(s);
+        slave_close();
         return 0;
     }
 
-    /* Re-arm EPOLLOUT only while bytes remain. */
     if (repl_engine_writable)
         repl_engine_writable(fd, s->write_buf.len > 0);
     return 0;
 }
 
-/* ── Send backlog from a given offset to slave ─────────────────────────
- *
- * Packs commands into the slave's write_buf.  Returns the next offset to
- * resume from, or the current head if caught up.                        */
+/* ── 从指定 offset 把 backlog 塞进从库 write_buf ────────────────────────
+ * 返回下一个续传 offset；追平（或 offset 无效）时返回当前 head。 */
 
-static size_t slave_backfill(repl_slave_t *s, size_t offset) {
+static size_t slave_backfill(size_t offset) {
     char buf[65536];
     size_t next_off;
 
     int n = repl_backlog_fetch(offset, buf, (int)sizeof(buf), &next_off);
-    if (n < 0 || n == 0)
-        return repl_backlog_offset();  /* caught up or error */
+    if (n <= 0)
+        return repl_backlog_offset();  /* 追平或无效 offset */
 
-    if (s->write_buf.len + n > s->write_buf.cap)
-        dynbuf_reserve(&s->write_buf, s->write_buf.len + n + 4096);
-    memcpy(s->write_buf.buf + s->write_buf.len, buf, (size_t)n);
-    s->write_buf.len += n;
+    if (g_slave.write_buf.len + n > g_slave.write_buf.cap)
+        dynbuf_reserve(&g_slave.write_buf, g_slave.write_buf.len + n + 4096);
+    memcpy(g_slave.write_buf.buf + g_slave.write_buf.len, buf, (size_t)n);
+    g_slave.write_buf.len += n;
 
     return next_off;
 }
 
-/* ── Parse PSYNC command from newly connected slave ────────────────────
- *
- * Expects: *2\r\n$5\r\nPSYNC\r\n$<n>\r\n<offset>\r\n                    */
+/* ── 解析新连接从库发来的 PSYNC（*2\r\n$5\r\nPSYNC\r\n$<n>\r\n<offset>\r\n）── */
 
-static void slave_handle_psync(repl_slave_t *s) {
+static void slave_handle_psync(void) {
     char buf[256];
-    ssize_t n = recv(s->fd, buf, sizeof(buf) - 1, MSG_DONTWAIT);
+    ssize_t n = recv(g_slave.fd, buf, sizeof(buf) - 1, MSG_DONTWAIT);
     if (n <= 0) {
         if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-            printf("[INCR-MASTER] slave fd=%d disconnected\n", s->fd);
-            slave_close(s);
+            printf("[INCR-MASTER] slave fd=%d disconnected\n", g_slave.fd);
+            slave_close();
         }
         return;
     }
-    buf[n] = '\0';
 
-    /* Quick sanity checks */
-    if (n < 10 || buf[0] != '*' || !strstr(buf, "PSYNC")) {
-        fprintf(stderr, "[INCR-MASTER] bad handshake from fd=%d\n", s->fd);
-        slave_close(s);
+    kvs_token_t tokens[3];
+    int argc = 0;
+    if (resp_parse_slices(buf, (int)n, tokens, 3, &argc) <= 0 ||
+        argc != 2 || !TOKEN_EQ(tokens[0], "PSYNC")) {
+        fprintf(stderr, "[INCR-MASTER] bad handshake from fd=%d\n", g_slave.fd);
+        slave_close();
         return;
     }
 
-    /* Parse offset from the last bulk string: $<digits>\r\n<digits>\r\n */
-    const char *dollar = strrchr(buf, '$');
-    if (!dollar) { slave_close(s); return; }
-
-    /* Skip bulk-string length: "$<n>\r\n" */
-    const char *p = dollar + 1;
-    while (*p >= '0' && *p <= '9') p++;
-    if (*p == '\r') p++;
-    if (*p == '\n') p++;
-
-    /* Now parse the actual offset value */
+    /* tokens[1] 是十进制 offset */
     size_t psync_offset = 0;
-    while (*p >= '0' && *p <= '9') {
-        psync_offset = psync_offset * 10 + (size_t)(*p - '0');
-        p++;
+    for (int i = 0; i < tokens[1].len; i++) {
+        char c = tokens[1].ptr[i];
+        if (c < '0' || c > '9') {
+            fprintf(stderr, "[INCR-MASTER] bad offset from fd=%d\n", g_slave.fd);
+            slave_close();
+            return;
+        }
+        psync_offset = psync_offset * 10 + (size_t)(c - '0');
     }
 
     printf("[INCR-MASTER] PSYNC %zu from fd=%d (current=%zu)\n",
-           psync_offset, s->fd, repl_backlog_offset());
+           psync_offset, g_slave.fd, repl_backlog_offset());
 
     if (repl_backlog_valid(psync_offset)) {
-        /* Incremental: queue +CONTINUE, then catch up from backlog */
-        dynbuf_append(&s->write_buf, "+CONTINUE\r\n", 11);
-        s->state      = REPL_STATE_STREAMING;
-        s->repl_offset = psync_offset;
+        /* 增量续传: 先回 +CONTINUE，再从 backlog 补发 */
+        dynbuf_cat(&g_slave.write_buf, "+CONTINUE\r\n", 11);
+        g_slave.state = REPL_STATE_STREAMING;
 
         size_t off = psync_offset;
         size_t target = repl_backlog_offset();
         while (off < target) {
-            size_t next = slave_backfill(s, off);
+            size_t next = slave_backfill(off);
             if (next <= off) break;  /* no progress */
             off = next;
         }
         printf("[INCR-MASTER] slave fd=%d streaming (backfill %zu -> %zu)\n",
-               s->fd, psync_offset, off);
+               g_slave.fd, psync_offset, off);
 
         if (repl_engine_writable)
-            repl_engine_writable(s->fd, 1);
+            repl_engine_writable(g_slave.fd, 1);
     } else {
-        /* Need full sync — send the error inline, then drop the link. */
+        /* offset 过期 → 需全量同步，回 FULLRESYNC 后拆链 */
         char resp[64];
         int rlen = snprintf(resp, sizeof(resp),
                             "+FULLRESYNC %zu\r\n", repl_backlog_offset());
-        send(s->fd, resp, (size_t)rlen, MSG_NOSIGNAL);
-        printf("[INCR-MASTER] slave fd=%d needs FULLRESYNC (asked=%zu window=[%zu,%zu))\n",
-               s->fd, psync_offset,
-               repl_backlog_offset() > REPL_BACKLOG_SIZE
-                   ? repl_backlog_offset() - REPL_BACKLOG_SIZE : 0,
-               repl_backlog_offset());
-        slave_close(s);
+        send(g_slave.fd, resp, (size_t)rlen, MSG_NOSIGNAL);
+        printf("[INCR-MASTER] slave fd=%d needs FULLRESYNC (asked=%zu)\n",
+               g_slave.fd, psync_offset);
+        slave_close();
     }
 }
 
-/* ── Accept new slave connections ─────────────────────────────────────── */
+/* ── 接受从库连接 ────────────────────────────────────────────────────── */
 
 int repl_incr_master_accept(int listen_fd) {
     (void)listen_fd;
@@ -221,16 +184,15 @@ int repl_incr_master_accept(int listen_fd) {
         int opt = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-        repl_slave_t *s = slave_alloc();
-        if (!s) {
-            fprintf(stderr, "[INCR-MASTER] slave table full\n");
-            close(cfd);
-            continue;
-        }
-        s->fd     = cfd;
-        s->state  = REPL_STATE_CONNECTED;
-        s->active = 1;
-        dynbuf_init(&s->write_buf, 65536);
+        /* 单从机：新连接到来时，先拆掉仍挂着的旧连接 */
+        if (g_slave.active)
+            slave_close();
+
+        memset(&g_slave, 0, sizeof(g_slave));
+        g_slave.fd     = cfd;
+        g_slave.state  = REPL_STATE_CONNECTED;
+        g_slave.active = 1;
+        dynbuf_init(&g_slave.write_buf, 65536);
         printf("[INCR-MASTER] slave connected fd=%d\n", cfd);
 
         if (repl_engine_register)
@@ -239,30 +201,29 @@ int repl_incr_master_accept(int listen_fd) {
     return 0;
 }
 
-/* ── Read callback: PSYNC handshake, or drop detection while streaming ── */
+/* ── 读回调：PSYNC 握手，或 streaming 时检测断开 ─────────────────────── */
 
 int repl_incr_master_read(int fd) {
-    repl_slave_t *s = slave_by_fd(fd);
-    if (!s || !s->active) return -1;
+    if (!g_slave.active || g_slave.fd != fd) return -1;
 
-    if (s->state == REPL_STATE_CONNECTED) {
-        slave_handle_psync(s);
+    if (g_slave.state == REPL_STATE_CONNECTED) {
+        slave_handle_psync();
     } else {
-        /* Streaming: a slave never sends.  Any bytes, EOF, or error = drop. */
+        /* Streaming: 从库不发数据，任何字节/EOF/错误都视为断开 */
         char tmp[64];
         ssize_t n = recv(fd, tmp, sizeof(tmp), MSG_DONTWAIT);
         if (n > 0 || n == 0 ||
             (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
             printf("[INCR-MASTER] slave fd=%d disconnected\n", fd);
-            slave_close(s);
+            slave_close();
         }
     }
     return 0;
 }
 
 void repl_incr_master_close(int fd) {
-    repl_slave_t *s = slave_by_fd(fd);
-    if (s) slave_close(s);
+    if (g_slave.active && g_slave.fd == fd)
+        slave_close();
 }
 
 /* ── Setup / teardown ─────────────────────────────────────────────────── */
@@ -304,26 +265,19 @@ int repl_incr_master_listen_fd(void) {
     return g_listen_fd;
 }
 
-/* ── Readiness query for the engine ─────────────────────────────────────
- *
- * Returns the poll mask the engine should wait on for a slave fd, so the
- * proactor can arm IORING_OP_POLL_ADD for just the readiness it needs:
- *
- *   CONNECTED             -> POLLIN   (await the PSYNC handshake)
- *   STREAMING + pending   -> POLLOUT  (flush write_buf)
- *   STREAMING + idle      -> 0        (nothing to wait on; a dropped slave
- *                                      is detected lazily on the next write)
- *
- * An unknown/inactive fd yields 0. */
+/* ── 引擎查询该 fd 应等待的就绪事件（据此 arm 精确的 IORING_OP_POLL_ADD）──
+ *   CONNECTED           -> POLLIN   等待 PSYNC 握手
+ *   STREAMING + 有数据  -> POLLOUT  冲刷 write_buf
+ *   STREAMING + 空闲    -> 0        无需等待（断开在下一次写时惰性发现）
+ * 未知/未激活 fd 返回 0。 */
 
 int repl_incr_master_poll_mask(int fd) {
-    repl_slave_t *s = slave_by_fd(fd);
-    if (!s || !s->active) return 0;
+    if (!g_slave.active || g_slave.fd != fd) return 0;
 
-    if (s->state == REPL_STATE_CONNECTED)
+    if (g_slave.state == REPL_STATE_CONNECTED)
         return POLLIN;
 
-    if (s->state == REPL_STATE_STREAMING && s->write_buf.len > 0)
+    if (g_slave.state == REPL_STATE_STREAMING && g_slave.write_buf.len > 0)
         return POLLOUT;
 
     return 0;

@@ -1,11 +1,8 @@
 /**
  * rdma_transport.c — RDMA 传输层实现
  *
- * 核心引擎提取自 tools/rdma_bw.c，升级点：
- *   P0  选择性信号 — sq_sig_all=0，仅每 QP_DEPTH 的最后一个 WR 产生 CQE
- *   P1  变长消息   — 任意 len，自动按 CHUNK_SIZE 拆分
- *   P2  窗口内推土 — 不等上层 flush，满 QP_DEPTH 自动排空
- *   P3  持久连接   — 包装已有 rdma_cm_id，不管生命周期
+ * 封装 chunk 拆分、滑动窗口流水线、选择性信号与 CQ 轮询。
+ * 包装已有 rdma_cm_id / QP，不管理连接生命周期。
  */
 
 #define _GNU_SOURCE
@@ -14,45 +11,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ── 内部 helpers ─────────────────────────────────────────────────── */
-
-static const char *wc_status_str(enum ibv_wc_status s)
-{
-    switch (s) {
-    case IBV_WC_SUCCESS:          return "SUCCESS";
-    case IBV_WC_LOC_LEN_ERR:      return "LOC_LEN_ERR";
-    case IBV_WC_LOC_QP_OP_ERR:    return "LOC_QP_OP_ERR";
-    case IBV_WC_LOC_EEC_OP_ERR:   return "LOC_EEC_OP_ERR";
-    case IBV_WC_LOC_PROT_ERR:     return "LOC_PROT_ERR";
-    case IBV_WC_WR_FLUSH_ERR:     return "WR_FLUSH_ERR";
-    case IBV_WC_MW_BIND_ERR:      return "MW_BIND_ERR";
-    case IBV_WC_BAD_RESP_ERR:     return "BAD_RESP_ERR";
-    case IBV_WC_LOC_ACCESS_ERR:   return "LOC_ACCESS_ERR";
-    case IBV_WC_REM_INV_REQ_ERR:  return "REM_INV_REQ_ERR";
-    case IBV_WC_REM_ACCESS_ERR:   return "REM_ACCESS_ERR";
-    case IBV_WC_REM_OP_ERR:       return "REM_OP_ERR";
-    case IBV_WC_RETRY_EXC_ERR:    return "RETRY_EXC_ERR";
-    case IBV_WC_RNR_RETRY_EXC_ERR:return "RNR_RETRY_EXC_ERR";
-    case IBV_WC_LOC_RDD_VIOL_ERR: return "LOC_RDD_VIOL_ERR";
-    case IBV_WC_REM_INV_RD_REQ_ERR:return "REM_INV_RD_REQ_ERR";
-    case IBV_WC_REM_ABORT_ERR:    return "REM_ABORT_ERR";
-    case IBV_WC_INV_EECN_ERR:     return "INV_EECN_ERR";
-    case IBV_WC_INV_EEC_STATE_ERR:return "INV_EEC_STATE_ERR";
-    case IBV_WC_FATAL_ERR:        return "FATAL_ERR";
-    case IBV_WC_RESP_TIMEOUT_ERR: return "RESP_TIMEOUT_ERR";
-    case IBV_WC_GENERAL_ERR:      return "GENERAL_ERR";
-    default:                      return "UNKNOWN";
-    }
-}
-
 static int do_poll_send(struct ibv_cq *cq)
 {
     struct ibv_wc wc;
     int n;
     do { n = ibv_poll_cq(cq, 1, &wc); } while (n == 0);
     if (n < 0 || wc.status != IBV_WC_SUCCESS) {
-        fprintf(stderr, "[xport] send CQ error n=%d status=%d (%s) wr_id=%lu\n",
-                n, wc.status, wc_status_str(wc.status), wc.wr_id);
+        fprintf(stderr, "[xport] send CQ error n=%d status=%d wr_id=%lu\n",
+                n, wc.status, wc.wr_id);
         return -1;
     }
     return 0;
@@ -175,8 +141,8 @@ int rdma_xport_poll_recv(rdma_xport_t *x, struct ibv_wc *wc)
     int n;
     do { n = ibv_poll_cq(x->id->recv_cq, 1, wc); } while (n == 0);
     if (n < 0 || wc->status != IBV_WC_SUCCESS) {
-        fprintf(stderr, "[xport] recv CQ error n=%d status=%d (%s) wr_id=%lu\n",
-                n, wc->status, wc_status_str(wc->status), wc->wr_id);
+        fprintf(stderr, "[xport] recv CQ error n=%d status=%d wr_id=%lu\n",
+                n, wc->status, wc->wr_id);
         return -1;
     }
     return 0;

@@ -19,7 +19,7 @@ static void config_default(void) {
     kvs_config.persist_mode  = PERSIST_NONE;  /* off by default */
     kvs_config.network_model = NET_REACTOR;
     kvs_config.maxclients    = 10000;
-    strncpy(kvs_config.wal_fsync_policy, "everysec", sizeof(kvs_config.wal_fsync_policy) - 1);
+    strncpy(kvs_config.aof_fsync_policy, "everysec", sizeof(kvs_config.aof_fsync_policy) - 1);
 
     kvs_config.rdma_sync_enabled = 0;
     kvs_config.rdma_role         = ROLE_MASTER;
@@ -37,13 +37,10 @@ static void config_default(void) {
     kvs_config.fullsync_timeout = 3600000;  /* 1 hour */
     kvs_config.fullsync_max_retries = 3;
 
-    kvs_config.latency_histogram_enabled = 0;
     kvs_config.expire_enabled            = 0;  /* off by default */
 
     kvs_config.incr_sync_enabled = 0;
     kvs_config.incr_repl_port    = 2001;
-
-    kvs_config.xdp_sync_enabled  = 0;
 }
 
 /* Resolve sentinel values and emit sanity warnings.  Called once after
@@ -158,9 +155,9 @@ int config_load(const char *path) {
             else if (strcasecmp(val, "aof")  == 0) kvs_config.persist_mode = PERSIST_AOF;
             else printf("[CONFIG] line %d: unknown persistence '%s'\n", lineno, val);
 
-        } else if (strcasecmp(key, "wal_fsync_policy") == 0) {
-            strncpy(kvs_config.wal_fsync_policy, val,
-                    sizeof(kvs_config.wal_fsync_policy) - 1);
+        } else if (strcasecmp(key, "aof_fsync_policy") == 0) {
+            strncpy(kvs_config.aof_fsync_policy, val,
+                    sizeof(kvs_config.aof_fsync_policy) - 1);
 
         /* ---- Replication ---- */
         } else if (strcasecmp(key, "rdma_sync") == 0) {
@@ -206,10 +203,6 @@ int config_load(const char *path) {
         } else if (strcasecmp(key, "fullsync_max_retries") == 0) {
             parse_int(val, lineno, "fullsync_max_retries", 0, 10, &kvs_config.fullsync_max_retries);
 
-        } else if (strcasecmp(key, "latency_histogram") == 0) {
-            int v = parse_bool(val, lineno, "latency_histogram");
-            if (v >= 0) kvs_config.latency_histogram_enabled = v;
-
         } else if (strcasecmp(key, "expire") == 0) {
             int v = parse_bool(val, lineno, "expire");
             if (v >= 0) kvs_config.expire_enabled = v;
@@ -221,11 +214,6 @@ int config_load(const char *path) {
 
         } else if (strcasecmp(key, "incr_repl_port") == 0) {
             parse_int(val, lineno, "incr_repl_port", 1, 65535, &kvs_config.incr_repl_port);
-
-        /* ---- Kernel-bypass incremental sync ---- */
-        } else if (strcasecmp(key, "xdp_sync") == 0) {
-            int v = parse_bool(val, lineno, "xdp_sync");
-            if (v >= 0) kvs_config.xdp_sync_enabled = v;
 
         } else {
             printf("[CONFIG] line %d: unknown key '%s'\n", lineno, key);
@@ -281,17 +269,11 @@ void config_print(void) {
         }
     }
 
-    if (kvs_config.latency_histogram_enabled)
-        printf("  Latency hist  : sampled dispatch histogram enabled\n");
     printf("  Expire        : %s\n",
            kvs_config.expire_enabled ? "on (Redis-style lazy)" : "off");
     if (kvs_config.incr_sync_enabled)
         printf("  Incr Repl     : on (port %d)\n", kvs_config.incr_repl_port);
     else
         printf("  Incr Repl     : off\n");
-    printf("  XDP Sync      : %s\n",
-           kvs_config.xdp_sync_enabled ? "on (AF_XDP + KCP gateway)" : "off");
-    printf("  Workers       : 1 (single-thread proactor)\n");
-    printf("  CPU pin       : off (single-threaded mode)\n");
     printf("========================================\n\n");
 }

@@ -2,7 +2,7 @@
  * persistence.c — project root resolution & path utilities.
  *
  * All persistence I/O logic lives in the sub-modules:
- *   persist_wal.c  — WAL write + AOF rewrite + WAL/AOF reload
+ *   persist_aof.c  — AOF write + rewrite + reload
  *   persist_rdb.c  — RDB save (fork + io_uring) and load (mmap)
  * ========================================================= */
 

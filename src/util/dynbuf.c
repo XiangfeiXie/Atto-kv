@@ -1,5 +1,5 @@
 #include "dynbuf.h"
-#include "server.h"
+#include "net_common.h"   /* KVS_NET_BUF_MAX */
 #include <stdlib.h>
 #include <string.h>
 
@@ -27,17 +27,13 @@ int dynbuf_reserve(DynBuf *db, int total_cap) {
     return 0;
 }
 
-int dynbuf_append(DynBuf *db, const char *data, int len) {
+int dynbuf_cat(DynBuf *db, const char *data, int len) {
     if (!db || !data || len <= 0) return -1;
     int rc = dynbuf_reserve(db, db->len + len);
     if (rc < 0) return rc;
     memcpy(db->buf + db->len, data, (size_t)len);
     db->len += len;
     return 0;
-}
-
-int dynbuf_cat(DynBuf *db, const char *data, int len) {
-    return dynbuf_append(db, data, len);
 }
 
 void dynbuf_clear(DynBuf *db) {

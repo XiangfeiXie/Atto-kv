@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <signal.h>
 #include "dynbuf.h"
-#include "net_common.h"    /* conn_t, client_t, buffer constants */
+#include "net_common.h"    /* conn_kind_t, buffer constants */
 
 /* ── Global graceful-shutdown flag ── */
 extern volatile sig_atomic_t g_kvs_stop;

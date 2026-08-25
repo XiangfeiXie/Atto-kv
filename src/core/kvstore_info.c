@@ -32,14 +32,14 @@ dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) {
         kvs_token_t s = tokens[1];
         if (!section_match(s, "all") && !section_match(s, "everything") &&
             !section_match(s, "default")) {
-            want_server = section_match(s, "server");
-            want_clients = section_match(s, "clients");
-            want_memory = section_match(s, "memory");
+            want_server      = section_match(s, "server");
+            want_clients     = section_match(s, "clients");
+            want_memory      = section_match(s, "memory");
             want_persistence = section_match(s, "persistence");
-            want_stats = section_match(s, "stats");
+            want_stats       = section_match(s, "stats");
             want_replication = section_match(s, "replication");
-            want_cpu = section_match(s, "cpu");
-            want_keyspace = section_match(s, "keyspace");
+            want_cpu         = section_match(s, "cpu");
+            want_keyspace    = section_match(s, "keyspace");
         }
     }
 
@@ -51,28 +51,19 @@ dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) {
         off += _n;                                                            \
     } while (0)
 
-    long long now_ms = get_time_now_real();
-    long long uptime_s = (now_ms - g_kvs_start_time_ms) / 1000;
-
     if (want_server) {
         struct utsname un = {0};
         uname(&un);
         APPEND("# Server\r\n");
-        APPEND("redis_version:9.1.0-kvstore\r\n");
-        APPEND("kvstore_version:10.0\r\n");
-        APPEND("redis_mode:standalone\r\n");
         APPEND("os:%s %s %s\r\n", un.sysname, un.release, un.machine);
-        APPEND("arch_bits:64\r\n");
         APPEND("process_id:%d\r\n", (int)getpid());
         APPEND("tcp_port:%d\r\n", kvs_config.port);
-        APPEND("uptime_in_seconds:%lld\r\n", uptime_s);
-        APPEND("uptime_in_days:%lld\r\n", uptime_s / 86400);
-        const char *netname =
+        APPEND("network_model:%s\r\n",
             (kvs_config.network_model == NET_PROACTOR) ? "proactor (io_uring)" :
             (kvs_config.network_model == NET_REACTOR)  ? "reactor (epoll)"     :
-                                                         "ntyco (coroutine)";
-        APPEND("network_model:%s\r\n", netname);
-        APPEND("workers:%d\r\n", 1);
+                                                         "ntyco (coroutine)");
+        APPEND("uptime_in_seconds:%lld\r\n",
+               (get_time_now_real() - g_kvs_start_time_ms) / 1000);
         APPEND("\r\n");
     }
 
@@ -98,11 +89,6 @@ dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) {
             allocated = 0;
         allocator = "jemalloc";
 #else
-        /* glibc: mallinfo2() splits accounting between the sbrk heap
-         * (uordblks = in-use chunk bytes) and mmap'd regions (hblkhd) —
-         * allocations > M_MMAP_THRESHOLD (128KB), e.g. the hash bucket
-         * array, bypass the heap and land in hblkhd.  Sum both to mirror
-         * jemalloc's stats.allocated (which counts everything). */
         struct mallinfo2 mi = mallinfo2();
         allocated = (size_t)(mi.uordblks + mi.hblkhd);
 #endif
@@ -119,22 +105,14 @@ dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) {
         APPEND("aof_enabled:%d\r\n", ENABLE_AOF ? 1 : 0);
         APPEND("rdb_enabled:%d\r\n", ENABLE_RDB ? 1 : 0);
         APPEND("loading:%d\r\n", g_in_reload ? 1 : 0);
-        APPEND("rdb_bgsave_in_progress:%d\r\n", rdb_bgsave_in_progress());
         APPEND("rdb_last_save_time:%llu\r\n",
                (unsigned long long)rdb_save_time());
         APPEND("rdb_changes_since_last_save:%llu\r\n",
                (unsigned long long)g_rdb_changes);
-        APPEND("rdb_bgsave_total:%llu\r\n",
-               (unsigned long long)rdb_bgsave_total());
-        APPEND("rdb_bgsave_skipped:%llu\r\n",
-               (unsigned long long)rdb_bgsave_skipped());
-        APPEND("rdb_bgsave_cooldown:%d\r\n", rdb_bgsave_cooldown_sec());
-        APPEND("rdb_bgsave_last_duration:%d\r\n", rdb_bgsave_last_duration());
         APPEND("\r\n");
     }
 
     if (want_stats) {
-        _Atomic uint64_t *pexp = kvs_expired_keys_ptr();
         APPEND("# Stats\r\n");
         APPEND("total_connections_received:%llu\r\n",
                (unsigned long long)atomic_load_explicit(
@@ -144,66 +122,7 @@ dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) {
                    &g_kvs_total_commands, memory_order_relaxed));
         APPEND("expired_keys:%llu\r\n",
                (unsigned long long)atomic_load_explicit(
-                   pexp, memory_order_relaxed));
-
-        /* Latency histogram (16 log2-spaced buckets, 1µs..≥16ms).
-         * Distributed across KVS_LAT_SLOTS cachelines; INFO sums them. */
-        uint64_t lat_buckets[KVS_LAT_BUCKETS] = {0};
-        uint64_t lat_total = 0, lat_sum = 0;
-        for (int s = 0; s < KVS_LAT_SLOTS; s++) {
-            for (int i = 0; i < KVS_LAT_BUCKETS; i++)
-                lat_buckets[i] += atomic_load_explicit(
-                    &g_kvs_lat_slots[s].hist[i], memory_order_relaxed);
-            lat_total += atomic_load_explicit(
-                &g_kvs_lat_slots[s].count, memory_order_relaxed);
-            lat_sum   += atomic_load_explicit(
-                &g_kvs_lat_slots[s].sum_ns, memory_order_relaxed);
-        }
-        APPEND("latency_sample_rate:64\r\n");
-        APPEND("latency_total_samples:%llu\r\n",
-               (unsigned long long)lat_total);
-        if (lat_total > 0)
-            APPEND("latency_mean_us:%.2f\r\n",
-                   (double)lat_sum / (double)lat_total / 1000.0);
-        else
-            APPEND("latency_mean_us:0.00\r\n");
-
-        static const uint64_t bucket_us[KVS_LAT_BUCKETS] = {
-            1, 2, 4, 8, 16, 32, 64, 128, 256, 512,
-            1024, 2048, 4096, 8192, 16384, 0
-        };
-        for (int i = 0; i < KVS_LAT_BUCKETS; i++) {
-            if (bucket_us[i] == 0)
-                APPEND("latency_us_le_inf:%llu\r\n",
-                       (unsigned long long)lat_buckets[i]);
-            else
-                APPEND("latency_us_le_%llu:%llu\r\n",
-                       (unsigned long long)bucket_us[i],
-                       (unsigned long long)lat_buckets[i]);
-        }
-        if (lat_total > 0) {
-            const double pcts[3] = { 0.50, 0.99, 0.999 };
-            const char  *names[3] = { "p50", "p99", "p999" };
-            for (int p = 0; p < 3; p++) {
-                uint64_t target = (uint64_t)((double)lat_total * pcts[p]);
-                if (target == 0) target = 1;
-                uint64_t cum = 0;
-                int picked = KVS_LAT_BUCKETS - 1;
-                for (int i = 0; i < KVS_LAT_BUCKETS; i++) {
-                    cum += lat_buckets[i];
-                    if (cum >= target) { picked = i; break; }
-                }
-                if (bucket_us[picked] == 0)
-                    APPEND("latency_%s_us:+inf\r\n", names[p]);
-                else
-                    APPEND("latency_%s_us:%llu\r\n",
-                           names[p], (unsigned long long)bucket_us[picked]);
-            }
-        } else {
-            APPEND("latency_p50_us:0\r\n");
-            APPEND("latency_p99_us:0\r\n");
-            APPEND("latency_p999_us:0\r\n");
-        }
+                   kvs_expired_keys_ptr(), memory_order_relaxed));
         APPEND("\r\n");
     }
 
@@ -214,17 +133,14 @@ dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) {
         APPEND("rdma_sync_enabled:%d\r\n",
                kvs_config.rdma_sync_enabled ? 1 : 0);
         if (kvs_config.rdma_sync_enabled) {
-            APPEND("rdma_transport:verbs/RoCE\r\n");
             if (kvs_config.rdma_role == ROLE_MASTER)
                 APPEND("rdma_listen:%s:%d\r\n",
                        kvs_config.rdma_listen_ip, kvs_config.rdma_listen_port);
             else {
                 APPEND("master_host:%s\r\n", kvs_config.rdma_master_ip);
                 APPEND("master_port:%d\r\n", kvs_config.master_port);
-                APPEND("rdma_master_port:%d\r\n", kvs_config.rdma_master_port);
             }
         }
-        APPEND("connected_slaves:0\r\n");
         APPEND("\r\n");
     }
 
@@ -241,10 +157,8 @@ dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb) {
     }
 
     if (want_keyspace) {
-        uint32_t nkeys = dict_count(&g_dict);
         APPEND("# Keyspace\r\n");
-        if (nkeys > 0)
-            APPEND("db0:keys=%u,expires=0,avg_ttl=0\r\n", nkeys);
+        APPEND("db0:keys=%u\r\n", (unsigned)dict_count(&g_dict));
         APPEND("\r\n");
     }
 

@@ -33,7 +33,7 @@ typedef struct {
     int  persist_mode;
     int  network_model;
     int  maxclients;
-    char wal_fsync_policy[16];  /* "always", "everysec", or "no" */
+    char aof_fsync_policy[16];  /* "always", "everysec", or "no" */
 
     /* Replication: RDMA fullsync (verbs/RoCE) */
     int  rdma_sync_enabled;
@@ -59,9 +59,6 @@ typedef struct {
     int  fullsync_timeout;      /* Fullsync timeout (ms) */
     int  fullsync_max_retries;  /* Max retry count */
 
-    /* Latency histogram for performance monitoring */
-    int  latency_histogram_enabled;
-
     /* Expiration (lazy + queue + background thread).  Turn off with
      *   expire off
      * in conf to eliminate all expire-related overhead — useful for
@@ -72,8 +69,6 @@ typedef struct {
     int  incr_sync_enabled;      /* incr_sync on|off */
     int  incr_repl_port;         /* dedicated port for incremental sync, default 2001 */
 
-    /* --- Kernel-bypass incremental sync (AF_XDP + KCP gateway) --- */
-    int  xdp_sync_enabled;       /* xdp_sync on|off — write cmds → SHM → gateway */
 } KvsConfig;
 
 extern KvsConfig kvs_config;

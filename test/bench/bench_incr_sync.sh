@@ -208,7 +208,7 @@ full_cleanup() {
     force_release_ports
     detach_xdp
     rm -f "${ROOT_DIR}/build/dump.rdb" "${ROOT_DIR}/build/dump.rdb.tmp" \
-          "${ROOT_DIR}/build/appendonly.aof" "${ROOT_DIR}/build/incr.wal"
+          "${ROOT_DIR}/build/appendonly.aof"
     sleep 0.3
 }
 

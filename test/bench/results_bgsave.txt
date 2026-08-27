@@ -1,0 +1,9 @@
+bench_bgsave — 2026-08-27 01:45:05
+systems: kvstore(proactor)/redis × mode(none/bgsave)  load=10000000  c=50  P=16  trig=1.5s+0.004s
+单位: requests per second (整轮); 降幅 = 1 - bgsave/none
+
+  系统  |         none |       bgsave |    降幅
+  ────────┼──────────────┼──────────────┼──────────
+  kvstore |    240534.94 |    142255.61 |      40.9
+  redis   |    132269.89 |     59365.85 |      55.1
+

@@ -90,15 +90,14 @@ set(PERSIST_SRCS
 )
 
 set(REPL_SRCS
-    src/repl/rdma_repl.c
-    src/repl/rdma_repl_master.c
-    src/repl/rdma_repl_slave.c
-    src/repl/rdma_transport.c
-    src/repl/tcp_repl_master.c
-    src/repl/tcp_repl_slave.c
-    src/repl-incr/repl_incr.c
-    src/repl-incr/repl_incr_master.c
-    src/repl-incr/repl_incr_slave.c
+    src/transport/sendfile.c
+    src/transport/rdma.c
+    src/transport/rdma_transport.c
+    src/repl/repl_fullsync.c
+    src/repl/repl_backlog.c
+    src/repl/repl_incr.c
+    src/repl/repl_incr_master.c
+    src/repl/repl_incr_slave.c
 )
 
 set(KVSTORE_SRCS
@@ -112,6 +111,53 @@ set(KVSTORE_SRCS
     ${REPL_SRCS}
 )
 
+# ── repl-recv（旁路 eBPF 增量同步）──────────────────────────────────────
+# 独立进程，与 kvstore 零耦合：uprobe/uretprobe 挂 master 进程 libc `recv`
+# （recv 挂载点，仅 reactor 引擎适用——proactor 的 io_uring recv 不经过 libc），
+# 把镜像到的请求字节 TCP 原样转发从机，从机当普通客户端命令应用。BPF 侧
+# 用 clang 编成 repl-recv.bpf.o，用户态 loader 链 libbpf。
+set(BPF_CLANG clang)
+set(REPL_RECV_DIR ${CMAKE_SOURCE_DIR}/src/repl-recv)
+
+add_custom_command(
+    OUTPUT ${CMAKE_BINARY_DIR}/repl-recv.bpf.o
+    COMMAND ${BPF_CLANG} -g -O2 -target bpf -D__TARGET_ARCH_x86
+            -I${REPL_RECV_DIR} -I/usr/include
+            -c ${REPL_RECV_DIR}/repl-recv.bpf.c
+            -o ${CMAKE_BINARY_DIR}/repl-recv.bpf.o
+    DEPENDS ${REPL_RECV_DIR}/repl-recv.bpf.c ${REPL_RECV_DIR}/repl-recv.h
+    COMMENT "Compiling repl-recv.bpf.o (eBPF)"
+)
+add_custom_target(repl-recv-bpf DEPENDS ${CMAKE_BINARY_DIR}/repl-recv.bpf.o)
+
+add_executable(repl-recv ${REPL_RECV_DIR}/repl-recv.c)
+target_include_directories(repl-recv PRIVATE ${REPL_RECV_DIR})
+target_link_libraries(repl-recv PRIVATE Threads::Threads bpf elf ${ZLIB_LIBRARIES})
+add_dependencies(repl-recv repl-recv-bpf)
+
+# ── repl-xdp（XDP 旁路镜像同步）──────────────────────────────────────────
+# 独立进程，与 kvstore 零耦合：XDP 程序挂客户端流量所经网卡（veth0）入方向，
+# 把客户端 TCP 负载采样进 ring buffer（镜像数据），从机方向 ACK/应答拦进
+# ring 并 DROP；用户态进程用 raw socket 重建镜像 TCP 段发往从机，从机内核
+# TCP 栈负责接收可靠，本进程负责发送可靠（RTO 重传）。
+set(REPL_XDP_DIR ${CMAKE_SOURCE_DIR}/src/repl-xdp)
+
+add_custom_command(
+    OUTPUT ${CMAKE_BINARY_DIR}/repl-xdp.bpf.o
+    COMMAND ${BPF_CLANG} -g -O2 -target bpf -D__TARGET_ARCH_x86
+            -I${REPL_XDP_DIR} -I/usr/include
+            -c ${REPL_XDP_DIR}/repl-xdp.bpf.c
+            -o ${CMAKE_BINARY_DIR}/repl-xdp.bpf.o
+    DEPENDS ${REPL_XDP_DIR}/repl-xdp.bpf.c ${REPL_XDP_DIR}/repl-xdp.h
+    COMMENT "Compiling repl-xdp.bpf.o (eBPF)"
+)
+add_custom_target(repl-xdp-bpf DEPENDS ${CMAKE_BINARY_DIR}/repl-xdp.bpf.o)
+
+add_executable(repl-xdp ${REPL_XDP_DIR}/repl-xdp.c)
+target_include_directories(repl-xdp PRIVATE ${REPL_XDP_DIR})
+target_link_libraries(repl-xdp PRIVATE bpf elf ${ZLIB_LIBRARIES})
+add_dependencies(repl-xdp repl-xdp-bpf)
+
 # ── kvstore target ────────────────────────────────────────────────────
 add_executable(kvstore ${KVSTORE_SRCS})
 
@@ -124,7 +170,7 @@ target_include_directories(kvstore PRIVATE
     src/net
     src/persist
     src/repl
-    src/repl-incr
+    src/transport
     ${NTYCO_DIR}/core
     ${URING_INCLUDE_DIRS}
     ${JEMALLOC_INCLUDE_DIRS}
@@ -133,7 +179,7 @@ target_include_directories(kvstore PRIVATE
 )
 
 target_link_libraries(kvstore PRIVATE
-    Threads::Threads
+    pthread          # NtyCo 协程库的传递依赖（libntyco.a 用 pthread TLS）；kvstore 本身单线程
     ${NTYCO_LIB}
     ${URING_LIBRARIES}
     ${JEMALLOC_LIBRARIES}
@@ -147,59 +193,3 @@ target_link_libraries(kvstore PRIVATE
 add_dependencies(kvstore ntyco)
 
 
-# ── Phase 8.1 — smoke / sanitizer-smoke targets ──────────────────────
-# Run as:
-#   cmake --build build --target smoke        (Release smoke 12 checks)
-#   cmake --build build --target asan-smoke   (rebuilds ASAN if needed)
-#   cmake --build build --target tsan-smoke   (TSAN focused lock smoke)
-#   cmake --build build --target smoke-all    (the matrix, gates merges)
-#
-# Each target depends on the right binary so cmake rebuilds before
-# running.  Exit non-zero on any FAIL; CI / hooks can simply run
-# `cmake --build build --target smoke-all`.
-add_custom_target(smoke
-    COMMAND ${CMAKE_COMMAND} -E echo "-- Phase 4B smoke [Release] --"
-    COMMAND ${CMAKE_SOURCE_DIR}/test/bench/multi_thread_smoke.sh
-    DEPENDS kvstore
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    USES_TERMINAL
-    COMMENT "Running Release multi_thread_smoke.sh"
-)
-
-# ASAN/TSAN builds live in separate build dirs so the targets here
-# only invoke the smoke scripts; the sanitizer build is the user's
-# responsibility (see test/bench/tsan.suppressions header for the
-# canonical configure flags).  Both targets fail loudly if the
-# expected binary is missing.
-add_custom_target(asan-smoke
-    COMMAND ${CMAKE_COMMAND} -E echo "-- Phase 4B smoke [ASAN] --"
-    COMMAND ${CMAKE_COMMAND} -E env
-            KVS=${CMAKE_SOURCE_DIR}/build-asan/kvstore
-            ASAN_OPTIONS=halt_on_error=0:detect_leaks=1:abort_on_error=0
-            ${CMAKE_SOURCE_DIR}/test/bench/multi_thread_smoke.sh
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    USES_TERMINAL
-    COMMENT "Running ASAN multi_thread_smoke.sh"
-)
-
-add_custom_target(tsan-smoke
-    COMMAND ${CMAKE_COMMAND} -E echo "-- Phase 8.2 TSAN focused lock smoke --"
-    COMMAND ${CMAKE_COMMAND} -E env
-            KVS=${CMAKE_SOURCE_DIR}/build-tsan/kvstore
-            ${CMAKE_SOURCE_DIR}/test/bench/tsan_lock_smoke.sh
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    USES_TERMINAL
-    COMMENT "Running TSAN lock smoke"
-)
-
-# Roll-up target — the merge gate.  Runs Release first (fastest, most
-# coverage), then ASAN, then TSAN.  Each script exits non-zero on FAIL
-# so cmake will halt the chain at the first failure.
-add_custom_target(smoke-all
-    DEPENDS smoke
-    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target asan-smoke
-    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target tsan-smoke
-    COMMAND ${CMAKE_COMMAND} -E echo "OK smoke + asan-smoke + tsan-smoke all green"
-    USES_TERMINAL
-    COMMENT "Phase 8.1 — full sanitizer matrix smoke (gate for any locking change)"
-)

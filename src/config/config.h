@@ -1,87 +1,180 @@
+/*=============================================================================
+ *  config.h — 运行时配置
+ *  
+ *  功能：定义所有配置项、常量、宏
+ *  来源：启动时从 .conf 文件加载
+ *  
+ *  配置分类：
+ *  1. 服务配置（端口、日志、持久化、网络模型、客户端数）
+ *  2. 复制配置（角色、增量开关、传输方式、地址/端口）
+ *  3. 过期配置（启用/禁用）
+ *============================================================================*/
+
 #ifndef __KVS_CONFIG_H__
 #define __KVS_CONFIG_H__
 
-/* =========================================================
- * Runtime configuration — loaded from .conf at startup.
- * ========================================================= */
+/*=============================================================================
+ *  网络模型常量
+ *============================================================================*/
 
-/* --- Log levels --- */
-#define LOG_DEBUG  0
-#define LOG_INFO   1
-#define LOG_WARN   2
-#define LOG_ERROR  3
+#define NET_REACTOR   0   /* Reactor 模型（epoll 水平触发） */
+#define NET_PROACTOR  1   /* Proactor 模型（io_uring 事件循环） */
+#define NET_NTYCO     2   /* NtyCo 协程模型（遗留引擎） */
 
-/* --- Network models --- */
-#define NET_REACTOR   0
-#define NET_PROACTOR  1
-#define NET_NTYCO     2
+/*=============================================================================
+ *  持久化模式常量
+ *============================================================================*/
 
-/* --- Persistence modes --- */
-#define PERSIST_NONE  0
-#define PERSIST_RDB   1
-#define PERSIST_AOF   2
+#define PERSIST_NONE  0   /* 不持久化（纯内存模式） */
+#define PERSIST_RDB   1   /* RDB 快照模式 */
+#define PERSIST_AOF   2   /* AOF 追加日志模式 */
 
-/* --- Replication roles --- */
-#define ROLE_MASTER  0
-#define ROLE_SLAVE   1
+/*=============================================================================
+ *  复制角色常量
+ *  
+ *  repl_role off：复制未启用
+ *  master：增量 PSYNC + 全量传输（主服务端口）
+ *  slave：连接主服务 + 流式同步
+ *  
+ *  全量传输（fullsync_transport = sendfile|rdma）
+ *  由 PSYNC 握手的 +FULLRESYNC 判定触发（数据面走独立端口）
+ *  与增量同步共用主服务端口（命令面）
+ *============================================================================*/
 
-/* ---- Config struct ---- */
+#define REPL_ROLE_OFF    0   /* 复制关闭 */
+#define REPL_ROLE_MASTER 1   /* 主节点 */
+#define REPL_ROLE_SLAVE  2   /* 从节点 */
+
+/*=============================================================================
+ *  配置结构体
+ *============================================================================*/
+
 typedef struct {
-    /* Service */
-    int  port;
-    int  loglevel;
-    int  persist_mode;
-    int  network_model;
-    int  maxclients;
-    char aof_fsync_policy[16];  /* "always", "everysec", or "no" */
+    /*-----------------------------------------------------------------------
+     *  服务配置
+     *-----------------------------------------------------------------------*/
+    int  port;                     /* 主服务端口（默认 2000） */
+    int  persist_mode;             /* 持久化模式（PERSIST_NONE/RDB/AOF） */
+    int  network_model;            /* 网络模型（NET_REACTOR/PROACTOR/NTYCO） */
+    int  maxclients;               /* 最大客户端连接数 */
+    char aof_fsync_policy[16];     /* AOF fsync 策略："always"/"everysec"/"no" */
 
-    /* Replication: RDMA fullsync (verbs/RoCE) */
-    int  rdma_sync_enabled;
-    int  rdma_role;              /* ROLE_MASTER=0 / ROLE_SLAVE=1 */
+    /*-----------------------------------------------------------------------
+     *  复制配置
+     *-----------------------------------------------------------------------*/
+    int  repl_role;                /* 复制角色（REPL_ROLE_OFF/MASTER/SLAVE） */
 
-    /* 传输方式: "sendfile" (TCP sendfile 零拷贝) | "rdma" (RDMA verbs) */
+    /**
+     * 增量同步开关
+     * 
+     * on → PSYNC 流式增量同步
+     * off → 仅全量（无 backlog/无传播/从库不增量）
+     * 
+     * 设计考虑：有关闭增量同步的场景（如对比全量传输性能）
+     * 故独立成开关
+     */
+    int  incr_sync;                /* 0=off，1=on */
+
+    /**
+     * 全量传输方式
+     * 
+     * "sendfile"：TCP sendfile 零拷贝
+     * "rdma"：RDMA verbs
+     * 
+     * 两种传输的代码都必须保留——它们是传输性能对比的对象
+     * 由 transport.c 按此选择具体实现
+     */
     char fullsync_transport[16];
 
-    /* Master's TCP service port — slave sends FULLSYNC here.
-     * Separated from rdma_* so handshake and data use different ports. */
+    /**
+     * Master 主服务端口
+     *
+     * Slave 的 PSYNC 握手（增量续传 + 全量触发判定）都连这里
+     * 与全量数据端口分离
+     */
     int  master_port;
 
-    /* Master RDMA CM listener: rdma_listen_ip:rdma_listen_port */
-    char rdma_listen_ip[64];
-    int  rdma_listen_port;
+    /**
+     * 全量同步专用数据端口
+     * 
+     * sendfile 与 rdma 两种传输共用
+     * Master 传输子进程 bind / Slave connect
+     */
+    int  fullsync_port;
 
-    /* Slave RDMA data path: rdma_master_ip:rdma_master_port
-     * (TCP sendfile uses rdma_master_port + 1).
-     * FULLSYNC handshake uses rdma_master_ip + master_port (separate). */
-    char rdma_master_ip[64];
-    int  rdma_master_port;
+    char fullsync_listen_ip[64];   /* Master 全量数据绑定地址（RDMA CM bind 用，默认 0.0.0.0） */
+    char fullsync_master_ip[64];   /* Slave 连接 master 全量数据端口的地址 */
 
-    int  fullsync_timeout;      /* Fullsync timeout (ms) */
-    int  fullsync_max_retries;  /* Max retry count */
+    int  fullsync_timeout;         /* 全量同步超时时间（毫秒） */
+    int  fullsync_max_retries;     /* 全量同步最大重试次数 */
 
-    /* Expiration (lazy + queue + background thread).  Turn off with
-     *   expire off
-     * in conf to eliminate all expire-related overhead — useful for
-     * clean pipeline benchmarks where no keys carry a TTL. */
+    /*-----------------------------------------------------------------------
+     *  过期配置
+     *-----------------------------------------------------------------------*/
+
+    /**
+     * 过期机制
+     * 
+     * lazy：访问时检查
+     * active：事件循环内抽样删除
+     * 
+     * 单线程 reactor 内执行，无独立后台线程
+     * fork 的 AOF 重写/RDB 保存除外
+     * 
+     * 配置 `expire off` 可关闭以消除全部过期开销
+     * （无 TTL 键的纯净基准场景）
+     */
     int  expire_enabled;
-
-    /* --- Incremental replication --- */
-    int  incr_sync_enabled;      /* incr_sync on|off */
-    int  incr_repl_port;         /* dedicated port for incremental sync, default 2001 */
 
 } KvsConfig;
 
+/*=============================================================================
+ *  全局配置实例
+ *============================================================================*/
+
 extern KvsConfig kvs_config;
 
-int  config_load(const char *path);
+/*=============================================================================
+ *  配置加载与打印
+ *============================================================================*/
+
+/**
+ * 从配置文件加载配置
+ * @param path 配置文件路径
+ * @return 0 成功，-1 失败
+ */
+int config_load(const char *path);
+
+/**
+ * 打印当前配置（用于启动时日志）
+ */
 void config_print(void);
 
-/* ---- Runtime feature flags ---- */
+/*=============================================================================
+ *  运行时特性标志
+ *  
+ *  基于配置自动计算，用于条件编译优化
+ *============================================================================*/
+
+/**
+ * RDB 是否启用
+ * persist_mode 为 PERSIST_RDB 或 PERSIST_AOF 时启用
+ */
 #define ENABLE_RDB \
     (kvs_config.persist_mode == PERSIST_RDB  || kvs_config.persist_mode == PERSIST_AOF)
+
+/**
+ * AOF 是否启用
+ * persist_mode 为 PERSIST_AOF 时启用
+ */
 #define ENABLE_AOF \
     (kvs_config.persist_mode == PERSIST_AOF)
+
+/**
+ * 过期机制是否启用
+ * expire_enabled = 1 时启用
+ */
 #define ENABLE_EXPIRE \
     (kvs_config.expire_enabled)
 
-#endif
+#endif /* __KVS_CONFIG_H__ */

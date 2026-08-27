@@ -1,32 +1,33 @@
+/*=============================================================================
+ *  kv_dict.c — 哈希字典实现
+ *  
+ *  功能：提供 K/V 存储的核心数据结构
+ *  设计特点：
+ *  1. 单表设计，无渐进 rehash（适合单线程场景）
+ *  2. 负载因子 >= 1 时一次性扩容（2 倍）
+ *  3. 内存布局：header + key + payload 连续存储
+ *  4. 支持随机采样（用于过期键淘汰）
+ *  5. 支持条目原地扩容（值变大时重建）
+ *============================================================================*/
+
 #include "kv_dict.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
-/* =====================================================================
- * Hash function: FNV-1a 64-bit + Murmur3 64-bit finalizer
- *
- * FNV gives every input byte a contribution; Murmur3 finalizer
- * avalanches high bits so that "hash & size_mask" distributes evenly
- * even for small power-of-two tables.
- * ===================================================================== */
+/*=============================================================================
+ *  内部常量与工具
+ *============================================================================*/
 
-/* kv_hash is now static inline in kv_dict.h */
+#define DICT_INIT_SIZE  16          /* 初始桶数（必须是 2 的幂） */
+#define DICT_MAX_SIZE   (1U << 24)  /* 桶数上限 ~16M */
 
-/* =====================================================================
- * Internal helpers
- * ===================================================================== */
-
-#define DICT_INIT_SIZE  16          /* must be power of 2 */
-#define DICT_MAX_SIZE   (1U << 24)  /* ~16M buckets max */
-
-/* Rehash batch size — scales with ht[0].size so a full migration takes a
- * bounded number of insert/delete operations regardless of table size. */
-static inline int rehash_batch(kv_dict_t *d) {
-    int n = (int)(d->ht[0].size >> 6);  /* d->ht[0].size / 64 */
-    return n < 8 ? 8 : n;
-}
-
+/**
+ * 计算大于等于 v 的最小 2 的幂
+ * 用于确定哈希表大小
+ * @param v 输入值
+ * @return 2 的幂
+ */
 static uint32_t next_pow2(uint32_t v) {
     if (v <= DICT_INIT_SIZE) return DICT_INIT_SIZE;
     v--;
@@ -36,21 +37,25 @@ static uint32_t next_pow2(uint32_t v) {
     return v + 1;
 }
 
-/* Allocate one entry: header + key + payload.  From the arena (bump pointer)
- * when present, otherwise a single malloc. */
-static kv_entry_t *entry_alloc(kv_dict_t *d, const char *key, uint32_t key_len,
-                                const char *payload, uint32_t payload_len,
-                                uint64_t hash)
+/**
+ * 分配一个 entry
+ * 内存布局：kv_entry_t 头部 + key 数据 + payload 数据
+ * 一次 malloc 完成，减少内存碎片
+ * 
+ * @param key 键指针
+ * @param key_len 键长度
+ * @param payload 值指针
+ * @param payload_len 值长度
+ * @param hash 键的哈希值（预计算）
+ * @return 分配的 entry 指针，失败返回 NULL
+ */
+static kv_entry_t *entry_alloc(const char *key, uint32_t key_len,
+                               const char *payload, uint32_t payload_len,
+                               uint64_t hash)
 {
     uint32_t total = (uint32_t)sizeof(kv_entry_t) + key_len + payload_len;
-    kv_entry_t *e;
-    if (d->arena && d->arena_used + total <= d->arena_cap) {
-        e = (kv_entry_t *)(d->arena + d->arena_used);
-        d->arena_used += total;
-    } else {
-        e = (kv_entry_t *)malloc((size_t)total);
-    }
-    if (!e) return NULL;
+    kv_entry_t *e = (kv_entry_t *)malloc((size_t)total);
+    if (unlikely(!e)) return NULL;
 
     e->next    = NULL;
     e->hash    = hash;
@@ -58,6 +63,7 @@ static kv_entry_t *entry_alloc(kv_dict_t *d, const char *key, uint32_t key_len,
     e->key_len = key_len;
     e->val_len = payload_len;
 
+    /* 复制 key 和 payload 到连续内存 */
     memcpy(e->data, key, key_len);
     if (payload && payload_len)
         memcpy(e->data + key_len, payload, payload_len);
@@ -65,403 +71,298 @@ static kv_entry_t *entry_alloc(kv_dict_t *d, const char *key, uint32_t key_len,
     return e;
 }
 
-/* =====================================================================
- * Hashtable sub-operations
- * ===================================================================== */
+/*=============================================================================
+ *  表分配 / 生命周期管理
+ *============================================================================*/
 
-static void ht_init(kv_ht_t *ht) {
-    ht->buckets   = NULL;
-    ht->size      = 0;
-    ht->size_mask = 0;
-    ht->used      = 0;
+/**
+ * 分配哈希表桶数组
+ * @param d 字典指针
+ * @param size 桶数量（2 的幂）
+ * @return 0 成功，-1 失败
+ */
+static int dict_alloc_table(kv_dict_t *d, uint32_t size) {
+    d->size      = size;
+    d->size_mask = size - 1;   /* 用于快速取模（hash & mask） */
+    d->used      = 0;
+    d->buckets   = (kv_entry_t **)calloc((size_t)size, sizeof(kv_entry_t *));
+    return d->buckets ? 0 : -1;
 }
 
-static int ht_alloc(kv_ht_t *ht, uint32_t size) {
-    ht->size      = size;
-    ht->size_mask = size - 1;
-    ht->used      = 0;
-    ht->buckets   = (kv_entry_t **)calloc((size_t)size, sizeof(kv_entry_t *));
-    return ht->buckets ? 0 : -1;
-}
-
-static void ht_destroy(kv_ht_t *ht) {
-    free(ht->buckets);
-    ht_init(ht);
-}
-
-/* =====================================================================
- * Dict lifecycle
- * ===================================================================== */
-
+/**
+ * 初始化字典结构
+ * @param d 字典指针
+ */
 void dict_init(kv_dict_t *d) {
-    ht_init(&d->ht[0]);
-    ht_init(&d->ht[1]);
-    d->rehash_idx = -1;
-    d->iterators  = 0;
-    d->arena      = NULL;
-    d->arena_cap  = 0;
-    d->arena_used = 0;
-    /* Start with a small table so the first adds trigger the lazy-init
-       path inside dict_add rather than pre-allocating here. */
+    d->buckets   = NULL;
+    d->size      = 0;
+    d->size_mask = 0;
+    d->used      = 0;
 }
 
+/**
+ * 清空字典（删除所有条目）
+ * @param d 字典指针
+ */
+void dict_clear(kv_dict_t *d) {
+    if (!d->buckets) return;
+    
+    /* 遍历所有桶，释放每个 entry */
+    for (uint32_t i = 0; i < d->size; i++) {
+        kv_entry_t *e = d->buckets[i];
+        while (e) {
+            kv_entry_t *next = e->next;
+            free(e);
+            e = next;
+        }
+    }
+    free(d->buckets);
+    dict_init(d);  /* 重置为空状态 */
+}
+
+/**
+ * 销毁字典
+ * @param d 字典指针
+ */
 void dict_destroy(kv_dict_t *d) {
     dict_clear(d);
-    ht_destroy(&d->ht[0]);
-    ht_destroy(&d->ht[1]);
-    d->rehash_idx = -1;
-    d->iterators  = 0;
 }
 
-void dict_clear(kv_dict_t *d) {
-    int has_arena = (d->arena != NULL);
-    const char *arena_end = d->arena + d->arena_cap;
+/**
+ * 预分配桶（批量加载前调用）
+ * 消除加载过程中的反复扩容，提高性能
+ * 必须作用在空 dict 上；若非空则先清空
+ * @param d 字典指针
+ * @param count 预期的条目数
+ */
+void dict_reserve(kv_dict_t *d, uint32_t count) {
+    if (d->buckets) dict_clear(d);
+    uint32_t size = next_pow2(count);
+    if (size > DICT_MAX_SIZE) size = DICT_MAX_SIZE;
+    dict_alloc_table(d, size);
+}
 
-    for (int t = 0; t < 2; t++) {
-        kv_ht_t *ht = &d->ht[t];
-        if (!ht->buckets) continue;
-        for (uint32_t i = 0; i < ht->size; i++) {
-            kv_entry_t *e = ht->buckets[i];
+/*=============================================================================
+ *  扩容
+ *  
+ *  设计决策：采用一次性扩容（非渐进式 rehash）
+ *  
+ *  优点：
+ *  - 插入路径更简单，无热路径分支
+ *  - 无双表维护开销
+ *  - 适合单线程场景
+ *  
+ *  缺点：
+ *  - 超大表扩容时有短暂停顿
+ *  - 但 demo / 批量加载场景通过 dict_reserve 可避免
+ *  
+ *  对比渐进式 rehash（双表 + rehash_idx）：
+ *  - 实现更简单，代码更易维护
+ *  - 无 rehash 过程中的指针跳转开销
+ *============================================================================*/
+
+/**
+ * 检查并执行扩容
+ * 负载因子 >= 1 时触发扩容到 2 倍
+ * @param d 字典指针
+ * @return 0 成功，-1 失败
+ */
+static int dict_maybe_grow(kv_dict_t *d) {
+    /* 惰性初始化：首个 add 时才建表 */
+    if (d->size == 0) return dict_alloc_table(d, DICT_INIT_SIZE);
+
+    /* 负载因子 >= 1 且未达到上限时扩容 */
+    if (d->size < DICT_MAX_SIZE && d->used >= d->size) {
+        uint32_t new_size = next_pow2(d->used * 2);
+        if (new_size > DICT_MAX_SIZE) new_size = DICT_MAX_SIZE;
+        if (new_size <= d->size) return 0;  /* 已达上限 */
+
+        /* 分配新桶数组 */
+        kv_entry_t **nb = (kv_entry_t **)calloc((size_t)new_size, sizeof(kv_entry_t *));
+        if (!nb) return -1;
+
+        /* 整体重链到新表：复用缓存的 hash，无需重算 */
+        for (uint32_t i = 0; i < d->size; i++) {
+            kv_entry_t *e = d->buckets[i];
             while (e) {
                 kv_entry_t *next = e->next;
-                /* Only free if NOT in arena (arena entries live in bulk block) */
-                if (!has_arena ||
-                    (char *)e < d->arena || (char *)e >= arena_end) {
-                    free(e);
-                }
+                uint32_t idx = (uint32_t)(e->hash & (new_size - 1));
+                /* 头插法 */
+                e->next = nb[idx];
+                nb[idx] = e;
                 e = next;
             }
         }
-        ht_init(ht);
-    }
-    d->rehash_idx = -1;
-
-    if (has_arena) {
-        free(d->arena);
-        d->arena = NULL;
-        d->arena_cap = 0;
-        d->arena_used = 0;
-    }
-}
-
-/* Pre-allocate hashtable for bulk load. Must be called on an empty dict
- * (after dict_clear). Eliminates progressive rehash overhead during
- * large batch inserts like fullsync. */
-void dict_reserve(kv_dict_t *d, uint32_t count) {
-    if (d->ht[0].buckets || d->ht[1].buckets || d->rehash_idx >= 0) {
-        /* Not empty — caller should have cleared first */
-        dict_clear(d);
-    }
-    uint32_t size = next_pow2(count);
-    if (size < DICT_INIT_SIZE) size = DICT_INIT_SIZE;
-    if (size > DICT_MAX_SIZE) size = DICT_MAX_SIZE;
-    ht_alloc(&d->ht[0], size);
-}
-
-/* Pre-allocate entry arena for bulk insert (fullsync slave).
- * All entries inserted after this will be carved from the arena
- * instead of individual malloc() calls.  Arena persists until
- * the next dict_clear(), which frees the entire block at once.
- *
- * Call after dict_clear() + dict_reserve() on the empty dict.
- * Safe to call even if no arena is needed (size=0 is a no-op). */
-void dict_arena_init(kv_dict_t *d, size_t size) {
-    if (size == 0) return;
-    d->arena = (char *)malloc(size);
-    if (d->arena) {
-        d->arena_cap  = size;
-        d->arena_used = 0;
-    }
-}
-
-
-/* =====================================================================
- * Progressive rehash: migrate up to 'steps' buckets from ht[0] to ht[1].
- * Called inside dict_add / dict_delete — amortised O(1).
- * ===================================================================== */
-
-static void dict_rehash_step(kv_dict_t *d, int steps) {
-    if (d->rehash_idx < 0 || d->iterators > 0) return;
-
-    while (steps-- > 0) {
-        /* Find next non-empty bucket */
-        while (d->rehash_idx < (int64_t)d->ht[0].size &&
-               d->ht[0].buckets[d->rehash_idx] == NULL)
-        {
-            d->rehash_idx++;
-        }
-
-        if (d->rehash_idx >= (int64_t)d->ht[0].size) {
-            /* Rehash complete: swap tables */
-            ht_destroy(&d->ht[0]);
-            d->ht[0] = d->ht[1];
-            ht_init(&d->ht[1]);
-            d->rehash_idx = -1;
-            return;
-        }
-
-        /* Migrate the entire chain at this bucket */
-        kv_entry_t *chain = d->ht[0].buckets[d->rehash_idx];
-        d->ht[0].buckets[d->rehash_idx] = NULL;
-
-        while (chain) {
-            kv_entry_t *next = chain->next;
-            uint32_t idx = (uint32_t)(chain->hash & d->ht[1].size_mask);
-
-            chain->next = d->ht[1].buckets[idx];
-            d->ht[1].buckets[idx] = chain;
-
-            d->ht[0].used--;
-            d->ht[1].used++;
-            chain = next;
-        }
-        d->rehash_idx++;
-    }
-}
-
-/* =====================================================================
- * Resize trigger logic
- * ===================================================================== */
-
-static int dict_maybe_expand(kv_dict_t *d) {
-    /* Already rehashing? */
-    if (d->rehash_idx >= 0) return 0;
-
-    uint32_t used = d->ht[0].used;
-    uint32_t size = d->ht[0].size;
-
-    /* Lazy initialise */
-    if (size == 0) return ht_alloc(&d->ht[0], DICT_INIT_SIZE);
-
-    /* Expand when load factor >= 1 (Redis-style: grow before the table
-     * fills, so new_size = next_pow2(used*2) = 2*size — a 2x jump, not the
-     * 4x jump `used > size` produced). */
-    if (size < DICT_MAX_SIZE && used >= size) {
-        uint32_t new_size = next_pow2(used * 2);
-        if (new_size > DICT_MAX_SIZE) new_size = DICT_MAX_SIZE;
-        if (new_size <= size) return 0;  /* already at max */
-        if (ht_alloc(&d->ht[1], new_size) < 0) return -1;
-        d->rehash_idx = 0;
-        return 1;
+        free(d->buckets);
+        d->buckets   = nb;
+        d->size      = new_size;
+        d->size_mask = new_size - 1;
     }
     return 0;
 }
 
-/* =====================================================================
- * Core operations
- * ===================================================================== */
+/*=============================================================================
+ *  核心操作
+ *============================================================================*/
 
-kv_entry_t *dict_find(kv_dict_t *d, const char *key, uint32_t key_len,
-                      uint64_t hash)
-{
-    /* Fast return when dict is empty (no tables allocated yet) */
-    if (d->ht[0].size == 0 && d->rehash_idx < 0)
-        return NULL;
-
-
-    {
-        uint32_t idx = (uint32_t)(hash & d->ht[0].size_mask);
-        kv_entry_t *e = d->ht[0].buckets[idx];
-        while (e) {
-            if (e->key_len == key_len &&
-                memcmp(entry_key(e), key, key_len) == 0)
-                return e;
-            e = e->next;
-        }
-    }
-
-    /* Search ht[1] only when rehash is actually in progress */
-    if (d->rehash_idx >= 0 && d->ht[1].size > 0) {
-        uint32_t idx = (uint32_t)(hash & d->ht[1].size_mask);
-        kv_entry_t *e = d->ht[1].buckets[idx];
-        while (e) {
-            if (e->key_len == key_len &&
-                memcmp(entry_key(e), key, key_len) == 0)
-                return e;
-            e = e->next;
-        }
-    }
-
-    return NULL;
-}
-
-
-/* ── Insertion helper: expand, rehash, select target ht, lazy init ── */
-
-static kv_ht_t *dict_prepare_insert(kv_dict_t *d) {
-    dict_maybe_expand(d);
-
-    if (d->rehash_idx >= 0) {
-        dict_rehash_step(d, rehash_batch(d));
-        if (d->ht[1].size == 0) goto use_ht0;
-        return &d->ht[1];
-    }
-
-use_ht0:
-    if (d->ht[0].size == 0) {
-        if (ht_alloc(&d->ht[0], DICT_INIT_SIZE) < 0)
-            return NULL;
-    }
-    return &d->ht[0];
-}
-
+/**
+ * 添加条目
+ * @param d 字典指针
+ * @param key 键指针
+ * @param key_len 键长度
+ * @param payload 值指针
+ * @param payload_len 值长度
+ * @param hash 键的哈希值
+ * @return 新增的 entry 指针，失败返回 NULL
+ */
 kv_entry_t *dict_add(kv_dict_t *d, const char *key, uint32_t key_len,
                      const char *payload, uint32_t payload_len, uint64_t hash)
 {
-    kv_ht_t *ht = dict_prepare_insert(d);
-    if (!ht) return NULL;
+    /* 扩容 fast-path：常见路径一个可预测的分支直接跳过 */
+    if (unlikely(d->used >= d->size)) {
+        if (dict_maybe_grow(d) < 0) return NULL;
+    }
 
-    kv_entry_t *e = entry_alloc(d, key, key_len, payload, payload_len, hash);
+    kv_entry_t *e = entry_alloc(key, key_len, payload, payload_len, hash);
     if (!e) return NULL;
 
-    uint32_t idx = (uint32_t)(hash & ht->size_mask);
-    e->next = ht->buckets[idx];
-    ht->buckets[idx] = e;
-    ht->used++;
+    /* 头插法 */
+    uint32_t idx = (uint32_t)(hash & d->size_mask);
+    e->next = d->buckets[idx];
+    d->buckets[idx] = e;
+    d->used++;
     return e;
 }
 
+/**
+ * 删除条目
+ * @param d 字典指针
+ * @param key 键指针
+ * @param key_len 键长度
+ * @param hash 键的哈希值
+ * @return 0 成功，-1 未找到
+ */
 int dict_delete(kv_dict_t *d, const char *key, uint32_t key_len,
                 uint64_t hash)
 {
-    kv_entry_t *prev = NULL;
+    if (unlikely(d->size == 0)) return -1;
 
-    for (int t = 0; t < 2; t++) {
-        kv_ht_t *ht = &d->ht[t];
-        if (ht->size == 0) continue;
-
-        uint32_t idx = (uint32_t)(hash & ht->size_mask);
-        kv_entry_t *e = ht->buckets[idx];
-        prev = NULL;
-
-        while (e) {
-            if (e->hash == hash && e->key_len == key_len &&
-                memcmp(entry_key(e), key, key_len) == 0)
-            {
-                /* Unlink */
-                if (prev)
-                    prev->next = e->next;
-                else
-                    ht->buckets[idx] = e->next;
-
-                /* Arena entries must not be freed individually —
-                 * they belong to the bulk arena freed in dict_clear(). */
-                int has_arena = (d->arena != NULL);
-                const char *arena_end = d->arena + d->arena_cap;
-                if (!has_arena ||
-                    (char *)e < d->arena || (char *)e >= arena_end) {
-                    free(e);
-                }
-                ht->used--;
-                dict_rehash_step(d, rehash_batch(d));
-                return 0;
-            }
-            prev = e;
-            e = e->next;
+    uint32_t idx = (uint32_t)(hash & d->size_mask);
+    kv_entry_t **pp = &d->buckets[idx];
+    
+    /* 遍历链表查找匹配的 entry */
+    while (*pp) {
+        kv_entry_t *e = *pp;
+        if (e->hash == hash && e->key_len == key_len &&
+            kv_fast_cmp(entry_key(e), key, (int)key_len) == 0)
+        {
+            *pp = e->next;   /* 从链表中摘除 */
+            free(e);
+            d->used--;
+            return 0;
         }
+        pp = &e->next;
     }
-
-    dict_rehash_step(d, rehash_batch(d));
-    return -1;  /* not found */
+    return -1;  /* 未找到 */
 }
 
+/**
+ * 调整 entry 的 payload 大小（原地或重建）
+ * @param d 字典指针
+ * @param e 待调整的 entry
+ * @param new_payload_len 新的 payload 长度
+ * @return 调整后的 entry 指针（可能与原指针不同），失败返回 NULL
+ */
 kv_entry_t *dict_resize_entry(kv_dict_t *d, kv_entry_t *e,
-                               uint32_t new_payload_len)
+                              uint32_t new_payload_len)
 {
-    /* Also advance rehash: overwrite is a hot path and must not stall
-     * bucket migration. */
-    dict_rehash_step(d, rehash_batch(d));
+    if (new_payload_len == e->val_len)
+        return e;  /* 长度不变，直接返回 */
 
-    uint32_t old_val_len = e->val_len;
-
-    if (new_payload_len == old_val_len)
-        return e;
-
-    /* Only the trailing payload changes size; the key at the head never
-     * moves.  Shrinking is free — just shorten val_len. */
-
-    if (new_payload_len < old_val_len) {
+    /* 缩小：key 在头部不动，只改尾部的 val_len 即可 */
+    if (new_payload_len < e->val_len) {
         e->val_len = new_payload_len;
         return e;
     }
 
-    /* Grow: realloc for a larger payload at the tail */
-    uint32_t old_total = (uint32_t)sizeof(kv_entry_t) + old_val_len + e->key_len;
-    uint32_t new_total = (uint32_t)sizeof(kv_entry_t) + new_payload_len + e->key_len;
+    /* 变大：新建 entry 顶替链中旧 entry，再释放旧的
+     * 
+     * 为什么不用 realloc 原地扩容？
+     * 1. jemalloc 下 realloc 可能移动指针，破坏桶链
+     * 2. 对 arena 内 entry 做 realloc 是未定义行为
+     */
+    uint32_t total = (uint32_t)sizeof(kv_entry_t) + e->key_len + new_payload_len;
+    kv_entry_t *ne = (kv_entry_t *)malloc((size_t)total);
+    if (unlikely(!ne)) return NULL;
 
-    kv_entry_t *ne = (kv_entry_t *)realloc(e, (size_t)new_total);
-    if (!ne) return NULL;
-
+    /* 复制原有数据 */
+    ne->next    = NULL;
+    ne->hash    = e->hash;
+    ne->expire  = e->expire;
+    ne->key_len = e->key_len;
     ne->val_len = new_payload_len;
+    memcpy(ne->data, entry_key(e), e->key_len);
 
-    /* Fix up bucket chain pointers if realloc moved the entry */
-    if (ne != e) {
-        for (int t = 0; t < 2; t++) {
-            kv_ht_t *ht = &d->ht[t];
-            if (ht->size == 0) continue;
-            uint32_t idx = (uint32_t)(ne->hash & ht->size_mask);
-            kv_entry_t **pp = &ht->buckets[idx];
-            while (*pp) {
-                if (*pp == e) {
-                    *pp = ne;
-                    goto done;
-                }
-                pp = &(*pp)->next;
-            }
-        }
-    }
-done:
+    /* 在桶链中找到 e 的位置，用 ne 顶替 */
+    uint32_t idx = (uint32_t)(e->hash & d->size_mask);
+    kv_entry_t **pp = &d->buckets[idx];
+    while (*pp && *pp != e) pp = &(*pp)->next;
+    ne->next = e->next;
+    if (*pp) *pp = ne;   /* e 不在链中时只释放旧的（理论上不应发生） */
+    free(e);
+
     return ne;
 }
 
-/* =====================================================================
- * Iteration
- * ===================================================================== */
+/*=============================================================================
+ *  迭代器
+ *  单表设计无渐进 rehash，天然安全
+ *============================================================================*/
 
+/**
+ * 创建迭代器
+ * @param d 字典指针
+ * @param safe 是否安全迭代（单线程无 rehash，此参数无实际作用）
+ * @return 迭代器指针，失败返回 NULL
+ */
 kv_iter_t *dict_iter_new(kv_dict_t *d, int safe) {
+    (void)safe;   /* 单线程 + 无渐进 rehash：迭代期间表不会切换 */
+
     kv_iter_t *it = (kv_iter_t *)calloc(1, sizeof(kv_iter_t));
     if (!it) return NULL;
 
     it->dict   = d;
-    it->table  = 0;
     it->bucket = -1;
     it->next   = NULL;
-    it->safe   = safe;
 
-    if (safe) d->iterators++;
-
-    /* Find the first entry */
-    dict_iter_next(it);
+    dict_iter_next(it);   /* 定位到第一个 entry */
     return it;
 }
 
+/**
+ * 获取迭代器的下一个 entry
+ * @param it 迭代器指针
+ * @return 下一个 entry，无更多返回 NULL
+ */
 kv_entry_t *dict_iter_next(kv_iter_t *it) {
     kv_entry_t *result = it->next;
 
-    /* Advance */
     while (1) {
+        /* 如果当前桶还有下一个，直接返回 */
         if (it->next) {
             it->next = it->next->next;
             if (it->next) break;
         }
 
-        /* Move to next bucket */
+        /* 移到下一个非空桶 */
         it->bucket++;
-        int max_table = (it->dict->rehash_idx >= 0) ? 2 : 1;
-
-        while (it->table < max_table) {
-            kv_ht_t *ht = &it->dict->ht[it->table];
-            if (ht->buckets && it->bucket < (int64_t)ht->size) {
-                while (it->bucket < (int64_t)ht->size) {
-                    if (ht->buckets[it->bucket]) {
-                        it->next = ht->buckets[it->bucket];
-                        goto done;
-                    }
-                    it->bucket++;
-                }
+        kv_dict_t *d = it->dict;
+        while (it->bucket < (int64_t)d->size) {
+            if (d->buckets[it->bucket]) {
+                it->next = d->buckets[it->bucket];
+                goto done;
             }
-            it->table++;
-            it->bucket = 0;
+            it->bucket++;
         }
         it->next = NULL;
         break;
@@ -470,68 +371,67 @@ done:
     return result;
 }
 
-
+/**
+ * 释放迭代器
+ * @param it 迭代器指针
+ */
 void dict_iter_free(kv_iter_t *it) {
-    if (!it) return;
-    if (it->safe && it->dict->iterators > 0)
-        it->dict->iterators--;
     free(it);
 }
 
-/* =====================================================================
- * Stats
- * ===================================================================== */
+/*=============================================================================
+ *  统计和辅助功能
+ *============================================================================*/
 
+/**
+ * 获取字典中的条目数
+ * @param d 字典指针
+ * @return 条目数
+ */
 uint32_t dict_count(kv_dict_t *d) {
-    uint32_t n = d->ht[0].used + d->ht[1].used;
-    return n;
+    return d->used;
 }
 
-/* Get a random key from the dictionary for expire sampling.
- * Returns NULL if the dictionary is empty. */
+/**
+ * 从字典中获取一个随机键
+ * 用于过期采样（active_expire_cycle）
+ * 
+ * 算法：
+ * 1. 随机选择一个桶
+ * 2. 线性探测找第一个非空桶
+ * 3. 在桶的链表中随机选择一个 entry
+ * 
+ * @param d 字典指针
+ * @return 随机 entry，空字典返回 NULL
+ */
 kv_entry_t *dict_get_random_key(kv_dict_t *d) {
-    if (d->ht[0].used == 0 && d->ht[1].used == 0) {
-        return NULL;
-    }
+    if (d->used == 0) return NULL;
 
-    /* Choose a non-empty hash table */
-    int table = (d->ht[1].used > 0) ? 1 : 0;
-    kv_ht_t *ht = &d->ht[table];
+    uint32_t bucket_idx = (uint32_t)rand() % d->size;
 
-    if (ht->used == 0) return NULL;
-
-    /* Random bucket index */
-    uint32_t bucket_idx = (uint32_t)rand() % ht->size;
-
-    /* Find first non-empty bucket (linear probing) */
-    uint32_t max_steps = ht->size;
+    /* 线性探测找第一个非空桶 */
+    uint32_t max_steps = d->size;
     while (max_steps-- > 0) {
-        if (ht->buckets[bucket_idx] != NULL) {
-            /* Count chain length */
-            kv_entry_t *entry = ht->buckets[bucket_idx];
+        if (d->buckets[bucket_idx] != NULL) {
+            kv_entry_t *entry = d->buckets[bucket_idx];
+            
+            /* 计算链长 */
             int chain_len = 0;
-            kv_entry_t *tmp = entry;
-            while (tmp) {
-                chain_len++;
-                tmp = tmp->next;
-            }
+            for (kv_entry_t *tmp = entry; tmp; tmp = tmp->next) chain_len++;
 
-            /* Random entry in chain */
+            /* 链内随机取一个（均匀分布） */
             int target = rand() % chain_len;
-            for (int i = 0; i < target; i++) {
-                entry = entry->next;
-            }
-
+            for (int i = 0; i < target; i++) entry = entry->next;
             return entry;
         }
-        bucket_idx = (bucket_idx + 1) % ht->size;
+        bucket_idx = (bucket_idx + 1) % d->size;
     }
-
-    return NULL;
+    return NULL;  /* 理论上不会到达（d->used > 0） */
 }
 
-/* =====================================================================
- * Single global dict — single-threaded, no sharding
- * ===================================================================== */
+/*=============================================================================
+ *  全局字典实例
+ *  单线程、无分片设计
+ *============================================================================*/
 
 kv_dict_t g_dict;

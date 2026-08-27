@@ -143,7 +143,7 @@ start_kvs_master() {
     start_kvs "kvstore-master-repl.conf"
     # 等待 RDMA 端口就绪
     if ! wait_for_port 0.0.0.0 $MASTER_RDMA_PORT 5; then
-        warn "RDMA 端口 $MASTER_RDMA_PORT 未监听（可能 rdma_sync 未开启）"
+        warn "RDMA 端口 $MASTER_RDMA_PORT 未监听（可能 repl_role 未设为 master）"
     fi
 }
 

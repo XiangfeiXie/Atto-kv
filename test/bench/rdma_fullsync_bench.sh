@@ -12,7 +12,7 @@ set -u; shopt -s nullglob
 # ── Defaults ───────────────────────────────────────────────────────────
 KEYS=400000; VSIZE=256; ITERATIONS=3; PORT=2000
 MODE=both; RDMA_IP=""; TIMEOUT=120
-SLAVE_PORT=$((PORT + 2))
+SLAVE_PORT=$((PORT + 2)); FPORT=$((PORT + 1))
 PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 KVS="${PROJECT_DIR}/build/kvstore"
 RDB_PATH="${PROJECT_DIR}/build/dump.rdb"
@@ -69,7 +69,7 @@ while [[ $# -gt 0 ]]; do
         --keys)       KEYS="$2";       shift 2 ;;
         --vsize)      VSIZE="$2";      shift 2 ;;
         --iterations) ITERATIONS="$2"; shift 2 ;;
-        --port)       PORT="$2";       SLAVE_PORT=$((PORT + 2)); shift 2 ;;
+        --port)       PORT="$2";       SLAVE_PORT=$((PORT + 2)); FPORT=$((PORT + 1)); shift 2 ;;
         --mode)       MODE="$2";       shift 2 ;;
         --rdma-ip)    RDMA_IP="$2";    shift 2 ;;
         -h|--help)    usage ;;
@@ -185,12 +185,9 @@ port ${PORT}
 network proactor
 maxclients 100
 persistence rdb
-rdma_sync on
-rdma_role master
-rdma_listen_ip ${RDMA_IP}
-rdma_listen_port ${PORT}
-rdma_master_ip ${RDMA_IP}
-rdma_master_port ${PORT}
+repl_role master
+fullsync_listen_ip ${RDMA_IP}
+fullsync_port ${FPORT}
 fullsync_transport ${transport}
 expire off
 EOF
@@ -200,11 +197,10 @@ port ${SLAVE_PORT}
 network proactor
 maxclients 100
 persistence none
-rdma_sync on
-rdma_role slave
+repl_role slave
 master_port ${PORT}
-rdma_master_ip ${RDMA_IP}
-rdma_master_port ${PORT}
+fullsync_master_ip ${RDMA_IP}
+fullsync_port ${FPORT}
 fullsync_transport ${transport}
 expire off
 EOF
@@ -223,7 +219,6 @@ port $PORT
 network reactor
 maxclients 1000
 persistence rdb
-rdma_sync off
 expire off
 EOF
 
@@ -361,8 +356,8 @@ run_one() {
     local xfer_bytes xfer_ms xfer_mbps prep_ms batches ent_sec
     if [ "$mode" = "sendfile" ]; then
         local xfer_line
-        xfer_line=$(grep '\[tcp-master\] xfer-end:' "$mlog" 2>/dev/null | tail -1)
-        [ -z "$xfer_line" ] && xfer_line=$(grep '\[tcp-slave\] xfer-end:' "$slog" 2>/dev/null | tail -1)
+        xfer_line=$(grep '\[sendfile\] xfer-end:' "$mlog" 2>/dev/null | tail -1)
+        [ -z "$xfer_line" ] && xfer_line=$(grep '\[sendfile\] xfer-end:' "$slog" 2>/dev/null | tail -1)
         xfer_bytes=$(echo "$xfer_line" | grep -oP 'bytes=\K[0-9]+' || echo "0")
         xfer_ms=$(echo "$xfer_line" | grep -oP 'ms=\K[0-9.]+' || echo "0")
         prep_ms="0"; batches="0"
@@ -372,7 +367,7 @@ run_one() {
         echo "$mode $iteration $KEYS $POP_RDB_SIZE $POP_RDB_MB $total_sec $TOTAL_MBPS $xfer_ms $prep_ms $XFER_MBPS_CALC $ENT_SEC $skeys $batches"
     else
         local xfer_line
-        xfer_line=$(grep '\[master\] xfer-end:' "$mlog" 2>/dev/null | tail -1)
+        xfer_line=$(grep '\[rdma\] xfer-end:' "$mlog" 2>/dev/null | tail -1)
         xfer_bytes=$(echo "$xfer_line" | grep -oP 'bytes=\K[0-9]+' || echo "0")
         xfer_ms=$(echo "$xfer_line" | grep -oP 'xfer=\K[0-9.]+' || echo "0")
         prep_ms=$(echo "$xfer_line" | grep -oP 'prep=\K[0-9.]+' || echo "0")

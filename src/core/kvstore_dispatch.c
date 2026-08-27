@@ -1,41 +1,71 @@
-/* kvstore_dispatch.c — RESP command dispatch */
+/*=============================================================================
+ *  kvstore_dispatch.c — RESP 命令分发器
+ *  功能：解析 RESP 协议命令，执行 K/V 操作，生成响应
+ *  设计原则：热路径优先（GET/SET），命令名不区分大小写
+ *============================================================================*/
 
 #include "kvstore_internal.h"
-#include "rdma_repl.h"
+#include "repl.h"
 #include "persistence.h"
 
 #include <stdio.h>
 #include <string.h>
 
-/* SET core: create or overwrite a key.  Returns 0 on success, 1 when NX/XX
- * fails, -1 on allocation error. */
+/*=============================================================================
+ *  SET 命令核心实现
+ *  最简语义：SET key value —— 总是覆盖原值，无 NX/XX/EX/PX 选项
+ *  过期时间通过独立 EXPIRE 命令设置（默认秒级）
+ *============================================================================*/
+
+/**
+ * SET 命令底层实现
+ * @param key 键
+ * @param key_len 键长度
+ * @param val 值
+ * @param val_len 值长度
+ * @param hash 键的哈希值（预先计算，避免重复计算）
+ * @param existing 预先查找的条目（NULL 表示不存在）
+ * @return 0 成功, -1 内存分配错误
+ */
 static int string_set(const char *key, uint32_t key_len,
                       const char *val, uint32_t val_len,
-                      long long expire, int mode,
                       uint64_t hash, kv_entry_t *existing)
 {
-    if (mode == 1 && existing) return 1;   /* NX: key exists */
-    if (mode == 2 && !existing) return 1;  /* XX: key missing */
-
     if (existing) {
+        /* 键已存在：原地覆盖值（长度相同直接覆盖，否则重分配条目） */
+        kv_entry_t *e;
         if (existing->val_len == val_len) {
             memcpy(entry_payload(existing), val, val_len);
-            existing->expire = expire;
-            return 0;
+            e = existing;
+        } else {
+            e = dict_resize_entry(&g_dict, existing, val_len);
+            if (!e) return -1;
+            memcpy(entry_payload(e), val, val_len);
         }
-        kv_entry_t *e = dict_resize_entry(&g_dict, existing, val_len);
-        if (!e) return -1;
-        memcpy(entry_payload(e), val, val_len);
-        e->expire = expire;
+        e->expire = 0;   /* 覆盖清除旧过期；TTL 由 EXPIRE 命令设置 */
         return 0;
     }
 
+    /* 键不存在：添加新条目 */
     kv_entry_t *e = dict_add(&g_dict, key, key_len, val, val_len, hash);
     if (!e) return -1;
-    if (expire) e->expire = expire;
     return 0;
 }
 
+/*=============================================================================
+ *  命令分发主函数
+ *  遍历命令表，匹配并执行对应命令
+ *============================================================================*/
+
+/**
+ * 命令分发器：解析并执行 RESP 命令
+ * @param tokens 解析出的 token 数组
+ * @param argc 参数个数（第一个是命令名）
+ * @param msg_raw 原始命令消息（用于日志和复制）
+ * @param msg_len 原始消息长度
+ * @param wb 写缓冲（输出响应）
+ * @return DISPATCH_OK 成功, DISPATCH_ERROR 错误, DISPATCH_CLOSE 关闭连接
+ */
 dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                                const char *msg_raw, int msg_len,
                                DynBuf *wb)
@@ -43,22 +73,29 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     if (tokens == NULL || argc <= 0 || wb == NULL)
         return DISPATCH_ERROR;
 
-    atomic_fetch_add_explicit(&g_kvs_total_commands, 1, memory_order_relaxed);
+    /* 统计总命令数（单线程，普通自增避免 lock 前缀） */
+    g_kvs_total_commands++;
 
     kvs_token_t cmd = tokens[0];
 
-    /* Commands are case-insensitive: fold to uppercase in a stack buffer. */
+    /*-------------------------------------------------------------------------
+     *  命令名大小写不敏感：转大写（在栈缓冲区中操作）
+     *  优化：先检查是否包含小写字母，避免不必要的转换
+     *-------------------------------------------------------------------------*/
     char ucmd_buf[32];
     int  ulen = cmd.len;
     if (ulen > (int)sizeof(ucmd_buf)) ulen = (int)sizeof(ucmd_buf);
+    
     int has_lower = 0;
     for (int i = 0; i < ulen; i++) {
         unsigned char ch = (unsigned char)cmd.ptr[i];
         if (ch >= 'a' && ch <= 'z') { has_lower = 1; break; }
     }
+    
     if (has_lower) {
         for (int i = 0; i < ulen; i++) {
             unsigned char ch = (unsigned char)cmd.ptr[i];
+            /* 小写转大写：利用 ASCII 大小写差 32（0x20） */
             ucmd_buf[i] = (ch >= 'a' && ch <= 'z') ? (char)(ch & 0xDF) : (char)ch;
         }
         cmd.ptr   = ucmd_buf;
@@ -66,91 +103,68 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         tokens[0] = cmd;
     }
 
-    /* ── Hot path: GET / SET — checked first (60-80% of requests) ── */
-
+    /*=========================================================================
+     *  热路径 1：GET 命令（60-80% 的请求）
+     *  优先检查，减少分支预测开销
+     *=========================================================================*/
     if (TOKEN_EQ(cmd, "GET")) {
         if (argc != 2) {
             dynbuf_cat(wb, RESP_ERR_ARGS, RESP_ERR_ARGS_LEN);
             return DISPATCH_ERROR;
         }
+        
         kvs_token_t key_tok = tokens[1];
         uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
         kv_entry_t *entry = dict_find(&g_dict, key_tok.ptr, (uint32_t)key_tok.len, hash);
+        
         if (!entry) {
-            dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);
+            dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);  /* 键不存在：返回空 */
         } else {
             reply_bulk(wb, entry_payload(entry), (int)entry_payload_len(entry));
         }
         return DISPATCH_OK;
     }
 
+    /*=========================================================================
+     *  热路径 2：SET 命令
+     *  最简语义：SET key value —— 总是覆盖原值，无 NX/XX/EX/PX 选项
+     *  过期时间通过 EXPIRE 命令设置（默认秒级）
+     *=========================================================================*/
     if (TOKEN_EQ(cmd, "SET")) {
-        if (argc < 3) {
+        if (argc != 3) {
             dynbuf_cat(wb, RESP_ERR_ARGS, RESP_ERR_ARGS_LEN);
             return DISPATCH_ERROR;
         }
+
         kvs_token_t key_tok = tokens[1];
         uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
         kv_entry_t *entry = dict_find(&g_dict, key_tok.ptr, (uint32_t)key_tok.len, hash);
 
-        long long expire = 0;
-        int mode = 0;               /* 0=default, 1=NX, 2=XX */
-        for (int i = 3; i < argc; i++) {
-            kvs_token_t opt = tokens[i];
-            if (opt.len == 2 && (opt.ptr[0]=='E'||opt.ptr[0]=='e') &&
-                                 (opt.ptr[1]=='X'||opt.ptr[1]=='x')) {
-                if (i + 1 >= argc) { dynbuf_lit(wb, "-ERR syntax error\r\n"); return DISPATCH_ERROR; }
-                long long s;
-                if (token_to_ll(tokens[++i], &s) < 0 || s <= 0) {
-                    dynbuf_lit(wb, "-ERR invalid expire time in 'set' command\r\n");
-                    return DISPATCH_ERROR;
-                }
-                expire = get_time_now() + s * 1000;
-            } else if (opt.len == 2 && (opt.ptr[0]=='P'||opt.ptr[0]=='p') &&
-                                        (opt.ptr[1]=='X'||opt.ptr[1]=='x')) {
-                if (i + 1 >= argc) { dynbuf_lit(wb, "-ERR syntax error\r\n"); return DISPATCH_ERROR; }
-                long long ms;
-                if (token_to_ll(tokens[++i], &ms) < 0 || ms <= 0) {
-                    dynbuf_lit(wb, "-ERR invalid expire time in 'set' command\r\n");
-                    return DISPATCH_ERROR;
-                }
-                expire = get_time_now() + ms;
-            } else if (opt.len == 2 && (opt.ptr[0]=='N'||opt.ptr[0]=='n') &&
-                                        (opt.ptr[1]=='X'||opt.ptr[1]=='x')) {
-                mode = 1;
-            } else if (opt.len == 2 && (opt.ptr[0]=='X'||opt.ptr[0]=='x') &&
-                                        (opt.ptr[1]=='X'||opt.ptr[1]=='x')) {
-                mode = 2;
-            } else {
-                dynbuf_lit(wb, "-ERR syntax error\r\n");
-                return DISPATCH_ERROR;
-            }
-        }
-
         int ret = string_set(key_tok.ptr, (uint32_t)key_tok.len,
                              tokens[2].ptr, (uint32_t)tokens[2].len,
-                             expire, mode, hash, entry);
+                             hash, entry);
         if (ret < 0) {
             dynbuf_cat(wb, RESP_ERROR, RESP_ERROR_LEN);
-        } else if (ret == 0) {
+        } else {
             dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+            /* 持久化和复制（仅在非重载模式下） */
             if (!g_in_reload) {
                 kvs_write_journal_append(msg_raw, msg_len);
                 kvs_repl_incr_hook(msg_raw, msg_len);
             }
-        } else {
-            dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);   /* NX/XX failed */
         }
         return DISPATCH_OK;
     }
 
-    /* ── Hot commands: PING / DEL ── */
-
+    /*=========================================================================
+     *  热路径 3：PING / DEL 命令
+     *=========================================================================*/
+    
     if (TOKEN_EQ(cmd, "PING")) {
         if (argc == 1)
             dynbuf_cat(wb, RESP_PONG, RESP_PONG_LEN);
         else if (argc == 2)
-            reply_bulk(wb, tokens[1].ptr, tokens[1].len);
+            reply_bulk(wb, tokens[1].ptr, tokens[1].len);  /* 回显参数 */
         else
             dynbuf_lit(wb, "-ERR wrong number of arguments for 'ping' command\r\n");
         return DISPATCH_OK;
@@ -161,6 +175,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
             return DISPATCH_ERROR;
         }
+        
         long long ndel = 0;
         for (int i = 1; i < argc; i++) {
             kvs_token_t kt = tokens[i];
@@ -170,7 +185,10 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             if (dict_delete(&g_dict, kt.ptr, (uint32_t)kt.len, kh) == 0)
                 ndel++;
         }
+        
         reply_integer(wb, ndel);
+        
+        /* 有实际删除时才记录日志和复制 */
         if (ndel > 0 && !g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
             kvs_repl_incr_hook(msg_raw, msg_len);
@@ -178,22 +196,13 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
-    /* ── Connection / administrative commands ── */
-
-    if (TOKEN_EQ(cmd, "FULLSYNC")) {
-        int ret = rdma_repl_master_trigger_sync();
-        if (ret == 0)
-            dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-        else
-            dynbuf_lit(wb, "-ERR fullsync trigger failed\r\n");
-        return DISPATCH_OK;
-    }
-
+    /* QUIT：关闭连接（响应后由上层关闭） */
     if (TOKEN_EQ(cmd, "QUIT")) {
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         return DISPATCH_CLOSE;
     }
 
+    /* ECHO：回显参数 */
     if (TOKEN_EQ(cmd, "ECHO")) {
         if (argc >= 2)
             reply_bulk(wb, tokens[1].ptr, tokens[1].len);
@@ -202,36 +211,37 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
+    /*=========================================================================
+     *  管理命令
+     *=========================================================================*/
+    
+    /* DBSIZE：返回当前键数量 */
     if (TOKEN_EQ(cmd, "DBSIZE")) {
         long long count = (long long)dict_count(&g_dict);
         reply_integer(wb, count);
         return DISPATCH_OK;
     }
 
+    /* SAVE / BGSAVE：执行 RDB 持久化（异步） */
     if (TOKEN_EQ(cmd, "SAVE") || TOKEN_EQ(cmd, "BGSAVE")) {
         rdb_save_async_uring();
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         return DISPATCH_OK;
     }
 
-    if (TOKEN_EQ(cmd, "BGREWRITEAOF")) {
-        int rc = kvs_aof_rewrite_bg();
-        if (rc == 0)
-            dynbuf_lit(wb, "+Background append only file rewriting started\r\n");
-        else
-            dynbuf_lit(wb, "-ERR BGREWRITEAOF already in progress\r\n");
-        return DISPATCH_OK;
-    }
-
+    /* CONFIG：配置管理命令（GET/SET/REWRITE） */
     if (TOKEN_EQ(cmd, "CONFIG"))
         return handle_config(tokens, argc, wb);
 
+    /* INFO：获取服务器信息 */
     if (TOKEN_EQ(cmd, "INFO"))
         return handle_info(tokens, argc, wb);
 
+    /* FLUSHALL / FLUSHDB：清空所有键 */
     if (TOKEN_EQ(cmd, "FLUSHALL") || TOKEN_EQ(cmd, "FLUSHDB")) {
         dict_clear(&g_dict);
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        /* 非重载模式下记录日志并复制 */
         if (!g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
             kvs_repl_incr_hook(msg_raw, msg_len);
@@ -239,17 +249,21 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
-    /* ── Remaining single-key: EXPIRE / TTL ── */
+    /*=========================================================================
+     *  键过期管理命令
+     *=========================================================================*/
 
     if (argc < 2) {
         dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
         return DISPATCH_ERROR;
     }
 
+    /* 提取键和哈希（后续命令共用） */
     kvs_token_t key_tok = tokens[1];
     uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
     kv_entry_t *entry = dict_find(&g_dict, key_tok.ptr, (uint32_t)key_tok.len, hash);
 
+    /* EXPIRE：设置秒级过期时间 */
     if (TOKEN_EQ(cmd, "EXPIRE")) {
         if (argc < 3) {
             dynbuf_lit(wb, "-ERR wrong number of arguments for 'expire' command\r\n");
@@ -260,9 +274,13 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             dynbuf_lit(wb, "-ERR value is not an integer or out of range\r\n");
             return DISPATCH_ERROR;
         }
-        if (!entry) { reply_integer(wb, 0); return DISPATCH_OK; }
-        entry->expire = get_time_now() + secs * 1000;
+        if (!entry) { 
+            reply_integer(wb, 0);  /* 键不存在 */
+            return DISPATCH_OK; 
+        }
+        entry->expire = get_time_now() + secs * 1000;  /* 秒转毫秒 */
         reply_integer(wb, 1);
+        
         if (!g_in_reload) {
             kvs_write_journal_append(msg_raw, msg_len);
             kvs_repl_incr_hook(msg_raw, msg_len);
@@ -270,15 +288,28 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
+    /* TTL：查询剩余生存时间（秒） */
     if (TOKEN_EQ(cmd, "TTL")) {
-        if (!entry) { reply_integer(wb, -2); return DISPATCH_OK; }
-        if (!entry->expire) { reply_integer(wb, -1); return DISPATCH_OK; }
+        if (!entry) { 
+            reply_integer(wb, -2);  /* 键不存在 */
+            return DISPATCH_OK; 
+        }
+        if (!entry->expire) { 
+            reply_integer(wb, -1);  /* 永不过期 */
+            return DISPATCH_OK; 
+        }
         long long rem_ms = entry->expire - get_time_now();
-        if (rem_ms < 0) { reply_integer(wb, -2); return DISPATCH_OK; }
-        reply_integer(wb, (rem_ms + 500) / 1000);
+        if (rem_ms < 0) { 
+            reply_integer(wb, -2);  /* 已过期 */
+            return DISPATCH_OK; 
+        }
+        reply_integer(wb, (rem_ms + 500) / 1000);  /* 向上取整 */
         return DISPATCH_OK;
     }
 
+    /*=========================================================================
+     *  未知命令处理
+     *=========================================================================*/
     dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
     return DISPATCH_ERROR;
 }

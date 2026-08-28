@@ -20,8 +20,8 @@
 #   ./test/bench/redis_fullsync_bench.sh [--keys N] [--vsize B] [--iterations N]
 #                                         [--port P] [--mode MODE]
 # =============================================================================
-
-set -u
+source "$(dirname "$0")/common.sh"    # 共享头：路径/颜色/日志/预检/速率计算
+set +e; set +o pipefail               # common.sh 强制 set -euo pipefail；本脚本按需容错
 shopt -s nullglob
 
 # ── 默认参数 ────────────────────────────────────────────────────────────────
@@ -36,36 +36,8 @@ TIMEOUT=300
 # ── 派生常量 ────────────────────────────────────────────────────────────────
 
 SLAVE_PORT=$((PORT + 1))
-LOG_DIR="/tmp/redis_fsync_bench_$$"
-mkdir -p "$LOG_DIR"
-
-# ── 统一速率计算辅助函数 ──
-# 使用 bc 而非 awk, 避免 gawk 常量折叠导致未执行分支的除零错误
-_fmt() { local v=$1; [ "${v:0:1}" = "." ] && echo "0$v" || echo "$v"; }
-calc_mbps() {
-    if [ "$(echo "$2 > 0" | bc 2>/dev/null)" = 1 ]; then
-        _fmt "$(echo "scale=2; $1 / $2 / 1048576" | bc)"
-    else
-        echo "0.00"
-    fi
-}
-calc_entps() {
-    if [ "$(echo "$2 > 0" | bc 2>/dev/null)" = 1 ]; then
-        echo "scale=0; $1 / $2" | bc
-    else
-        echo "0"
-    fi
-}
-C_BLD=$'\033[1m';   C_DIM=$'\033[2m'
-C_RED=$'\033[31m';  C_GRN=$'\033[32m';  C_YEL=$'\033[33m'
-C_CYN=$'\033[36m';  C_RST=$'\033[0m'
 
 # ── 辅助函数 ────────────────────────────────────────────────────────────────
-
-die()  { echo "${C_RED}[FATAL]${C_RST} $*" >&2; exit 1; }
-info() { echo "${C_GRN}[INFO]${C_RST}  $*" >&2; }
-warn() { echo "${C_YEL}[WARN]${C_RST}  $*" >&2; }
-step() { echo "${C_CYN}[STEP]${C_RST}  $*" >&2; }
 
 usage() {
     cat <<EOF
@@ -114,7 +86,7 @@ done
 
 # ── 工具检查 ────────────────────────────────────────────────────────────────
 
-for tool in redis-server redis-cli python3 bc; do
+for tool in redis-server redis-cli bc; do
     command -v "$tool" >/dev/null 2>&1 || die "缺少工具: $tool"
 done
 
@@ -171,8 +143,8 @@ await_log() {
 
 # ── Phase 1: 数据填充 ──────────────────────────────────────────────────────
 
-# 单次 Python 流式生成 RESP 数据, 直接管道送入 redis-cli --pipe
-# 避免每批 spawn Python (原来 40× 次冷启动) → 大幅提速
+# 单进程 awk 生成 RESP 流 → redis-cli --pipe（与 rdma_fullsync_bench 一致，不依赖 python）
+# value 用 ABC.. 循环模式; rdbcompression no 时 RDB 大小与随机数据一致，保证可比。
 populate_redis() {
     step "Phase 1: 填充测试数据 ($KEYS 条 × ${VSIZE} B)"
 
@@ -190,24 +162,16 @@ populate_redis() {
         die "Redis 填充实例启动失败 (检查 ${LOG_DIR}/populate.log)"
     fi
 
-    # 流式生成 RESP → redis-cli --pipe (单次 Python 调用, 内存 O(1))
-    info "  生成并写入 $KEYS keys (streaming → redis-cli --pipe)..."
+    info "  生成并写入 $KEYS keys (awk → redis-cli --pipe)..."
     local pop_start; pop_start=$(date +%s.%N)
-    python3 -c "
-import sys, struct
-
-vsize = $VSIZE
-for i in range(1, $KEYS + 1):
-    k = f'key:{i:012d}'.encode()
-    unit = struct.pack('>Q', i)
-    rep = (vsize + 7) // 8
-    v = (unit * rep)[:vsize]
-    sys.stdout.buffer.write(f'*3\r\n\$3\r\nSET\r\n\${len(k)}\r\n'.encode())
-    sys.stdout.buffer.write(k)
-    sys.stdout.buffer.write(f'\r\n\${len(v)}\r\n'.encode())
-    sys.stdout.buffer.write(v)
-    sys.stdout.buffer.write(b'\r\n')
-" 2>/dev/null | timeout 300 redis-cli -p "$PORT" --pipe >"${LOG_DIR}/pipe_out.txt" 2>&1
+    awk -v n="$KEYS" -v vs="$VSIZE" '
+        BEGIN {
+            for (j = 0; j < vs; j++) v = v sprintf("%c", 65 + (j % 26));  /* ABC.. 填充 */
+            for (i = 1; i <= n; i++) {
+                k = sprintf("key:%012d", i);
+                printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", length(k), k, vs, v;
+            }
+        }' | timeout 300 redis-cli -p "$PORT" --pipe > "${LOG_DIR}/pipe_out.txt" 2>&1
 
     local pop_end; pop_end=$(date +%s.%N)
     local pop_sec; pop_sec=$(echo "$pop_end - $pop_start" | bc)

@@ -504,15 +504,32 @@ int rdb_load_stream_begin(const char *buf, size_t len) {
 }
 
 /**
- * 追加流式 RDB 数据
- * @return 成功加载的条目数，-1（数据损坏）
+ * 追加流式 RDB 数据（到缓冲末尾）
+ * @return 成功加载的条目数
  */
 int rdb_load_stream_append(const char *buf, size_t len) {
+    return rdb_load_stream_append_n(buf, len, -1, NULL);
+}
+
+/**
+ * 追加流式 RDB 数据（限条数版）
+ * 最多解析 limit 条（-1 = 不限，读到缓冲末尾）。
+ * 单块全量传输专用：数据长度由流头 key_count 自描述，
+ * 解析到第 key_count 条即停止，无需外部字节数（见 rdma.c）。
+ *
+ * @param limit 最多解析条目数（-1 = 不限）
+ * @param consumed 输出：实际消费字节数（可为 NULL）
+ * @return 成功加载的条目数
+ */
+int rdb_load_stream_append_n(const char *buf, size_t len, int limit,
+                             size_t *consumed) {
     const char *p   = buf;
     const char *end = buf + len;
     int loaded = 0;
 
     while (p < end) {
+        if (limit >= 0 && loaded >= limit) break;
+
         int klen = 0, dlen = 0;
         long long expire = 0;
 
@@ -538,6 +555,7 @@ int rdb_load_stream_append(const char *buf, size_t len) {
         loaded++;
     }
 
+    if (consumed) *consumed = (size_t)(p - buf);
     return loaded;
 }
 

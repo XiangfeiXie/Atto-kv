@@ -9,7 +9,6 @@
 #include <netinet/tcp.h>
 #include <liburing.h>
 
-#include "server.h"
 #include "kvstore.h"
 #include "config.h"
 #include "protocol.h"
@@ -134,9 +133,6 @@ static void conn_release(int fd) {
 
     /* 先通知 repl 清理该连接的状态（普通客户端是 no-op，内部按角色判断） */
     repl_on_close(fd);
-
-    /* 更新全局统计 */
-    g_kvs_connected_clients--;
 
     /* 复位槽位并关闭 socket */
     conn_reset_slot(c);
@@ -298,7 +294,6 @@ static int conn_init_fd(int fd, int arm_read) {
     c->event         = 0;
     c->on_data       = g_default_handler;  /* 默认使用普通客户端处理器 */
 
-    atomic_fetch_add_explicit(&g_kvs_connected_clients, 1, memory_order_relaxed);
     /* 默认立即 arm 第一个 recv；repl 收养路径传 0（slave 先发 PSYNC，
      * send 完成后由 handle_write 串行 arm recv） */
     if (!arm_read) return 0;
@@ -318,7 +313,6 @@ static void handle_accept(struct io_uring_cqe *cqe) {
         close(connfd);
         return;
     }
-    atomic_fetch_add_explicit(&g_kvs_total_connections, 1, memory_order_relaxed);
 }
 
 /**

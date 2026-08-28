@@ -2,7 +2,7 @@
  *  kvstore_internal.h — KV 存储内部声明
  *  
  *  用途：供 kvstore_*.c 各模块共享的内部声明
- *  包含：kvstore_dispatch.c, kvstore_config.c, kvstore_info.c, kvstore_expire.c
+ *  包含：kvstore_dispatch.c, kvstore_config.c, kvstore_expire.c
  *  
  *  重要：不要在 network / persist / repl 层包含此头文件！
  *  这些层应该直接包含 kvstore.h（公开接口）
@@ -17,7 +17,7 @@
 #define KVSTORE_INTERNAL_H
 
 #include "kvstore.h"        /* 公开接口：基本类型、字典、配置等 */
-#include "persist_aof.h"    /* AOF 持久化接口 */
+#include "persistence.h"    /* AOF 持久化接口（AOF 接口已并入） */
 
 /*=============================================================================
  *  kvstore.c 提供的工具函数
@@ -103,9 +103,6 @@ static inline void kvs_repl_incr_hook(const char *msg, int length) {
  *  kvstore_expire.c 提供的接口
  *============================================================================*/
 
-/* 获取过期键计数器的指针（供 INFO 命令读取） */
-_Atomic uint64_t *kvs_expired_keys_ptr(void);
-
 /* 主动过期清理循环（每轮事件循环调用一次）
  * 随机采样并删除已过期的键 */
 void active_expire_cycle(void);
@@ -114,14 +111,7 @@ void active_expire_cycle(void);
  *  kvstore_config.c 提供的接口
  *============================================================================*/
 
-/* CONFIG GET/SET 命令处理函数 */
+/* CONFIG 伪装包命令处理函数（只应答 redis-benchmark 启动探测的 GET） */
 dispatch_result_t handle_config(kvs_token_t *tokens, int argc, DynBuf *wb);
-
-/*=============================================================================
- *  kvstore_info.c 提供的接口
- *============================================================================*/
-
-/* INFO 命令处理函数 */
-dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb);
 
 #endif /* KVSTORE_INTERNAL_H */

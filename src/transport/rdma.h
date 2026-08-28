@@ -6,7 +6,7 @@
  *  本层只做 kvstore 业务控制（RDB 序列化 / 加载 / 性能统计）
  *
  *  设计原则：
- *  1. 传输格式与 sendfile 路径统一（batch_hdr + RDB stream 续段）
+ *  1. 传输格式与 sendfile 路径统一（流头 token + RDB stream）
  *  2. 流式帧传输：服务端泵式序列化，客户端逐帧加载，大小不受单缓冲限制
  *  3. 上层由 repl_fullsync.c 按配置开关直接调用
  *
@@ -23,17 +23,15 @@
  *  协议信封
  *============================================================================*/
 
-/** RDMA 魔数：用于握手确认 */
-#define RDMA_MAGIC      0x52444233u   /* "RDB3" */
-
 /**
- * 快照头部结构
- * 快照载荷开头携带，magic 校验 + token（快照 offset，供增量模块续传）
+ * 快照流头（RDMA 整块传输的数据块头）
+ * 仅 token（快照 offset）：数据长度由随后的 RDB 流头 key_count 自描述，
+ * 加载后核对数量、不一致即失败（无需 magic 等校验字段）。
+ * 与 sendfile 路径结构一致：流头 token + RDB 流。
  */
 struct batch_hdr {
-    uint32_t magic;                 /* 魔数（0x52444233） */
-    uint64_t token;                 /* 快照 offset（会话元数据） */
-} __attribute__((packed));
+    uint64_t token;                 /* 快照 offset，htobe64 */
+};
 
 /*=============================================================================
  *  传输入口

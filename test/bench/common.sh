@@ -37,6 +37,31 @@ warn() { echo -e "${YELLOW}[WARN]${NC}  $(date +%H:%M:%S) $*" >&2; }
 err()  { echo -e "${RED}[ERROR]${NC} $(date +%H:%M:%S) $*" >&2; }
 step() { echo -e "${CYAN}[STEP]${NC}  $(date +%H:%M:%S) $*" >&2; }
 
+# ---- 便捷别名: info/die + C_* 颜色（全量同步 bench 脚本共用）----
+info() { log "$@"; }
+die()  { err "$@"; exit 1; }
+
+C_BLD=$'\033[1m';   C_DIM=$'\033[2m'
+C_RED=$'\033[31m';  C_GRN=$'\033[32m';  C_YEL=$'\033[33m'
+C_CYN=$'\033[36m';  C_RST=$'\033[0m'
+
+# ---- 速率计算（统一基准: Throughput = 字节数 / 秒 / 1048576  →  MB/s）----
+_fmt() { local v=$1; [ "${v:0:1}" = "." ] && echo "0$v" || echo "$v"; }
+calc_mbps() {
+    if [ "$(echo "$2 > 0" | bc 2>/dev/null)" = 1 ]; then
+        _fmt "$(echo "scale=2; $1 / $2 / 1048576" | bc)"
+    else
+        echo "0.00"
+    fi
+}
+calc_entps() {
+    if [ "$(echo "$2 > 0" | bc 2>/dev/null)" = 1 ]; then
+        echo "scale=0; $1 / $2" | bc
+    else
+        echo "0"
+    fi
+}
+
 # ---- 预检 ----
 require_root() {
     if [ "${EUID:-0}" -ne 0 ]; then

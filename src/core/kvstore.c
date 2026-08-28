@@ -22,7 +22,6 @@
 #include <ctype.h>
 
 #include "repl.h"
-#include "persist_aof.h"
 #include "persistence.h"
 
 /*=============================================================================
@@ -31,9 +30,6 @@
 
 int g_in_reload = 0;                              /* 是否在数据重载中（抑制日志/复制） */
 
-uint64_t g_kvs_total_commands     = 0;            /* 总命令数（单线程无需原子） */
-_Atomic uint64_t g_kvs_total_connections  = 0;    /* 历史总连接数（原子） */
-_Atomic int      g_kvs_connected_clients  = 0;    /* 当前连接数（原子） */
 long long        g_kvs_start_time_ms      = 0;    /* 启动时间戳（毫秒） */
 volatile sig_atomic_t g_kvs_stop = 0;             /* 停止标志（信号触发） */
 
@@ -337,6 +333,20 @@ int main(int argc, char *argv[]) {
      *  4. 复制初始化
      *  repl_role off → 不 fork、不建 backlog
      *  repl_on_close / repl_tick 为直接函数，内部按 role 判断，无需布线
+     *
+     *  角色接线（控制面入口即引擎三个回调：client_handler / tick / on_close）：
+     *    MASTER：
+     *      启动   repl_fullsync_master_start()   安装 SIGCHLD 回收（数据面子进程）
+     *             repl_backlog_init()            1MB 积压缓冲（仅 incr on）
+     *      运行时 client_handler 注入 repl_incr_master_client_handler（PSYNC 探测）：
+     *             PSYNC → +CONTINUE 流式 / +FULLRESYNC fork 数据面子进程
+     *             repl_tick 无动作；repl_on_close 清理 streaming 从库
+     *    SLAVE：
+     *      启动   repl_incr_slave_start()        记录 Master 地址，状态置 IDLE
+     *      运行时 repl_tick → repl_incr_slave_tick 统一推进
+     *             （连接 / 重连 / +FULLRESYNC 数据面全量交接）
+     *             Master 链路的 client_handler 由 repl 内部挂载
+     *             repl_on_close → 断线安排重连
      *-------------------------------------------------------------------------*/
     if (kvs_config.repl_role == REPL_ROLE_MASTER) {
         /* Master：启动全量同步服务（PSYNC 握手判定 +FULLRESYNC 时 fork 传输） */

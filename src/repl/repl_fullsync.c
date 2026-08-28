@@ -15,7 +15,7 @@
  *============================================================================*/
 
 #include "repl_fullsync.h"
-#include "repl_backlog.h"
+#include "repl.h"
 #include "persistence.h"
 #include "kvstore.h"
 #include "sendfile.h"
@@ -33,8 +33,14 @@
  *============================================================================*/
 
 /**
- * 快照偏移量
- * 流头 token = 快照 offset，供增量模块续传
+ * 快照偏移量（数据面 → 控制面的权威续传 offset）
+ *
+ * 全量传输的流头 token = 快照对应的 master 绝对 offset。
+ * Slave 加载完快照后由 repl_fullsync_slave_start 写入，
+ * 增量模块据此续传（repl_incr_slave_reset_offset 对齐）。
+ *
+ * 交接契约：与 master 回 +FULLRESYNC 回复文本中的 offset 在同一时刻取同一值，
+ * 但以此处 token 为权威（见 repl_incr_master.c 的 master_start_fullsync）。
  */
 size_t g_repl_snapshot_offset = 0;
 

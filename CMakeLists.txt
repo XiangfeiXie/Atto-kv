@@ -69,7 +69,6 @@ set(CORE_SRCS
     src/core/kvstore.c
     src/core/kvstore_expire.c
     src/core/kvstore_config.c
-    src/core/kvstore_info.c
     src/core/kvstore_dispatch.c
 )
 
@@ -94,7 +93,6 @@ set(REPL_SRCS
     src/transport/rdma.c
     src/transport/rdma_transport.c
     src/repl/repl_fullsync.c
-    src/repl/repl_backlog.c
     src/repl/repl_incr.c
     src/repl/repl_incr_master.c
     src/repl/repl_incr_slave.c
@@ -136,25 +134,30 @@ target_link_libraries(repl-recv PRIVATE Threads::Threads bpf elf ${ZLIB_LIBRARIE
 add_dependencies(repl-recv repl-recv-bpf)
 
 # ── repl-xdp（XDP 旁路镜像同步）──────────────────────────────────────────
-# 独立进程，与 kvstore 零耦合：XDP 程序挂客户端流量所经网卡（veth0）入方向，
-# 把客户端 TCP 负载采样进 ring buffer（镜像数据），从机方向 ACK/应答拦进
-# ring 并 DROP；用户态进程用 raw socket 重建镜像 TCP 段发往从机，从机内核
-# TCP 栈负责接收可靠，本进程负责发送可靠（RTO 重传）。
+# 独立进程，与 kvstore 零耦合：XDP 程序挂 kvstore master 客户端流量所经网卡
+# （veth0）入方向，把客户端 → master(MASTER_PORT) 的 TCP 负载采样进 ring
+# buffer，原包一律 XDP_PASS；用户态进程用内核 TCP socket 把采到的字节写往
+# 从机（从机内核 TCP 栈负责接收可靠），主/从机的增量同步由镜像完成。
+# 默认 MASTER_PORT/SLAVE_PORT 对齐 kvstore 主从端口（2000/2001），
+# 可通过 -DMASTER_PORT=.. -DSLAVE_PORT=.. 覆盖。
 set(REPL_XDP_DIR ${CMAKE_SOURCE_DIR}/src/repl-xdp)
+set(REPL_XDP_DEFINES "" CACHE STRING
+    "repl-xdp 端口/网卡覆盖，例: -DMASTER_PORT=6380 -DSLAVE_PORT=6381")
 
 add_custom_command(
     OUTPUT ${CMAKE_BINARY_DIR}/repl-xdp.bpf.o
-    COMMAND ${BPF_CLANG} -g -O2 -target bpf -D__TARGET_ARCH_x86
+    COMMAND ${BPF_CLANG} -g -O2 -target bpf -D__TARGET_ARCH_x86 ${REPL_XDP_DEFINES}
             -I${REPL_XDP_DIR} -I/usr/include
-            -c ${REPL_XDP_DIR}/repl-xdp.bpf.c
+            -c ${REPL_XDP_DIR}/repl-xdp-sock.bpf.c
             -o ${CMAKE_BINARY_DIR}/repl-xdp.bpf.o
-    DEPENDS ${REPL_XDP_DIR}/repl-xdp.bpf.c ${REPL_XDP_DIR}/repl-xdp.h
+    DEPENDS ${REPL_XDP_DIR}/repl-xdp-sock.bpf.c ${REPL_XDP_DIR}/vmlinux.h
     COMMENT "Compiling repl-xdp.bpf.o (eBPF)"
 )
 add_custom_target(repl-xdp-bpf DEPENDS ${CMAKE_BINARY_DIR}/repl-xdp.bpf.o)
 
-add_executable(repl-xdp ${REPL_XDP_DIR}/repl-xdp.c)
+add_executable(repl-xdp ${REPL_XDP_DIR}/repl-xdp-sock.c)
 target_include_directories(repl-xdp PRIVATE ${REPL_XDP_DIR})
+target_compile_options(repl-xdp PRIVATE ${REPL_XDP_DEFINES})
 target_link_libraries(repl-xdp PRIVATE bpf elf ${ZLIB_LIBRARIES})
 add_dependencies(repl-xdp repl-xdp-bpf)
 

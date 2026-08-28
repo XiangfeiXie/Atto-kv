@@ -10,7 +10,7 @@
  *  - KEY VALUE
  *  - 支持 # 注释
  *  - 键不区分大小写
- *  - 支持布尔值（on/off, yes/no, true/false, 1/0）
+ *  - 布尔值只支持 on/off（不区分大小写）
  *============================================================================*/
 
 #include "config.h"
@@ -49,7 +49,7 @@ static void config_default(void) {
 
     /* 复制配置 */
     kvs_config.repl_role         = REPL_ROLE_OFF;      /* 复制默认关闭 */
-    kvs_config.incr_sync         = 1;                  /* 增量同步默认开启 */
+    kvs_config.incr_sync         = 0;                  /* 增量同步默认关闭（opt-in，conf 显式开启） */
     kvs_config.master_port       = 6379;               /* 与 port 保持一致 */
     kvs_config.fullsync_port     = 2101;               /* 全量数据端口 */
 
@@ -118,20 +118,17 @@ static int parse_int(const char *val, int lineno, const char *key,
 
 /**
  * 解析布尔值
- * 支持：on/off, yes/no, true/false, 1/0
+ * 只支持 on/off（不区分大小写），不接受 yes/no、true/false、1/0 等别名
  * @param val 字符串值
  * @param lineno 行号（用于错误报告）
  * @param key 键名（用于错误报告）
  * @return 1 真，0 假，-1 错误
  */
 static int parse_bool(const char *val, int lineno, const char *key) {
-    if (strcasecmp(val, "on")   == 0 || strcasecmp(val, "yes") == 0 ||
-        strcasecmp(val, "1")    == 0 || strcasecmp(val, "true") == 0)
-        return 1;
-    if (strcasecmp(val, "off")  == 0 || strcasecmp(val, "no")  == 0 ||
-        strcasecmp(val, "0")    == 0 || strcasecmp(val, "false") == 0)
-        return 0;
-    printf("[CONFIG] line %d: bad boolean '%s' for %s\n", lineno, val, key);
+    if (strcasecmp(val, "on") == 0)  return 1;
+    if (strcasecmp(val, "off") == 0) return 0;
+    printf("[CONFIG] line %d: bad boolean '%s' for %s (expected on|off)\n",
+           lineno, val, key);
     return -1;
 }
 

@@ -7,7 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include "server.h"
 #include "kvstore.h"
 
 // 全局协议处理器

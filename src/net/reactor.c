@@ -10,7 +10,6 @@
 #include <stdlib.h>
 #include <fcntl.h>
 
-#include "server.h"
 #include "kvstore.h"
 #include "protocol.h"
 #include "config.h"

@@ -73,9 +73,6 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     if (tokens == NULL || argc <= 0 || wb == NULL)
         return DISPATCH_ERROR;
 
-    /* 统计总命令数（单线程，普通自增避免 lock 前缀） */
-    g_kvs_total_commands++;
-
     kvs_token_t cmd = tokens[0];
 
     /*-------------------------------------------------------------------------
@@ -171,27 +168,24 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     }
 
     if (TOKEN_EQ(cmd, "DEL")) {
-        if (argc < 2) {
-            dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
+        /* 只允许一条命令删一个 key：多 key 中间失败无回滚，本项目不做 */
+        if (argc != 2) {
+            dynbuf_cat(wb, RESP_ERR_ARGS, RESP_ERR_ARGS_LEN);
             return DISPATCH_ERROR;
         }
-        
-        long long ndel = 0;
-        for (int i = 1; i < argc; i++) {
-            kvs_token_t kt = tokens[i];
-            uint64_t kh = kv_hash((const uint8_t *)kt.ptr, (uint32_t)kt.len);
-            kv_entry_t *ke = dict_find(&g_dict, kt.ptr, (uint32_t)kt.len, kh);
-            if (!ke) continue;
-            if (dict_delete(&g_dict, kt.ptr, (uint32_t)kt.len, kh) == 0)
-                ndel++;
-        }
-        
-        reply_integer(wb, ndel);
-        
-        /* 有实际删除时才记录日志和复制 */
-        if (ndel > 0 && !g_in_reload) {
-            kvs_write_journal_append(msg_raw, msg_len);
-            kvs_repl_incr_hook(msg_raw, msg_len);
+
+        kvs_token_t kt = tokens[1];
+        uint64_t kh = kv_hash((const uint8_t *)kt.ptr, (uint32_t)kt.len);
+        kv_entry_t *ke = dict_find(&g_dict, kt.ptr, (uint32_t)kt.len, kh);
+        if (ke && dict_delete(&g_dict, kt.ptr, (uint32_t)kt.len, kh) == 0) {
+            reply_integer(wb, 1);
+            /* 有实际删除时才记录日志和复制 */
+            if (!g_in_reload) {
+                kvs_write_journal_append(msg_raw, msg_len);
+                kvs_repl_incr_hook(msg_raw, msg_len);
+            }
+        } else {
+            reply_integer(wb, 0);
         }
         return DISPATCH_OK;
     }
@@ -222,23 +216,28 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
-    /* SAVE / BGSAVE：执行 RDB 持久化（异步） */
-    if (TOKEN_EQ(cmd, "SAVE") || TOKEN_EQ(cmd, "BGSAVE")) {
-        rdb_save_async_uring();
+    /* SAVE：阻塞落盘（同步序列化 + 写入，完成才回 +OK） */
+    if (TOKEN_EQ(cmd, "SAVE")) {
+        rdb_save_sync();
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         return DISPATCH_OK;
     }
 
-    /* CONFIG：配置管理命令（GET/SET/REWRITE） */
+    /* BGSAVE：独立进程落盘（fork 子进程 io_uring 写，不阻塞主循环） */
+    if (TOKEN_EQ(cmd, "BGSAVE")) {
+        if (rdb_save_async_uring() == 0)
+            dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        else
+            dynbuf_lit(wb, "-ERR Background save already in progress\r\n");
+        return DISPATCH_OK;
+    }
+
+    /* CONFIG：伪装包——只应答 redis-benchmark 启动探测的 GET save / GET appendonly */
     if (TOKEN_EQ(cmd, "CONFIG"))
         return handle_config(tokens, argc, wb);
 
-    /* INFO：获取服务器信息 */
-    if (TOKEN_EQ(cmd, "INFO"))
-        return handle_info(tokens, argc, wb);
-
-    /* FLUSHALL / FLUSHDB：清空所有键 */
-    if (TOKEN_EQ(cmd, "FLUSHALL") || TOKEN_EQ(cmd, "FLUSHDB")) {
+    /* FLUSHALL：清空所有键（只有一个全局 dict，不需要 FLUSHDB） */
+    if (TOKEN_EQ(cmd, "FLUSHALL")) {
         dict_clear(&g_dict);
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         /* 非重载模式下记录日志并复制 */

@@ -7,38 +7,19 @@
 #   bash test/bench/rdma_fullsync_bench.sh --mode sendfile
 #   bash test/bench/rdma_fullsync_bench.sh --keys 100000 --iterations 5
 # =============================================================================
-set -u; shopt -s nullglob
+source "$(dirname "$0")/common.sh"    # 共享头：路径/颜色/日志/预检/速率计算
+set +e; set +o pipefail               # common.sh 强制 set -euo pipefail；本脚本按需容错
+shopt -s nullglob
 
 # ── Defaults ───────────────────────────────────────────────────────────
 KEYS=400000; VSIZE=256; ITERATIONS=3; PORT=2000
 MODE=both; RDMA_IP=""; TIMEOUT=120
 SLAVE_PORT=$((PORT + 2)); FPORT=$((PORT + 1))
-PROJECT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-KVS="${PROJECT_DIR}/build/kvstore"
+KVS="$KVS_BIN"
 RDB_PATH="${PROJECT_DIR}/build/dump.rdb"
 POP_RDB_PATH="${PROJECT_DIR}/build/populate.rdb"
-LOG_DIR="/tmp/kvs_fsync_bench_$$"; mkdir -p "$LOG_DIR"
 
-# ── Helpers ─────────────────────────────────────────────────────────────
-C_BLD=$'\033[1m'; C_DIM=$'\033[2m'
-C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'; C_CYN=$'\033[36m'; C_RST=$'\033[0m'
-die()  { echo "${C_RED}[FATAL]${C_RST} $*" >&2; exit 1; }
-info() { echo "${C_GRN}[INFO]${C_RST}  $*" >&2; }
-warn() { echo "${C_YEL}[WARN]${C_RST}  $*" >&2; }
-step() { echo "${C_CYN}[STEP]${C_RST}  $*" >&2; }
-
-_fmt() { local v=$1; [ "${v:0:1}" = "." ] && echo "0$v" || echo "$v"; }
-calc_mbps() {
-    if [ "$(echo "$2 > 0" | bc 2>/dev/null)" = 1 ]; then
-        _fmt "$(echo "scale=2; $1 / $2 / 1048576" | bc)"
-    else echo "0.00"; fi
-}
-calc_entps() {
-    if [ "$(echo "$2 > 0" | bc 2>/dev/null)" = 1 ]; then
-        echo "scale=0; $1 / $2" | bc
-    else echo "0"; fi
-}
-
+# ── Usage ──────────────────────────────────────────────────────────────
 usage() {
     cat <<EOF
 Usage: $0 [options]
@@ -81,7 +62,7 @@ done
 [[ "$KEYS" -gt 0 ]] 2>/dev/null || die "Invalid keys: $KEYS"
 
 # ── Tool checks ──────────────────────────────────────────────────────────
-for tool in redis-cli python3 bc; do
+for tool in redis-cli bc; do
     command -v "$tool" >/dev/null 2>&1 || die "Missing: $tool"
 done
 [ -x "$KVS" ] || die "kvstore not built: $KVS"
@@ -179,25 +160,27 @@ wait_port() {
 # ── Config generation ────────────────────────────────────────────────────
 write_configs() {
     local transport=$1 mconf=$2 sconf=$3
-    # Master
+    # Master（incr off：PSYNC 一律回 +FULLRESYNC 驱动全量，不建 backlog）
     cat > "$mconf" <<EOF
 port ${PORT}
 network proactor
 maxclients 100
 persistence rdb
 repl_role master
+incr_sync off
 fullsync_listen_ip ${RDMA_IP}
 fullsync_port ${FPORT}
 fullsync_transport ${transport}
 expire off
 EOF
-    # Slave
+    # Slave（incr off：一次全量加载后结束，不建增量链路）
     cat > "$sconf" <<EOF
 port ${SLAVE_PORT}
 network proactor
 maxclients 100
 persistence none
 repl_role slave
+incr_sync off
 master_port ${PORT}
 fullsync_master_ip ${RDMA_IP}
 fullsync_port ${FPORT}
@@ -207,8 +190,8 @@ EOF
 }
 
 # ── Phase 1: Data population ─────────────────────────────────────────────
-# Uses populate_kv.py: streaming single-TCP-connection non-blocking pipeline,
-# dramatically faster than spawning python3 per-batch (was ~200× spawns for 400K)
+# 单进程 awk 生成 RESP 流 → redis-cli --pipe，一次管道填充全部 key。
+# 不依赖 python；value 用 ABC.. 循环模式（kvstore RDB 不压缩，大小与随机数据一致）。
 populate_data() {
     step "Phase 1: Populating $KEYS keys × ${VSIZE}B..."
 
@@ -229,47 +212,22 @@ EOF
         die "Populate instance failed to start (check ${LOG_DIR}/populate.log)"
     fi
 
-    local POPULATE_PY="${PROJECT_DIR}/test/bench/populate_kv.py"
-    [ -f "$POPULATE_PY" ] || die "populate_kv.py not found: $POPULATE_PY"
-
-    local keys retries=0 WORKERS=4
-    while true; do
-        info "  Writing $KEYS keys (streaming, ${WORKERS} parallel connections)..."
-
-        # Split key range across parallel workers for max throughput
-        local chunk=$((KEYS / WORKERS)) w
-        local -a worker_pids=()
-        for ((w=0; w<WORKERS; w++)); do
-            local w_start=$((w * chunk))
-            local w_end=$((w_start + chunk - 1))
-            [ $w -eq $((WORKERS - 1)) ] && w_end=$((KEYS - 1))
-            python3 "$POPULATE_PY" 127.0.0.1 "$PORT" "$w_start" "$w_end" "$VSIZE" \
-                > "${LOG_DIR}/pop_worker_${w}.out" \
-                2> "${LOG_DIR}/pop_worker_${w}.err" &
-            worker_pids+=($!)
-        done
-
-        # Wait for all workers; show tail of each on failure
-        local failed=0
-        for ((w=0; w<WORKERS; w++)); do
-            wait "${worker_pids[w]}" 2>/dev/null || {
-                warn "  Worker $w exited with error:"
-                tail -3 "${LOG_DIR}/pop_worker_${w}.err" >&2
-                failed=$((failed + 1))
+    info "  Writing $KEYS keys (awk → redis-cli --pipe)..."
+    awk -v n="$KEYS" -v vs="$VSIZE" '
+        BEGIN {
+            for (j = 0; j < vs; j++) v = v sprintf("%c", 65 + (j % 26));  /* ABC.. 填充 */
+            for (i = 0; i < n; i++) {
+                k = sprintf("key:%012d", i);
+                printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", length(k), k, vs, v;
             }
-        done
-        [ "$failed" -gt 0 ] && warn "  $failed/$WORKERS workers reported errors (may be harmless)"
+        }' | timeout 300 redis-cli -p "$PORT" --pipe > "${LOG_DIR}/pipe_out.txt" 2>&1
 
-        keys=$(redis-cli -p "$PORT" DBSIZE 2>/dev/null || echo 0)
-        if [ "$keys" -ge "$KEYS" ]; then break; fi
-
-        retries=$((retries + 1))
-        if [ "$retries" -ge 3 ]; then
-            warn "Population incomplete: expected $KEYS, got $keys (after $retries retries)"
-            kvskill; return 1
-        fi
-        warn "  Incomplete ($keys/$KEYS), retry $retries..."
-    done
+    local keys
+    keys=$(redis-cli -p "$PORT" DBSIZE 2>/dev/null || echo 0)
+    [ "$keys" -ge "$KEYS" ] || {
+        warn "Population incomplete: expected $KEYS, got $keys"
+        kvskill; return 1
+    }
 
     # SAVE + record RDB size
     redis-cli -p "$PORT" SAVE >/dev/null 2>&1

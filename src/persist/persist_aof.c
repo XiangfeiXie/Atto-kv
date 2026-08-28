@@ -5,10 +5,9 @@
  *  1. 追加写：单线程无锁 io_uring 环形缓冲落盘（appendonly.aof）
  *  2. 启动重放：aof_reload_mmap 用 mmap 重放 raw RESP 命令
  *
- *  对外接口见 persist_aof.h
+ *  对外接口见 persistence.h（AOF 接口已并入）
  *============================================================================*/
 
-#include "persist_aof.h"
 #include "persistence.h"
 #include "kvstore.h"     /* get_time_now (cached clock) */
 

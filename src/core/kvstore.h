@@ -1,13 +1,16 @@
 /*=============================================================================
  *  kvstore.h — KV 存储公开接口
- *  
+ *
  *  用途：提供 KV 存储的核心类型声明和对外接口
- *  包含：网络引擎入口、时间函数、命令分发、全局统计、复制接口
- *  
+ *  包含：服务器基础定义（原 server.h）、网络引擎入口、时间函数、
+ *        命令分发、全局状态、复制接口
+ *
  *  设计原则：
  *  1. 所有外部模块（network/persist/repl）应包含此头文件
  *  2. 内部实现细节在 kvstore_internal.h 中声明
  *  3. 复制与引擎之间的接口通过函数指针解耦
+ *  4. 禁止本文件 include persistence.h（persistence.h 依赖本文件的
+ *     类型定义，若互相包含会成环；持久化接口由各 .c 自行 include）
  *============================================================================*/
 
 #ifndef __KV_STORE_H__
@@ -17,10 +20,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <signal.h>       /* sig_atomic_t：g_kvs_stop */
 #include <sys/time.h>
 #include <unistd.h>
 
-#include "server.h"
+#include "dynbuf.h"       /* DynBuf：msg_handler / 回复接口 */
 #include "config.h"
 #include "protocol.h"
 #include "kv_dict.h"
@@ -28,6 +33,59 @@
 #ifdef USE_JEMALLOC
 #include <jemalloc/jemalloc.h>
 #endif
+
+/*=============================================================================
+ *  服务器基础定义（原 server.h，已并入）
+ *  整个系统最底层的基础类型和全局声明，所有模块共享
+ *============================================================================*/
+
+/*-------------------------------------------------------------------------
+ *  全局优雅关闭标志
+ *  使用 sig_atomic_t 确保在信号处理器中安全读写
+ *  设置：SIGTERM/SIGINT 信号处理器
+ *  读取：主事件循环，检测到后退出
+ *-------------------------------------------------------------------------*/
+
+/**
+ * g_kvs_stop：服务器停止标志
+ *
+ * 类型选择说明：
+ * - sig_atomic_t：保证在信号处理器中的读写是原子的
+ * - volatile：防止编译器优化掉循环中的读取
+ *
+ * 写入：信号处理器（sig_shutdown）
+ * 读取：主循环（reactor/proactor/ntyco 的事件循环）
+ *
+ * 优雅关闭流程：
+ * 1. 用户发送 SIGTERM/SIGINT
+ * 2. 信号处理器设置 g_kvs_stop = 1
+ * 3. 主循环检测到后退出
+ * 4. 执行清理（关闭连接、刷新 AOF、释放资源）
+ */
+extern volatile sig_atomic_t g_kvs_stop;
+
+/*-------------------------------------------------------------------------
+ *  回调函数类型定义
+ *
+ *  不同网络引擎使用不同的回调签名：
+ *  - msg_handler：遗留 ntyco 协程引擎使用
+ *  - kvs_drain_fn：proactor/reactor 引擎使用（定义在 protocol.h）
+ *
+ *  设计目的：隔离网络层与业务层，使引擎可以独立切换
+ *-------------------------------------------------------------------------*/
+
+/**
+ * 消息处理函数类型（仅用于遗留 ntyco 引擎）
+ *
+ * @param msg 输入消息指针（注意：不保证是以 \0 结尾的字符串）
+ * @param len 消息长度
+ * @param write_buf 写缓冲（输出响应）
+ * @return 0 成功，非 0 失败
+ *
+ * 注意：proactor/reactor 引擎使用 kvs_drain_fn（声明在 protocol.h）
+ * 该类型保留仅为了兼容 ntyco 引擎
+ */
+typedef int (*msg_handler)(char *msg, int len, DynBuf *write_buf);
 
 /*=============================================================================
  *  网络引擎入口函数
@@ -123,22 +181,6 @@ void kvs_flush_all(void);
  */
 extern int g_in_reload;
 
-/*=============================================================================
- *  INFO 命令统计计数器
- *  
- *  设计考虑：
- *  - g_kvs_total_commands：仅在单线程事件循环中写入（dispatch 串行执行）
- *    且仅在 INFO 命令同一线程读取，因此使用普通 uint64_t
- *    若使用 _Atomic，x86-64 上会编译为 `lock add` 指令，有额外串行化开销
- *    在热路径上不可忽略
- *  
- *  - g_kvs_total_connections / g_kvs_connected_clients：
- *    连接事件可能在不同上下文发生，使用原子操作保证安全
- *============================================================================*/
-
-extern uint64_t g_kvs_total_commands;                /* 总命令处理数（单线程） */
-extern _Atomic uint64_t g_kvs_total_connections;     /* 历史总连接数（原子） */
-extern _Atomic int      g_kvs_connected_clients;     /* 当前活跃连接数（原子） */
 extern long long        g_kvs_start_time_ms;         /* 启动时间戳（只读） */
 
 /*=============================================================================

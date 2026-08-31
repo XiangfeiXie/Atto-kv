@@ -60,9 +60,6 @@ static void config_default(void) {
     strncpy(kvs_config.fullsync_master_ip, "127.0.0.1",
             sizeof(kvs_config.fullsync_master_ip) - 1);
 
-    kvs_config.fullsync_timeout = 3600000;     /* 1 小时 */
-    kvs_config.fullsync_max_retries = 3;
-
     kvs_config.expire_enabled            = 0;  /* 过期默认关闭 */
 }
 
@@ -250,12 +247,6 @@ int config_load(const char *path) {
 
         } else if (strcasecmp(key, "master_port") == 0) {
             parse_int(val, lineno, "master_port", 1, 65535, &kvs_config.master_port);
-
-        } else if (strcasecmp(key, "fullsync_timeout") == 0) {
-            parse_int(val, lineno, "fullsync_timeout", 1000, 7200000, &kvs_config.fullsync_timeout);
-
-        } else if (strcasecmp(key, "fullsync_max_retries") == 0) {
-            parse_int(val, lineno, "fullsync_max_retries", 0, 10, &kvs_config.fullsync_max_retries);
 
         } else if (strcasecmp(key, "expire") == 0) {
             int v = parse_bool(val, lineno, "expire");

@@ -105,9 +105,6 @@ typedef struct {
     char fullsync_listen_ip[64];   /* Master 全量数据绑定地址（RDMA CM bind 用，默认 0.0.0.0） */
     char fullsync_master_ip[64];   /* Slave 连接 master 全量数据端口的地址 */
 
-    int  fullsync_timeout;         /* 全量同步超时时间（毫秒） */
-    int  fullsync_max_retries;     /* 全量同步最大重试次数 */
-
     /*-----------------------------------------------------------------------
      *  过期配置
      *-----------------------------------------------------------------------*/

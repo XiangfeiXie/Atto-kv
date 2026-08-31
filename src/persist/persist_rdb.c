@@ -5,11 +5,13 @@
  *  1. RDB 保存：同步（rdb_save_sync）和异步 fork（rdb_save_async_uring）
  *  2. RDB 加载：mmap 加载和流式加载（全量同步用）
  *  3. 流式序列化器：RDMA 全量同步 Master 端使用
- *  4. 子进程回收管理：统一 SIGCHLD 处理
+ *  4. 子进程回收：BGSAVE 入口 waitpid 探活（ECHILD=全局 handler 已回收）
  *============================================================================*/
 
+#define _GNU_SOURCE   /* close_range: 保存子进程关掉继承的服务端 fd */
 #include "persistence.h"
 #include "kvstore.h"
+#include "dynbuf.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,7 +19,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <signal.h>
 #include <liburing.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -36,37 +37,10 @@
 #define RDB_MAX_KEY_COUNT 100000000
 
 /*=============================================================================
- *  动态缓冲区（RDB 序列化用）
- *============================================================================*/
-
-typedef struct {
-    char  *buf;      /* 缓冲区指针 */
-    size_t len;      /* 当前已用长度 */
-    size_t cap;      /* 缓冲区容量 */
-} rdb_buf_t;
-
-/*=============================================================================
  *  全局状态
  *============================================================================*/
 
-static volatile pid_t g_rdb_child_pid = 0;  /* BGSAVE 子进程 PID，0=未运行 */
-
-/*=============================================================================
- *  动态缓冲区辅助函数
- *============================================================================*/
-
-/**
- * 确保缓冲区有足够空间
- * 容量不足时翻倍扩容
- */
-static void rdb_buf_reserve(rdb_buf_t *b, size_t need) {
-    if (b->len + need <= b->cap) return;
-    size_t ncap = b->cap ? b->cap : 64 * 1024;  /* 初始 64KB */
-    while (ncap < b->len + need)
-        ncap *= 2;
-    b->buf = (char *)realloc(b->buf, ncap);
-    b->cap = ncap;
-}
+static pid_t g_rdb_child_pid = 0;  /* BGSAVE 子进程 PID，0=未运行 */
 
 /*=============================================================================
  *  RDB 格式辅助
@@ -115,7 +89,7 @@ static size_t serialize_entry_to_ptr(char *dst, kv_entry_t *e) {
 
 /*=============================================================================
  *  io_uring 写入
- * 分块异步写入 + fdatasync，带 read fallback
+ * 分块异步写入 + fsync（io_uring 是项目基石，无阻塞写回退）
  *============================================================================*/
 
 /**
@@ -131,23 +105,8 @@ static int rdb_write_uring(int fd, const char *data, size_t total) {
 
     struct io_uring ring;
     if (io_uring_queue_init(DEPTH, &ring, 0) < 0) {
-        /* fallback：阻塞 write() + fdatasync */
-        size_t off = 0;
-        while (off < total) {
-            ssize_t w = write(fd, data + off, total - off);
-            if (w < 0 && errno == EINTR) continue;
-            if (w <= 0) {
-                fprintf(stderr, "[RDB] fallback write failed at offset %zu: %s\n",
-                        off, strerror(errno));
-                return -1;
-            }
-            off += (size_t)w;
-        }
-        if (fdatasync(fd) < 0) {
-            fprintf(stderr, "[RDB] fallback fdatasync failed: %s\n", strerror(errno));
-            return -1;
-        }
-        return 0;
+        fprintf(stderr, "[RDB] io_uring_queue_init failed: %s\n", strerror(errno));
+        return -1;
     }
 
     size_t off = 0;
@@ -215,7 +174,8 @@ static int rdb_write_uring(int fd, const char *data, size_t total) {
         }
     }
 
-    /* 最终 fsync：用 IOSQE_IO_DRAIN 保证先于所有写完成 */
+    /* 最终 fsync：用 IOSQE_IO_DRAIN 保证先于所有写完成
+     * 写循环结束后 SQE 必然空闲，get_sqe 失败即按保存失败处理（fail-closed） */
     int ok = 0;
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
     if (sqe) {
@@ -230,9 +190,6 @@ static int rdb_write_uring(int fd, const char *data, size_t total) {
         } else {
             fprintf(stderr, "[RDB] fsync wait failed: %s\n", strerror(errno));
         }
-    } else {
-        if (fdatasync(fd) == 0) ok = 1;
-        else fprintf(stderr, "[RDB] fdatasync failed: %s\n", strerror(errno));
     }
     io_uring_queue_exit(&ring);
     return ok ? 0 : -1;
@@ -320,22 +277,27 @@ void rdb_serialize_end(rdb_serializer_t *rs) {
  *============================================================================*/
 
 void rdb_save_sync(void) {
-    rdb_buf_t b  = {0};
+    DynBuf b;
+    dynbuf_init(&b, KVS_NET_BUF_INIT);
     int key_count = (int)dict_count(&g_dict);
 
-    /* 使用流式序列化器序列化所有数据 */
-    rdb_buf_reserve(&b, 64 * 1024);
+    /* 使用流式序列化器序列化所有数据到 DynBuf */
     rdb_serializer_t rs;
     rdb_serialize_begin(&rs);
     int done = 0;
     while (!done) {
-        size_t n = rdb_serialize_next(&rs, b.buf + b.len, b.cap - b.len, &done);
+        size_t n = rdb_serialize_next(&rs, b.buf + b.len, (size_t)(b.cap - b.len), &done);
         if (n == 0 && !done) {
             /* 放不下下一条 entry，扩容再试 */
-            rdb_buf_reserve(&b, b.len + 64 * 1024);
+            if (dynbuf_reserve(&b, b.len + 64 * 1024) < 0) {
+                fprintf(stderr, "[RDB] serialization buffer grow failed\n");
+                rdb_serialize_end(&rs);
+                dynbuf_free(&b);
+                return;
+            }
             continue;
         }
-        b.len += n;
+        b.len += (int)n;
     }
     rdb_serialize_end(&rs);
 
@@ -349,101 +311,44 @@ void rdb_save_sync(void) {
     int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         fprintf(stderr, "[RDB] open tmp failed: %s\n", strerror(errno));
-        free(b.buf);
+        dynbuf_free(&b);
         return;
     }
 
     /* 写失败绝不能把残缺文件 rename 成 dump.rdb
      * 否则下次启动会拿损坏快照清空整库 */
-    if (rdb_write_uring(fd, b.buf, b.len) < 0) {
+    if (rdb_write_uring(fd, b.buf, (size_t)b.len) < 0) {
         close(fd);
         unlink(tmp_path);
-        free(b.buf);
+        dynbuf_free(&b);
         return;
     }
     close(fd);
     rename(tmp_path, dst_path);
 
-    free(b.buf);
-    printf("[RDB] saved via io_uring, %zu bytes (%d keys)\n", b.len, key_count);
-}
-
-/*=============================================================================
- *  子进程回收管理（统一 SIGCHLD 处理）
- *  
- *  问题：SIGCHLD 每进程只能有一个 handler
- *  解决方案：统一 handler + 回调注册机制
- *  
- *  BGSAVE 子进程与 repl 全量同步传输子进程各自注册回调
- *  互不覆盖，解决此前两个模块各自装 SIGCHLD 互相覆盖的问题
- *============================================================================*/
-
-#define MAX_CHILD_REAP_CBS 3   /* BGSAVE + repl 传输 + AOF 重写 */
-
-static kvs_child_reap_fn g_reap_cbs[MAX_CHILD_REAP_CBS];
-static int               g_reap_n = 0;
-
-/**
- * 统一 SIGCHLD 信号处理器
- * 用 waitpid(-1) 回收所有子进程，逐个通知注册的回调
- */
-static void kvs_sigchld_handler(int signo) {
-    (void)signo;
-    int status; pid_t pid;
-    while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
-        for (int i = 0; i < g_reap_n; i++)
-            g_reap_cbs[i](pid, status);
-}
-
-/**
- * 初始化子进程回收机制（幂等）
- */
-void kvs_child_reap_init(void) {
-    static int installed = 0;
-    if (installed) return;
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = kvs_sigchld_handler;
-    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-    sigaction(SIGCHLD, &sa, NULL);
-    installed = 1;
-}
-
-/**
- * 注册子进程回收回调（幂等，去重）
- */
-void kvs_child_reap_register(kvs_child_reap_fn fn) {
-    for (int i = 0; i < g_reap_n; i++)
-        if (g_reap_cbs[i] == fn) return;   /* 已注册，跳过 */
-    if (g_reap_n < MAX_CHILD_REAP_CBS)
-        g_reap_cbs[g_reap_n++] = fn;
+    size_t nbytes = (size_t)b.len;  /* dynbuf_free 会清零 len，先取字节数 */
+    dynbuf_free(&b);
+    printf("[RDB] saved via io_uring, %zu bytes (%d keys)\n", nbytes, key_count);
 }
 
 /*=============================================================================
  *  异步保存（fork + 子进程 io_uring 写入）
  *  Redis 风格：同时只运行一个 BGSAVE
+ *  子进程回收：全局 SIGCHLD handler 已回收，此处仅探活确认
  *============================================================================*/
-
-/**
- * BGSAVE 子进程退出回调
- * 清 PID（子进程已被统一 SIGCHLD 回收）
- */
-static void rdb_reap_child(pid_t pid, int status) {
-    (void)status;
-    if (pid == g_rdb_child_pid)
-        g_rdb_child_pid = 0;
-}
 
 /**
  * 异步 RDB 保存（BGSAVE）
  * @return 0 成功（或已触发），-1 已在运行
  */
 int rdb_save_async_uring(void) {
-    kvs_child_reap_init();
-    kvs_child_reap_register(rdb_reap_child);
-
-    if (g_rdb_child_pid > 0)
-        return -1;   /* BGSAVE 已在运行 */
+    /* 探活上一轮子进程：已退出（SIGCHLD handler 已回收 → ECHILD）则放行，
+     * 仍存活则拒绝 */
+    if (g_rdb_child_pid > 0) {
+        if (waitpid(g_rdb_child_pid, NULL, WNOHANG) == 0)
+            return -1;   /* BGSAVE 仍在运行 */
+        g_rdb_child_pid = 0;   /* 已结束 */
+    }
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -455,7 +360,11 @@ int rdb_save_async_uring(void) {
     }
     
     if (pid == 0) {
-        /* 子进程：执行同步保存后退出 */
+        /* 子进程：执行同步保存后退出
+         * 先关掉继承的服务端 fd(监听 socket/io_uring/连接 fd):
+         * 否则保存子进程把监听端口一直钉在 LISTEN 态, 父进程被 SIGTERM
+         * 退出后端口仍被占用, 快速重启会 bind: Address already in use (实测踩坑) */
+        close_range(3, ~0U, 0);
         rdb_save_sync();
         fflush(stdout);
         fflush(stderr);
@@ -504,18 +413,13 @@ int rdb_load_stream_begin(const char *buf, size_t len) {
 }
 
 /**
- * 追加流式 RDB 数据（到缓冲末尾）
- * @return 成功加载的条目数
- */
-int rdb_load_stream_append(const char *buf, size_t len) {
-    return rdb_load_stream_append_n(buf, len, -1, NULL);
-}
-
-/**
  * 追加流式 RDB 数据（限条数版）
  * 最多解析 limit 条（-1 = 不限，读到缓冲末尾）。
- * 单块全量传输专用：数据长度由流头 key_count 自描述，
- * 解析到第 key_count 条即停止，无需外部字节数（见 rdma.c）。
+ *
+ * RDMA 数据面专用（见 rdma.c 调用）：接收块是预分配大缓冲区，
+ * 真实数据后是未用空间，limit=key_count 让解析在第 key_count 条即停，
+ * 防止把尾部未用空间误当成条目解析。
+ * 文件加载路径（rdb_load_from_buf）用 limit=-1 读到缓冲末尾。
  *
  * @param limit 最多解析条目数（-1 = 不限）
  * @param consumed 输出：实际消费字节数（可为 NULL）
@@ -569,7 +473,7 @@ int rdb_load_from_buf(const char *buf, size_t len) {
     int expected = rdb_load_stream_begin(buf, 4);
     if (expected < 0) return -1;
     
-    int loaded = rdb_load_stream_append(buf + 4, len - 4);
+    int loaded = rdb_load_stream_append_n(buf + 4, len - 4, -1, NULL);
     if (loaded < 0) {
         dict_clear(&g_dict);
         return -1;

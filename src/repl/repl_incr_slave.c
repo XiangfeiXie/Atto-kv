@@ -14,34 +14,39 @@
  *  4. 全量加载后复位 offset，重新 PSYNC 续连
  *  5. 断线：offset 保留，tick 周期重连
  *
- *  控制面状态机（4 态）：
+ *  控制面状态（链路存在性 + 标志位，无独立枚举）：
  *
- *    状态：
- *      SLAVE_IDLE      — 无链路，等待 tick 连接/重连
- *      SLAVE_HANDSHAKE — 已连接，等待 +CONTINUE / +FULLRESYNC
- *      SLAVE_STREAMING — 增量流式回放中
- *      SLAVE_FULLSYNC  — +FULLRESYNC 交接：tick 走数据面全量；
- *                        仅全量模式（incr off）完成一次后即终结
+ *    链路存在性由 g_repl_fd 表达，子状态由标志位区分：
+ *      fd>=0 + !handshake_done  → 待握手（等 +CONTINUE / +FULLRESYNC）
+ *      fd>=0 +  handshake_done  → 流式回放中
+ *      fd<0  +  !sync_done      → 无链路，tick 连接/重连
+ *      g_sync_done=1            → 终结（仅全量完成 / 全量后 rejudge 失败）
  *
  *    转移：
- *      IDLE      --tick: 连接成功并 adopt--> HANDSHAKE
- *      IDLE      --tick: 连接失败--> IDLE（1s 后重试）
- *      HANDSHAKE --+CONTINUE--> STREAMING
- *      HANDSHAKE --+FULLRESYNC--> FULLSYNC（关链路，fd 置 -1）
- *      HANDSHAKE --意外响应--> IDLE（1s 后重试）
- *      STREAMING --on_close: 断开--> IDLE（offset 保留，1s 后重试）
- *      FULLSYNC  --tick: 全量成功，incr on--> IDLE（以快照 offset 重连）
- *      FULLSYNC  --tick: 全量成功，incr off--> FULLSYNC（retry=NEVER 终结）
- *      FULLSYNC  --tick: 全量失败--> FULLSYNC（1s 后重试）
+ *      无链路       --tick: 连接成功并 adopt--> 待握手
+ *      无链路       --tick: 连接失败--> 无链路（1s 后重试）
+ *      待握手       --+CONTINUE--> 流式回放（fullsync_done 清零）
+ *      待握手       --+FULLRESYNC（fullsync_done=0）--> 摘链 + 内联数据面全量
+ *                     ├─ 全量成功，incr on --> 无链路（fullsync_done=1，tick 重连 rejudge）
+ *                     ├─ 全量成功，incr off--> g_sync_done 终结（仅全量模式，不同步增量）
+ *                     └─ 全量失败--> 无链路（fullsync_done 保持 0，1s 后重试）
+ *      待握手       --+FULLRESYNC（fullsync_done=1，全量后 rejudge 仍失败）
+ *                     --> g_sync_done 终结（增量同步失败，断开）
+ *      待握手       --意外响应--> 无链路（1s 后重试）
+ *      流式回放     --on_close: 断开--> 无链路（offset 保留，1s 后重试）
+ *
+ *    g_fullsync_done 守卫语义：同一同步周期内最多一次全量；达成 +CONTINUE
+ *    （增量基线建立）即清零，允许后续断线过久时再次全量（自愈）。
  *
  *    统一重试时间戳（g_next_retry，tick 唯一行动门槛 now < g_next_retry）：
- *      - 0 或过去时间      → 立即可行动（初始 / 增量续连）
- *      - now + 1000        → 1s 后重试（连接失败 / 全量失败 / 断线）
- *      - REPL_RETRY_NEVER  → 永不行动（仅全量模式完成，同步终结）
+ *      - 0 或过去时间 → 立即可行动（初始 / 全量后 rejudge 续连）
+ *      - now + 1000   → 1s 后重试（连接失败 / 全量传输失败 / 断线）
+ *    终结由 g_sync_done 标志表达（仅全量模式完成 / 全量后 rejudge 失败，
+ *    tick 入口直接返回，不再连接）
  *
  *    触发入口（引擎三个回调，控制面所有跳转都汇聚于此）：
- *      数据到达 → repl_incr_slave_master_link_handler（HANDSHAKE 握手 / STREAMING 回放）
- *      每轮循环 → repl_incr_slave_tick（连接 / 重连 / FULLSYNC 数据面交接）
+ *      数据到达 → repl_incr_slave_master_link_handler（握手 / 流式回放）
+ *      每轮循环 → repl_incr_slave_tick（连接 / 重连）
  *      连接释放 → repl_incr_slave_on_close（断开 → 安排重连）
  *============================================================================*/
 
@@ -51,7 +56,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <limits.h>   /* LLONG_MAX：REPL_RETRY_NEVER */
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -60,34 +64,20 @@
 
 /*=============================================================================
  *  模块状态
+ *  链路存在性由 g_repl_fd 表达，子状态由 g_handshake_done / g_fullsync_done /
+ *  g_sync_done 区分（见文件头状态机图）；handler / tick / on_close 三个回调共同推进
  *============================================================================*/
 
-/**
- * Slave 控制面状态（见文件头状态机图）
- * 由 handler / tick / on_close 三个引擎回调共同推进
- */
-typedef enum {
-    SLAVE_IDLE      = 0,   /* 无链路，等待 tick 连接/重连 */
-    SLAVE_HANDSHAKE = 1,   /* 已连接，等待 +CONTINUE / +FULLRESYNC */
-    SLAVE_STREAMING = 2,   /* 增量流式回放中 */
-    SLAVE_FULLSYNC  = 3,   /* +FULLRESYNC 交接：数据面全量；仅全量模式完成即终结 */
-} slave_state_t;
+static int          g_repl_fd         = -1;  /* >=0 链路 fd；-1 无链路 */
+static int          g_handshake_done  = 0;   /* 1=握手响应已收（+CONTINUE→流式） */
+static int          g_fullsync_done   = 0;   /* 1=本同步周期已做过全量（守卫：禁止连续两次全量） */
+static int          g_sync_done       = 0;   /* 1=终结：仅全量模式完成 / 全量后 rejudge 失败 */
+static size_t       g_slave_offset    = 0;   /* 已消费到的 master 绝对 offset（命令边界） */
+static char         g_master_ip[64]   = {0}; /* Master IP 地址 */
+static int          g_master_port     = 0;   /* Master 端口 */
 
-/**
- * 重试时间戳"永不"哨兵
- * 统一重试语义见文件头：tick 门槛 now < g_next_retry 在达到此值时永远为真，
- * 即同步终结（仅全量模式完成一次全量后不再有任何动作）
- */
-static const long long REPL_RETRY_NEVER = LLONG_MAX;
-
-static int          g_repl_fd       = -1;   /* master 链路 fd（HANDSHAKE/STREAMING 时有效，其余 -1） */
-static slave_state_t g_state        = SLAVE_IDLE; /* 控制面当前状态 */
-static size_t       g_slave_offset  = 0;    /* 已消费到的 master 绝对 offset（命令边界） */
-static char         g_master_ip[64] = {0};  /* Master IP 地址 */
-static int          g_master_port   = 0;    /* Master 端口 */
-
-static int          g_incr_enabled  = 1;    /* incr_sync off → 只做一次全量 */
-static long long    g_next_retry    = 0;    /* 下一次允许 tick 行动的时间戳（统一语义见文件头） */
+static int          g_incr_enabled    = 1;   /* incr_sync off → 只做一次全量 */
+static long long    g_next_retry      = 0;   /* 下一次允许 tick 行动的时间戳（退避语义见文件头） */
 
 /*=============================================================================
  *  流式回放
@@ -160,7 +150,7 @@ static int slave_replay_stream(int fd, DynBuf *rb, int *r_off) {
 }
 
 /*=============================================================================
- *  握手处理（SLAVE_HANDSHAKE 状态）
+ *  握手处理（待握手：fd>=0 + !handshake_done）
  *  解析 PSYNC 响应，决定进入流式 / 全量 / 重连
  *============================================================================*/
 
@@ -173,9 +163,9 @@ static int slave_replay_stream(int fd, DynBuf *rb, int *r_off) {
  * @return 0 成功（或等待更多数据）
  *
  * 转移：
- * - +CONTINUE  → SLAVE_STREAMING（行后可能夹带 backfill，直接回放）
- * - +FULLRESYNC→ SLAVE_FULLSYNC（关链路，fd 置 -1，tick 走数据面全量）
- * - 意外响应   → SLAVE_IDLE（1s 后重试）
+ * - +CONTINUE  → g_handshake_done=1（流式，行后可能夹带 backfill，直接回放）
+ * - +FULLRESYNC→ 摘链 + 内联数据面全量；全量后 rejudge 仍 +FULLRESYNC → 终结失败
+ * - 意外响应   → 无链路（1s 后重试）
  */
 static int slave_handle_handshake(DynBuf *rb, int *r_off, int *want_close) {
     const char *b = rb->buf + *r_off;
@@ -191,7 +181,8 @@ static int slave_handle_handshake(DynBuf *rb, int *r_off, int *want_close) {
     if (linelen >= 10 && strncmp(b, "+CONTINUE", 9) == 0) {
         *r_off += linelen;
         rb->len -= linelen;   /* 维护不变量：len 为 r_off 起未消费尾部 */
-        g_state = SLAVE_STREAMING;
+        g_handshake_done = 1;
+        g_fullsync_done  = 0;   /* 达成增量基线，清除全量守卫（允许后续再全量） */
         g_next_retry = 0;
         printf("[INCR-SLAVE] +CONTINUE — 流式接收 (offset=%zu)\n",
                g_slave_offset);
@@ -200,22 +191,44 @@ static int slave_handle_handshake(DynBuf *rb, int *r_off, int *want_close) {
 
     /*-----------------------------------------------------------------
      *  +FULLRESYNC：offset 过期，需要全量同步
-     *  续传 offset 以数据面快照 token（g_repl_snapshot_offset）为准，
-     *  全量完成后由 repl_incr_slave_reset_offset 对齐
+     *  全量在握手中内联执行（阻塞）；全量成功后以快照 offset 重新
+     *  PSYNC rejudge——仍失败则终结（同一周期最多一次全量）
      *-----------------------------------------------------------------*/
     if (linelen >= 12 && strncmp(b, "+FULLRESYNC", 11) == 0) {
-        printf("[INCR-SLAVE] +FULLRESYNC — 转全量同步\n");
-        g_state      = SLAVE_FULLSYNC;
-        g_repl_fd    = -1;         /* 提前摘链：on_close 将因 fd 不匹配而早退，保留 FULLSYNC */
-        g_next_retry = 0;          /* 立即可行动：tick 立刻走数据面全量 */
+        /* 全量后的 rejudge 仍失败：backlog 已回绕，全量也追不上 → 终结 */
+        if (g_fullsync_done) {
+            fprintf(stderr,
+                    "[INCR-SLAVE] 全量后 offset 仍超出 backlog，增量同步失败\n");
+            g_repl_fd   = -1;
+            g_sync_done = 1;   /* 终结：tick 入口永久返回 */
+            if (want_close) *want_close = 1;
+            return 0;
+        }
+
+        printf("[INCR-SLAVE] +FULLRESYNC — 执行全量同步\n");
+        g_repl_fd = -1;        /* 提前摘链：on_close 将因 fd 不匹配而早退 */
         if (want_close) *want_close = 1;
+
+        /* 内联执行数据面全量（阻塞，等价原 tick 内的阻塞调用）。
+         * 传输失败可重试（fullsync_done 保持 0）；成功后重新 PSYNC rejudge。 */
+        if (repl_fullsync_slave_start() == 0) {
+            g_fullsync_done = 1;            /* 守卫：本同步周期已做全量 */
+            repl_incr_slave_reset_offset(); /* 对齐到快照 offset */
+            if (!g_incr_enabled) {
+                printf("[INCR-SLAVE] 仅全量模式，同步完成\n");
+                g_sync_done = 1;            /* 终结：只全量不增量 */
+            } else {
+                g_next_retry = 0;           /* tick 立即重连 PSYNC（rejudge） */
+            }
+        } else {
+            g_next_retry = get_time_now() + 1000;  /* 传输失败：1s 后重试 */
+        }
         return 0;
     }
 
     /* 意外的响应 */
     fprintf(stderr, "[INCR-SLAVE] 意外 PSYNC 响应: %.*s\n", linelen, b);
-    g_state      = SLAVE_IDLE;
-    g_repl_fd    = -1;
+    g_repl_fd    = -1;   /* 摘链（两标志位保持 0 → 无链路态） */
     g_next_retry = get_time_now() + 1000;
     if (want_close) *want_close = 1;
     return 0;
@@ -230,8 +243,8 @@ static int slave_handle_handshake(DynBuf *rb, int *r_off, int *want_close) {
  * Slave 端 Master 链路 handler
  *
  * 功能：
- * 1. 握手阶段（SLAVE_HANDSHAKE）：解析 +CONTINUE / +FULLRESYNC
- * 2. 流式阶段（SLAVE_STREAMING）：回放增量命令
+ * 1. 握手未完成（!g_handshake_done）：解析 +CONTINUE / +FULLRESYNC
+ * 2. 握手已完成（g_handshake_done）：回放增量命令
  *
  * @param fd 连接 fd
  * @param rb 读缓冲
@@ -245,14 +258,9 @@ int repl_incr_slave_master_link_handler(int fd, DynBuf *rb, int *r_off,
     (void)wb;
     if (fd != g_repl_fd) return -1;
 
-    switch (g_state) {
-    case SLAVE_HANDSHAKE:
+    if (!g_handshake_done)
         return slave_handle_handshake(rb, r_off, want_close);
-    case SLAVE_STREAMING:
-        return slave_replay_stream(fd, rb, r_off);
-    default:
-        return 0;   /* IDLE/FULLSYNC 态 fd 已置 -1，数据不会到达 */
-    }
+    return slave_replay_stream(fd, rb, r_off);
 }
 
 /*=============================================================================
@@ -296,7 +304,7 @@ static int slave_connect_once(const char *ip, int port) {
 }
 
 /*=============================================================================
- *  连接收养（IDLE → HANDSHAKE）
+ *  连接收养（无链路 → 待握手）
  *  将已连接的 fd 交给引擎，并发送 PSYNC 命令
  *============================================================================*/
 
@@ -305,9 +313,9 @@ static int slave_connect_once(const char *ip, int port) {
  * 握手由 repl_incr_slave_master_link_handler 推进
  */
 static void slave_adopt(int fd) {
-    g_repl_fd    = fd;
-    g_state      = SLAVE_HANDSHAKE;
-    g_next_retry = 0;
+    g_repl_fd        = fd;
+    g_handshake_done = 0;   /* 新链路重新握手 */
+    g_next_retry     = 0;
 
     /* 注册 handler（引擎接管 fd） */
     if (repl_engine_register)
@@ -326,58 +334,26 @@ static void slave_adopt(int fd) {
 
 /*=============================================================================
  *  事件循环 Tick（引擎每轮调用）
- *  按状态推进：FULLSYNC 数据面交接 / IDLE 连接与重连
+ *  无链路时推进：连接 / 重连（全量在握手内联完成，tick 不感知）
  *============================================================================*/
 
 /**
  * Slave 端 Tick（引擎每轮事件循环调用）
  *
- * 行动门槛：只有无链路（IDLE/FULLSYNC）且过了重试时间戳才推进；
- * 链路已建立（HANDSHAKE/STREAMING）时 tick 不做事，等引擎事件。
+ * 行动门槛：非终结（!g_sync_done）、无链路（g_repl_fd < 0）且过了重试时间戳才推进；
+ * 链路已建立（g_repl_fd >= 0）时 tick 不做事，等引擎事件。
  */
 void repl_incr_slave_tick(void) {
-    if (g_master_ip[0] == '\0') return;   /* 未配置 Master */
-
-    switch (g_state) {
-    case SLAVE_HANDSHAKE:
-    case SLAVE_STREAMING:
-        return;                          /* 链路已建立，等引擎事件 */
-    case SLAVE_IDLE:
-    case SLAVE_FULLSYNC:
-        break;                           /* 无链路：往下推进 */
-    }
+    if (g_sync_done || g_master_ip[0] == '\0') return;  /* 终结 / 未配置 Master */
+    if (g_repl_fd >= 0) return;                         /* 链路已建立，等引擎事件 */
 
     long long now = get_time_now();
-    if (now < g_next_retry) return;      /* 退避中 / 终结（REPL_RETRY_NEVER） */
-
-    /*-------------------------------------------------------------------------
-     *  FULLSYNC 交接：由 +FULLRESYNC 握手置位，tick 走数据面全量
-     *  incr_sync off 时 master 无 backlog → 一律 +FULLRESYNC → 一次全量后终结
-     *-------------------------------------------------------------------------*/
-    if (g_state == SLAVE_FULLSYNC) {
-        fprintf(stderr, "[INCR-SLAVE] 全量同步...\n");
-
-        /* 数据面端口接收并加载快照（阻塞式，见 repl_fullsync.c） */
-        if (repl_fullsync_slave_start() == 0) {
-            repl_incr_slave_reset_offset();  /* 对齐到快照 offset */
-            /* 仅全量模式（incr off）：一次全量后终结，不建增量链路 */
-            if (!g_incr_enabled) {
-                printf("[INCR-SLAVE] 仅全量模式，同步完成\n");
-                g_next_retry = REPL_RETRY_NEVER;  /* 终结：tick 永久退避 */
-                return;
-            }
-            /* 增量模式：以快照 offset 重新 PSYNC 续连 */
-            g_state = SLAVE_IDLE;
-            g_next_retry = 0;
-        } else {
-            g_next_retry = now + 1000;   /* 失败：保留 FULLSYNC，1s 后重试 */
-            return;
-        }
-    }
+    if (now < g_next_retry) return;                     /* 退避中 */
 
     /*-------------------------------------------------------------------------
      *  IDLE：连接 Master 并发送 PSYNC
-     *  首次发送 PSYNC 0；全量完成后以快照 offset 续连
+     *  首次发送 PSYNC 0；全量后以快照 offset 续连（rejudge）
+     *  全量在握手内联完成，tick 不感知（见 slave_handle_handshake）
      *-------------------------------------------------------------------------*/
     int fd = slave_connect_once(g_master_ip, g_master_port);
     if (fd < 0) {
@@ -390,7 +366,7 @@ void repl_incr_slave_tick(void) {
 }
 
 /*=============================================================================
- *  连接关闭回调（STREAMING/HANDSHAKE → IDLE）
+ *  连接关闭回调（链路断开 → 无链路，安排重连）
  *============================================================================*/
 
 /**
@@ -402,9 +378,9 @@ void repl_incr_slave_tick(void) {
 void repl_incr_slave_on_close(int fd) {
     if (fd != g_repl_fd) return;
     printf("[INCR-SLAVE] master link fd=%d closed\n", fd);
-    g_repl_fd    = -1;
-    g_state      = SLAVE_IDLE;
-    g_next_retry = get_time_now() + 1000;   /* 1s 后重连（offset 保留，只到命令边界） */
+    g_repl_fd         = -1;
+    g_handshake_done  = 0;
+    g_next_retry      = get_time_now() + 1000;   /* 1s 后重连（offset 保留，只到命令边界） */
 }
 
 /*=============================================================================
@@ -430,7 +406,10 @@ int repl_incr_slave_start(const char *master_ip, int master_port) {
     snprintf(g_master_ip, sizeof(g_master_ip), "%s", master_ip);
     g_master_port        = master_port;
     g_incr_enabled       = kvs_config.incr_sync;  /* off → 一次全量后终结 */
-    g_state              = SLAVE_IDLE;   /* 全量一律由 +FULLRESYNC 握手触发（Redis 模型） */
+    g_repl_fd            = -1;           /* 无链路 */
+    g_handshake_done     = 0;
+    g_fullsync_done      = 0;            /* 守卫清零：允许首次全量 */
+    g_sync_done          = 0;            /* 终结清零 */
     g_next_retry         = 0;
     return 0;
 }

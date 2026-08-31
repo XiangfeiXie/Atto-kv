@@ -52,17 +52,28 @@
  *    · 每轮循环 → repl_tick   （slave 连接 / 重连 / 全量交接推进）
  *    · 连接释放 → repl_on_close（master：清理 streaming 从库 / slave：安排重连）
  *
- *  Slave 侧状态（4 态，详见 repl_incr_slave.c）：
- *    IDLE ──tick: 连接成功/adopt──> HANDSHAKE ──+CONTINUE──> STREAMING
- *     │  ↑                            │                          │
- *     │  └── on_close: 断开（offset 保留，1s 重试）──────────────┘
- *     └── tick: 连接失败（1s 重试）
- *    HANDSHAKE ──+FULLRESYNC──> FULLSYNC ──tick: 数据面全量成功──> IDLE（重连）
- *                                         │       └─ incr off: retry=NEVER 终结
- *                                         └──失败: 保留 FULLSYNC 重试
+ *  Slave 侧状态（链路存在性 + 标志位，无独立枚举，详见 repl_incr_slave.c）：
+ *    链路存在性由 g_repl_fd 表达，子状态由 g_handshake_done / g_fullsync_done /
+ *    g_sync_done 区分：
+ *      fd>=0 + !handshake_done     → 待握手（等 +CONTINUE / +FULLRESYNC）
+ *      fd>=0 +  handshake_done     → 流式回放
+ *      fd<0  +  !sync_done         → 待连接 / 重连
+ *      g_sync_done=1               → 终结（仅全量完成 / 全量后 rejudge 失败）
  *
- *  终结由统一重试时间戳表达：tick 门槛 now < g_next_retry 配合
- *  REPL_RETRY_NEVER（LLONG_MAX）即永久退避（仅全量模式完成一次后）
+ *    转移：
+ *      待握手  --+CONTINUE--> 流式回放（fullsync_done 清零）
+ *      待握手  --+FULLRESYNC（fullsync_done=0）--> 摘链 + 内联数据面全量
+ *               ├─ 全量成功，incr on --> 无链路（fullsync_done=1，重连 rejudge）
+ *               ├─ 全量成功，incr off--> g_sync_done 终结（仅全量模式）
+ *               └─ 全量失败--> 无链路（fullsync_done 保持 0，1s 重试）
+ *      待握手  --+FULLRESYNC（fullsync_done=1，全量后 rejudge 仍失败）
+ *               --> g_sync_done 终结（增量同步失败，断开）
+ *      待握手  --意外响应--> 无链路（1s 后重试）
+ *      流式回放 --on_close: 断开--> 无链路（offset 保留，1s 重试）
+ *
+ *  终结由 g_sync_done 标志表达：仅全量模式完成 / 全量后 rejudge 失败，
+ *  tick 入口直接返回，不再连接。统一重试时间戳 g_next_retry 只承担退避：
+ *  now < g_next_retry 时 tick 不行动（初始 / 续传 = 0，立即可行动）。
  *
  *  Master 侧（单 streaming 从库，g_slave.fd >= 0 即 streaming）：
  *    无从库 ──PSYNC 决策点（offset 在 backlog 窗口内且 incr on）──> +CONTINUE
@@ -73,7 +84,8 @@
  *  交接契约（跨平面）：
  *    +CONTINUE   → 控制面流式回放（backlog 补发 + 实时命令流推送）
  *    +FULLRESYNC → 数据面 RDB 全量；流头 token（g_repl_snapshot_offset）
- *                  为权威续传 offset，从库复位后重新 PSYNC 续连
+ *                  为权威续传 offset，从库复位后重新 PSYNC 续连；
+ *                  续连若再次 +FULLRESYNC（backlog 已回绕）→ 增量同步失败终结
  *============================================================================*/
 
 #include "repl_fullsync.h"    /* 全量同步编排（Master/Slave 全量流程） */
@@ -260,7 +272,7 @@ void repl_incr_master_on_close(int fd);
  *
  * 功能：
  * 1. 记录 Master 地址（IP + 端口）
- * 2. 首次全量 + 连接由 tick 统一推进（非阻塞）
+ * 2. 连接由 tick 推进；全量在 PSYNC 握手内联完成（见 repl_incr_slave.c）
  *
  * @param master_ip Master IP 地址
  * @param master_port Master 端口

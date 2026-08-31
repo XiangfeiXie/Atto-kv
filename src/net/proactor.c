@@ -29,12 +29,13 @@
  *  4. event 掩码分别记录 recv/send 在飞（仅 master 流式推送路径两者并存）
  *============================================================================*/
 
-/* CQE user_data 编码：(fd << 2) | op
- * 用 op 位区分完成的是读还是写（master 流式推送路径两者并存）
- * accept 沿用裸 g_listen_fd（无 op 位） */
+/* CQE user_data 编码：高 32 位 = 完成类型，低 32 位 = fd
+ * 显式类型区分 accept/recv/send，无需再与监听 fd 比对
+ * 0 保留：io_uring 超时 CQE 的 user_data 为 0，落在 fd 0 空槽被 inactive 拦下 */
 enum {
-    OP_RECV = 0,    /* 读操作完成 */
-    OP_SEND = 1     /* 写操作完成 */
+    TYPE_RECV   = 1,   /* 读操作完成 */
+    TYPE_SEND   = 2,   /* 写操作完成 */
+    TYPE_ACCEPT = 3    /* accept 完成 */
 };
 
 /* conn_t.event 在飞掩码：recv 与 send 可并存
@@ -106,22 +107,6 @@ static int conn_pool_init(int max_clients) {
 }
 
 /**
- * 复位连接槽位以复用
- * 保留 read/write 缓冲的底层分配（buf/cap 保留、len 清零）
- * 避免在 accept 热路径上反复创建/销毁缓冲
- */
-static void conn_reset_slot(conn_t *c) {
-    /* 保存缓冲内存指针和容量 */
-    char *rb = c->read_buf.buf, *wb = c->write_buf.buf;
-    int   rc = c->read_buf.cap,  wc = c->write_buf.cap;
-
-    /* 清零整个结构体（保留缓冲内存） */
-    memset(c, 0, sizeof(*c));
-    c->read_buf.buf  = rb;  c->read_buf.cap  = rc;
-    c->write_buf.buf = wb;  c->write_buf.cap = wc;
-}
-
-/**
  * 释放连接
  * 幂等设计：repl 交接时可能重复释放，通过 active 标记保护
  * @param fd 连接文件描述符
@@ -134,8 +119,12 @@ static void conn_release(int fd) {
     /* 先通知 repl 清理该连接的状态（普通客户端是 no-op，内部按角色判断） */
     repl_on_close(fd);
 
-    /* 复位槽位并关闭 socket */
-    conn_reset_slot(c);
+    /* 复位槽位并关闭 socket（保留 read/write 缓冲底层内存，避免 accept 热路径反复 malloc） */
+    char *rb = c->read_buf.buf, *wb = c->write_buf.buf;
+    int   rc = c->read_buf.cap,  wc = c->write_buf.cap;
+    memset(c, 0, sizeof(*c));
+    c->read_buf.buf  = rb;  c->read_buf.cap  = rc;
+    c->write_buf.buf = wb;  c->write_buf.cap = wc;
     close(fd);
 }
 
@@ -161,61 +150,37 @@ static void conn_pool_destroy(void) {
  *============================================================================*/
 
 /**
- * 确保读缓冲有至少 4KB 可用空间
- * 策略：先回收已消费的前缀（memmove），不够再翻倍扩容
- * @param c 连接对象
- * @return 可用写空间大小，无法扩容时返回 -1
- */
-static ssize_t ensure_read_space(conn_t *c) {
-    DynBuf *rb = &c->read_buf;
-    size_t tail  = (size_t)(c->r_off + rb->len);  /* 当前写入位置 */
-    size_t avail = (size_t)rb->cap - tail;         /* 剩余可用空间 */
-
-    /* 空间充足直接返回 */
-    if (avail >= 4096)
-        return (ssize_t)avail;
-
-    /* 有已消费前缀且缓冲非空：压缩缓冲，回收空间 */
-    if (c->r_off > 0 && rb->len > 0) {
-        memmove(rb->buf, rb->buf + c->r_off, (size_t)rb->len);
-        tail    = (size_t)rb->len;
-        c->r_off = 0;
-        avail   = (size_t)rb->cap - tail;
-    }
-    if (avail >= 4096)
-        return (ssize_t)avail;
-
-    /* 空间仍不足：扩容（翻倍策略） */
-    size_t new_cap = rb->cap ? (size_t)rb->cap * 2 : KVS_NET_BUF_INIT;
-    if (new_cap > KVS_NET_BUF_MAX) return -1;     /* 超过上限 */
-    char *new_buf = realloc(rb->buf, new_cap);
-    if (!new_buf) return -1;
-    rb->buf = new_buf;
-    rb->cap = (int)new_cap;
-    return (ssize_t)(new_cap - tail);
-}
-
-/**
  * 提交 recv SQE（非阻塞）
+ * 先确保读缓冲有可用空间（已满则翻倍扩容，与 reactor 一致）；
+ * 读缓冲不压缩已消费前缀，命令完整消费后由 handle_read 归零 r_off，
+ * 慢速滴灌下由 KVS_NET_BUF_MAX 上限兜底
  * @param c 连接对象
- * @return 0 成功，-1 失败
+ * @return 0 成功，-1 失败（缓冲超限/无 SQE）
  */
 static int arm_recv(conn_t *c) {
     /* 前置检查：连接活跃、未在飞、未标记关闭 */
     if (!c->active || (c->event & EV_RECV) || c->status)
         return 0;
 
-    /* 确保读缓冲有足够空间 */
-    ssize_t avail = ensure_read_space(c);
-    if (avail < 0) return -1;
-    size_t tail = (size_t)(c->r_off + c->read_buf.len);
+    /* 读缓冲当前写入位置；空间不足则翻倍扩容 */
+    DynBuf *rb = &c->read_buf;
+    size_t tail = (size_t)(c->r_off + rb->len);
+    if (tail >= (size_t)rb->cap) {
+        size_t new_cap = rb->cap ? (size_t)rb->cap * 2 : KVS_NET_BUF_INIT;
+        if (new_cap > KVS_NET_BUF_MAX) return -1;
+        char *new_buf = realloc(rb->buf, new_cap);
+        if (!new_buf) return -1;
+        rb->buf = new_buf;
+        rb->cap = (int)new_cap;
+    }
+    size_t avail = (size_t)rb->cap - tail;
 
     /* 获取 SQE 并提交 recv 请求 */
     struct io_uring_sqe *sqe = io_uring_get_sqe(&g_ring);
     if (!sqe) return -1;
 
-    io_uring_prep_recv(sqe, c->fd, c->read_buf.buf + tail, (size_t)avail, 0);
-    sqe->user_data = (uint64_t)(uint32_t)c->fd << 2 | OP_RECV;
+    io_uring_prep_recv(sqe, c->fd, rb->buf + tail, avail, 0);
+    sqe->user_data = ((uint64_t)TYPE_RECV << 32) | (uint32_t)c->fd;
     c->event |= EV_RECV; /* 标记在飞 */
     return 0;
 }
@@ -237,7 +202,7 @@ static int arm_send(conn_t *c) {
     io_uring_prep_send(sqe, c->fd,
                        c->write_buf.buf + c->w_off,
                        (size_t)c->write_buf.len, MSG_NOSIGNAL);
-    sqe->user_data = (uint64_t)(uint32_t)c->fd << 2 | OP_SEND;
+    sqe->user_data = ((uint64_t)TYPE_SEND << 32) | (uint32_t)c->fd;
     c->event |= EV_SEND; /* 标记在飞 */
     return 0;
 }
@@ -250,7 +215,7 @@ static int arm_accept(void) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&g_ring);
     if (!sqe) return -1;
     io_uring_prep_accept(sqe, g_listen_fd, NULL, NULL, SOCK_NONBLOCK);
-    sqe->user_data = (uint64_t)(uint32_t)g_listen_fd;  /* 裸 fd，无 op 位 */
+    sqe->user_data = ((uint64_t)TYPE_ACCEPT << 32) | (uint32_t)g_listen_fd;
     return 0;
 }
 
@@ -425,21 +390,23 @@ static void handle_write(conn_t *c, int res) {
  * CQE 分发器：根据 user_data 区分 accept/recv/send
  */
 static void handle_cqe(struct io_uring_cqe *cqe) {
-    uint32_t ud = (uint32_t)cqe->user_data;
+    /* 解码：高 32 位类型，低 32 位 fd */
+    uint64_t ud   = cqe->user_data;
+    uint32_t type = (uint32_t)(ud >> 32);
+    int      fd   = (int)(uint32_t)ud;
 
-    /* accept 完成：user_data == listen_fd（无 op 位） */
-    if (ud == (uint32_t)g_listen_fd) {
+    /* accept 完成（低 32 位为监听 fd，此处不使用） */
+    if (type == TYPE_ACCEPT) {
         handle_accept(cqe);
         return;
     }
 
-    /* 普通连接：解码 fd 和 op */
-    int fd = (int)(ud >> 2);
+    /* 普通连接：校验 fd 后按类型分发 */
     if (fd < 0 || fd >= conn_pool_size) return;
     conn_t *c = &conn_pool[fd];
     if (!c->active) return;
 
-    if ((ud & 3) == OP_SEND)
+    if (type == TYPE_SEND)
         handle_write(c, cqe->res);
     else
         handle_read(cqe, c);

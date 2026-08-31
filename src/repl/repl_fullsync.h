@@ -6,7 +6,7 @@
  *  设计原则：
  *  1. 传输无关：具体传输方式（sendfile/RDMA）由内部按配置分派
  *  2. 上层逻辑：fork 传输子进程、PSYNC +FULLRESYNC 触发、从库全量流程
- *  3. 子进程回收：通过持久化模块的统一 SIGCHLD 机制（kvs_child_reap_*）
+ *  3. 子进程回收：全局 SIGCHLD handler 回收（无派发框架）
  *  4. 与增量模块配合：全量同步后记录快照偏移，增量模块据此续传
  *============================================================================*/
 
@@ -44,37 +44,19 @@ extern size_t g_repl_snapshot_offset;
  *============================================================================*/
 
 /**
- * 启动 Master 全量同步服务
- *
- * 功能：
- * 1. 安装子进程回收机制（统一 SIGCHLD handler）
- * 2. 注册本模块的子进程回收回调
- *
- * 调用时机：服务器启动时，且 repl_role == MASTER
- *
- * @return 0 成功，-1 失败
- *
- * 注意：
- * - SIGCHLD 由持久化模块统一安装（kvs_child_reap_init）
- * - 本模块只需注册回调（kvs_child_reap_register）
- * - 回调由统一 handler 用 waitpid(-1) 回收后通知
- */
-int repl_fullsync_master_start(void);
-
-/**
  * 触发 Master 全量同步（PSYNC 握手判定 +FULLRESYNC 时）
  *
  * 功能：
- * 1. 清理上一轮残留子进程
+ * 1. 清理上一轮残留子进程（kill + waitpid）
  * 2. fork 传输子进程，内部按配置分派 sendfile / RDMA 发送 RDB 快照
  *
  * 调用时机：PSYNC 握手 offset 过期回 +FULLRESYNC 时
  *
- * @return 0 成功（或已触发），-1 失败
+ * @return 0 成功，-1 失败
  *
  * 限制：
  * - 同时只运行一个全量同步传输子进程
- * - 子进程由统一 SIGCHLD 回收
+ * - 子进程回收：全局 SIGCHLD handler
  */
 int repl_fullsync_master_trigger(void);
 

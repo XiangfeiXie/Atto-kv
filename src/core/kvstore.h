@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <signal.h>       /* sig_atomic_t：g_kvs_stop */
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "dynbuf.h"       /* DynBuf：msg_handler / 回复接口 */
@@ -143,6 +144,21 @@ long long get_time_now_real(void);
  */
 void update_cached_time(void);
 
+/**
+ * 单调时钟当前时刻（纳秒）
+ * CLOCK_MONOTONIC：vDSO 用户态读取，不陷入内核；单调时钟不受
+ * NTP / 校时跳变影响，适合耗时测量
+ * 传输层计时（sendfile.c / rdma.c / rdma_transport.c）统一走这里，
+ * 替代各文件重复的 clock_gettime + 手工换算
+ * 注意：单调时钟（相对时刻），不是墙钟；需要 epoch 时间戳请用 get_time_now()
+ */
+static inline uint64_t now_monotonic_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 /*=============================================================================
  *  命令分发
  *============================================================================*/
@@ -182,6 +198,7 @@ void kvs_flush_all(void);
 extern int g_in_reload;
 
 extern long long        g_kvs_start_time_ms;         /* 启动时间戳（只读） */
+extern uint64_t get_used_mem(void);                  /* allocator 存活分配字节（INFO used_memory） */
 
 /*=============================================================================
  *  复制 ↔ 引擎 访问接口

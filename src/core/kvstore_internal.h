@@ -114,4 +114,11 @@ void active_expire_cycle(void);
 /* CONFIG 伪装包命令处理函数（只应答 redis-benchmark 启动探测的 GET） */
 dispatch_result_t handle_config(kvs_token_t *tokens, int argc, DynBuf *wb);
 
+/*=============================================================================
+ *  kvstore_info.c 提供的接口
+ *============================================================================*/
+
+/* INFO 命令处理函数（最小实现，只回 memory 段 used_memory） */
+dispatch_result_t handle_info(kvs_token_t *tokens, int argc, DynBuf *wb);
+
 #endif /* KVSTORE_INTERNAL_H */

@@ -4,19 +4,18 @@
  *  职责：
  *  1. Master 端：fork 传输子进程，发送 RDB 快照
  *  2. Slave 端：由 PSYNC +FULLRESYNC 握手触发，经数据面端口接收并加载快照
- *  3. 子进程回收：单传输子进程 + 统一 SIGCHLD 回收
+ *  3. 子进程回收：全局 SIGCHLD handler 回收（单传输子进程）
  *  4. 传输分派：按 fullsync_transport 配置选择 sendfile / RDMA 实现
  *
  *  设计原则：
  *  1. 一主一从：至多一个传输子进程存活（原 session 管理简化）
- *  2. 子进程回收：通过持久化模块统一 SIGCHLD 机制
+ *  2. 子进程回收：全局 SIGCHLD handler 防僵尸，trigger 非阻塞 kill 清理
  *  3. 传输分派：fullsync_server_run / fullsync_client_run 按配置开关直选
  *  4. 快照偏移量：流头 token 传递给增量模块续传
  *============================================================================*/
 
 #include "repl_fullsync.h"
 #include "repl.h"
-#include "persistence.h"
 #include "kvstore.h"
 #include "sendfile.h"
 #include "rdma.h"
@@ -26,7 +25,6 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
-#include <sys/wait.h>
 
 /*=============================================================================
  *  全局状态
@@ -45,37 +43,10 @@
 size_t g_repl_snapshot_offset = 0;
 
 /**
- * 当前传输子进程 PID
- * 一主一从：至多一个传输子进程存活
- *
- * 使用 volatile sig_atomic_t：
- * - 被 SIGCHLD 处理器读写
- * - 保证原子性
+ * 当前传输子进程 PID（一主一从：至多一个传输子进程存活）
+ * 回收方式：全局 SIGCHLD handler 回收；trigger 只做残留进程 kill 清理
  */
-static volatile sig_atomic_t g_child = -1;
-
-/*=============================================================================
- *  子进程回收
- *  由持久化模块统一 SIGCHLD 处理器分发调用
- *============================================================================*/
-
-/**
- * 子进程回收回调
- *
- * 功能：
- * 1. 匹配当前传输子进程 PID → 清 g_child
- * 2. 记录子进程退出状态（正常退出或信号终止）
- *
- * 调用上下文：异步信号上下文（SIGCHLD handler）
- * 限制：只能读 pid、写 sig_atomic_t、打日志
- */
-static void repl_child_reap(pid_t pid, int status) {
-    if (pid == g_child) g_child = -1;
-    if (WIFEXITED(status))
-        printf("[REPL] child %d exit=%d\n", pid, WEXITSTATUS(status));
-    else if (WIFSIGNALED(status))
-        fprintf(stderr, "[REPL] child %d signal=%d\n", pid, WTERMSIG(status));
-}
+static pid_t g_child = -1;
 
 /*=============================================================================
  *  传输分派（原 transport.c）
@@ -117,66 +88,43 @@ static int fullsync_client_run(uint64_t *out_token) {
  *============================================================================*/
 
 /**
- * 启动 Master 全量同步服务
- * 安装统一 SIGCHLD handler 并注册本模块回收回调
- */
-int repl_fullsync_master_start(void) {
-    kvs_child_reap_init();           /* 安装统一 SIGCHLD handler（幂等） */
-    kvs_child_reap_register(repl_child_reap);  /* 注册本模块回调 */
-    return 0;
-}
-
-/**
  * 触发 Master 全量同步（PSYNC 握手判定 +FULLRESYNC 时）
  *
  * 流程：
- * 1. 清理上一轮残留子进程（避免占着数据面端口）
- * 2. 创建管道（父子进程通信）
- * 3. fork 传输子进程
- * 4. 子进程调用 fullsync_server_run 发送快照
- * 5. 父进程等待子进程就绪信号
+ * 1. 清理上一轮残留子进程（非阻塞 kill，占数据面端口的旧进程直接终止）
+ * 2. fork 传输子进程发送快照
+ *
+ * 不等待子进程就绪（ready_fd=-1）也不阻塞回收：
+ * - slave 数据面连接有重试兜底
+ * - 子进程退出由全局 SIGCHLD handler 回收
+ * - 避免事件循环被 RDMA 慢初始化（可长达数秒）阻塞
  *
  * @return 0 成功，-1 失败
  */
 int repl_fullsync_master_trigger(void) {
-    /* 清理上一轮残留子进程
-     * 先快照到局部变量，避免 handler 把 g_child 清成 -1 后误伤 kill(-1, ...)
-     * 防死锁：先 SIGTERM 再 SIGKILL */
-    pid_t old = (pid_t)g_child;
+    /* 清理上一轮残留子进程（非阻塞，不阻塞主循环）：
+     * 已退出（SIGCHLD handler 已回收）→ kill 返回 ESRCH 跳过；
+     * 仍存活 → SIGKILL 终止，socket 由内核释放，
+     * 新子进程 bind 竞态由 slave 数据面重试兜底 */
+    pid_t old = g_child;
     if (old > 0) {
-        kill(old, SIGTERM);
-        usleep(50000);  /* 50ms */
-        if (kill(old, 0) == 0) {  /* 进程仍在运行 */
+        if (kill(old, 0) == 0)   /* 仍存活才需要终止 */
             kill(old, SIGKILL);
-            usleep(50000);
-        }
+        g_child = -1;
     }
-
-    /* 创建管道：子进程就绪后通过管道通知父进程 */
-    int pipefd[2];
-    if (pipe(pipefd) < 0) { perror("pipe"); return -1; }
 
     /* fork 传输子进程 */
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
-        close(pipefd[0]); close(pipefd[1]);
         return -1;
     }
 
     if (pid == 0) {
-        /* 子进程：关闭管道读端，执行传输 */
-        close(pipefd[0]);
-        _exit(fullsync_server_run(repl_backlog_offset(), pipefd[1]));
+        _exit(fullsync_server_run(repl_backlog_offset(), -1));  /* 无就绪管道 */
     }
 
-    /* 父进程：关闭管道写端，等待子进程就绪 */
-    close(pipefd[1]);
-    char ready;
-    if (read(pipefd[0], &ready, 1) < 0) perror("read pipe");
-    close(pipefd[0]);
-
-    g_child = (sig_atomic_t)pid;
+    g_child = pid;
     return 0;
 }
 

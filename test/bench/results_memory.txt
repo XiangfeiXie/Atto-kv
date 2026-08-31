@@ -1,0 +1,8 @@
+bench_memory — 2026-08-30 11:47:30
+N=1000000 keys  V=16 B  release_wait=15s  (峰值=填充后 VmHWM; 返回率=FLUSHALL 后内存归还比例)
+
+  allocator | 基线(kB) | 峰值(kB) |  used(kB) | 峰值/key(B) | 释放后(kB) | 返回率%
+  jemalloc |      5856 |     78852 |     71636 |        74.7 |       8156 |      97
+  glibc    |      2728 |     89112 |     87084 |        88.5 |      80916 |       9
+
+结论: jemalloc 峰值/key 比 glibc 低 15.6%; 返回率 97% vs 9%

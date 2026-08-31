@@ -113,8 +113,7 @@ int sendfile_server_run(uint64_t token, int ready_fd) {
      *  4. 执行 RDB 保存（同步方式）
      *     计时开始（与 RDMA 路径对齐，便于性能对比）
      *-------------------------------------------------------------------------*/
-    struct timespec t1, t2; 
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint64_t t1 = now_monotonic_ns();
 
     printf("[sendfile] SAVE ...\n");
     rdb_save_sync();
@@ -156,7 +155,10 @@ int sendfile_server_run(uint64_t token, int ready_fd) {
         goto out; 
     }
 
-    /* 6c. sendfile 零拷贝发送数据（循环发送） */
+    /* 6c. sendfile 零拷贝发送数据（循环发送）
+     *     xfer 计时从 t1(rdb_save_sync 之前)起算, 即含落盘+传输。
+     *     落盘是 sendfile 路径的固有耗时(序列化并写 dump.rdb); RDMA 无落盘
+     *     (内存直序列化), 同键 xfer 对比才能体现两端到端差异 */
     off_t off = 0;
     size_t remaining = (size_t)file_size;
     size_t sent = 0;
@@ -172,13 +174,14 @@ int sendfile_server_run(uint64_t token, int ready_fd) {
         remaining -= (size_t)n;
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &t2);
+    uint64_t t2 = now_monotonic_ns();
 
-    /* 统计传输性能 */
-    double ms = (t2.tv_sec - t1.tv_sec) * 1000.0 + 
-                (t2.tv_nsec - t1.tv_nsec) / 1e6;
-    double mbps = (ms > 0) ? ((double)sent / (ms / 1000.0) / (1024.0 * 1024.0)) : 0;
-    printf("[sendfile] xfer-end: bytes=%zu ms=%.1f mbps=%.2f\n", sent, ms, mbps);
+    /* 统计传输性能
+     * xfer = 落盘+传输耗时(从 t1 起算), mbps 按此计算;
+     * 与 RDMA 的 xfer=(纯直写, 无落盘) 同键对比 */
+    double xfer_ms = (t2 > t1) ? (double)(t2 - t1) / 1e6 : 0.0;
+    double mbps    = (xfer_ms > 0) ? ((double)sent / (xfer_ms / 1000.0) / (1024.0 * 1024.0)) : 0;
+    printf("[sendfile] xfer-end: bytes=%zu xfer=%.1f mbps=%.2f\n", sent, xfer_ms, mbps);
 
 out:
     close(fd); 
@@ -326,10 +329,9 @@ int sendfile_client_run(uint64_t *out_token) {
         return -1; 
     }
 
-    struct timespec t1, t2; 
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint64_t t1 = now_monotonic_ns();
     ssize_t got = recv_all(fd, tfd, (size_t)fsz);
-    clock_gettime(CLOCK_MONOTONIC, &t2);
+    uint64_t t2 = now_monotonic_ns();
     close(fd); 
     close(tfd);
 
@@ -344,12 +346,11 @@ int sendfile_client_run(uint64_t *out_token) {
         return -1;
     }
 
-    /* 传输性能统计 */
-    double ms = (t2.tv_sec - t1.tv_sec) * 1000.0 + 
-                (t2.tv_nsec - t1.tv_nsec) / 1e6;
+    /* 传输性能统计 (接收端 ms 即纯 recv 耗时, xfer 与主/从端格式对齐) */
+    double ms = (t2 > t1) ? (double)(t2 - t1) / 1e6 : 0.0;
     double mbps = (ms > 0) ? ((double)fsz / (ms / 1000.0) / (1024.0 * 1024.0)) : 0;
-    printf("[sendfile] xfer-end: bytes=%lu ms=%.1f mbps=%.2f\n",
-           (unsigned long)fsz, ms, mbps);
+    printf("[sendfile] xfer-end: bytes=%lu ms=%.1f xfer=%.1f mbps=%.2f\n",
+           (unsigned long)fsz, ms, ms, mbps);
 
     /*-------------------------------------------------------------------------
      *  6. mmap + 加载 RDB 数据

@@ -18,14 +18,21 @@
 #define _GNU_SOURCE
 #include "rdma.h"
 #include "rdma_transport.h"
-#include "kvstore.h"
-#include "kv_dict.h"
-#include "persistence.h"
+#include "config.h"       /* kvs_config */
+#include "kv_dict.h"      /* g_dict / dict_reserve / dict_clear */
+#include "persistence.h"  /* rdb_serialize_* / rdb_load_stream_* */
+#include "kvstore.h"      /* now_monotonic_ns */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <endian.h>      /* htobe64 / be64toh */
+
+/*=============================================================================
+ *  工具
+ *============================================================================*/
+
+#define RDB_STREAM_HDR_LEN  4   /* RDB 流头：key_count uint32（序列化器先写 4B 头部） */
 
 /*=============================================================================
  *  入口
@@ -35,9 +42,8 @@
  * RDMA 服务端入口
  *
  * 流程：
- * 1. rdma_xport_server_accept：监听 + 接受连接 + 收对端缓冲凭证
- * 2. 整个 RDB 序列化进暂存块（头 + key_count + entries）
- * 3. rdma_xport_send：分块流水线推送（内部含完成排空）
+ * 1. 整个 RDB 序列化进调用方自持的暂存块（流头 + key_count + entries）
+ * 2. rdma_xport_send：监听 + 接受 + 分块流水线推送（内部含完成排空）
  *
  * @param token 快照 offset（会话元数据）
  * @param ready_fd 就绪管道 fd：监听成功后写 1 字节通知父进程
@@ -50,27 +56,26 @@ int rdma_server_run(uint64_t token, int ready_fd)
     if (!strcmp(ip, "0.0.0.0"))
         ip = NULL;
 
-    rdma_xport_t *xport = rdma_xport_server_accept(ip,
-                                                   kvs_config.fullsync_port,
-                                                   ready_fd);
-    if (!xport)
+    /* 先建连接：监听必须在对端连接之前就绪。大快照序列化耗时数百 ms,
+     * 若后起监听, 对端 REQ 落在监听就绪前会被丢弃、rdma_connect 永远
+     * 等不到事件, 双方挂死。因此 conn_open 先行, 再序列化, 最后直写 */
+    rdma_xport_conn_t *conn = NULL;
+    uint64_t t0 = now_monotonic_ns();   /* 连接建立计时起点 */
+    if (rdma_xport_conn_open(ip, kvs_config.fullsync_port, ready_fd, &conn) < 0)
         return -1;
+    uint64_t t1 = now_monotonic_ns();   /* 连接就绪: xfer 从此起算(序列化+直写, 不含连接建立) */
 
-    printf("[rdma] xfer-begin\n");
-    struct timespec t1;
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-
-    size_t capacity = 0;
-    char *dst = rdma_xport_send_buf(xport, &capacity);
-    if (!dst) {
-        fprintf(stderr, "[rdma] no send buffer\n");
-        rdma_xport_destroy(xport);
+    /* 发送暂存块（调用方自持，整份快照序列化目标） */
+    char *buf = malloc(RDMA_BUF_SIZE);
+    if (!buf) {
+        fprintf(stderr, "[rdma] malloc(%zu) failed\n", (size_t)RDMA_BUF_SIZE);
+        rdma_xport_conn_close(conn);
         return -1;
     }
 
     /* 快照流头：仅 token（快照 offset），数据长度由 RDB 流头 key_count 自描述 */
     struct batch_hdr bh = { .token = htobe64(token) };
-    memcpy(dst, &bh, sizeof(bh));
+    memcpy(buf, &bh, sizeof(bh));
     size_t off = sizeof(bh);
 
     /* 流式序列化整个 RDB 写入暂存块 */
@@ -79,12 +84,9 @@ int rdma_server_run(uint64_t token, int ready_fd)
     rdb_serialize_begin(&rs);
     while (1) {
         int done = 0;
-        struct timespec s1, s2;
-        clock_gettime(CLOCK_MONOTONIC, &s1);
-        size_t n = rdb_serialize_next(&rs, dst + off, capacity - off, &done);
-        clock_gettime(CLOCK_MONOTONIC, &s2);
-        prep_ns += (uint64_t)(s2.tv_sec - s1.tv_sec) * 1000000000ULL
-                 + (uint64_t)(s2.tv_nsec - s1.tv_nsec);
+        uint64_t s1 = now_monotonic_ns();
+        size_t n = rdb_serialize_next(&rs, buf + off, RDMA_BUF_SIZE - off, &done);
+        prep_ns += now_monotonic_ns() - s1;
         off += n;
 
         if (done)
@@ -92,39 +94,32 @@ int rdma_server_run(uint64_t token, int ready_fd)
         if (n == 0) {
             fprintf(stderr,
                     "[rdma] snapshot exceeds transport buffer (%zu B), aborting\n",
-                    capacity);
+                    (size_t)RDMA_BUF_SIZE);
             rdb_serialize_end(&rs);
-            rdma_xport_destroy(xport);
+            free(buf);
             return -1;
         }
     }
     rdb_serialize_end(&rs);
 
-    if (rdma_xport_send(xport, dst, off) < 0) {
-        rdma_xport_destroy(xport);
+    /* 传输阶段：分块流水线直写（连接已就绪, 内含完成排空 + 断连清理） */
+    printf("[rdma] xfer-begin\n");
+    int rc = rdma_xport_conn_send(conn, buf, off);
+    uint64_t t2 = now_monotonic_ns();
+    free(buf);
+    if (rc < 0)
         return -1;
-    }
 
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-
-    /* 性能统计（与 sendfile 路径日志键保持一致） */
-    uint64_t t1_ns = (uint64_t)t1.tv_sec * 1000000000ULL
-                   + (uint64_t)t1.tv_nsec;
-    uint64_t wall_ns = ((uint64_t)ts.tv_sec * 1000000000ULL
-                      + (uint64_t)ts.tv_nsec) > t1_ns
-                     ? ((uint64_t)ts.tv_sec * 1000000000ULL
-                      + (uint64_t)ts.tv_nsec) - t1_ns : 0;
-    uint64_t xfer_ns = (wall_ns > prep_ns) ? (wall_ns - prep_ns) : 0;
+    /* 性能统计（与 sendfile 路径同口径: 不含连接建立）
+     * xfer = 序列化 + 直写 (t1 在连接就绪后起算), mbps 按此计算 */
+    double conn_ms = (t1 > t0) ? (double)(t1 - t0) / 1e6 : 0.0;
     double prep_ms = (double)prep_ns / 1e6;
-    double xfer_ms = (double)xfer_ns / 1e6;
-    double wall_ms = (double)wall_ns / 1e6;
+    double xfer_ms = (t2 > t1) ? (double)(t2 - t1) / 1e6 : 0.0;
     double mbps = (xfer_ms > 0.0)
                 ? (off / (xfer_ms / 1000.0) / (1024.0 * 1024.0)) : 0.0;
-    printf("[rdma] xfer-end: bytes=%zu wall=%.1f prep=%.1f xfer=%.1f mbps=%.2f batches=%d\n",
-           off, wall_ms, prep_ms, xfer_ms, mbps, 1);
+    printf("[rdma] xfer-end: bytes=%zu conn=%.1f prep=%.1f xfer=%.1f mbps=%.2f batches=%d\n",
+           off, conn_ms, prep_ms, xfer_ms, mbps, 1);
 
-    rdma_xport_destroy(xport);
     return 0;
 }
 
@@ -132,9 +127,8 @@ int rdma_server_run(uint64_t token, int ready_fd)
  * RDMA 客户端入口
  *
  * 流程：
- * 1. rdma_xport_client_connect：连接 + 注册接收缓冲 + 发缓冲凭证
- * 2. rdma_xport_wait_done：等尾部 IMM（整块已落入接收缓冲）
- * 3. 解出流头 token → 按 RDB 流头 key_count 限条数加载 → 数量不一致即失败
+ * 1. rdma_xport_recv：连接 + 注册接收缓冲 + 发缓冲凭证 + 等尾部 IMM
+ * 2. 解出流头 token → 按 RDB 流头 key_count 限条数加载 → 数量不一致即失败
  *
  * @param out_token 输出：从流头解出的 token（快照 offset）
  * @return 0 成功，-1 失败
@@ -143,25 +137,27 @@ int rdma_client_run(uint64_t *out_token)
 {
     setlinebuf(stdout); setlinebuf(stderr);
 
-    rdma_xport_t *xport = rdma_xport_client_connect(kvs_config.fullsync_master_ip,
-                                                    kvs_config.fullsync_port);
-    if (!xport)
+    /* 接收缓冲（调用方自持，远程写目标） */
+    char *buf = calloc(1, RDMA_BUF_SIZE);
+    if (!buf) {
+        fprintf(stderr, "[rdma] malloc(%zu) failed\n", (size_t)RDMA_BUF_SIZE);
         return -1;
+    }
 
+    uint64_t t1 = now_monotonic_ns();
     printf("[rdma] xfer-begin\n");
-    struct timespec t1, t2;
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-
-    const char *data = rdma_xport_recv_buf(xport);
-    if (!data || rdma_xport_wait_done(xport) < 0) {
+    int rc = rdma_xport_recv(kvs_config.fullsync_master_ip,
+                             kvs_config.fullsync_port, buf, RDMA_BUF_SIZE);
+    uint64_t t2 = now_monotonic_ns();
+    if (rc < 0) {
         fprintf(stderr, "[rdma] recv failed\n");
-        rdma_xport_destroy(xport);
+        free(buf);
         return -1;
     }
 
     /* 快照流头：token（快照 offset）+ RDB 流（key_count 头 + entries） */
     struct batch_hdr bh;
-    memcpy(&bh, data, sizeof(bh));
+    memcpy(&bh, buf, sizeof(bh));
     uint64_t snap = be64toh(bh.token);
     if (out_token)
         *out_token = snap;
@@ -171,12 +167,14 @@ int rdma_client_run(uint64_t *out_token)
     int status = 0;
     long loaded = -1;
     size_t consumed = 0;
-    int expected = rdb_load_stream_begin(data + sizeof(bh), 4);
+    const char *stream = buf + sizeof(bh);            /* 跳过流头 token */
+    int expected = rdb_load_stream_begin(stream, RDB_STREAM_HDR_LEN);
     if (expected >= 0) {
         if (expected > 0)
             dict_reserve(&g_dict, (uint32_t)expected);
-        loaded = rdb_load_stream_append_n(data + sizeof(bh) + 4,
-                                          RDMA_BUF_SIZE - sizeof(bh) - 4,
+        loaded = rdb_load_stream_append_n(stream + RDB_STREAM_HDR_LEN,
+                                          RDMA_BUF_SIZE - sizeof(bh)
+                                          - RDB_STREAM_HDR_LEN,
                                           expected, &consumed);
         if (loaded != expected) {
             fprintf(stderr, "[rdma] key count mismatch: expected %d, got %ld\n",
@@ -187,19 +185,17 @@ int rdma_client_run(uint64_t *out_token)
     } else {
         status = -1;
     }
-
-    clock_gettime(CLOCK_MONOTONIC, &t2);
+    free(buf);
 
     /* 性能统计 */
-    size_t total_bytes = (status == 0) ? sizeof(bh) + 4 + consumed : 0;
-    double ms = (t2.tv_sec - t1.tv_sec) * 1000.0
-              + (t2.tv_nsec - t1.tv_nsec) / 1e6;
+    size_t total_bytes = (status == 0)
+                       ? sizeof(bh) + RDB_STREAM_HDR_LEN + consumed : 0;
+    double ms = (t2 > t1) ? (double)(t2 - t1) / 1e6 : 0.0;
     double mbps = (ms > 0)
                 ? (total_bytes / (ms / 1000.0) / (1024.0 * 1024.0))
                 : 0;
     printf("[rdma] xfer-end: entries=%ld bytes=%zu ms=%.1f mbps=%.2f batches=%d\n",
            (status == 0) ? loaded : 0, total_bytes, ms, mbps, 1);
 
-    rdma_xport_destroy(xport);
     return status;
 }

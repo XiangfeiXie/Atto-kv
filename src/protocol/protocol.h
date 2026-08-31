@@ -9,7 +9,7 @@
  *  设计原则：
  *  1. 零拷贝 Token 切片（只引用原始数据，不复制）
  *  2. 流式解析（支持不完整数据，区分协议错误）
- *  3. 兼容 RESP 数组格式和内联命令格式
+ *  3. 只支持 RESP 数组格式（内联命令等非 RESP 一律拒绝）
  *============================================================================*/
 
 #ifndef __KVS_PROTOCOL_H__
@@ -24,7 +24,6 @@
 
 #define KVS_MAX_TOKENS         128                /* 单条命令最大参数个数 */
 #define KVS_MAX_BULK_LEN       (512 * 1024 * 1024) /* Bulk String 最大长度 512MB */
-#define KVS_MAX_INLINE_LEN     65536              /* 内联命令最大长度 64KB */
 #define KVS_RB_COMPACT_RATIO   2                  /* 读缓冲压缩阈值（已消费 > cap/2） */
 #define BUF_INIT_CAP           4096               /* 初始缓冲容量 4KB */
 
@@ -119,13 +118,12 @@ int resp_parse_slices(const char *buf, int buflen,
 typedef int (*kvs_drain_fn)(int fd, DynBuf *rb, int *r_off, DynBuf *wb, int *want_close);
 
 /**
- * 默认命令解析函数（RESP + 内联命令 fallback）
- * 
+ * 默认命令解析函数（仅 RESP 数组格式）
+ *
  * 功能：
- * 1. 优先解析 RESP 数组格式（*N\r\n$L\r\n...）
- * 2. 失败时 fallback 到内联命令格式（PING\r\n）
- * 3. 支持流式解析（不完整数据返回 0）
- * 4. 支持协议错误检测（返回 -1）
+ * 1. 解析 RESP 数组格式（*N\r\n$L\r\n...）
+ * 2. 支持流式解析（不完整数据返回 0）
+ * 3. 协议错误（非 RESP / 损坏）返回 -1，上层发送错误响应并关闭连接
  * 
  * @param fd 连接 fd（可用于 repl 回调）
  * @param rb 读缓冲

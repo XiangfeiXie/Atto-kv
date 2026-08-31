@@ -3,7 +3,8 @@
  *
  *  职责：
  *  1. 追加写：单线程无锁 io_uring 环形缓冲落盘（appendonly.aof）
- *  2. 启动重放：aof_reload_mmap 用 mmap 重放 raw RESP 命令
+ *     只存 RESP 格式——网络层已拒绝内联命令，此处原样落盘
+ *  2. 启动重放：aof_reload_mmap 用 mmap 重放 RESP 命令（文件内单一格式）
  *
  *  对外接口见 persistence.h（AOF 接口已并入）
  *============================================================================*/
@@ -65,7 +66,7 @@ typedef enum {
 
 static fsync_mode_t g_fsync_mode      = FSYNC_EVERYSEC;
 static int          g_fsync_in_flight = 0;   /* fsync 请求是否在飞 */
-static time_t       g_last_fsync      = 0;   /* 上次 fsync 时间 */
+static long long    g_last_fsync      = 0;   /* 上次 fsync 时间（毫秒，缓存时钟） */
 
 /*=============================================================================
  *  io_uring 辅助函数
@@ -171,7 +172,7 @@ static void aof_submit_fsync(void) {
         io_uring_sqe_set_data(sqe, (void *)(uintptr_t)-1);  /* -1 表示 fsync */
         io_uring_submit(&g_aof_ring);
         g_fsync_in_flight = 1;
-        g_last_fsync = time(NULL);
+        g_last_fsync = get_time_now();
     }
 }
 
@@ -186,8 +187,8 @@ static void aof_fsync_check(void) {
         aof_submit_fsync();
         break;
     case FSYNC_EVERYSEC: {
-        time_t now = time(NULL);
-        if (now > g_last_fsync && !g_fsync_in_flight)
+        long long now = get_time_now();
+        if (now - g_last_fsync >= 1000 && !g_fsync_in_flight)
             aof_submit_fsync();
         break;
     }
@@ -213,9 +214,9 @@ static void aof_flush_current_slot(void) {
     aof_slot_t *slot = &g_ring[g_prod_idx];
     slot->len = g_prod_pos;
 
-    /* 如果槽位还在飞，等待完成（仅当磁盘慢于环形缓冲区时发生） */
+    /* 如果槽位还在飞，等待完成（仅当磁盘慢于环形缓冲区时发生）
+     * wait_cqe 在 CQE 已就绪时立即返回，无需先 reap */
     if (slot->in_flight) {
-        aof_reap_completions();
         while (slot->in_flight) {
             struct io_uring_cqe *cqe = NULL;
             if (io_uring_wait_cqe(&g_aof_ring, &cqe) == 0 && cqe) {
@@ -225,9 +226,14 @@ static void aof_flush_current_slot(void) {
         }
     }
 
-    /* 获取 SQE 并提交异步写入 */
+    /* 获取 SQE 并提交异步写入
+     * aof_get_sqe 在 SQ 满时先 submit 腾空再取，健康 ring 下必成功；
+     * 返回 NULL 仅当 ring 异常（io_uring 内部失败），此时无同步回退，
+     * 报错后照常滚动，让故障可见而非静默丢数据 */
     struct io_uring_sqe *sqe = aof_get_sqe();
-    if (sqe) {
+    if (!sqe) {
+        fprintf(stderr, "[AOF] FATAL: no SQE, slot data lost\n");
+    } else {
         io_uring_prep_write(sqe, g_aof_fd, slot->data, slot->len, g_aof_offset);
         io_uring_sqe_set_data(sqe, (void *)(uintptr_t)(long)g_prod_idx);
         g_aof_offset += slot->len;
@@ -237,13 +243,6 @@ static void aof_flush_current_slot(void) {
 
         /* 顺便收割已完成的请求 */
         aof_reap_completions();
-    } else {
-        /* 灾难性情况：fallback 到同步写入 */
-        fprintf(stderr, "[AOF] FATAL: no SQE, using sync write fallback\n");
-        ssize_t w = write(g_aof_fd, slot->data, slot->len);
-        if (w < 0)
-            fprintf(stderr, "[AOF] sync write error: %s\n", strerror(errno));
-        /* slot 不标记 in_flight，可立即复用 */
     }
 
     /* 滚动到下一个槽位 */
@@ -337,7 +336,7 @@ int kvs_aof_persist_start(void) {
     g_prod_pos        = 0;
     g_inflight_count  = 0;
     g_fsync_in_flight = 0;
-    g_last_fsync      = time(NULL);
+    g_last_fsync      = get_time_now();
 
     printf("[AOF] lock-free ring ready (%d slots x %d KB)\n",
            AOF_RING_SIZE, AOF_SLOT_SIZE / 1024);
@@ -345,20 +344,17 @@ int kvs_aof_persist_start(void) {
 }
 
 /**
- * 热路径：追加原始 RESP 字节到环形缓冲区
+ * 热路径：追加命令到环形缓冲区
+ * 只收 RESP 命令（网络层已拒绝内联等非 RESP 格式），原样单次 memcpy
  * 无锁，单线程调用
  */
 int kvs_aof_persist_append_raw(const char *payload, uint32_t len) {
     if (!payload || len == 0 || len > KVS_JOURNAL_MAX_PAYLOAD) return -1;
 
-    /* 当前槽放不下新记录就 flush
-     * flush 后槽空，AOF_SLOT_SIZE == KVS_JOURNAL_MAX_PAYLOAD
-     * 保证任何合法记录都能装下，不会越界 */
+    /* RESP 原样写入，无 header、无 CRC、无 time() 系统调用 */
     if (g_prod_pos + len > AOF_SLOT_SIZE) {
         aof_flush_current_slot();
     }
-
-    /* 单次 memcpy — 无 header、无 CRC、无 time() 系统调用 */
     memcpy(g_ring[g_prod_idx].data + g_prod_pos, payload, len);
     g_prod_pos += len;
 
@@ -417,6 +413,8 @@ void kvs_aof_persist_stop(void) {
 /*=============================================================================
  *  AOF 重放（启动时）
  *  使用 mmap 快速加载并重放所有命令
+ *  文件只含 RESP 格式（网络层只收 RESP，AOF 原样落盘），
+ *  解析失败即文件损坏/截断，停止重放
  *============================================================================*/
 
 void aof_reload_mmap(void) {
@@ -441,6 +439,7 @@ void aof_reload_mmap(void) {
         int argc = 0;
         int cmd_len = resp_parse_slices(p, (int)remaining,
                                         tokens, KVS_MAX_TOKENS, &argc);
+        /* AOF 只存 RESP（网络层已拒绝非 RESP），非 RESP 即损坏/截断 */
         if (cmd_len <= 0) break;
         dynbuf_clear(&wb);
         kvs_dispatch(tokens, argc, p, cmd_len, &wb);

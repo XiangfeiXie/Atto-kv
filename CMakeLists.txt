@@ -70,6 +70,7 @@ set(CORE_SRCS
     src/core/kvstore_expire.c
     src/core/kvstore_config.c
     src/core/kvstore_dispatch.c
+    src/core/kvstore_info.c
 )
 
 set(ENGINE_SRCS

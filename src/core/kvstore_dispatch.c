@@ -76,29 +76,20 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     kvs_token_t cmd = tokens[0];
 
     /*-------------------------------------------------------------------------
-     *  命令名大小写不敏感：转大写（在栈缓冲区中操作）
-     *  优化：先检查是否包含小写字母，避免不必要的转换
+     *  命令名大小写不敏感：无条件单遍转大写（栈缓冲区）
+     *  命令名 ≤ 32B，逐条预判有无小写是多余的二次扫描，直接转
      *-------------------------------------------------------------------------*/
     char ucmd_buf[32];
     int  ulen = cmd.len;
     if (ulen > (int)sizeof(ucmd_buf)) ulen = (int)sizeof(ucmd_buf);
-    
-    int has_lower = 0;
     for (int i = 0; i < ulen; i++) {
         unsigned char ch = (unsigned char)cmd.ptr[i];
-        if (ch >= 'a' && ch <= 'z') { has_lower = 1; break; }
+        /* 小写转大写：利用 ASCII 大小写差 32（0x20） */
+        ucmd_buf[i] = (ch >= 'a' && ch <= 'z') ? (char)(ch & 0xDF) : (char)ch;
     }
-    
-    if (has_lower) {
-        for (int i = 0; i < ulen; i++) {
-            unsigned char ch = (unsigned char)cmd.ptr[i];
-            /* 小写转大写：利用 ASCII 大小写差 32（0x20） */
-            ucmd_buf[i] = (ch >= 'a' && ch <= 'z') ? (char)(ch & 0xDF) : (char)ch;
-        }
-        cmd.ptr   = ucmd_buf;
-        cmd.len   = ulen;
-        tokens[0] = cmd;
-    }
+    cmd.ptr   = ucmd_buf;
+    cmd.len   = ulen;
+    tokens[0] = cmd;
 
     /*=========================================================================
      *  热路径 1：GET 命令（60-80% 的请求）
@@ -236,9 +227,16 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     if (TOKEN_EQ(cmd, "CONFIG"))
         return handle_config(tokens, argc, wb);
 
-    /* FLUSHALL：清空所有键（只有一个全局 dict，不需要 FLUSHDB） */
+    /* INFO：最小实现，只回 memory 段 used_memory（bench_memory.sh 读内存用）
+     * 其余字段按需再加，见 kvstore_info.c */
+    if (TOKEN_EQ(cmd, "INFO"))
+        return handle_info(tokens, argc, wb);
+
+    /* FLUSHALL：清空所有键（只有一个全局 dict，不需要 FLUSHDB）
+     * 走 kvs_flush_all() 而非裸 dict_clear: jemalloc 版在清库后同步
+     * arenas.purge 把内存还给 OS, 否则 FLUSHALL 后 RSS 不回落 */
     if (TOKEN_EQ(cmd, "FLUSHALL")) {
-        dict_clear(&g_dict);
+        kvs_flush_all();
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         /* 非重载模式下记录日志并复制 */
         if (!g_in_reload) {

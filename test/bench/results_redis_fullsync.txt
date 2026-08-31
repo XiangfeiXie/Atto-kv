@@ -1,0 +1,7 @@
+redis_fullsync_bench — 2026-08-30 09:54:34
+keys=400000  vsize=256  指标: master 端传输耗时 (序列化+发送, 不含连接/不含 slave 加载)
+  起始: fork (disk=BGSAVE / diskless=RDB transfer); 结束: master Synchronization with replica succeeded
+
+  mode      |        bytes | 耗时(ms) |       MB/s
+  disk      |    110400098 |     4265.0 |      24.69
+  diskless  |    110400098 |     1904.0 |      55.30

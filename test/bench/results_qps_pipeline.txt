@@ -1,0 +1,14 @@
+bench_qps — 2026-08-30 11:52:09
+aof=off (基准(persistence none))  systems=proactor redis  test=set  nclients=2  conn=50  ops=500000  data=16
+pipelines: 1 4 8 16 20 40 80 160   (单位: SET QPS)
+
+  P      |     proactor |        redis
+  P1    |        43055 |        37557
+  P4    |       170316 |       128983
+  P8    |       332107 |       190440
+  P16   |       621328 |       301233
+  P20   |       749909 |       301351
+  P40   |      1322865 |       329327
+  P80   |      2080297 |       347348
+  P160  |      3160891 |       343466
+

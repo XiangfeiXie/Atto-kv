@@ -1,218 +1,164 @@
 #!/bin/bash
 # =============================================================================
-# bench_memory.sh — KVStore 内存占用测量脚本
+# bench_memory.sh — malloc(glibc) vs jemalloc 对 kvstore 的内存生命周期对比
 #
-# 目标：在 kvstore-none.conf（不开启任何功能）下，测量纯 KV 数据的内存占用，
-#       并同时报告三个层面的"内存"：
-#         · allocated   — INFO memory 的 used_memory（存活分配字节的精确和）
-#                         jemalloc: stats.allocated；glibc: mallinfo2().uordblks
-#         · rss         — /proc/<pid>/status 的 VmRSS（真实物理占用）
-#         · private     — /proc/<pid>/smaps_rollup 的 Private_Dirty+Private_Clean
-#                         剔除共享库/代码页，最干净的 KV 占用
+# 三阶段测量（对应 kvstore 真实关心的三个点）:
+#   1) 启动   — 空库 RSS 基线
+#   2) 峰值   — 填充 N×V 后读物理峰值 VmHWM + allocator 自报 used_memory
+#               峰值/key = 同量数据占多少物理内存 (容量); 峰值−used = 分片浪费
+#   3) 释放   — FLUSHALL 后等 RELEASE_WAIT 秒再读 RSS
+#               返回率 = 删除后内存还给系统的比例 (对应 TTL/淘汰/清库后的表现)
 #
-# 方法：每个 (N,V) 配置独立重启空服务 → 采 baseline → 填充 → settle → 采稳态，
-#       用差分 (after-baseline) 除以真实 DBSIZE 得到每 key 开销。
+# 固定测试点: N=1000000 key × V=16 字节 (小 value = 海量小分配, allocator 差异最明显)。
 #
-# 用法：
-#   ./test/bench/bench_memory.sh                          # 默认二维小扫描
-#   ./test/bench/bench_memory.sh --n "100000 1000000" --v "16 256 4096"
-#   ./test/bench/bench_memory.sh --n 50000 --v 64 --settle 8
-#   # jemalloc vs glibc 对比（各跑一次，输出到不同 CSV）
-#   ./test/bench/bench_memory.sh --bin build/kvstore        --out test/bench/results_memory_jemalloc.csv
-#   ./test/bench/bench_memory.sh --bin build-glibc/kvstore  --out test/bench/results_memory_glibc.csv
+# jemalloc 版通过环境变量注入 MALLOC_CONF="dirty_decay_ms:0": 释放的脏页立即
+# MADV_DONTNEED 还给 OS, 否则默认 MADV_FREE 成 muzzy 态 RSS 不降, 测不出返回率。
+# start_kvs 在 common.sh 共用不能改, 本脚本用 start_kvs_mem 包装注入。
 #
-# 关键参数：
-#   --n      key 数量列表        (默认 100000 1000000)
-#   --v      值大小列表(字节)    (默认 16 256 4096)
-#   --settle 填充后静置秒数      (默认 15，覆盖 jemalloc dirty_decay=10s)
-#   --samples 稳态采样次数       (默认 5，间隔 1s，取 min)
-#   --conf   配置文件            (默认 kvstore-none.conf)
-#   --bin    kvstore 二进制      (默认 build/kvstore；glibc 用 build-glibc/kvstore)
-#   --out    结果 CSV 输出路径   (默认 test/bench/results_memory.csv)
+# 用法（项目根目录执行）:
+#   sudo ./test/bench/bench_memory.sh                      # jemalloc vs glibc
+#   sudo ./test/bench/bench_memory.sh --bin build/kvstore  # 只测单个
+#
+# 输出: 终端对比表 + test/bench/results_memory.txt
 # =============================================================================
 
-set -euo pipefail
+script_name=$(basename "$0")
+source "$(dirname "$0")/common.sh"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# 复用公共函数库 (start_kvs / stop_kvs / wait_for_port / log / 颜色)
-# shellcheck source=common.sh
-source "${SCRIPT_DIR}/common.sh"
+# 固定参数
+N=1000000                # key 数量
+V=16                     # value 字节
+BASE_SETTLE=2            # 启动后静置
+RELEASE_WAIT=15          # FLUSHALL 后静置 (让 jemalloc dirty_decay≈10s 真实生效)
+HOST=127.0.0.1
+RESULT_FILE="test/bench/results_memory.txt"
 
-# ---- 默认参数 ----
-CONF="${CONF:-kvstore-none.conf}"
-N_LIST="100000 1000000"
-V_LIST="16 256 4096"
-SETTLE_SEC=15
-SAMPLES=5
-BASELINE_SETTLE_SEC=2
-HOST="127.0.0.1"
-RESULT_CSV="${PROJECT_DIR}/test/bench/results_memory.csv"
+# 默认对比两个 allocator 的二进制
+BINS=("build/kvstore" "build-glibc/kvstore")
+BIN_LABELS=("jemalloc" "glibc")
 
-# ---- 解析 CLI ----
-while [ $# -gt 0 ]; do
+# ── 参数解析 (仅 --bin) ─────────────────────────────────────────────────
+help() {  # 只打印头部注释块 (到第一个非 # 行即停)
+    awk '!/^#/ {exit} NR>=2 {sub(/^# */, ""); print}' "$0"
+    exit 0
+}
+while [[ $# -gt 0 ]]; do
     case "$1" in
-        --n)        N_LIST="$2";       shift 2 ;;
-        --v)        V_LIST="$2";       shift 2 ;;
-        --settle)   SETTLE_SEC="$2";   shift 2 ;;
-        --samples)  SAMPLES="$2";      shift 2 ;;
-        --conf)     CONF="$2";         shift 2 ;;
-        --bin)      KVS_BIN="$2";      shift 2 ;;
-        --out)      RESULT_CSV="$2";   shift 2 ;;
-        *) echo "未知参数: $1" >&2; exit 1 ;;
+        --bin)      BINS=("$2"); BIN_LABELS=("$(basename "$2")"); shift 2 ;;
+        -h|--help)  help ;;
+        *)          echo "未知参数: $1" >&2; exit 1 ;;
     esac
 done
 
-# ---- 预检 ----
-require_tools_py() {
-    for tool in redis-cli python3 bc; do
-        if ! command -v "$tool" >/dev/null 2>&1; then
-            err "缺少工具: $tool"
-            exit 1
-        fi
-    done
-    if [ ! -x "$KVS_BIN" ]; then
-        err "kvstore 未编译: $KVS_BIN"
-        exit 1
-    fi
-}
-require_tools_py
+require_tools
 
-CONF_PATH="${CONF_DIR}/${CONF}"
-if [ ! -f "$CONF_PATH" ]; then
-    err "配置文件不存在: $CONF_PATH"
-    exit 1
-fi
-PORT=$(grep '^port ' "$CONF_PATH" | awk '{print $2}')
-PORT=${PORT:-2000}
+WORK="$(mktemp -d /tmp/membench.XXXXXX)"
+CONF_PATH="${WORK}/mem.conf"
+write_kvs_conf "$CONF_PATH" "$KVS_PORT" proactor rdb
 
-# ---- 采样函数 ----
-# sample_once <pid> <port> → 输出 7 个数字 (kB)：
-#   alloc rss vmsize hwm priv_dirty priv_clean pss
-sample_once() {
-    local pid=$1 port=$2
+cleanup() { stop_all; rm -rf "$WORK"; }
+trap cleanup EXIT
 
-    # 逻辑分配量 (INFO memory used_memory, 字节)
-    #   jemalloc = stats.allocated；glibc = mallinfo2().uordblks
-    local alloc_b=0
-    local info
-    if info=$(redis-cli -h "$HOST" -p "$port" INFO memory 2>/dev/null); then
-        # RESP 行尾带 \r，剥离后再取数值，否则 $(( )) 会报 syntax error
-        alloc_b=$(printf '%s\n' "$info" | tr -d '\r' | awk -F: '$1=="used_memory"{print $2; exit}')
-        alloc_b=${alloc_b:-0}
-    fi
-    local alloc_kb=$((alloc_b / 1024))
-
-    local status="/proc/$pid/status"
-    local rss=0 vmsize=0 hwm=0
-    if [ -r "$status" ]; then
-        rss=$(awk '/^VmRSS:/{print $2}' "$status");   rss=${rss:-0}
-        vmsize=$(awk '/^VmSize:/{print $2}' "$status"); vmsize=${vmsize:-0}
-        hwm=$(awk '/^VmHWM:/{print $2}' "$status");   hwm=${hwm:-0}
-    fi
-
-    local pd=0 pc=0 pss=0
-    local sm="/proc/$pid/smaps_rollup"
-    if [ -r "$sm" ]; then
-        pd=$(awk '/^Private_Dirty:/{print $2}' "$sm"); pd=${pd:-0}
-        pc=$(awk '/^Private_Clean:/{print $2}' "$sm"); pc=${pc:-0}
-        pss=$(awk '/^Pss:/{print $2}' "$sm");           pss=${pss:-0}
-    fi
-
-    echo "$alloc_kb $rss $vmsize $hwm $pd $pc $pss"
+# ── 一次读数: "used_kB rss_kB hwm_kB" (INFO used_memory + /proc VmRSS/VmHWM) ──
+read_mem() { # $1=port  $2=pid
+    local port=$1 pid=$2 used_b rss hwm
+    used_b=$(redis-cli -h "$HOST" -p "$port" INFO memory 2>/dev/null \
+        | tr -d '\r' | awk -F: '$1=="used_memory"{print $2; exit}')
+    used_b=${used_b:-0}
+    rss=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null); rss=${rss:-0}
+    hwm=$(awk '/^VmHWM:/{print $2}' "/proc/$pid/status" 2>/dev/null); hwm=${hwm:-0}
+    echo "$((used_b / 1024)) $rss $hwm"
 }
 
-# sample_stable <pid> <port> <samples> <interval> → 同 sample_once，但
-#   RSS/private 取多次采样的最小值（空闲时只降不升，min 才是收敛值），
-#   allocated/vmsize/hwm/pss 取最后一次（稳定量）。
-sample_stable() {
-    local pid=$1 port=$2 samples=${3:-5} interval=${4:-1}
-    local a r v h pd pc ps
-    local min_rss=999999999 min_pd=999999999 min_pc=999999999
-    local la=0 lv=0 lh=0 lps=0
-    for ((i=0; i<samples; i++)); do
-        read -r a r v h pd pc ps <<< "$(sample_once "$pid" "$port")"
-        la=$a; lv=$v; lh=$h; lps=$ps
-        [ "$r" -lt "$min_rss" ] && min_rss=$r
-        [ "$pd" -lt "$min_pd" ] && min_pd=$pd
-        [ "$pc" -lt "$min_pc" ] && min_pc=$pc
-        [ $i -lt $((samples-1)) ] && sleep "$interval"
-    done
-    echo "$la $min_rss $lv $lh $min_pd $min_pc $lps"
+# ── 启动 kvstore（本脚本专用包装, 不动 common.sh 的 start_kvs）──────────
+# 链接了 jemalloc 的二进制注入 MALLOC_CONF="dirty_decay_ms:0":
+# kvs_flush_all 里 arenas.purge 才对脏页走 MADV_DONTNEED, FLUSHALL 后 RSS 真的回落
+# (实测: 默认 muzzy 态 RSS 不降, dirty_decay_ms:0 立即降). export 的变量被子进程继承,
+# jemalloc 进程启动读库时生效. glibc 版不注入(它不读 MALLOC_CONF, 也无需此配置).
+start_kvs_mem() { # $1=conf  $2=port  $3=bin
+    local conf=$1 port=$2 bin=$3
+    if ldd "$bin" 2>/dev/null | grep -q jemalloc; then
+        export MALLOC_CONF="dirty_decay_ms:0"
+    else
+        unset MALLOC_CONF
+    fi
+    start_kvs "$conf" "$port"
 }
 
-# ---- 单配置测量 ----
-measure_one() {
-    local n=$1 vsize=$2
+# ── 测一个 allocator → "基线rss 峰值hwm used_kB 峰值/key(B) 释放rss 返回率%" ──
+measure_one() { # $1=bin  $2=label
+    local bin=$1 label=$2 pid base_rss hwm used release_rss
+    stop_all
+    KVS_BIN="$bin"
+    start_kvs_mem "$CONF_PATH" "$KVS_PORT" "$bin" >&2   # log 走 stderr, 防污染 $(...) 捕获
+    pid=$(pgrep -x kvstore | head -1)
+    [ -n "$pid" ] || { err "$label 进程未找到"; return 1; }
 
-    step "重启空服务 (conf=$CONF)"
-    start_kvs "$CONF"
-    local pid
-    pid=$(cat "${LOG_DIR}/kvstore.pid")
-    sleep "$BASELINE_SETTLE_SEC"
+    sleep "$BASE_SETTLE"
+    read -r _ base_rss _ <<< "$(read_mem "$KVS_PORT" "$pid")"
+    log "  $label 启动: rss=${base_rss}kB" >&2
 
-    local base
-    base=$(sample_stable "$pid" "$PORT" 3 1)
-    read -r ba br bv bh bpd bpc bps <<< "$base"
-    log "baseline: alloc=${ba}kB rss=${br}kB hwm=${bh}kB priv=$((bpd+bpc))kB"
-
-    step "填充 n=$n vsize=$vsize"
-    local sent
-    sent=$(python3 "${SCRIPT_DIR}/populate_kv.py" "$HOST" "$PORT" 1 "$n" "$vsize" 2>/dev/null)
-    sent=${sent:-0}
-    log "填充完成 sent=$sent"
-
-    step "settle ${SETTLE_SEC}s 后稳态采样"
-    sleep "$SETTLE_SEC"
-    local after
-    after=$(sample_stable "$pid" "$PORT" "$SAMPLES" 1)
-    read -r aa ar av ah apd apc aps <<< "$after"
-    log "after:    alloc=${aa}kB rss=${ar}kB hwm=${ah}kB priv=$((apd+apc))kB"
-
-    # 校验实际落盘数
-    local dbsize=0
-    dbsize=$(redis-cli -h "$HOST" -p "$PORT" DBSIZE 2>/dev/null | tr -d '\r')
+    # 填充后立即记实际条数——必须在 FLUSHALL 之前, 否则 DBSIZE 恒为 0
+    pipe_populate "$HOST" "$KVS_PORT" "$N" "$V"
+    local dbsize denom peak_key ret
+    dbsize=$(redis-cli -h "$HOST" -p "$KVS_PORT" DBSIZE 2>/dev/null | tr -d '\r')
     dbsize=${dbsize:-0}
-    if [ "$dbsize" -ne "$n" ]; then
-        warn "DBSIZE=$dbsize != 期望 $n，按实际值计算"
+    [ "$dbsize" -eq "$N" ] || warn "$label 实际填充 $dbsize (期望 $N), 按实际计算"
+
+    read -r used _ hwm <<< "$(read_mem "$KVS_PORT" "$pid")"
+    log "  $label 峰值: hwm=${hwm}kB used=${used}kB" >&2
+
+    redis-cli -h "$HOST" -p "$KVS_PORT" FLUSHALL >/dev/null 2>&1 || true
+    sleep "$RELEASE_WAIT"
+    read -r _ release_rss _ <<< "$(read_mem "$KVS_PORT" "$pid")"
+    log "  $label 释放: rss=${release_rss}kB" >&2
+
+    denom=$dbsize; [ "$denom" -eq 0 ] && denom=1
+    peak_key=$(awk "BEGIN{printf \"%.1f\", ($hwm - $base_rss)*1024/$denom}")
+    if [ "$hwm" -gt "$base_rss" ]; then
+        ret=$(awk "BEGIN{v=($hwm - $release_rss)*100/($hwm - $base_rss); if(v<0)v=0; if(v>100)v=100; printf \"%.0f\", v}")
+    else
+        ret="N/A"
     fi
-
-    # 差分 + 每 key 开销 (字节)
-    local d_alloc=$((aa - ba)) d_rss=$((ar - br)) d_hwm=$((ah - bh))
-    local d_priv=$(( (apd + apc) - (bpd + bpc) ))
-
-    awk -v da="$d_alloc" -v dr="$d_rss" -v dh="$d_hwm" -v dp="$d_priv" -v n="$dbsize" \
-        -v N="$n" -v V="$vsize" \
-        'BEGIN {
-            if (n <= 0) n = 1;
-            ov = (da > 0 && dp > da) ? (dp - da) * 100.0 / da : 0.0;
-            printf "%d,%d,%d,%d,%d,%d,%d,%.1f,%.1f,%.1f,%.1f\n",
-                N, V, n,
-                da, dr, dh, dp,
-                (da * 1024) / n, (dr * 1024) / n, (dp * 1024) / n, ov;
-        }'
+    echo "$base_rss $hwm $used $peak_key $release_rss $ret"
 }
 
-# ---- 主流程 ----
-main() {
-    # 打印 CSV 头到 stdout + 结果文件
-    local header="N,V,dbsize,alloc_kb,rss_kb,rss_peak_kb,private_kb,alloc_b_per_key,rss_b_per_key,private_b_per_key,overhead_pct"
-    echo "$header"
-    echo "$header" > "$RESULT_CSV"
-    log "内存测量开始: conf=$CONF port=$PORT N={$N_LIST} V={$V_LIST} settle=${SETTLE_SEC}s"
+# ── 主流程 ──────────────────────────────────────────────────────────────
+> "$RESULT_FILE"
+{
+    echo "bench_memory — $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "N=$N keys  V=$V B  release_wait=${RELEASE_WAIT}s  (峰值=填充后 VmHWM; 返回率=FLUSHALL 后内存归还比例)"
+    echo ""
+    printf "  %-8s | %9s | %9s | %9s | %11s | %10s | %7s\n" \
+        "allocator" "基线(kB)" "峰值(kB)" "used(kB)" "峰值/key(B)" "释放后(kB)" "返回率%"
+} >> "$RESULT_FILE"
 
-    for vsize in $V_LIST; do
-        for n in $N_LIST; do
-            step "=== 测量 N=$n V=$vsize ==="
-            local row
-            row=$(measure_one "$n" "$vsize")
-            echo "$row"
-            echo "$row" >> "$RESULT_CSV"
-            log "记录: $row"
-        done
-    done
+declare -A MEMS
+for i in "${!BINS[@]}"; do
+    bin=${BINS[$i]}; label=${BIN_LABELS[$i]}
+    [ -x "$bin" ] || { err "二进制不存在: $bin"; continue; }
+    res=$(measure_one "$bin" "$label") || { err "$label 测量失败"; continue; }
+    read -r base_rss hwm used peak_key release_rss ret <<< "$res"
+    MEMS["$label"]="$peak_key $ret"
+    line="$(printf "  %-8s | %9s | %9s | %9s | %11s | %10s | %7s" \
+        "$label" "$base_rss" "$hwm" "$used" "$peak_key" "$release_rss" "$ret")"
+    echo "$line"
+    echo "$line" >> "$RESULT_FILE"
+done
+stop_all
 
-    stop_kvs
-    log "完成。结果已写入 $RESULT_CSV"
-}
-
-main "$@"
+# 结论: jemalloc 相对 glibc 的峰值/key 下降 + 返回率对比
+if [ -n "${MEMS[jemalloc]:-}" ] && [ -n "${MEMS[glibc]:-}" ]; then
+    read -r jkey jret <<< "${MEMS[jemalloc]}"
+    read -r gkey gret <<< "${MEMS[glibc]}"
+    drop=$(awk "BEGIN{printf \"%.1f\", (1 - $jkey/$gkey)*100}")
+    echo ""
+    echo "结论: jemalloc 峰值/key 比 glibc 低 ${drop}%  (同数据占更少物理内存)"
+    echo "结论: jemalloc 返回率 ${jret}% vs glibc ${gret}%  (删除后归还系统的比例)"
+    {
+        echo ""
+        echo "结论: jemalloc 峰值/key 比 glibc 低 ${drop}%; 返回率 ${jret}% vs ${gret}%"
+    } >> "$RESULT_FILE"
+fi
+echo ""
+echo "结果已写入: $RESULT_FILE"

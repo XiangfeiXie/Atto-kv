@@ -1,7 +1,6 @@
 #include "protocol.h"
 #include "config.h"
 #include "kvstore.h"
-#include <stdio.h>
 #include <string.h>
 
 /*=============================================================================
@@ -67,8 +66,10 @@ static inline int kvs_is_crlf(const char *p) {
 int resp_parse_slices(const char *buf, int buflen,
                       kvs_token_t *tokens, int max_tokens, int *out_argc)
 {
-    /* 最小有效 RESP 数组：至少 4 字节（"*1\r\n"） */
-    if (unlikely(buflen < 4 || buf[0] != '*')) return -1;
+    /* 非 '*' 开头必为协议错误；'*' 前缀不足 4 字节是未完成的命令开头
+     * （如只收到 "*3"），交由下方 CRLF 完整性检查返回 0（等待更多数据），
+     * 不能在此判为协议错误——proactor 分块读时 recv 边界常落在命令中间 */
+    if (unlikely(buf[0] != '*')) return -1;
 
     const char *p = buf + 1, *end = buf + buflen;
 
@@ -85,8 +86,7 @@ int resp_parse_slices(const char *buf, int buflen,
 
     /* 关键区分：数据不完整 vs 协议错误
      * 如果只剩 '\r' 而 '\n' 尚未到达，这是数据不完整，不是协议错误
-     * 返回 -1 会导致 fallback 到内联命令解析，错误解析 "*3\r\n" 头
-     * 从而破坏协议流 */
+     * 返回 -1 即协议错误（非 RESP 数组格式），由上层拒绝 */
     if (unlikely(p + 1 >= end)) return 0;    /* 不完整：等待更多数据 */
     if (unlikely(!kvs_is_crlf(p))) return -1; /* 协议错误 */
     if (unlikely(argc <= 0 || argc > max_tokens)) return -1;
@@ -138,10 +138,9 @@ int resp_parse_slices(const char *buf, int buflen,
 /*=============================================================================
  *  命令分发循环
  *  从读缓冲中提取命令，执行并生成响应到写缓冲
- *  
- *  支持两种输入格式：
- *  1. RESP 数组格式（主要）："*N\r\n$L\r\n<data>\r\n..."
- *  2. 内联命令格式（兼容）："PING\r\n" 或 "SET key value\r\n"
+ *
+ *  只支持 RESP 数组格式："*N\r\n$L\r\n<data>\r\n..."
+ *  非 RESP（内联命令等）由 resp_parse_slices 返回 -1，统一拒绝
  *============================================================================*/
 
 /**
@@ -167,56 +166,9 @@ int kvs_drain_resp_commands_off(int fd, DynBuf *rb, int *r_off, DynBuf *wb, int 
         kvs_token_t tokens[KVS_MAX_TOKENS];
         int argc = 0;
         
-        /* 尝试按 RESP 数组格式解析 */
+        /* 只支持 RESP 数组格式；内联命令等非 RESP 一律按协议错误拒绝 */
         int cmd_len = resp_parse_slices(rb->buf + off, remaining,
                                         tokens, KVS_MAX_TOKENS, &argc);
-
-        /*-------------------------------------------------------------------
-         *  内联命令 fallback（兼容 redis-benchmark 和 redis-cli）
-         *  redis-benchmark 发送 "PING\r\n"
-         *  redis-cli 发送内联命令如 "SET key value\r\n"
-         *-------------------------------------------------------------------*/
-        if (cmd_len == -1) {
-            const char *p = rb->buf + off;
-            const char *end = p + remaining;
-            
-            /* 查找换行符 */
-            const char *ln = memchr(p, '\n', (size_t)(end - p));
-            if (!ln || p == ln) { 
-                cmd_len = 0; 
-                break;  /* 行不完整，等待更多数据 */
-            }
-
-            /* 拷贝行到临时缓冲区（限制长度防止溢出） */
-            char line[256];
-            int linelen = (int)(ln - p);
-            if (linelen > 255) linelen = 255;
-            if (linelen > 0 && p[linelen - 1] == '\r') linelen--;
-            memcpy(line, p, linelen);
-            line[linelen] = '\0';
-
-            /* 按空格分割 token */
-            argc = 0;
-            char *saveptr = NULL;
-            char *tok = strtok_r(line, " ", &saveptr);
-            while (tok && argc < KVS_MAX_TOKENS) {
-                tokens[argc].ptr = tok;
-                tokens[argc].len = (int)strlen(tok);
-                argc++;
-                tok = strtok_r(NULL, " ", &saveptr);
-            }
-
-            /* 空行处理（例如 redis-cli --pipe 同步标记的 \r\n）
-             * 静默消费，不产生任何命令 */
-            if (argc == 0) {
-                int consumed = (int)(ln + 1 - p);
-                off       += consumed;
-                remaining -= consumed;
-                continue;
-            }
-
-            cmd_len = (int)(ln + 1 - p); /* 消耗的字节数（包含 \n） */
-        }
 
         /* 解析失败：发送错误响应，标记关闭 */
         if (cmd_len <= 0) {

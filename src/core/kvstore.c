@@ -18,8 +18,13 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <signal.h>
+#include <sys/wait.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <ctype.h>
+#ifndef USE_JEMALLOC
+#include <malloc.h>   /* mallinfo2: glibc 构建的 used_memory 探测 */
+#endif
 
 #include "repl.h"
 #include "persistence.h"
@@ -84,52 +89,23 @@ void update_cached_time(void) {
  * @return 0 成功，-1 失败（非数字或溢出）
  */
 int token_to_ll(kvs_token_t t, long long *out) {
-    if (t.len <= 0 || t.len > 20) return -1;
-    
-    int i = 0, neg = 0;
-    if (t.ptr[0] == '-') { 
-        neg = 1; 
-        i = 1; 
-        if (t.len == 1) return -1;   /* 单独的 '-' 无效 */
-    } else if (t.ptr[0] == '+') { 
-        i = 1; 
-        if (t.len == 1) return -1;   /* 单独的 '+' 无效 */
-    }
-    
-    unsigned long long v = 0;
-    for (; i < t.len; i++) {
-        unsigned c = (unsigned char)t.ptr[i] - (unsigned)'0';
-        if (c > 9) return -1;        /* 非数字字符 */
-        
-        /* 溢出检查 */
-        if (v > (unsigned long long)9223372036854775807ULL / 10) return -1;
-        v = v * 10 + c;
-        if (!neg && v > (unsigned long long)9223372036854775807ULL) return -1;
-        if (neg && v > (unsigned long long)9223372036854775808ULL) return -1;
-    }
-    *out = neg ? -(long long)v : (long long)v;
+    char buf[32];
+    if (t.len <= 0 || t.len >= (int)sizeof(buf)) return -1;
+    memcpy(buf, t.ptr, (size_t)t.len);
+    buf[t.len] = '\0';
+
+    /* 拒绝非数字（含前导空白）：strtoll 会跳过空白，原始语义不跳 */
+    if (buf[0] != '+' && buf[0] != '-' &&
+        !(buf[0] >= '0' && buf[0] <= '9'))
+        return -1;
+
+    errno = 0;
+    char *end = NULL;
+    long long v = strtoll(buf, &end, 10);
+    if (errno == ERANGE || end != buf + t.len)
+        return -1;               /* 溢出或尾部有垃圾字符 */
+    *out = v;
     return 0;
-}
-
-/*=============================================================================
- *  共享响应缓存
- *  预分配 0-255 的整数响应，避免重复构造
- *============================================================================*/
-
-static const char *g_int_resp[256];   /* 响应字符串指针 */
-static int         g_int_resp_len[256]; /* 响应字符串长度 */
-static char        g_int_buf[256][16];  /* 响应字符串存储 */
-
-/**
- * 初始化共享响应缓存
- * 预生成 ":0\r\n" 到 ":255\r\n"
- */
-static void init_shared_responses(void) {
-    for (int i = 0; i < 256; i++) {
-        int n = snprintf(g_int_buf[i], sizeof(g_int_buf[i]), ":%d\r\n", i);
-        g_int_resp[i]     = g_int_buf[i];
-        g_int_resp_len[i] = n;
-    }
 }
 
 /**
@@ -157,20 +133,22 @@ static inline int fmt_resp_header(char *dst, char sig, int v) {
     return (int)(p - dst);
 }
 
+/* 最常用整数值的预置响应（DEL/EXPIRE 返回 0/1，直接拼接避免格式化开销） */
+static const char RESP_INT_0[] = ":0\r\n";
+static const char RESP_INT_1[] = ":1\r\n";
+
 /**
  * 回复整数（RESP 整数格式）
- * 0-255 走缓存，其他手写
+ * 0/1 走预置串，其他手写（单次 reserve 一次写满，含负数与 INT64_MIN）
  * @param wb 写缓冲
  * @param v 整数值
  */
 void reply_integer(DynBuf *wb, long long v) {
-    /* 小值走缓存 */
-    if (v >= 0 && v <= 255) {
-        dynbuf_cat(wb, g_int_resp[v], g_int_resp_len[v]);
-        return;
-    }
-    
-    /* 大值手写：单次 reserve 一次写满 */
+    /* 最常见值直接拼接 */
+    if (v == 0) { dynbuf_cat(wb, RESP_INT_0, sizeof(RESP_INT_0) - 1); return; }
+    if (v == 1) { dynbuf_cat(wb, RESP_INT_1, sizeof(RESP_INT_1) - 1); return; }
+
+    /* 其他值手写：单次 reserve 一次写满 */
     char buf[32], *p = buf;
     *p++ = ':';
     
@@ -231,7 +209,6 @@ void reply_bulk(DynBuf *wb, const char *s, int len) {
  */
 int init_kvengine(void) {
     dict_init(&g_dict);
-    init_shared_responses();
     printf("Using string storage engine (single global dict)\n");
     return 0;
 }
@@ -251,7 +228,47 @@ void dest_kvengine(void) {
 void kvs_flush_all(void) {
     dict_clear(&g_dict);
 #ifdef USE_JEMALLOC
-    mallctl("arenas.purge", NULL, NULL, NULL, 0);  /* 强制释放内存给 OS */
+    /* 先 flush 线程 tcache: free 的对象先进 tcache, 不清它 arenas.purge 无物可清;
+     * 再 purge 脏页把内存还给 OS (实测踩坑) */
+    mallctl("thread.tcache.flush", NULL, NULL, NULL, 0);
+    mallctl("arenas.purge", NULL, NULL, NULL, 0);
+#endif
+}
+
+#ifdef USE_JEMALLOC
+/* malloc_stats_print 输出捕获缓冲（INFO 低频调用，静态缓冲足够）
+ * opts="mdga" 只打印全局汇总行（约 2KB），首行即 "Allocated:" 实时总量 */
+static char   g_je_stats_buf[8192];
+static size_t g_je_stats_len;
+
+static void je_stats_cb(void *opaque, const char *s) {
+    (void)opaque;
+    size_t n = strlen(s);
+    if (g_je_stats_len + n < sizeof(g_je_stats_buf))
+        memcpy(g_je_stats_buf + g_je_stats_len, s, n);
+    g_je_stats_len += n;
+}
+#endif
+
+/**
+ * 获取 allocator 自报的存活分配字节数（INFO used_memory 用）
+ * jemalloc: malloc_stats_print 汇总行的 Allocated = 当前存活分配，Redis 同款语义
+ * glibc:    mallinfo2 的 uordblks（堆内已用）+ hblkhd（mmap 已用）近似
+ *
+ * 实测踩坑：本系统 jemalloc(5.3.0) 的 mallctl("stats.allocated")（命名和 mib
+ * 两种路径都试过）只统计大分配，海量小分配（dict 条目这类）不反映进去，值恒定；
+ * 只有 malloc_stats_print 的 "Allocated:" 汇总行才含全部存活分配（含小分配）。
+ */
+uint64_t get_used_mem(void) {
+#ifdef USE_JEMALLOC
+    g_je_stats_len = 0;
+    malloc_stats_print(je_stats_cb, NULL, "mdga");
+    const char *p = strstr(g_je_stats_buf, "Allocated:");
+    if (!p) return 0;
+    return (uint64_t)atoll(p + 10);   /* "Allocated:" 后是数值 */
+#else
+    struct mallinfo2 mi = mallinfo2();
+    return (uint64_t)mi.uordblks + (uint64_t)mi.hblkhd;
 #endif
 }
 
@@ -289,6 +306,16 @@ static void sig_shutdown(int signo) {
     g_kvs_stop = 1;
 }
 
+/**
+ * 子进程回收信号处理器（SIGCHLD）
+ * 用 waitpid(-1) 回收所有已退出子进程（BGSAVE / 全量传输），防止僵尸
+ * 无派发框架：各模块在各自入口 waitpid 探活自己的 PID（ECHILD = 已被本处理器回收）
+ */
+static void sig_child_reap(int signo) {
+    (void)signo;
+    while (waitpid(-1, NULL, WNOHANG) > 0) { }
+}
+
 /*=============================================================================
  *  程序入口
  *============================================================================*/
@@ -298,13 +325,21 @@ int main(int argc, char *argv[]) {
      *  1. 信号设置
      *-------------------------------------------------------------------------*/
     signal(SIGPIPE, SIG_IGN);  /* 忽略 SIGPIPE（写已关闭 socket 会返回 EPIPE） */
-    
+
     struct sigaction sa;
     sa.sa_handler = sig_shutdown;
     sa.sa_flags   = 0;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT,  &sa, NULL);
+
+    /* 子进程回收：waitpid(-1) 回收所有已退出子进程，防僵尸
+     * 无派发框架：各模块入口 waitpid 探活自己的 PID（ECHILD = 已回收） */
+    struct sigaction sa_chld;
+    sa_chld.sa_handler = sig_child_reap;
+    sa_chld.sa_flags   = SA_RESTART | SA_NOCLDSTOP;
+    sigemptyset(&sa_chld.sa_mask);
+    sigaction(SIGCHLD, &sa_chld, NULL);
     
     setlinebuf(stdout);
     setlinebuf(stderr);
@@ -336,8 +371,7 @@ int main(int argc, char *argv[]) {
      *
      *  角色接线（控制面入口即引擎三个回调：client_handler / tick / on_close）：
      *    MASTER：
-     *      启动   repl_fullsync_master_start()   安装 SIGCHLD 回收（数据面子进程）
-     *             repl_backlog_init()            1MB 积压缓冲（仅 incr on）
+     *     启动   repl_backlog_init()            1MB 积压缓冲（仅 incr on）
      *      运行时 client_handler 注入 repl_incr_master_client_handler（PSYNC 探测）：
      *             PSYNC → +CONTINUE 流式 / +FULLRESYNC fork 数据面子进程
      *             repl_tick 无动作；repl_on_close 清理 streaming 从库
@@ -349,8 +383,8 @@ int main(int argc, char *argv[]) {
      *             repl_on_close → 断线安排重连
      *-------------------------------------------------------------------------*/
     if (kvs_config.repl_role == REPL_ROLE_MASTER) {
-        /* Master：启动全量同步服务（PSYNC 握手判定 +FULLRESYNC 时 fork 传输） */
-        repl_fullsync_master_start();
+        /* Master：全量同步在 PSYNC 握手判定 +FULLRESYNC 时 fork 传输子进程
+         * （repl_fullsync_master_trigger），无需启动时初始化 */
         if (kvs_config.incr_sync)
             repl_backlog_init();  /* 增量关闭时无 backlog/无传播 */
     } else if (kvs_config.repl_role == REPL_ROLE_SLAVE) {

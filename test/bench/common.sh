@@ -2,50 +2,55 @@
 # =============================================================================
 # common.sh — 性能基准测试公共函数库
 #
-# 用法: source test/bench/common.sh
+# 用法: source common.sh      # 统一在项目根目录下执行所有 bench_*.sh
+#
+# 职责:
+#   · 日志（纯文本，无颜色）/ 预检 / 速率计算
+#   · 临时配置生成（write_kvs_conf / write_redis_conf）
+#   · 服务器启动与清理（start_kvs / start_redis / stop_all）
+#   · 聚合 QPS 压测（bench_qps）+ 预热（warmup_server）
+#   · 数据填充（pipe_populate：awk → redis-cli --pipe，不依赖 python）
+#
+# 设计约定:
+#   · 相对项目根目录使用路径（build/kvstore 等），无 PROJECT_DIR 等派生常量
+#   · 无颜色、无比值列、无兼容旧调用的包装函数、无运行时改配置
+#   · 清理一律杀干净（pkill kvstore/redis-server/redis-benchmark），不做
+#     进程区分；每轮都是独立启动的干净实例
 # =============================================================================
 
 set -euo pipefail
+shopt -s nullglob
 
-# ---- 路径常量 ----
-PROJECT_DIR="/home/xxf/9.1-kvstore"
-KVS_BIN="${PROJECT_DIR}/build/kvstore"
-CONF_DIR="${PROJECT_DIR}/conf"
+# ---- 基础路径（相对项目根目录）----
+KVS_BIN="build/kvstore"
 LOG_DIR="/tmp/kvstore_bench_$$"
-mkdir -p "$LOG_DIR" 2>/dev/null || LOG_DIR="$(mktemp -d -t kvstore_bench.XXXXXX)"
+mkdir -p "$LOG_DIR"
 
-# ---- 默认端口 ----
+# ---- 默认端口（脚本可按需覆盖）----
 KVS_PORT=2000
 KVS_SLAVE_PORT=2002
-REDIS_PORT=6379
-MASTER_RDMA_PORT=2100
+REDIS_PORT=2001
 
-# ---- CPU 核绑定（对齐 inazuma-kv 方法：server/client 分核，消除核心争抢）----
-SERVER_CORES=${SERVER_CORES:-"0,3"}   # 服务器绑核
-CLIENT_CORES=${CLIENT_CORES:-"1,2"}   # redis-benchmark 客户端绑核
-BENCH_RAND=${BENCH_RAND:-1000000}     # -r 随机 key 范围（0 关闭随机）
+# ---- CPU 核绑定（server / client 分核）----
+SERVER_CORES=${SERVER_CORES:-"0,3"}
+CLIENT_CORES=${CLIENT_CORES:-"1,2"}
+IFS=',' read -r -a CLIENT_CORE_LIST <<< "$CLIENT_CORES"
 
-# ---- 结果输出 ----
-RESULT_FILE="${PROJECT_DIR}/test/bench/results.txt"
-RESULT_CSV="${PROJECT_DIR}/test/bench/results.csv"
+# ---- 压测默认参数（脚本可按需覆盖）----
+NCLIENTS=${NCLIENTS:-2}
+OPS=${OPS:-500000}
+CONN=${CONN:-50}
+DATA=${DATA:-16}
+WARMUP_OPS=${WARMUP_OPS:-1000000}
 
-# ---- 颜色 ----
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
-
-log()  { echo -e "${GREEN}[INFO]${NC}  $(date +%H:%M:%S) $*" >&2; }
-warn() { echo -e "${YELLOW}[WARN]${NC}  $(date +%H:%M:%S) $*" >&2; }
-err()  { echo -e "${RED}[ERROR]${NC} $(date +%H:%M:%S) $*" >&2; }
-step() { echo -e "${CYAN}[STEP]${NC}  $(date +%H:%M:%S) $*" >&2; }
-
-# ---- 便捷别名: info/die + C_* 颜色（全量同步 bench 脚本共用）----
-info() { log "$@"; }
+# ---- 日志（纯文本，直接可写入 txt）----
+log()  { echo "[$(date +%H:%M:%S)] $*"; }
+warn() { echo "[WARN] $(date +%H:%M:%S) $*" >&2; }
+err()  { echo "[ERROR] $(date +%H:%M:%S) $*" >&2; }
+step() { echo "[STEP] $(date +%H:%M:%S) $*" >&2; }
 die()  { err "$@"; exit 1; }
 
-C_BLD=$'\033[1m';   C_DIM=$'\033[2m'
-C_RED=$'\033[31m';  C_GRN=$'\033[32m';  C_YEL=$'\033[33m'
-C_CYN=$'\033[36m';  C_RST=$'\033[0m'
-
-# ---- 速率计算（统一基准: Throughput = 字节数 / 秒 / 1048576  →  MB/s）----
+# ---- 速率计算（字节数 / 秒 → MB/s；条目 / 秒）----
 _fmt() { local v=$1; [ "${v:0:1}" = "." ] && echo "0$v" || echo "$v"; }
 calc_mbps() {
     if [ "$(echo "$2 > 0" | bc 2>/dev/null)" = 1 ]; then
@@ -69,260 +74,126 @@ require_root() {
         exit 1
     fi
 }
-
 require_tools() {
-    for tool in redis-cli redis-benchmark nc bc; do
-        if ! command -v "$tool" >/dev/null 2>&1; then
-            err "缺少工具: $tool"
-            exit 1
-        fi
+    for tool in redis-cli redis-benchmark bc taskset; do
+        command -v "$tool" >/dev/null 2>&1 || { err "缺少工具: $tool"; exit 1; }
     done
-    if [ ! -x "$KVS_BIN" ]; then
-        err "kvstore 未编译: $KVS_BIN"
-        exit 1
-    fi
-    mkdir -p "$LOG_DIR"
+    [ -x "$KVS_BIN" ] || { err "kvstore 未编译: $KVS_BIN"; exit 1; }
 }
 
-# ---- 进程/端口管理 ----
+# ---- 端口等待 ----
 wait_for_port() {
-    local host=$1 port=$2 timeout=${3:-10}
+    local host=$1 port=$2 timeout=${3:-10} i
     for ((i=0; i<timeout*2; i++)); do
-        if ss -tlnp 2>/dev/null | grep -q ":${port} "; then return 0; fi
+        if ss -tln 2>/dev/null | grep -q ":${port} "; then return 0; fi
         sleep 0.5
     done
     return 1
 }
 
-stop_kvs() {
-    # 先通过 pid 文件杀
-    local pidfile="${LOG_DIR}/kvstore.pid"
-    if [ -f "$pidfile" ]; then
-        local pid=$(cat "$pidfile")
-        kill "$pid" 2>/dev/null || true
-        rm -f "$pidfile"
-    fi
-    # 杀所有残留 kvstore 进程（排除本脚本自身）
-    for sig in TERM KILL; do
-        for pid in $(pgrep -x "kvstore" 2>/dev/null || true); do
-            kill -$sig "$pid" 2>/dev/null || true
-        done
-        sleep 0.3
-    done
+# ---- 进程 / 端口清理（一律杀干净）----
+stop_all() {
+    pkill -x kvstore 2>/dev/null || true
+    pkill -x redis-server 2>/dev/null || true
+    pkill -x redis-benchmark 2>/dev/null || true
     sleep 0.5
-    # 确保端口释放
-    local port
-    for port in $KVS_PORT $KVS_SLAVE_PORT $MASTER_RDMA_PORT; do
-        if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
-            fuser -k ${port}/tcp 2>/dev/null || true
-        fi
-    done
-    # 等待端口完全释放，避免随后的启动立即命中 EADDRINUSE。
-    for ((i=0; i<20; i++)); do
-        if ! ss -tlnp 2>/dev/null | grep -qE ":(${KVS_PORT}|${KVS_SLAVE_PORT}|${MASTER_RDMA_PORT}|6382) "; then
-            break
-        fi
-        sleep 0.1
-    done
-    sleep 0.3
 }
 
+# ---- 临时配置生成（统一走临时目录，不依赖 conf/）----
+# write_kvs_conf <文件> <port> <network> <persistence> [额外配置行...]
+write_kvs_conf() {
+    local file=$1 port=$2 net=$3 pers=$4; shift 4
+    {
+        echo "port ${port}"
+        echo "network ${net}"
+        echo "persistence ${pers}"
+        echo "repl_role off"
+        echo "expire off"
+        for kv in "$@"; do echo "$kv"; done
+    } > "$file"
+}
+# write_redis_conf <文件> <port> <aof on|off>
+write_redis_conf() {
+    local file=$1 port=$2 aof=$3
+    local aof_yes="no"; [ "$aof" = on ] && aof_yes="yes"
+    cat > "$file" <<EOF
+port ${port}
+bind 127.0.0.1
+protected-mode no
+save ""
+appendonly ${aof_yes}
+appendfsync everysec
+maxclients 10000
+loglevel warning
+EOF
+}
+
+# ---- 服务器管理（每轮独立启动）----
+# start_kvs <绝对conf路径> <port>
 start_kvs() {
-    local conf=$1
-    local conf_path="${CONF_DIR}/${conf}"
-    if [ ! -f "$conf_path" ]; then
-        err "配置文件不存在: $conf_path"
-        exit 1
-    fi
-    stop_kvs
-    # 清理旧持久化文件
-    rm -f "${PROJECT_DIR}/build/dump.rdb" "${PROJECT_DIR}/build/dump.rdb.tmp" \
-          "${PROJECT_DIR}/build/appendonly.aof"
-    # 提取配置中 port 的值
-    local port=$(grep '^port ' "$conf_path" | awk '{print $2}')
-    port=${port:-$KVS_PORT}
-    nohup taskset -c "$SERVER_CORES" "$KVS_BIN" "$conf_path" > "${LOG_DIR}/kvstore_${conf}.log" 2>&1 &
+    local conf=$1 port=$2
+    rm -f build/dump.rdb build/dump.rdb.tmp build/appendonly.aof \
+          dump.rdb dump.rdb.tmp appendonly.aof
+    nohup taskset -c "$SERVER_CORES" "$KVS_BIN" "$conf" > "${LOG_DIR}/kvstore.log" 2>&1 &
     local pid=$!
     sleep 0.2
     if ! kill -0 "$pid" 2>/dev/null; then
-        err "kvstore 启动失败 (conf=$conf, pid=$pid)"
-        tail -20 "${LOG_DIR}/kvstore_${conf}.log"
-        exit 1
+        err "kvstore 启动失败 (conf=$conf)"; tail -20 "${LOG_DIR}/kvstore.log"; exit 1
     fi
-    echo "$pid" > "${LOG_DIR}/kvstore.pid"
     if ! wait_for_port 127.0.0.1 "$port" 10; then
-        err "kvstore 启动超时 ($conf, port=$port)"
-        tail -20 "${LOG_DIR}/kvstore_${conf}.log"
-        exit 1
+        err "kvstore 启动超时 (port=$port)"; tail -20 "${LOG_DIR}/kvstore.log"; exit 1
     fi
-    if ! ss -tnlp 2>/dev/null | grep -q ":${port} .*pid=${pid}"; then
-        err "kvstore 未绑定到端口 ${port} (conf=$conf, pid=$pid)"
-        tail -20 "${LOG_DIR}/kvstore_${conf}.log"
-        kill "$pid" 2>/dev/null || true
-        exit 1
-    fi
-    log "kvstore 已启动 (conf=$conf, pid=$pid, port=$port)"
+    log "kvstore 已启动 (${conf##*/}, pid=$pid, port=$port)"
 }
 
-start_kvs_master() {
-    start_kvs "kvstore-master-repl.conf"
-    # 等待 RDMA 端口就绪
-    if ! wait_for_port 0.0.0.0 $MASTER_RDMA_PORT 5; then
-        warn "RDMA 端口 $MASTER_RDMA_PORT 未监听（可能 repl_role 未设为 master）"
-    fi
-}
-
-start_kvs_slave() {
-    local conf_path="${CONF_DIR}/kvstore-slave-repl.conf"
-    if [ ! -f "$conf_path" ]; then
-        err "配置文件不存在: $conf_path"
-        exit 1
-    fi
-    # 不调 stop_kvs，因为 master 还在跑
-    rm -f "${PROJECT_DIR}/build/dump.rdb" "${PROJECT_DIR}/build/dump.rdb.tmp" \
-          "${PROJECT_DIR}/build/appendonly.aof"
-    nohup "$KVS_BIN" "$conf_path" > "${LOG_DIR}/kvstore_slave.log" 2>&1 &
-    local pid=$!
-    echo "$pid" > "${LOG_DIR}/kvstore_slave.pid"
-    if ! wait_for_port 127.0.0.1 $KVS_SLAVE_PORT 10; then
-        err "kvstore slave 启动超时"
-        tail -20 "${LOG_DIR}/kvstore_slave.log"
-        exit 1
-    fi
-    log "kvstore slave 已启动 (pid=$pid, port=$KVS_SLAVE_PORT)"
-}
-
-# ---- Redis 管理 (Redis 6.0 daemonize mode) ----
+# start_redis <绝对conf路径>
 start_redis() {
-    # 先停旧实例
-    pkill -x redis-server 2>/dev/null || true
-    sleep 0.5
-    # 清理持久化文件
-    rm -f /var/lib/redis/dump.rdb /var/lib/redis/appendonly.aof
-    rm -f /home/xxf/dump.rdb /home/xxf/appendonly.aof
-    redis-server --daemonize yes --port $REDIS_PORT
-    sleep 1
-    redis-cli -p $REDIS_PORT PING >/dev/null 2>&1 || { err "Redis 启动失败"; exit 1; }
-    # 绑定 redis-server 主线程到指定核
-    local redis_pid
-    redis_pid=$(pgrep -x redis-server | head -1)
-    if [ -n "$redis_pid" ]; then
-        taskset -pc "$SERVER_CORES" "$redis_pid" >/dev/null 2>&1 \
-            || warn "taskset 绑定 redis-server 失败 (pid=$redis_pid)"
+    local conf=$1 port
+    port=$(grep '^port ' "$conf" | awk '{print $2}')
+    nohup taskset -c "$SERVER_CORES" redis-server "$conf" > "${LOG_DIR}/redis.log" 2>&1 &
+    local pid=$!
+    if ! wait_for_port 127.0.0.1 "$port" 10; then
+        err "redis 启动失败 (conf=$conf)"; tail -20 "${LOG_DIR}/redis.log"; exit 1
     fi
-    redis-cli -p $REDIS_PORT FLUSHALL >/dev/null
-    log "Redis 6.0 已启动 (port=$REDIS_PORT)"
+    redis-cli -p "$port" FLUSHALL >/dev/null 2>&1 || true
+    log "redis 已启动 (${conf##*/}, pid=$pid, port=$port)"
 }
 
-redis_configure() {
-    local mode=$1  # none | aof
-    case "$mode" in
-        none)
-            redis-cli -p $REDIS_PORT CONFIG SET save "" >/dev/null
-            redis-cli -p $REDIS_PORT CONFIG SET appendonly no >/dev/null
-            log "Redis: 持久化已关闭"
-            ;;
-        aof)
-            redis-cli -p $REDIS_PORT CONFIG SET appendonly yes >/dev/null
-            redis-cli -p $REDIS_PORT CONFIG SET appendfsync everysec >/dev/null
-            log "Redis: AOF 已开启 (appendfsync everysec)"
-            ;;
-        *)
-            err "未知 Redis 模式: $mode"
-            exit 1
-            ;;
-    esac
-    redis-cli -p $REDIS_PORT FLUSHALL >/dev/null
+# ---- 压测 ----
+# warmup_server <port> —— SET 预热（不计入 QPS）
+warmup_server() {
+    taskset -c "$CLIENT_CORES" redis-benchmark -h 127.0.0.1 -p "$1" -t set \
+        -n "$WARMUP_OPS" -c 50 -P 100 -d "$DATA" -q >/dev/null 2>&1 || true
 }
 
-stop_redis() {
-    pkill -x redis-server 2>/dev/null || true
-    sleep 0.5
-}
-
-# ---- 数据填充 ----
-populate() {
-    local host=$1 port=$2 n=$3
-    local batch_size=10000
-    log "填充 ${n} 条数据到 ${host}:${port}..."
-    local remaining=$n
-    local sent=0
-    while [ $remaining -gt 0 ]; do
-        local batch=$batch_size
-        [ $batch -gt $remaining ] && batch=$remaining
-        for i in $(seq $((sent+1)) $((sent+batch))); do
-            printf 'SET key:%012d benchmark_value_\r\n' $i
-        done | timeout 300 redis-cli -h "$host" -p "$port" --pipe > /dev/null 2>&1
-        sent=$((sent + batch))
-        remaining=$((remaining - batch))
-        echo -n "."
+# bench_qps <port> <test> <P> —— NCLIENTS 并行 redis-benchmark，CSV 第2列求和
+bench_qps() {
+    local port=$1 t=$2 P=$3 pids=() i q=""
+    local cli_to=$((OPS / 10000 + 60))   # P1 下每客户端 ~20K qps 的安全余量
+    for i in $(seq 0 $((NCLIENTS - 1))); do
+        local core="${CLIENT_CORE_LIST[$((i % ${#CLIENT_CORE_LIST[@]}))]}"
+        taskset -c "$core" timeout "$cli_to" \
+            redis-benchmark -h 127.0.0.1 -p "$port" -t "$t" -n "$OPS" \
+            -c "$CONN" -P "$P" -d "$DATA" --csv 2>/dev/null >"${LOG_DIR}/bench_c$i.csv" &
+        pids+=($!)
     done
-    echo ""
-    log "填充完成: ${n} 条"
+    for pid in "${pids[@]:-}"; do wait "$pid" 2>/dev/null || true; done
+    # 各客户端 CSV 第 2 列 = requests/sec；服务器为瓶颈时求和即服务器 QPS
+    q=$(awk -F',' 'FNR>1 {gsub(/"/,"",$2); sum+=$2} END {printf "%.0f", sum}' \
+        "${LOG_DIR}"/bench_c*.csv 2>/dev/null || true)
+    echo "${q:-0}"
 }
 
-# ---- redis-benchmark ----
-run_bench() {
-    local host=$1 port=$2 test=$3 n=${4:-1000000} c=${5:-50} P=${6:-20} d=${7:-3}
-    local csv_line qps="0" retry=0
-    while [ $retry -lt 2 ]; do
-        # 客户端绑核 (CLIENT_CORES) + 随机 key (-r)：消除客户端瓶颈与单 key 热点
-        csv_line=$(taskset -c "$CLIENT_CORES" redis-benchmark -h "$host" -p "$port" -t "$test" \
-            -n "$n" -c "$c" -P "$P" -d "$d" -r "$BENCH_RAND" --csv 2>/dev/null \
-            | grep -E '^"[^"]+","[0-9]' | tail -1)
-        if [ -n "$csv_line" ]; then
-            qps=$(echo "$csv_line" | cut -d',' -f2 | tr -d '"')
-            if [[ "$qps" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-                echo "$qps"
-                return 0
-            fi
-        fi
-        retry=$((retry + 1))
-        [ $retry -lt 2 ] && sleep 0.5
-    done
-    echo "${qps:-0}"
-}
-
-run_bench_quiet() {
-    run_bench "$@" 2>/dev/null
-}
-
-# 带随机 key 的压测（-r 参数，更接近真实场景）
-run_bench_r() {
-    local host=$1 port=$2 test=$3 n=${4:-1000000} c=${5:-50} P=${6:-20} d=${7:-3} r=${8:-1000000}
-    local csv_line
-    csv_line=$(taskset -c "$CLIENT_CORES" redis-benchmark -h "$host" -p "$port" -t "$test" \
-        -n "$n" -c "$c" -P "$P" -d "$d" -r "$r" --csv 2>/dev/null | tail -1)
-    local qps=$(echo "$csv_line" | cut -d',' -f2 | tr -d '"')
-    echo "${qps:-0}"
-}
-
-# ---- 内存采样 ----
-sample_memory() {
-    local pid=$1
-    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-        echo "0 0"
-        return
-    fi
-    local status="/proc/$pid/status"
-    local vmsize=$(grep VmSize "$status" 2>/dev/null | awk '{print $2}')
-    local vmrss=$(grep VmRSS  "$status" 2>/dev/null | awk '{print $2}')
-    echo "${vmsize:-0} ${vmrss:-0}"
-}
-
-# ---- 结果记录 ----
-init_results() {
-    echo "# KVStore Performance Benchmark Results — $(date '+%Y-%m-%d %H:%M:%S')" > "$RESULT_FILE"
-    echo "test,scenario,qps" > "$RESULT_CSV"
-}
-
-record_result() {
-    local test=$1 scenario=$2 qps=$3
-    echo "${test} | ${scenario}: ${qps} req/s" >> "$RESULT_FILE"
-    echo "${test},${scenario},${qps}" >> "$RESULT_CSV"
-    echo -e "  ${GREEN}→ ${qps} req/s${NC}  (${scenario})"
-}
-
-record_raw() {
-    echo "$@" >> "$RESULT_FILE"
+# ---- 数据填充：awk 生成 RESP 流 → redis-cli --pipe（不依赖 python）----
+# pipe_populate <host> <port> <n> <vsize>
+pipe_populate() {
+    local host=$1 port=$2 n=$3 vs=$4
+    awk -v n="$n" -v vs="$vs" '
+        BEGIN {
+            for (j = 0; j < vs; j++) v = v sprintf("%c", 65 + (j % 26));  /* ABC.. 填充 */
+            for (i = 0; i < n; i++) {
+                k = sprintf("key:%012d", i);
+                printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", length(k), k, vs, v;
+            }
+        }' | timeout 300 redis-cli -h "$host" -p "$port" --pipe >/dev/null 2>&1
 }

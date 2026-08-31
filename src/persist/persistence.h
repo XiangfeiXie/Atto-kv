@@ -77,38 +77,6 @@ const char *persist_path(const char *rel);
 int file_read_full(const char *path, char **buf, size_t *size,
                    int *is_mmap, const char *tag);
 
-/*=============================================================================
- *  子进程回收管理（SIGCHLD 统一处理）
- *  
- *  问题：SIGCHLD 每进程只能有一个 handler
- *  解决方案：统一 handler + 回调注册机制
- *  
- *  使用场景：
- *  - BGSAVE 子进程（persist_rdb.c）
- *  - 全量同步传输子进程（repl_fullsync.c）
- *  
- *  两个模块各自注册 reap 回调，由统一 handler 用 waitpid(-1) 回收后逐个通知
- *  回调在异步上下文运行：只能读 pid、写 sig_atomic_t 或打日志
- *============================================================================*/
-
-/**
- * 子进程回收回调函数类型
- * @param pid 已终止的子进程 PID
- * @param status waitpid 返回的状态码
- */
-typedef void (*kvs_child_reap_fn)(pid_t pid, int status);
-
-/**
- * 初始化子进程回收机制（幂等）
- * 安装全局 SIGCHLD handler
- */
-void kvs_child_reap_init(void);
-
-/**
- * 注册子进程回收回调（幂等，去重注册）
- * @param fn 回调函数
- */
-void kvs_child_reap_register(kvs_child_reap_fn fn);
 
 /*=============================================================================
  *  AOF 持久化（原 persist_aof.h，已并入）
@@ -241,7 +209,6 @@ int rdb_load_from_buf(const char *buf, size_t len);
  * 支持分块接收和增量解析
  */
 int rdb_load_stream_begin(const char *buf, size_t len);   /* 开始流式加载 */
-int rdb_load_stream_append(const char *buf, size_t len);  /* 追加数据块（到缓冲末尾） */
 int rdb_load_stream_append_n(const char *buf, size_t len, int limit,
                              size_t *consumed);  /* 追加数据块（限条数，可选输出消费字节数） */
 

@@ -51,13 +51,13 @@
 #define MASTER_PORT 2000          /* kvstore master 端口 */
 #endif
 #ifndef SLAVE_IP
-#define SLAVE_IP    "10.0.1.2"    /* 从机 veth1 IP */
+#define SLAVE_IP    "192.168.30.136"    /* 从机 veth1 IP */
 #endif
 #ifndef SLAVE_PORT
-#define SLAVE_PORT  2001          /* kvstore slave 端口 */
+#define SLAVE_PORT  2000          /* kvstore slave 端口 */
 #endif
 #ifndef IFACE
-#define IFACE       "veth0"       /* master 侧客户端流量所经网卡 */
+#define IFACE       "ens33"       /* master 侧客户端流量所经网卡 */
 #endif
 
 struct sock_rec {

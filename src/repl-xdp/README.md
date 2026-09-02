@@ -85,6 +85,8 @@ sudo ip netns exec red bash -c 'prlimit --pid $$ --memlock=unlimited; nohup \
 
 > **测试客户端必须从 slave netns（或任何跨 veth 的地方）发起**：客户端若在
 > master netns 内连本机 IP，走本地回环路径不经 veth0，XDP 采样不到。
+> （把 `IFACE` 改挂 `lo` 想直接镜像本机填充同样采不到——回环大块写的 frag 问题，
+> 见下文「已知问题」。）
 
 ```bash
 # 向 master 写 10 万 key（跨 veth → master 10.0.1.1:2000）
@@ -127,6 +129,35 @@ sudo pkill -x kvstore
   ~500KB 且自动排空）。
 - **客户端重传**：同一包被客户端重传时 BPF 采到同 seq 重复段，用户态按
   `seq < g_next_seq` 丢弃，不影响正确性。
+
+## 已知问题：IFACE=lo 镜像本机填充采不到数据（未修复）
+
+**场景**：把 `IFACE` 从网卡改挂 `lo`，想镜像「master 本机向 127.0.0.1 填充」的流量。
+
+**症状**：repl-xdp 启动正常（`[xdp] 已挂 lo`、已连从机、开始镜像），但客户端
+`fill` 大块写入期间，退出统计为 `镜像 0 字节`。抓 BPF ring 发现**只采到连接 SYN，
+DATA 记录一条没有**（`drops` 计数为 0，排除 ring 溢出）。
+
+**根因**（2026-08-31 实测定位，未修复）：回环路径上，**大块 `send()` 的 TCP 负载
+挂在 skb 的 page frags（非线形）里**。generic（SKB 模式）XDP 的 `ctx->data ~
+data_end` 只覆盖 skb 线性头；payload 在 frag 中时，repl-xdp-sock.bpf.c 里
+`payload < data_end` 不成立，DATA 分支被静默跳过 → ring 里只有 SYN 锚点。
+
+| 客户端发送方式 | lo 上 XDP 能否采到 DATA |
+|---|---|
+| 大块 send（testcase fill 512KB 一次） | ✗ 只有 SYN |
+| 单条小 send（62B） | ✓ |
+| 单连接逐条小 send（27B×500 + TCP_NODELAY） | ✓ |
+
+**排除项**：不是 GSO/GRO——`ethtool -K lo gro off gso off tso off` 后依旧丢。
+lo 专属：`IFACE=ens33` 的跨机镜像正常（网卡驱动 RX 重建线形 skb，payload 可见）；
+lo 不走驱动，发送端 frag skb 原样进 RX，XDP 只能看到线性头。
+
+**修复方向（未实施）**：
+- **最小**：testcase fill 改小分块 send + `TCP_NODELAY`，让每个 send 独立成小线性段。
+  只对本 demo 的客户端生效。
+- **通用**：改用 TC eBPF 挂 lo，用 `bpf_skb_load_bytes()` 穿透 frag 读 payload。
+  注意 lo 的 MSS=65483（单段可达 64KB）> `MAX_REC=2048`，需处理大段切块或压 MTU。
 
 ## 配置项（`-D` 覆盖，改后需重新编译）
 

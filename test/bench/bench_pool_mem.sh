@@ -25,14 +25,13 @@
 #  N 按 N×total ≈ 固定 payload 缩放 —— 池每档最后一个不满超块最多浪费 64KB,
 #  档越大尾耗占比越高, N 太小会把节省量吃掉甚至反超。
 #
-#  用法(项目根): bash test/bench/bench_pool_mem.sh [R]
-#    R  每(档位,形态)重复轮数, 默认 3, 取中位数
+#  用法(项目根): bash test/bench/bench_pool_mem.sh
+#  单轮: 4 形态 × 3 档 各跑一次, 结果直接入表(不做重复取中位数)
 #  输出: 终端表 + test/bench/results_pool_mem.txt
 #=============================================================================
 script_name=$(basename "$0")
 source "$(dirname "$0")/common.sh"
 
-R=${1:-3}
 PORT=2000
 SERVER_CORES=5              # server 钉单核(bench_qps 同款隔离核), 减调度噪声
 SETTLE=1                    # 启动后静置(等 reactor 就绪)
@@ -136,14 +135,10 @@ measure_round() { # $1=bin  $2=kv_pool值  $3=N  $4=stream
     echo "$su $sr $pu $ph $qu $qr $dbsize"
 }
 
-# 取某文件第 c 列的中位数
-colmed() { awk -v c="$2" '{print $c}' "$1" | sort -n \
-    | awk '{a[NR]=$1} END{ if (NR == 0) {print 0} else if (NR % 2) print a[(NR+1)/2]; else print int((a[NR/2]+a[NR/2+1])/2) }'; }
-
 > "$RESULT_FILE"
 {
     echo "bench_pool_mem — $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "纯插入 N×V, 每(档位,形态) ${R} 轮取中位数; 三列均取自进程 [MEM] 自报"
+    echo "纯插入 N×V, 每形态 1 轮; 三列均取自进程 [MEM] 自报"
     echo "启动=[MEM]startup  峰值=[MEM]shutdown/pre-release  回收=[MEM]shutdown/post-release(FLUSHALL 后)"
     echo "峰值/key = (峰值used − 启动used)/dbsize; 回收率 = (峰值used − 回收used)/(峰值used − 启动used)"
     echo ""
@@ -161,28 +156,23 @@ for arm in "${ARMS[@]}"; do
     echo "" >> "$RESULT_FILE"
     echo "── V=$V (N=$N, entry total=$((48+V)); $NOTE)" >> "$RESULT_FILE"
 
-    declare -a SU PU PH QU QR PK RET   # 形态 → 各列中位数
+    declare -a SU PU PH QU QR PK RET   # 形态 → 各列
     for i in "${!BINS[@]}"; do
-        raws="$WORK/arm${V}_cfg${i}.txt"; : > "$raws"
-        for ((r = 1; r <= R; r++)); do
-            measure_round "${BINS[$i]}" "${POOLV[$i]}" "$N" "$STREAM" >> "$raws" || true
-        done
-        [ -s "$raws" ] || { echo "  ${LABELS[$i]}: 无有效轮次" >&2; continue; }
+        row=$(measure_round "${BINS[$i]}" "${POOLV[$i]}" "$N" "$STREAM") \
+            || { echo "  ${LABELS[$i]}: 该轮无效, 跳过" >&2; continue; }
 
-        read -r s_u s_r p_u p_h q_u q_r <<< \
-            "$(colmed "$raws" 1) $(colmed "$raws" 2) $(colmed "$raws" 3) \
-               $(colmed "$raws" 4) $(colmed "$raws" 5) $(colmed "$raws" 6)"
+        read -r s_u s_r p_u p_h q_u q_r _ <<< "$row"
         SU[$i]=$s_u; PU[$i]=$p_u; PH[$i]=$p_h; QU[$i]=$q_u; QR[$i]=$q_r
-        PK[$i]=$(awk -v p="${PU[$i]}" -v s="${SU[$i]}" -v d="$N" \
+        PK[$i]=$(awk -v p="$p_u" -v s="$s_u" -v d="$N" \
             'BEGIN{ printf "%.1f", (p-s)/d }')
-        RET[$i]=$(awk -v p="${PU[$i]}" -v s="${SU[$i]}" -v q="${QU[$i]}" \
+        RET[$i]=$(awk -v p="$p_u" -v s="$s_u" -v q="$q_u" \
             'BEGIN{ if (p>s) printf "%.0f", (p-q)*100/(p-s); else print "-" }')
 
         printf "  %-13s %11s %12s %10s %11s %12s %11s %8s\n" \
             "${LABELS[$i]}" "${SU[$i]}" "${PU[$i]}" "${PK[$i]}" \
             "${PH[$i]}" "${QU[$i]}" "${QR[$i]}" "${RET[$i]}" \
             | tee -a "$RESULT_FILE"
-        echo "     raw: $(tr '\n' '|' < "$raws")" >&2
+        echo "     raw: $row" >&2
     done
 
     # 同底座内 池-无池 的峰值/key 差(核心结论: 池省多少 / 亏多少)

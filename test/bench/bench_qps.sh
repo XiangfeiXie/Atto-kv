@@ -2,12 +2,13 @@
 # =============================================================================
 # bench_qps.sh — proactor / redis 的 pipeline SET QPS 压测（基线与 AOF 二合一）
 #
-# 同一套系统（kvstore proactor / redis）× 同一套方法（NCLIENTS 聚合 QPS），
+# 同一套系统（kvstore proactor / redis）× 同一套方法（本地回环，单客户端 QPS），
 # 通过 --aof 开关选择测量目标：
 #   --aof off（默认）→ 基准：kvstore(persistence none) / redis(save "" aof no)
 #   --aof on         → AOF：kvstore(persistence aof everysec) / redis(appendonly yes)
 #
-# 指标：只测 SET 的聚合 QPS。
+# 指标：只测 SET 的 QPS。服务器与压测客户端同机、走 127.0.0.1 回环，
+#       客户端只跑 1 个 redis-benchmark 进程（单线程，绑单核）。
 #
 # 用法（项目根目录执行）:
 #   ./test/bench/bench_qps.sh               # 基准
@@ -22,7 +23,8 @@ source "$(dirname "$0")/common.sh"
 
 # 本脚本覆盖的默认参数（单核公平对比）
 SERVER_CORES="5"
-CLIENT_CORES="0,2"
+CLIENT_CORES="0"
+NCLIENTS=1                                            # 单客户端：1 个 benchmark 进程
 IFS=',' read -r -a CLIENT_CORE_LIST <<< "$CLIENT_CORES"
 PIPELINES=(1 4 8 16 20 40 80 160)
 AOF=off

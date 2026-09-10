@@ -1,6 +1,5 @@
 # Build artifacts
 *.o
-build/
-build-glibc/
+build*/
 .cache/
 *.csv

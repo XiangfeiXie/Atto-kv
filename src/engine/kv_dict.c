@@ -7,13 +7,40 @@
  *  2. 负载因子 >= 1 时一次性扩容（2 倍）
  *  3. 内存布局：header + key + payload 连续存储
  *  4. 支持随机采样（用于过期键淘汰）
- *  5. 支持条目原地扩容（值变大时重建）
+ *  5. 条目尺寸变化一律重建（缩小/放大统一，不做原地 realloc）
  *============================================================================*/
 
 #include "kv_dict.h"
+#include "kv_pool.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+
+/*=============================================================================
+ *  数据域 entry 分配器（自研内存池 kv_pool，可选注入）
+ *
+ *  - s_pool 为空 → 底座 malloc/free（独立测试 / 配置 kv_pool off 时行为不变）
+ *  - s_pool 注入 → entry 整块分配/释放全走池。free 携带尺寸，尺寸由 entry
+ *    头部（key_len/val_len）原样推导 → 要求「块尺寸恒 == 头部推导值」；
+ *    dict_resize_entry 一律重建（缩小不原地）即为此契约的前提。
+ *  - 池实例由 kvstore.c 建/销（init_kvengine 注入、dest_kvengine 解绑），
+ *    主线程专属（dict 变更仅发生在引擎主循环）。
+ *============================================================================*/
+
+static kv_pool_t *s_pool;   /* 注入的数据域内存池；NULL = 底座 malloc/free */
+
+/** 一次 entry 整块分配：total = 32 + key_len + val_len（对齐 ≥16 由池保证） */
+static kv_entry_t *kv_entry_block_alloc(uint32_t total) {
+    if (s_pool) return (kv_entry_t *)kv_pool_alloc(s_pool, (size_t)total);
+    return (kv_entry_t *)malloc((size_t)total);
+}
+
+/** 一次 entry 整块释放：尺寸从头部推导（kv_pool「free 携带尺寸」契约） */
+static void kv_entry_free(kv_entry_t *e) {
+    uint32_t total = (uint32_t)sizeof(kv_entry_t) + e->key_len + e->val_len;
+    if (s_pool) kv_pool_free(s_pool, e, (size_t)total);
+    else        free(e);
+}
 
 /*=============================================================================
  *  内部常量与工具
@@ -54,7 +81,7 @@ static kv_entry_t *entry_alloc(const char *key, uint32_t key_len,
                                uint64_t hash)
 {
     uint32_t total = (uint32_t)sizeof(kv_entry_t) + key_len + payload_len;
-    kv_entry_t *e = (kv_entry_t *)malloc((size_t)total);
+    kv_entry_t *e = kv_entry_block_alloc(total);
     if (unlikely(!e)) return NULL;
 
     e->next    = NULL;
@@ -102,22 +129,27 @@ void dict_init(kv_dict_t *d) {
 
 /**
  * 清空字典（删除所有条目）
+ * 全清后若注入池则整批归还空超块给底座（kv_pool_release_all）——被清掉的
+ * entry 内存真正还回底座，后续 jemalloc purge 才能把页还给 OS（对 FLUSHALL /
+ * RDB 重载后的 RSS 回落必需）。dict_clear 是全量清空（无存活 entry），恰是
+ * release_all 的契约前提；下次插入由池重新开块，容量测量各档独立不串高水位。
  * @param d 字典指针
  */
 void dict_clear(kv_dict_t *d) {
     if (!d->buckets) return;
-    
+
     /* 遍历所有桶，释放每个 entry */
     for (uint32_t i = 0; i < d->size; i++) {
         kv_entry_t *e = d->buckets[i];
         while (e) {
             kv_entry_t *next = e->next;
-            free(e);
+            kv_entry_free(e);
             e = next;
         }
     }
     free(d->buckets);
     dict_init(d);  /* 重置为空状态 */
+    if (s_pool) kv_pool_release_all(s_pool);
 }
 
 /**
@@ -257,7 +289,7 @@ int dict_delete(kv_dict_t *d, const char *key, uint32_t key_len,
             kv_fast_cmp(entry_key(e), key, (int)key_len) == 0)
         {
             *pp = e->next;   /* 从链表中摘除 */
-            free(e);
+            kv_entry_free(e);
             d->used--;
             return 0;
         }
@@ -267,11 +299,22 @@ int dict_delete(kv_dict_t *d, const char *key, uint32_t key_len,
 }
 
 /**
- * 调整 entry 的 payload 大小（原地或重建）
+ * 调整 entry 的 payload 大小（一律重建）
  * @param d 字典指针
- * @param e 待调整的 entry
+ * @param e 待调整的 entry（返回后原指针已释放，不得再用）
  * @param new_payload_len 新的 payload 长度
- * @return 调整后的 entry 指针（可能与原指针不同），失败返回 NULL
+ * @return 调整后的 entry 指针（新块），失败返回 NULL
+ *
+ * 为什么尺寸一改就重建，连缩小也不原地（只改 val_len）？
+ * 1. 对 arena / 内存池内的 entry 做原地 realloc 是未定义行为（指针移动破坏
+ *    桶链），放大早如此，缩小不应例外。
+ * 2. 重建保证「块尺寸恒 == sizeof(kv_entry_t) + key_len + val_len」：
+ *    entry 释放时总能从头部原样算出当初的分配尺寸。这是后续 kv_pool
+ *    「free 携带尺寸」契约的严格前提——原地缩小会让头部推导尺寸小于实际
+ *    块，free 按尺寸路由档位时账本漂移（档位 live 计数被减成负值）。
+ *
+ * 代价只在「反复把同一 key 改小」的写路径上多一次分配/释放；SET 每次 resize
+ * 后都整段重写新 payload（string_set），重建无须拷贝旧 payload，只拷 key。
  */
 kv_entry_t *dict_resize_entry(kv_dict_t *d, kv_entry_t *e,
                               uint32_t new_payload_len)
@@ -279,23 +322,14 @@ kv_entry_t *dict_resize_entry(kv_dict_t *d, kv_entry_t *e,
     if (new_payload_len == e->val_len)
         return e;  /* 长度不变，直接返回 */
 
-    /* 缩小：key 在头部不动，只改尾部的 val_len 即可 */
-    if (new_payload_len < e->val_len) {
-        e->val_len = new_payload_len;
-        return e;
-    }
-
-    /* 变大：新建 entry 顶替链中旧 entry，再释放旧的
-     * 
-     * 为什么不用 realloc 原地扩容？
-     * 1. jemalloc 下 realloc 可能移动指针，破坏桶链
-     * 2. 对 arena 内 entry 做 realloc 是未定义行为
-     */
+    /* 新建 entry 顶替链中旧 entry，再释放旧的（缩小放大统一路径）
+     * - 不调用 realloc：arena / 池内 entry 指针可能移动，破坏桶链
+     * - 只拷 key + 头部字段，payload 由调用方随后整段写入 */
     uint32_t total = (uint32_t)sizeof(kv_entry_t) + e->key_len + new_payload_len;
-    kv_entry_t *ne = (kv_entry_t *)malloc((size_t)total);
+    kv_entry_t *ne = kv_entry_block_alloc(total);
     if (unlikely(!ne)) return NULL;
 
-    /* 复制原有数据 */
+    /* 复制原有数据（key 固定在头部，永不移动） */
     ne->next    = NULL;
     ne->hash    = e->hash;
     ne->expire  = e->expire;
@@ -309,7 +343,7 @@ kv_entry_t *dict_resize_entry(kv_dict_t *d, kv_entry_t *e,
     while (*pp && *pp != e) pp = &(*pp)->next;
     ne->next = e->next;
     if (*pp) *pp = ne;   /* e 不在链中时只释放旧的（理论上不应发生） */
-    free(e);
+    kv_entry_free(e);    /* 释放旧块：尺寸从其头部推导 == 当初 alloc 尺寸 */
 
     return ne;
 }
@@ -427,6 +461,20 @@ kv_entry_t *dict_get_random_key(kv_dict_t *d) {
         bucket_idx = (bucket_idx + 1) % d->size;
     }
     return NULL;  /* 理论上不会到达（d->used > 0） */
+}
+
+/*=============================================================================
+ *  内存池绑定（数据域 entry 分配器）
+ *  kvstore.c 启动时 kv_pool_create() 后注入、dest_kvengine 解绑并销毁；
+ *  未绑定（NULL）时 entry 分配回退底座 malloc/free（独立测试行为不变）。
+ *============================================================================*/
+
+void dict_set_pool(kv_pool_t *pool) {
+    s_pool = pool;
+}
+
+kv_pool_t *dict_pool(void) {
+    return s_pool;
 }
 
 /*=============================================================================

@@ -24,6 +24,11 @@
 
 #include <stddef.h>      /* size_t：backlog 偏移量 */
 #include "dynbuf.h"      /* DynBuf：增量接口 */
+#include "protocol.h"    /* kvs_token_t / dispatch_result_t：PSYNC 控制命令走命令分发 */
+
+struct rbuf;             /* rbuf 节点队列读缓冲（net/rbuf.h）：rbuf 形态 handler
+                          * 的参数类型。本头只依赖类型名，不拉进网络存储头 */
+
 
 /*=============================================================================
  *  双平面架构
@@ -48,7 +53,8 @@
  *  控制面状态机总览（PSYNC 驱动）
  *
  *  引擎三个回调是控制面全部跳转的入口，控制面逻辑以它们为骨架：
- *    · 数据到达 → client_handler（master：PSYNC 握手决策 / slave：握手+回放）
+ *    · 数据到达 → client_handler（slave：握手+回放）；master 无专属 handler，
+ *      PSYNC 作为控制命令经命令分发层 kvs_dispatch 的 PSYNC 分支接管
  *    · 每轮循环 → repl_tick   （slave 连接 / 重连 / 全量交接推进）
  *    · 连接释放 → repl_on_close（master：清理 streaming 从库 / slave：安排重连）
  *
@@ -75,7 +81,7 @@
  *  tick 入口直接返回，不再连接。统一重试时间戳 g_next_retry 只承担退避：
  *  now < g_next_retry 时 tick 不行动（初始 / 续传 = 0，立即可行动）。
  *
- *  Master 侧（单 streaming 从库，g_slave.fd >= 0 即 streaming）：
+ *  Master 侧（单 streaming 从库，g_slave_fd >= 0 即 streaming）：
  *    无从库 ──PSYNC 决策点（offset 在 backlog 窗口内且 incr on）──> +CONTINUE
  *              + backlog 补发 → streaming（实时传播）
  *         └── 窗口外 / incr off 无 backlog ──> +FULLRESYNC
@@ -221,36 +227,23 @@ int repl_backlog_valid(size_t offset);
  *-------------------------------------------------------------------------*/
 
 /**
- * Master 主端口的默认 client handler
+ * Master 端 PSYNC 命令处理（命令分发层入口，kvstore_dispatch.c 的 PSYNC 分支调用）
  *
- * 功能：
- * 1. 快速探测 PSYNC 命令
- * 2. 如果是 PSYNC → 切换为 slave handler
- * 3. 否则委托 kvs_drain_resp_commands_off 处理普通命令
+ * 仅当 repl_engine_append!=NULL 且本机 repl_role==MASTER 时被 dispatch 接管。
+ * 决策：offset 纯数字且在 backlog 窗口内（incr on）→ 写 +CONTINUE + backlog
+ * 回补进 wb，置 g_slave_fd = 当前连接 fd（取 g_kvs_drain_fd），返回
+ * DISPATCH_OK（不关连接，可继续管道命令 / P4 不设 streaming guard）；
+ * 否则 → 写 +FULLRESYNC 进 wb、repl_fullsync_master_trigger() fork 数据面子进程，
+ * 返回 DISPATCH_CLOSE（引擎冲刷后关 = QUIT 同路径）。
+ * argc!=2 / offset 非纯数字 → 写错误并返回 DISPATCH_CLOSE。
+ * journaled 不置位；回复与普通命令同路径直接 dynbuf_cat(wb)（wb 即引擎连接缓冲）。
  *
- * 注入方式：kvstore.c 注入给 proactor/reactor 作为默认 handler
- *
- * @param fd 连接 fd
- * @param rb 读缓冲
- * @param r_off 读偏移
- * @param wb 写缓冲
- * @param want_close 关闭标志
- * @return 处理的命令数，-1 表示协议错误
+ * @param tokens 已解析 token（tokens[0] 已大写）
+ * @param argc 参数个数
+ * @param wb 引擎写缓冲（drain 返回后引擎冲刷）
+ * @return DISPATCH_OK（流式，继续）/ DISPATCH_CLOSE（全量或错误，冲刷后关）
  */
-int repl_incr_master_client_handler(int fd, DynBuf *rb, int *r_off,
-                                    DynBuf *wb, int *want_close);
-
-/**
- * Master 端从库连接的 handler
- *
- * 功能：
- * 1. 从库在 streaming 期间不应再发数据
- * 2. 任何输入视为连接断开
- *
- * 调用时机：从库 PSYNC 成功后切换为该 handler
- */
-int repl_incr_master_slave_handler(int fd, DynBuf *rb, int *r_off,
-                                   DynBuf *wb, int *want_close);
+dispatch_result_t repl_master_psync_handle(kvs_token_t *tokens, int argc, DynBuf *wb);
 
 /**
  * Master 端连接关闭回调
@@ -281,25 +274,24 @@ void repl_incr_master_on_close(int fd);
 int repl_incr_slave_start(const char *master_ip, int master_port);
 
 /**
- * Slave 端 Master 链路 handler
+ * Slave 端 Master 链路 handler（slave_adopt 注册给引擎）
  *
- * 功能：
- * 1. 握手协议：处理 +CONTINUE / +FULLRESYNC
- * 2. 流式回放：接收并执行 Master 发送的增量命令
- *
- * 状态机：
- * - 握手阶段：等待 +CONTINUE 或 +FULLRESYNC
- * - 回放阶段：逐条执行 RESP 命令
+ * 链路读缓冲与普通连接一致（rbuf 节点队列）：
+ *  - 握手未完成（fd>=0 + !handshake_done）：解析 PSYNC 响应第一行
+ *    （rbuf 逻辑流按行扫前缀，+CONTINUE / +FULLRESYNC / 意外）；
+ *  - 握手已完成（handshake_done）：流式回放复用协议层 rbuf drain
+ *    （kvs_drain_rbuf_commands），整命令粒度与 AOF 一致，offset 推进 =
+ *    drain 消费字节；协议错误经 want_close → on_close 安排重连。
+ * 由 repl_engine_register_rbuf 挂载，对 reactor/proactor 通用。
  *
  * @param fd 连接 fd
- * @param rb 读缓冲
- * @param r_off 读偏移
+ * @param rb 读缓冲（节点队列）
  * @param wb 写缓冲
  * @param want_close 关闭标志
  * @return 处理的命令数，-1 表示协议错误
  */
-int repl_incr_slave_master_link_handler(int fd, DynBuf *rb, int *r_off,
-                                        DynBuf *wb, int *want_close);
+int repl_incr_slave_link_rbuf_handler(int fd, struct rbuf *rb, DynBuf *wb,
+                                      int *want_close);
 
 /**
  * Slave 端连接关闭回调
@@ -344,8 +336,8 @@ void repl_incr_slave_reset_offset(void);
  * 功能：把写命令推送给已完成 +CONTINUE 握手的从库（streaming 状态）
  *
  * 调用位置：每次成功的写命令后（SET/DEL/FLUSHALL/EXPIRE 等）
- * 调用者：kvs_repl_incr_hook（kvstore_internal.h）
- *         ——backlog 追加在 hook 内完成，本函数只负责推送
+ * 调用者：kvs_journal_effect（kvstore_dispatch.c）
+ *         ——backlog 追加在钩子内完成，本函数只负责推送
  *
  * @param resp_data RESP 格式的命令数据
  * @param len 数据长度

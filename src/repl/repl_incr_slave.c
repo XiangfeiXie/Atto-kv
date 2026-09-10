@@ -45,7 +45,7 @@
  *    tick 入口直接返回，不再连接）
  *
  *    触发入口（引擎三个回调，控制面所有跳转都汇聚于此）：
- *      数据到达 → repl_incr_slave_master_link_handler（握手 / 流式回放）
+ *      数据到达 → repl_incr_slave_link_rbuf_handler（握手 / 流式回放）
  *      每轮循环 → repl_incr_slave_tick（连接 / 重连）
  *      连接释放 → repl_incr_slave_on_close（断开 → 安排重连）
  *============================================================================*/
@@ -53,6 +53,7 @@
 #include "repl.h"
 #include "kvstore.h"
 #include "protocol.h"
+#include "rbuf.h"       /* Master 链路读缓冲与普通连接一致：rbuf 节点队列 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,122 +81,87 @@ static int          g_incr_enabled    = 1;   /* incr_sync off → 只做一次�
 static long long    g_next_retry      = 0;   /* 下一次允许 tick 行动的时间戳（退避语义见文件头） */
 
 /*=============================================================================
- *  流式回放
- *  从读缓冲中解析并执行 RESP 命令
- *  只推进到命令边界（offset 只计完整命令）
+ *  Master 链路 Handler（slave 出站链路，引擎挂载）
+ *
+ *  Slave 的 Master 链路读缓冲与普通连接一致（rbuf 节点队列，
+ *  reactor/proactor 同构）；数据到达按状态分派，状态机见文件头图：
+ *    - 握手（fd>=0 + !handshake_done）：在 rbuf 逻辑流上按行
+ *      （memchr '\n'）解析 PSYNC 响应第一行 → slave_handshake_rbuf
+ *    - 流式回放（handshake_done）：复用协议层 rbuf drain
+ *      （kvs_drain_rbuf_commands）整命令消费 → slave_replay_rbuf
+ *
+ *  拷贝粒度与 AOF / 普通客户端一致（整命令），offset 推进天然只计完整
+ *  命令边界（drain 消费字节）；协议错误由 drain 置 want_close → 引擎断链
+ *  → on_close 安排重连（全程用 want_close 表达失败，无 -1 返回值遗留）。
+ *
+ *  M2 清理：原 DynBuf 三件套（slave_replay_stream / slave_handle_handshake /
+ *  repl_incr_slave_master_link_handler）已删——全引擎读缓冲均为 rbuf，
+ *  状态机只保留一份 rbuf 实现，无形态分叉。
  *============================================================================*/
 
-/**
- * 回放流式数据
- *
- * 功能：
- * 1. 从读缓冲中解析完整的 RESP 命令
- * 2. 执行命令（写入本地字典）
- * 3. 推进 offset（只计完整命令边界）
- *
- * @param fd 连接 fd
- * @param rb 读缓冲
- * @param r_off 读偏移
- * @return 0 成功，-1 协议错误
- *
- * 设计要点：
- * - master 转发的只会是标准 RESP，不做其他格式兜底
- * - g_in_reload=1 抑制日志和复制传播
- * - offset 只推进到命令边界（断线重续安全）
- */
-static int slave_replay_stream(int fd, DynBuf *rb, int *r_off) {
-    (void)fd;
-    int off = *r_off, remaining = rb->len;
-
-    DynBuf dummy;
-    dynbuf_init(&dummy, 256);
-
-    while (remaining > 0) {
-        kvs_token_t tokens[KVS_MAX_TOKENS];
-        int argc = 0;
-        int cmd_len = resp_parse_slices(rb->buf + off, remaining,
-                                        tokens, KVS_MAX_TOKENS, &argc);
-
-        if (cmd_len < 0) {
-            dynbuf_free(&dummy);
-            return -1;          /* 协议错误：交给引擎断线走重连 */
-        }
-        if (cmd_len == 0)
-            break;              /* 命令不完整，等更多数据 */
-
-        /* 执行命令（g_in_reload 抑制日志/复制/AOF） */
-        dummy.len = 0;
-        g_in_reload = 1;
-        kvs_dispatch(tokens, argc, rb->buf + off, cmd_len, &dummy);
-        g_in_reload = 0;
-
-        off += cmd_len;
-        remaining -= cmd_len;
+/** 在 rbuf 逻辑流 [0, len) 中找第一个 '\n' 的下标；找不到返回 0 */
+static int rbuf_find_newline(const struct rbuf *rb, uint32_t *idx) {
+    uint32_t off = 0, len = rbuf_len(rb);
+    while (off < len) {
+        const char *base = NULL;
+        uint32_t n = rbuf_contig(rb, off, &base);   /* 段内连续可读长度 */
+        const char *nl = memchr(base, '\n', n);
+        if (nl) { *idx = off + (uint32_t)(nl - base); return 1; }
+        off += n;                                    /* 未中：换下一连续段 */
     }
-
-    dynbuf_free(&dummy);
-
-    /* 只计完整命令边界的字节数 → 断线重连续传对齐 */
-    g_slave_offset += (size_t)(off - *r_off);
-
-    /* 缓冲压缩（与 kvs_drain 相同逻辑） */
-    if (off > rb->cap / KVS_RB_COMPACT_RATIO && remaining > 0 &&
-        remaining < off) {
-        memmove(rb->buf, rb->buf + off, (size_t)remaining);
-        off = 0;
-    }
-    *r_off = off;
-    rb->len = remaining;
     return 0;
 }
 
-/*=============================================================================
- *  握手处理（待握手：fd>=0 + !handshake_done）
- *  解析 PSYNC 响应，决定进入流式 / 全量 / 重连
- *============================================================================*/
+/**
+ * 流式回放：复用普通命令 drain 消费完整命令
+ *
+ * g_in_reload=1 罩住 drain → 其 want_raw（!g_in_reload）在回放期不物化、不回传
+ * journal 到 kvs_journal_effect——从 master 收到的写不落本机 AOF/backlog；
+ * kvs_journal_effect 自身的 g_in_reload 短路是第二道保险。
+ * offset 推进 = drain 消费字节（before − after），只到完整命令边界。
+ */
+static int slave_replay_rbuf(struct rbuf *rb, int *want_close) {
+    uint32_t before = rbuf_len(rb);
+    DynBuf dummy;
+    dynbuf_init(&dummy, 256);
+
+    g_in_reload = 1;
+    int rc = kvs_drain_rbuf_commands(-1, rb, &dummy, want_close);
+    g_in_reload = 0;
+    dynbuf_free(&dummy);
+
+    g_slave_offset += (size_t)(before - rbuf_len(rb));
+    return rc < 0 ? -1 : 0;
+}
 
 /**
- * 处理 PSYNC 握手响应（第一行）
- *
- * @param rb 读缓冲
- * @param r_off 读偏移
- * @param want_close 关闭标志
- * @return 0 成功（或等待更多数据）
- *
- * 转移：
- * - +CONTINUE  → g_handshake_done=1（流式，行后可能夹带 backfill，直接回放）
- * - +FULLRESYNC→ 摘链 + 内联数据面全量；全量后 rejudge 仍 +FULLRESYNC → 终结失败
- * - 意外响应   → 无链路（1s 后重试）
+ * 处理 PSYNC 握手响应：按 rbuf 逻辑流找第一行 '\n'，前缀判定只需行首 64B
+ * （+FULLRESYNC 行很短，超长行的其余字节无关紧要）。
  */
-static int slave_handle_handshake(DynBuf *rb, int *r_off, int *want_close) {
-    const char *b = rb->buf + *r_off;
-    int rem = rb->len;
-    const char *nl = memchr(b, '\n', (size_t)rem);
-    if (!nl) return 0;   /* 第一行不完整，等待 */
+static int slave_handshake_rbuf(struct rbuf *rb, int *want_close) {
+    uint32_t nl_idx;
+    if (!rbuf_find_newline(rb, &nl_idx))
+        return 0;   /* 第一行不完整，等待 */
 
-    int linelen = (int)(nl + 1 - b);
+    uint32_t linelen = nl_idx + 1;
+    char line[64];
+    uint32_t got = rbuf_copy(rb, 0, line, sizeof(line));
 
-    /*-----------------------------------------------------------------
-     *  +CONTINUE：增量续传成功，进入流式模式
-     *-----------------------------------------------------------------*/
-    if (linelen >= 10 && strncmp(b, "+CONTINUE", 9) == 0) {
-        *r_off += linelen;
-        rb->len -= linelen;   /* 维护不变量：len 为 r_off 起未消费尾部 */
+    /* +CONTINUE：增量续传成功，进入流式（行后可能已夹带 backfill） */
+    if (linelen >= 10 && strncmp(line, "+CONTINUE", 9) == 0) {
+        rbuf_consume(rb, linelen);
         g_handshake_done = 1;
-        g_fullsync_done  = 0;   /* 达成增量基线，清除全量守卫（允许后续再全量） */
-        g_next_retry = 0;
+        g_fullsync_done  = 0;   /* 达成增量基线，清除全量守卫 */
+        g_next_retry     = 0;
         printf("[INCR-SLAVE] +CONTINUE — 流式接收 (offset=%zu)\n",
                g_slave_offset);
-        return slave_replay_stream(g_repl_fd, rb, r_off);  /* 行后可能已夹带 backfill */
+        if (rbuf_len(rb) > 0)
+            return slave_replay_rbuf(rb, want_close);   /* 夹带 backfill：同批回放 */
+        return 0;
     }
 
-    /*-----------------------------------------------------------------
-     *  +FULLRESYNC：offset 过期，需要全量同步
-     *  全量在握手中内联执行（阻塞）；全量成功后以快照 offset 重新
-     *  PSYNC rejudge——仍失败则终结（同一周期最多一次全量）
-     *-----------------------------------------------------------------*/
-    if (linelen >= 12 && strncmp(b, "+FULLRESYNC", 11) == 0) {
-        /* 全量后的 rejudge 仍失败：backlog 已回绕，全量也追不上 → 终结 */
+    /* +FULLRESYNC：offset 过期，走数据面全量（内联阻塞） */
+    if (linelen >= 12 && strncmp(line, "+FULLRESYNC", 11) == 0) {
         if (g_fullsync_done) {
             fprintf(stderr,
                     "[INCR-SLAVE] 全量后 offset 仍超出 backlog，增量同步失败\n");
@@ -209,58 +175,41 @@ static int slave_handle_handshake(DynBuf *rb, int *r_off, int *want_close) {
         g_repl_fd = -1;        /* 提前摘链：on_close 将因 fd 不匹配而早退 */
         if (want_close) *want_close = 1;
 
-        /* 内联执行数据面全量（阻塞，等价原 tick 内的阻塞调用）。
-         * 传输失败可重试（fullsync_done 保持 0）；成功后重新 PSYNC rejudge。 */
         if (repl_fullsync_slave_start() == 0) {
-            g_fullsync_done = 1;            /* 守卫：本同步周期已做全量 */
+            g_fullsync_done = 1;
             repl_incr_slave_reset_offset(); /* 对齐到快照 offset */
             if (!g_incr_enabled) {
                 printf("[INCR-SLAVE] 仅全量模式，同步完成\n");
-                g_sync_done = 1;            /* 终结：只全量不增量 */
+                g_sync_done = 1;
             } else {
                 g_next_retry = 0;           /* tick 立即重连 PSYNC（rejudge） */
             }
         } else {
-            g_next_retry = get_time_now() + 1000;  /* 传输失败：1s 后重试 */
+            g_next_retry = get_time_now() + 1000;   /* 传输失败：1s 后重试 */
         }
         return 0;
     }
 
     /* 意外的响应 */
-    fprintf(stderr, "[INCR-SLAVE] 意外 PSYNC 响应: %.*s\n", linelen, b);
-    g_repl_fd    = -1;   /* 摘链（两标志位保持 0 → 无链路态） */
+    fprintf(stderr, "[INCR-SLAVE] 意外 PSYNC 响应: %.*s\n", (int)got, line);
+    g_repl_fd    = -1;   /* 摘链 */
     g_next_retry = get_time_now() + 1000;
     if (want_close) *want_close = 1;
     return 0;
 }
 
-/*=============================================================================
- *  Master 链路 Handler（引擎调用）
- *  按当前状态分派：握手 or 流式回放
- *============================================================================*/
-
 /**
- * Slave 端 Master 链路 handler
- *
- * 功能：
- * 1. 握手未完成（!g_handshake_done）：解析 +CONTINUE / +FULLRESYNC
- * 2. 握手已完成（g_handshake_done）：回放增量命令
- *
- * @param fd 连接 fd
- * @param rb 读缓冲
- * @param r_off 读偏移
- * @param wb 写缓冲
- * @param want_close 关闭标志
- * @return 处理的命令数
+ * Slave 端 Master 链路 handler（slave_adopt 注册给引擎）
+ * 握手 / 回放按 g_handshake_done 分派；对 reactor/proactor 通用
  */
-int repl_incr_slave_master_link_handler(int fd, DynBuf *rb, int *r_off,
-                                        DynBuf *wb, int *want_close) {
+int repl_incr_slave_link_rbuf_handler(int fd, struct rbuf *rb, DynBuf *wb,
+                                      int *want_close) {
     (void)wb;
     if (fd != g_repl_fd) return -1;
 
     if (!g_handshake_done)
-        return slave_handle_handshake(rb, r_off, want_close);
-    return slave_replay_stream(fd, rb, r_off);
+        return slave_handshake_rbuf(rb, want_close);
+    return slave_replay_rbuf(rb, want_close);
 }
 
 /*=============================================================================
@@ -310,16 +259,18 @@ static int slave_connect_once(const char *ip, int port) {
 
 /**
  * 收养已连接的 fd 进引擎，发送 PSYNC 命令
- * 握手由 repl_incr_slave_master_link_handler 推进
+ * 握手由 repl_incr_slave_link_rbuf_handler 推进
  */
 static void slave_adopt(int fd) {
     g_repl_fd        = fd;
     g_handshake_done = 0;   /* 新链路重新握手 */
     g_next_retry     = 0;
 
-    /* 注册 handler（引擎接管 fd） */
-    if (repl_engine_register)
-        repl_engine_register(fd, repl_incr_slave_master_link_handler);
+    /* 注册 handler（引擎接管 fd）。全引擎读缓冲均为 rbuf，只挂 rbuf 版
+     * link handler；DynBuf 版 repl_engine_register 已删（M2），两引擎的
+     * start() 只赋 repl_engine_register_rbuf。 */
+    if (repl_engine_register_rbuf)
+        repl_engine_register_rbuf(fd, repl_incr_slave_link_rbuf_handler);
 
     /* 发送 PSYNC <offset> 命令 */
     if (repl_engine_append) {
@@ -353,7 +304,7 @@ void repl_incr_slave_tick(void) {
     /*-------------------------------------------------------------------------
      *  IDLE：连接 Master 并发送 PSYNC
      *  首次发送 PSYNC 0；全量后以快照 offset 续连（rejudge）
-     *  全量在握手内联完成，tick 不感知（见 slave_handle_handshake）
+     *  全量在握手内联完成，tick 不感知（见 slave_handshake_rbuf）
      *-------------------------------------------------------------------------*/
     int fd = slave_connect_once(g_master_ip, g_master_port);
     if (fd < 0) {

@@ -1,0 +1,200 @@
+#!/bin/bash
+#=============================================================================
+#  bench_pool_mem.sh — 纯插入下 4 形态的内存"占用 + 回收"
+#
+#  4 形态 = 2 个二进制(底座) × 2 条 conf(运行期 kv_pool on|off):
+#    glibc / glibc+池 / jemalloc / jemalloc+池
+#
+#  三列数据(同一次测量里全部取自该进程自报的 [MEM] 行, 口径一致):
+#    启动  = [MEM] startup              (刚建好引擎、尚未起 reactor 的空库值)
+#    峰值  = [MEM] shutdown/pre-release (灌满 N×V、数据仍在)
+#    回收  = [MEM] shutdown/post-release(优雅退出路径里 FLUSHALL 全清归还之后)
+#  进程退出后 /proc 消失, 故"关闭时内存"只能由进程打印 —— kvstore.c 已加。
+#
+#  辅指标 RSS: 启动/回收取 [MEM] 行里的 rss, 峰值取 /proc VmHWM(物理水位)。
+#  注意 glibc 无任何 trim, 回收 RSS 必然居高(底座特性, 非池缺陷); jemalloc
+#  形态注入 MALLOC_CONF=dirty_decay_ms:0, 使 kvs_flush_all 的 arenas.purge
+#  真能把脏页还 OS, 否则 RSS 假性不降。
+#
+#  为什么测三档 value(klen 固定 16 → entry total = 48+V)? 池档表与底座档表
+#  取整粒度不同, "省不省"取决于值落在哪段:
+#    V=16  不省档: 池64 = jemalloc64, 对 glibc 省 16B(glibc 每块多 16B 头)
+#    V=240 省  档: 池288 < jemalloc320, 对 glibc 也省 16B
+#    V=465 亏损档: 池576 < jemalloc640(仍省), 对 glibc 反而亏 48B
+#  第三档是关键: 同一测量里池"赢 jemalloc、输 glibc", 符号相反。
+#  N 按 N×total ≈ 固定 payload 缩放 —— 池每档最后一个不满超块最多浪费 64KB,
+#  档越大尾耗占比越高, N 太小会把节省量吃掉甚至反超。
+#
+#  用法(项目根): bash test/bench/bench_pool_mem.sh [R]
+#    R  每(档位,形态)重复轮数, 默认 3, 取中位数
+#  输出: 终端表 + test/bench/results_pool_mem.txt
+#=============================================================================
+script_name=$(basename "$0")
+source "$(dirname "$0")/common.sh"
+
+R=${1:-3}
+PORT=2000
+SERVER_CORES=5              # server 钉单核(bench_qps 同款隔离核), 减调度噪声
+SETTLE=1                    # 启动后静置(等 reactor 就绪)
+RESULT_FILE="test/bench/results_pool_mem.txt"
+
+BINS=(  "build/kvstore"      "build/kvstore"
+        "build-glibc/kvstore" "build-glibc/kvstore" )
+POOLV=( "off" "on" "off" "on" )
+LABELS=("jemalloc" "jemalloc+池" "glibc" "glibc+池" )
+
+# "V:N:说明"    entry total = 48+V
+ARMS=(
+  "16:1000000:不省档 — 池64=je64(打平), 对 glibc 省16"
+  "240:400000:省档   — 池288<je320(省32), 对 glibc 省16"
+  "465:200000:亏损档 — 池576<je640(省64), 对 glibc 亏48"
+)
+
+require_tools
+for b in "${BINS[@]}"; do
+    [ -x "$b" ] || { echo "缺二进制: $b" >&2; exit 1; }
+done
+
+WORK="$(mktemp -d /tmp/poolmem.XXXXXX)"
+CONF="$WORK/mem.conf"
+LOG="${LOG_DIR}/kvstore.log"
+trap 'stop_all; rm -rf "$WORK"' EXIT
+
+# 预生成 RESP 流(顺序唯一 key + 定长 value), 同档 4 形态共用同一文件
+gen_stream() { # $1=V  $2=N  $3=out
+    awk -v n="$2" -v vs="$1" 'BEGIN{
+        for (j = 0; j < vs; j++) v = v sprintf("%c", 65 + (j % 26));
+        for (i = 0; i < n; i++) {
+            k = sprintf("key:%012d", i);
+            printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", length(k), k, vs, v;
+        }
+    }' > "$3"
+}
+
+# 抓进程日志里某标签的 [MEM] 行 → "used rss" (进程自报, 见 kvstore.c mem_report)
+log_mem() { # $1=标签
+    grep -F "[MEM] $1 " "$LOG" 2>/dev/null | tail -1 | awk '{
+        for (i = 1; i <= NF; i++) {
+            if ($i ~ /^used=/) u = substr($i, 6);
+            if ($i ~ /^rss=/)  r = substr($i, 5);
+        }
+        print u, r
+    }'
+}
+
+# 读 /proc VmHWM (kB)
+read_hwm() { awk '/^VmHWM:/{print $2; exit}' "/proc/$1/status" 2>/dev/null; }
+
+# 等进程退出(优雅关闭走 dest_kvengine 打印 [MEM], 最长等 5s)
+wait_gone() { # $1=pid
+    for _ in $(seq 1 50); do
+        kill -0 "$1" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+# ── 跑一轮: 启动→灌入→读峰值→SIGTERM→读回收 ────────────────────────────
+# 输出 "启动used 启动rss 峰值used 峰值HWM 回收used 回收rss dbsize" (失败则不输出)
+measure_round() { # $1=bin  $2=kv_pool值  $3=N  $4=stream
+    local bin=$1 poolv=$2 n=$3 stream=$4 pid dbsize su sr pu ph qu qr
+
+    write_kvs_conf "$CONF" "$PORT" proactor none
+    echo "kv_pool $poolv" >> "$CONF"
+    # jemalloc 形态注入 dirty_decay_ms:0, 让 FLUSHALL 的 purge 真还页给 OS
+    if ldd "$bin" 2>/dev/null | grep -q jemalloc; then
+        export MALLOC_CONF="dirty_decay_ms:0"
+    else
+        unset MALLOC_CONF
+    fi
+
+    stop_all
+    KVS_BIN="$bin"
+    start_kvs "$CONF" "$PORT" >&2
+    pid=$(pgrep -x kvstore | head -1)
+    [ -n "$pid" ] || { echo "  进程未找到: $bin" >&2; return 1; }
+
+    sleep "$SETTLE"
+    read -r su sr <<< "$(log_mem startup)"          # 启动列
+    [ -n "$su" ] || { echo "  [warn] 缺 [MEM] startup 行" >&2; return 1; }
+
+    redis-cli -h 127.0.0.1 -p "$PORT" --pipe < "$stream" >/dev/null 2>&1 || true
+    dbsize=$(redis-cli -h 127.0.0.1 -p "$PORT" DBSIZE 2>/dev/null | tr -d '\r')
+    if [ "${dbsize:-0}" -ne "$n" ]; then
+        echo "  [warn] DBSIZE=${dbsize:-0} != $n, 该轮弃用" >&2
+        return 1
+    fi
+
+    pu=$(redis-cli -h 127.0.0.1 -p "$PORT" INFO memory 2>/dev/null \
+        | tr -d '\r' | awk -F: '$1=="used_memory"{print $2; exit}')   # 峰值列(used)
+    ph=$(read_hwm "$pid")                                              # 峰值列(RSS 水位)
+
+    kill -TERM "$pid" 2>/dev/null || true
+    wait_gone "$pid" || { echo "  [warn] 进程未按时退出" >&2; return 1; }
+    read -r qu qr <<< "$(log_mem 'shutdown/post-release')"             # 回收列
+
+    echo "$su $sr $pu $ph $qu $qr $dbsize"
+}
+
+# 取某文件第 c 列的中位数
+colmed() { awk -v c="$2" '{print $c}' "$1" | sort -n \
+    | awk '{a[NR]=$1} END{ if (NR == 0) {print 0} else if (NR % 2) print a[(NR+1)/2]; else print int((a[NR/2]+a[NR/2+1])/2) }'; }
+
+> "$RESULT_FILE"
+{
+    echo "bench_pool_mem — $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "纯插入 N×V, 每(档位,形态) ${R} 轮取中位数; 三列均取自进程 [MEM] 自报"
+    echo "启动=[MEM]startup  峰值=[MEM]shutdown/pre-release  回收=[MEM]shutdown/post-release(FLUSHALL 后)"
+    echo "峰值/key = (峰值used − 启动used)/dbsize; 回收率 = (峰值used − 回收used)/(峰值used − 启动used)"
+    echo ""
+} >> "$RESULT_FILE"
+
+printf "  %-13s %11s %12s %10s %11s %12s %11s %8s\n" \
+    "形态" "启动used" "峰值used" "峰值/key" "峰值HWM_kB" "回收used" "回收RSS_kB" "回收率%" | tee -a "$RESULT_FILE"
+
+for arm in "${ARMS[@]}"; do
+    V=${arm%%:*}; rest=${arm#*:}; N=${rest%%:*}; NOTE=${rest#*:}
+    STREAM="$WORK/arm_v${V}.resp"
+    gen_stream "$V" "$N" "$STREAM"
+    echo ""
+    echo "── V=$V (N=$N, entry total=$((48+V)); $NOTE)"
+    echo "" >> "$RESULT_FILE"
+    echo "── V=$V (N=$N, entry total=$((48+V)); $NOTE)" >> "$RESULT_FILE"
+
+    declare -a SU PU PH QU QR PK RET   # 形态 → 各列中位数
+    for i in "${!BINS[@]}"; do
+        raws="$WORK/arm${V}_cfg${i}.txt"; : > "$raws"
+        for ((r = 1; r <= R; r++)); do
+            measure_round "${BINS[$i]}" "${POOLV[$i]}" "$N" "$STREAM" >> "$raws" || true
+        done
+        [ -s "$raws" ] || { echo "  ${LABELS[$i]}: 无有效轮次" >&2; continue; }
+
+        read -r s_u s_r p_u p_h q_u q_r <<< \
+            "$(colmed "$raws" 1) $(colmed "$raws" 2) $(colmed "$raws" 3) \
+               $(colmed "$raws" 4) $(colmed "$raws" 5) $(colmed "$raws" 6)"
+        SU[$i]=$s_u; PU[$i]=$p_u; PH[$i]=$p_h; QU[$i]=$q_u; QR[$i]=$q_r
+        PK[$i]=$(awk -v p="${PU[$i]}" -v s="${SU[$i]}" -v d="$N" \
+            'BEGIN{ printf "%.1f", (p-s)/d }')
+        RET[$i]=$(awk -v p="${PU[$i]}" -v s="${SU[$i]}" -v q="${QU[$i]}" \
+            'BEGIN{ if (p>s) printf "%.0f", (p-q)*100/(p-s); else print "-" }')
+
+        printf "  %-13s %11s %12s %10s %11s %12s %11s %8s\n" \
+            "${LABELS[$i]}" "${SU[$i]}" "${PU[$i]}" "${PK[$i]}" \
+            "${PH[$i]}" "${QU[$i]}" "${QR[$i]}" "${RET[$i]}" \
+            | tee -a "$RESULT_FILE"
+        echo "     raw: $(tr '\n' '|' < "$raws")" >&2
+    done
+
+    # 同底座内 池-无池 的峰值/key 差(核心结论: 池省多少 / 亏多少)
+    for base in "jemalloc:0:1" "glibc:2:3"; do
+        b=${base%%:*}; r=${base#*:}; no=${r%%:*}; on=${r#*:}
+        [ -n "${PK[$no]:-}" ] && [ -n "${PK[$on]:-}" ] || continue
+        d=$(awk -v a="${PK[$no]}" -v b="${PK[$on]}" 'BEGIN{ printf "%+.1f", b-a }')
+        line="  Δ峰值/key (池−无池) $b: ${d}B"
+        echo "$line" | tee -a "$RESULT_FILE"
+    done
+done
+
+stop_all
+echo ""
+echo "结果已写入: $RESULT_FILE"

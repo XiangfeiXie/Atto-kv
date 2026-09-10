@@ -42,22 +42,28 @@
 #include <sys/socket.h>
 #include <net/if.h>
 #include <poll.h>
+#include <time.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <linux/if_link.h>
 
-/* 与 BPF 侧保持一致（MASTER_PORT 由 BPF 采样生效；用户态经 -D 覆盖） */
+/* 与 BPF 侧保持一致（MASTER_PORT 由 BPF 采样生效；用户态经 -D 覆盖）。
+ * 默认值对齐 kvstore 主从端口 + veth demo 拓扑（见 src/repl-xdp/README.md）：
+ * MASTER_PORT=2000、SLAVE_PORT=2001、IFACE=veth0、SLAVE_IP=10.0.1.2。
+ * 换端口/网卡用 -D 覆盖编译（注意：仅数字宏可经 REPL_XDP_DEFINES 安全传递，
+ * 字符串宏 SLAVE_IP/IFACE 的覆盖须改本默认值——CMake 对含引号 -D 的 make
+ * 展开会粘参数）。 */
 #ifndef MASTER_PORT
 #define MASTER_PORT 2000          /* kvstore master 端口 */
 #endif
 #ifndef SLAVE_IP
-#define SLAVE_IP    "192.168.30.136"    /* 从机 veth1 IP */
+#define SLAVE_IP    "10.0.1.2"    /* 从机 veth1 IP */
 #endif
 #ifndef SLAVE_PORT
-#define SLAVE_PORT  2000          /* kvstore slave 端口 */
+#define SLAVE_PORT  2001          /* kvstore slave 端口 */
 #endif
 #ifndef IFACE
-#define IFACE       "ens33"       /* master 侧客户端流量所经网卡 */
+#define IFACE       "veth0"       /* master 侧客户端流量所经网卡 */
 #endif
 
 struct sock_rec {
@@ -73,6 +79,11 @@ struct sock_rec {
 static volatile int g_run = 1;
 static int g_sock = -1;
 static unsigned long g_mirrored = 0;    /* 已写入从机的镜像字节数 */
+
+/* 速率监测：用户态从 ring 消费的字节数/记录数（口径 = 记录 size = 16B 头 +
+ * 负载，与 BPF produced map 逐字节一致 → 每秒差分两者即生产/消费速率）。 */
+static unsigned long g_cons_bytes = 0;
+static unsigned long g_cons_recs = 0;
 
 static void on_sigint(int sig)
 {
@@ -373,6 +384,8 @@ static int on_event(void *ctx, void *data, size_t size)
     const struct sock_rec *rec = data;
     if (size < sizeof(*rec) || rec->len > size - sizeof(*rec))
         return 0;
+    g_cons_bytes += size;                /* 消费字节（= BPF produced 同口径） */
+    g_cons_recs++;                       /* 消费记录条数 */
     const unsigned char *payload =
         (const unsigned char *)data + sizeof(*rec);
     if (rec->type == REC_SYN)
@@ -435,6 +448,27 @@ static int attach_xdp(int ifindex, struct bpf_program *prog)
         return 0;
     fprintf(stderr, "[xdp] attach %s 失败（DRV+SKB 都不行）\n", IFACE);
     return -1;
+}
+
+/* 读 per-CPU u64 计数并跨 CPU 求和（produced / drops 同构）。
+ * per-CPU map 的 LOOKUP_ELEM 会写 value_size*可用CPU数 字节到用户 buffer
+ * （只给 8 字节会越界踩栈，历史 bug），必须按 libbpf_num_possible_cpus()
+ * 分配数组再逐 CPU 求和。map_fd 无效时返回 0。 */
+static unsigned long read_percpu_sum(int map_fd)
+{
+    __u32 zero = 0;
+    int nr_cpus = libbpf_num_possible_cpus();
+    if (nr_cpus <= 0)
+        return 0;
+    __u64 *vals = calloc((size_t)nr_cpus, sizeof(__u64));
+    if (!vals)
+        return 0;
+    unsigned long sum = 0;
+    if (bpf_map_lookup_elem(map_fd, &zero, vals) == 0)
+        for (int i = 0; i < nr_cpus; i++)
+            sum += (unsigned long)vals[i];
+    free(vals);
+    return sum;
 }
 
 int main(int argc, char **argv)
@@ -507,11 +541,50 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* 速率监测用的两个 per-CPU 计数 map（旧 bpf.o 无 produced 时 fd<0，
+     * read_percpu_sum 内部兜底为 0，不阻断运行） */
+    int prod_fd  = bpf_object__find_map_fd_by_name(obj, "produced");
+    int drops_fd = bpf_object__find_map_fd_by_name(obj, "drops");
+
     fprintf(stderr, "[sock] 开始镜像（Ctrl-C 退出）\n");
+
+    /* 每秒统计：XDP 生产速率 vs 用户态消费速率。
+     * 口径统一为 ring 记录字节（16B 头 + 负载）：produced/consumed 累计差 =
+     * ring 未消费存量。消费 work-conserving，稳态两者秒差应≈0（都等于转发速
+     * 率）；backlog>0 表示 ring 积压（消费跑输生产），drops>0 才真正丢采样。 */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long long stat_ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    unsigned long prod_base  = prod_fd  >= 0 ? read_percpu_sum(prod_fd)  : 0;
+    unsigned long cons_base  = g_cons_bytes;
+    unsigned long recs_base  = g_cons_recs;
+
     while (g_run) {
         ring_buffer__poll(rb, 20);          /* 消费 ring → 进待发缓冲 */
         pend_flush();                       /* 尽力发往从机 */
         drain_responses();                  /* 读掉从机应答，绝不让它堵 */
+
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        long long now_ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+        if (now_ms - stat_ms >= 1000) {
+            double dt = (now_ms - stat_ms) / 1000.0;
+            unsigned long prod  = prod_fd  >= 0 ? read_percpu_sum(prod_fd)  : 0;
+            unsigned long drops = drops_fd >= 0 ? read_percpu_sum(drops_fd) : 0;
+            long long d_prod = (long long)(prod - prod_base);
+            long long d_cons = (long long)(g_cons_bytes - cons_base);
+            fprintf(stderr,
+                    "[stat] prod=%8.2f MB/s  cons=%8.2f MB/s  "
+                    "backlog=%+7.1f KB  drops=%lu  recs=%lu/s\n",
+                    d_prod / dt / (1024.0 * 1024.0),
+                    d_cons / dt / (1024.0 * 1024.0),
+                    (double)(d_prod - d_cons) / 1024.0,
+                    drops,
+                    (unsigned long)((g_cons_recs - recs_base) / dt));
+            stat_ms = now_ms;
+            prod_base = prod;
+            cons_base = g_cons_bytes;
+            recs_base = g_cons_recs;
+        }
     }
 
     /* 5. 清理 + 统计 */
@@ -519,31 +592,17 @@ int main(int argc, char **argv)
     close(g_sock);
     bpf_xdp_detach(ifindex, 0, NULL);
 
-    /* 读 BPF 丢包计数（ring 满丢弃）
-     * drops 是 per-CPU 数组：内核 BPF_MAP_LOOKUP_ELEM 会写 value_size*可用CPU数
-     * 字节到用户 buffer（实测 8 字节不够，越界踩栈 → 退出即 stack smashing）。
-     * 必须按 libbpf_num_possible_cpus() 分配，再求和。 */
-    int drops_fd = bpf_object__find_map_fd_by_name(obj, "drops");
-    unsigned long drops = 0;
-    if (drops_fd >= 0) {
-        __u32 zero = 0;
-        int nr_cpus = libbpf_num_possible_cpus();
-        if (nr_cpus > 0) {
-            __u64 *vals = calloc((size_t)nr_cpus, sizeof(__u64));
-            if (vals) {
-                int i;
-                if (bpf_map_lookup_elem(drops_fd, &zero, vals) == 0)
-                    for (i = 0; i < nr_cpus; i++)
-                        drops += (unsigned long)vals[i];
-                free(vals);
-            }
-        }
-    }
+    unsigned long drops = drops_fd >= 0 ? read_percpu_sum(drops_fd) : 0;
+    unsigned long prod  = prod_fd  >= 0 ? read_percpu_sum(prod_fd)  : 0;
+
     if (g_tee)
         fclose(g_tee);
     bpf_object__close(obj);
 
     fprintf(stderr, "[sock] 退出：镜像 %lu 字节，待发峰值 %lu 字节，"
-            "BPF ring 丢采样 %lu 条\n", g_mirrored, g_pend_peak, drops);
+            "BPF ring 丢采样 %lu 条\n"
+            "[sock] 统计：生产总计 %lu 字节，消费总计 %lu 字节"
+            "（差 = ring 残留存量）\n",
+            g_mirrored, g_pend_peak, drops, prod, g_cons_bytes);
     return 0;
 }

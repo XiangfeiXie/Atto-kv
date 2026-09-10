@@ -12,6 +12,7 @@
 #include "kvstore.h"
 #include "config.h"
 #include "protocol.h"
+#include "rbuf.h"
 
 /*=============================================================================
  *  常量定义
@@ -56,17 +57,21 @@ typedef struct {
     int     active;             /* 连接是否活跃（用于幂等释放） */
     
     /* 读写缓冲（Slab 风格复用，热路径零分配） */
-    DynBuf  read_buf;           /* 读缓冲：协议解析的原始数据 */
+    rbuf_t  rq;                 /* 读缓冲（节点队列）：协议解析的原始数据，与 reactor 同构 */
     DynBuf  write_buf;          /* 写缓冲：待发送的响应数据 */
-    int     r_off;              /* 读缓冲已消费偏移（未压缩） */
     int     w_off;              /* 写缓冲已发送偏移（未压缩） */
-    
+
+    /* io_uring recvmsg 的 msghdr/iovec：须存活到 CQE 完成（单连接同一时刻仅一个
+     * recv 在飞），per-conn 持久复用，热路径零分配 */
+    struct iovec iov[RBUF_MAX_IOV];
+    struct msghdr msg;
+
     /* 状态控制 */
     int     status;             /* 标记需要关闭（QUIT / 协议错误），发完再关 */
     uint8_t event;              /* 在飞 I/O 掩码：EV_RECV/EV_SEND（可并存） */
-    
+
     /* 业务处理器：支持普通客户端和 Replication 连接动态切换 */
-    kvs_drain_fn on_data;       /* 数据处理函数，由业务层注入 */
+    kvs_rbuf_drain_fn on_data;  /* 数据到达入口（rbuf 形态，与 reactor 同类型） */
 } conn_t;
 
 /*=============================================================================
@@ -81,7 +86,7 @@ static int               g_accept_armed = 0;    /* accept SQE 是否已在飞 */
 
 /* 默认数据处理函数，由 proactor_start(port, handler) 注入
  * 普通客户端连接沿用该默认，repl 连接按需覆盖 */
-static kvs_drain_fn      g_default_handler = NULL;
+static kvs_rbuf_drain_fn g_default_handler = NULL;
 
 /*=============================================================================
  *  连接池管理
@@ -119,12 +124,16 @@ static void conn_release(int fd) {
     /* 先通知 repl 清理该连接的状态（普通客户端是 no-op，内部按角色判断） */
     repl_on_close(fd);
 
-    /* 复位槽位并关闭 socket（保留 read/write 缓冲底层内存，避免 accept 热路径反复 malloc） */
-    char *rb = c->read_buf.buf, *wb = c->write_buf.buf;
-    int   rc = c->read_buf.cap,  wc = c->write_buf.cap;
+    /* 复位槽位并关闭 socket（保留读写底层存储，避免 accept 热路径反复 malloc）：
+     *  - 写缓冲：保留 malloc 的 buf 内存（Slab 复用）
+     *  - rbuf：保留整块结构（node_cap + 节点池；队列残留节点由下次 conn_init_fd
+     *    的 rbuf_reset 统一回池，无需在此逐个归还） */
+    char  *wb = c->write_buf.buf;
+    int    wc = c->write_buf.cap;
+    rbuf_t rq = c->rq;
     memset(c, 0, sizeof(*c));
-    c->read_buf.buf  = rb;  c->read_buf.cap  = rc;
     c->write_buf.buf = wb;  c->write_buf.cap = wc;
+    c->rq = rq;
     close(fd);
 }
 
@@ -136,8 +145,8 @@ static void conn_pool_destroy(void) {
     for (int i = 0; i < conn_pool_size; i++) {
         if (conn_pool[i].active)
             conn_release(i);
-        /* 释放缓冲内存 */
-        dynbuf_free(&conn_pool[i].read_buf);
+        /* 释放读写存储（rbuf 节点池 + DynBuf 写缓冲） */
+        rbuf_destroy(&conn_pool[i].rq);
         dynbuf_free(&conn_pool[i].write_buf);
     }
     free(conn_pool);
@@ -151,37 +160,37 @@ static void conn_pool_destroy(void) {
 
 /**
  * 提交 recv SQE（非阻塞）
- * 先确保读缓冲有可用空间（已满则翻倍扩容，与 reactor 一致）；
- * 读缓冲不压缩已消费前缀，命令完整消费后由 handle_read 归零 r_off，
- * 慢速滴灌下由 KVS_NET_BUF_MAX 上限兜底
+ * 读缓冲唯一形态 = rbuf 节点队列（与 reactor 同构）：rbuf_reserve 暴露现有队尾
+ * 空闲空间 + 池新节点的 iovec[]，io_uring_recvmsg 多段 gather 直灌节点内存（零
+ * 拷贝）；收到字节数由 handle_read 的 rbuf_commit 入队。
+ * msghdr/iovec 为 per-conn 持久（conn_t 字段），存活到 CQE 完成；单连接同一时刻
+ * 仅一个 recv 在飞，字段复用安全。
  * @param c 连接对象
- * @return 0 成功，-1 失败（缓冲超限/无 SQE）
+ * @return 0 成功，-1 失败（池空且新节点分配失败/无 SQE；已配对 rbuf_commit(0)）
  */
 static int arm_recv(conn_t *c) {
     /* 前置检查：连接活跃、未在飞、未标记关闭 */
     if (!c->active || (c->event & EV_RECV) || c->status)
         return 0;
 
-    /* 读缓冲当前写入位置；空间不足则翻倍扩容 */
-    DynBuf *rb = &c->read_buf;
-    size_t tail = (size_t)(c->r_off + rb->len);
-    if (tail >= (size_t)rb->cap) {
-        size_t new_cap = rb->cap ? (size_t)rb->cap * 2 : KVS_NET_BUF_INIT;
-        if (new_cap > KVS_NET_BUF_MAX) return -1;
-        char *new_buf = realloc(rb->buf, new_cap);
-        if (!new_buf) return -1;
-        rb->buf = new_buf;
-        rb->cap = (int)new_cap;
-    }
-    size_t avail = (size_t)rb->cap - tail;
+    /* 取可写段（现有 tail 空闲 + 池新节点）；reserve 后必须 commit 配对 */
+    int nseg = rbuf_reserve(&c->rq, c->iov, RBUF_MAX_IOV);
+    if (nseg <= 0) return -1;      /* 池空且新节点分配失败：OOM */
 
-    /* 获取 SQE 并提交 recv 请求 */
+    /* 组装 msghdr（recvmsg 一次灌多段） */
+    memset(&c->msg, 0, sizeof(c->msg));
+    c->msg.msg_iov    = c->iov;
+    c->msg.msg_iovlen = (size_t)nseg;
+
+    /* 获取 SQE 并提交 recvmsg 请求 */
     struct io_uring_sqe *sqe = io_uring_get_sqe(&g_ring);
-    if (!sqe) return -1;
-
-    io_uring_prep_recv(sqe, c->fd, rb->buf + tail, avail, 0);
+    if (!sqe) {
+        rbuf_commit(&c->rq, 0);    /* 归还保留段（reserve/commit 硬约定） */
+        return -1;
+    }
+    io_uring_prep_recvmsg(sqe, c->fd, &c->msg, 0);
     sqe->user_data = ((uint64_t)TYPE_RECV << 32) | (uint32_t)c->fd;
-    c->event |= EV_RECV; /* 标记在飞 */
+    c->event |= EV_RECV;           /* 标记在飞 */
     return 0;
 }
 
@@ -242,18 +251,18 @@ static int conn_init_fd(int fd, int arm_read) {
 
     conn_t *c = &conn_pool[fd];
 
-    /* 首次使用时惰性分配读/写缓冲（热路径零 malloc） */
-    if (!c->read_buf.buf)
-        dynbuf_init(&c->read_buf, KVS_NET_BUF_INIT);
+    /* 惰性初始化读写缓冲（热路径零 malloc）；rbuf 首用建节点池，复用槽位仅回池复位 */
+    if (c->rq.node_cap == 0)
+        rbuf_init(&c->rq, RBUF_NODE_SIZE);
+    else
+        rbuf_reset(&c->rq);
     if (!c->write_buf.buf)
         dynbuf_init(&c->write_buf, KVS_NET_BUF_INIT);
 
-    /* 重置连接状态（保留缓冲内存） */
+    /* 重置连接状态（保留缓冲底层存储） */
     c->fd            = fd;
     c->active        = 1;
-    c->read_buf.len  = 0;
     c->write_buf.len = 0;
-    c->r_off         = 0;
     c->w_off         = 0;
     c->status        = 0;
     c->event         = 0;
@@ -283,8 +292,8 @@ static void handle_accept(struct io_uring_cqe *cqe) {
 /**
  * 处理读完成事件
  * 核心逻辑：
- * 1. 数据追加到读缓冲
- * 2. 调用业务处理器解析命令、生成回复
+ * 1. recvmsg 直灌节点内存，收到字节经 rbuf_commit 入队（reserve/commit 配对收尾）
+ * 2. 调用业务处理器（kvs_rbuf_drain_fn）解析并消费缓冲中的完整命令
  * 3. 串行模型：有回复先 arm send，send 完成后再 arm 下一次读
  * 4. 同一连接上 recv 与 send 不同时在飞
  */
@@ -292,18 +301,16 @@ static void handle_read(struct io_uring_cqe *cqe, conn_t *c) {
     int res = cqe->res;
     c->event &= ~EV_RECV;   /* 清除 recv 在飞标记 */
 
-    DynBuf *rb = &c->read_buf;
     DynBuf *wb = &c->write_buf;
 
-    /* 追加数据到读缓冲 */
-    if (res > 0)
-        rb->len += res;
+    /* 收尾 reserve/commit 配对：实际收到的字节入队（EOF/错误传 0，归还保留段） */
+    rbuf_commit(&c->rq, res < 0 ? 0 : res);
 
     /* 处理对端关闭或错误 */
     if (res <= 0) {
-        /* 排掉剩余字节，异步冲刷待发回复后释放 */
-        if (rb->len > 0) {
-            c->on_data(c->fd, rb, &c->r_off, wb, NULL);
+        /* 排掉剩余完整命令，异步冲刷待发回复后释放 */
+        if (rbuf_len(&c->rq) > 0) {
+            c->on_data(c->fd, &c->rq, wb, NULL);
             if (!c->active) return;   /* handler 可能已释放连接 */
         }
         if (wb->len > 0) {
@@ -318,15 +325,19 @@ static void handle_read(struct io_uring_cqe *cqe, conn_t *c) {
         return;
     }
 
-    /* 正常读完成：调用业务处理器解析数据 */
+    /* 已收未消费逻辑字节上限（与 reactor 同款 16MB 护栏） */
+    if (rbuf_len(&c->rq) > 16u * 1024u * 1024u) {
+        fprintf(stderr, "[proactor] fd %d read buffer overflow\n", c->fd);
+        conn_release(c->fd);
+        return;
+    }
+
+    /* 正常读完成：调用业务处理器解析并消费缓冲中的所有命令
+     * 消费端只认逻辑字节流，整段回池由 rbuf 内部完成，本路径无 r_off 账本 */
     int want_close = 0;
-    c->on_data(c->fd, rb, &c->r_off, wb, &want_close);
+    c->on_data(c->fd, &c->rq, wb, &want_close);
     if (want_close) c->status = 1;    /* 业务层要求关闭（如 QUIT 命令） */
     if (!c->active) return;           /* handler 可能已释放连接（如 repl） */
-
-    /* 清理已完全消费的读缓冲 */
-    if (rb->len == 0)
-        c->r_off = 0;
 
     /* 串行（半双工）模型：有回复先发，send 完成后再 arm 下一次读 */
     if (wb->len > 0) {
@@ -419,12 +430,17 @@ static void handle_cqe(struct io_uring_cqe *cqe) {
  *============================================================================*/
 
 /**
- * 注册一个连接为 repl 连接，切换到专用 handler
+ * 注册一个连接为 repl 连接，切换到 repl 专用 handler
+ *
+ * proactor 全连接读缓冲都是 rbuf（与 reactor 同构），故只提供 rbuf 形态 register；
+ * 该函数实例赋给 repl_engine_register_rbuf 全局（见 proactor_start），repl 的
+ * link handler 挂载点统一走它（slave_adopt），无形态分叉。
+ *
  * @param fd 连接 fd
- * @param handler repl 专用数据处理函数
+ * @param handler repl 专用数据处理函数（kvs_rbuf_drain_fn）
  * @return 0 成功，-1 失败
  */
-static int eng_repl_register(int fd, kvs_drain_fn handler) {
+static int eng_repl_register_rbuf(int fd, kvs_rbuf_drain_fn handler) {
     if (fd < 0 || fd >= conn_pool_size) return -1;
     conn_t *c = &conn_pool[fd];
     if (!c->active) {
@@ -467,13 +483,6 @@ static int eng_repl_append(int fd, const char *data, int len) {
     return arm_send(c);
 }
 
-/**
- * 释放 repl 连接（通过引擎的统一释放路径）
- */
-static void eng_repl_release(int fd) {
-    conn_release(fd);
-}
-
 /*=============================================================================
  *  主事件循环
  *  设计要点：
@@ -509,9 +518,13 @@ static void proactor_loop(void) {
             int ret = io_uring_submit_and_wait_timeout(&g_ring, &tick_cqe, 1,
                                                        &ts, NULL);
             if (ret < 0) {
-                if (ret == -EINTR || ret == -ETIME) continue;  /* 中断/超时：继续 */
-                fprintf(stderr, "[proactor] submit_and_wait: %s\n", strerror(-ret));
-                break;
+                if (ret != -EINTR && ret != -ETIME) {
+                    fprintf(stderr, "[proactor] submit_and_wait: %s\n", strerror(-ret));
+                    break;
+                }
+                /* 中断/超时：不 continue，落下去跑 update_cached_time + repl_tick。
+                 * 原实现 continue 会跳过下方周期性维护——与注释
+                 * 「100ms 超时：空闲时周期性醒来」意图不符（proactor bug） */
             }
             /* 阻塞返回后重新收割（可能只有超时 CQE，也可能有真实事件） */
             nready = io_uring_peek_batch_cqe(&g_ring, cqes, 128);
@@ -611,17 +624,18 @@ static void worker_destroy(void) {
 /**
  * 启动 Proactor 引擎
  * @param port 监听端口
- * @param handler 默认业务处理器（由 protocol.c 注入）
+ * @param handler 默认业务处理器（rbuf 形态；master 与其余角色一律
+ *        kvs_drain_rbuf_commands，PSYNC 握手在命令分发层接管）
  * @return 0 成功，-1 失败
  */
-int proactor_start(unsigned short port, kvs_drain_fn handler) {
+int proactor_start(unsigned short port, kvs_rbuf_drain_fn handler) {
     /* 设置默认处理器 */
     g_default_handler = handler;
 
-    /* 注册 repl 引擎接口（供 replication 模块使用） */
-    repl_engine_register = eng_repl_register;
-    repl_engine_append   = eng_repl_append;
-    repl_engine_release  = eng_repl_release;
+    /* 注册 repl 引擎接口（供 replication 模块使用）。proactor 全连接 rbuf，
+     * 赋 rbuf 形态 register 即可（repl 的 link handler 挂载点，见 repl_incr_slave.c） */
+    repl_engine_register_rbuf = eng_repl_register_rbuf;
+    repl_engine_append        = eng_repl_append;
 
     /* 初始化连接池 */
     if (conn_pool_init(kvs_config.maxclients) < 0) return -1;

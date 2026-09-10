@@ -28,12 +28,18 @@
 
 #include "repl.h"
 #include "persistence.h"
+#include "kv_pool.h"
 
 /*=============================================================================
  *  全局状态
  *============================================================================*/
 
 int g_in_reload = 0;                              /* 是否在数据重载中（抑制日志/复制） */
+
+/* 数据域 kv entry 分配用的自研内存池（main 线程专属）
+ * init_kvengine 按配置项 kv_pool 创建并注入 kv_dict、dest_kvengine 解绑后销毁。
+ * 配置关（kv_pool off）时保持 NULL：整个数据域回退底座 malloc/free。 */
+static kv_pool_t *s_entry_pool;
 
 long long        g_kvs_start_time_ms      = 0;    /* 启动时间戳（毫秒） */
 volatile sig_atomic_t g_kvs_stop = 0;             /* 停止标志（信号触发） */
@@ -209,16 +215,36 @@ void reply_bulk(DynBuf *wb, const char *s, int len) {
  */
 int init_kvengine(void) {
     dict_init(&g_dict);
+    /* 数据域 kv entry 分配接入自研内存池：必须在 engine_reload 加载数据
+     * 之前注入（否则首轮 entry 已走底座）。池实例主线程专属；配置关或
+     * 创建失败都回退底座 malloc（dict_set_pool(NULL)），不影响正确性。 */
+    if (kvs_config.kv_pool_enabled) {
+        s_entry_pool = kv_pool_create();
+        dict_set_pool(s_entry_pool);
+        if (!s_entry_pool)
+            fprintf(stderr, "[kvstore] kv_pool 创建失败，entry 分配回退底座 malloc\n");
+    }
     printf("Using string storage engine (single global dict)\n");
     return 0;
 }
 
 /**
  * 销毁 KV 引擎
+ *
+ * 退出前打印两次内存快照：进程退出后 /proc 条目消失，(used_memory, VmRSS)
+ * 的"关闭时"读数只能由进程自报 —— 这是回收情况的唯一可读时点。
+ * 两次分别对应：数据仍在（≈峰值）与 全清归还后（entry/桶/超块均已释放）。
  */
 void dest_kvengine(void) {
+    mem_report("shutdown/pre-release");
     kvs_flush_all();
+    mem_report("shutdown/post-release");
     dict_destroy(&g_dict);
+    /* 解绑须在池销毁前：dict_destroy 内的 dict_clear 仍会向池归还 entry。
+     * 未启用（s_entry_pool == NULL）时两者都是 no-op。 */
+    dict_set_pool(NULL);
+    kv_pool_destroy(s_entry_pool);
+    s_entry_pool = NULL;
 }
 
 /**
@@ -270,6 +296,33 @@ uint64_t get_used_mem(void) {
     struct mallinfo2 mi = mallinfo2();
     return (uint64_t)mi.uordblks + (uint64_t)mi.hblkhd;
 #endif
+}
+
+/**
+ * 打印内存快照（used_memory + VmRSS）
+ *
+ * 启动 / 关闭等关键时点调用：退出后 /proc 消失，进程内自报是"关闭时内存"
+ * 的唯一可读来源。used_memory 口径见 get_used_mem（jemalloc=Allocated 汇总行，
+ * glibc=uordblks+hblkhd，两者都含池的超块 —— 超块是底座的存活分配）。
+ *
+ * @param tag 时点标签，直接进日志，便于脚本按标签抓取
+ */
+void mem_report(const char *tag) {
+    uint64_t used = get_used_mem();
+    long     rss  = 0;   /* VmRSS，读 /proc/self/status（非 Linux 则为 0） */
+    FILE *fp = fopen("/proc/self/status", "r");
+    if (fp) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) {
+            if (strncmp(line, "VmRSS:", 6) == 0) {
+                sscanf(line + 6, "%ld", &rss);
+                break;
+            }
+        }
+        fclose(fp);
+    }
+    fprintf(stdout, "[MEM] %s used=%llu rss=%ld KB\n",
+            tag, (unsigned long long)used, rss);
 }
 
 /**
@@ -353,12 +406,24 @@ int main(int argc, char *argv[]) {
     config_load(conf_path);
     config_print();
 
+    /* ntyco 引擎不参与复制：repl_engine_* 恒 NULL（仅 reactor/proactor 赋值），
+     * PSYNC 控制命令需这两引擎的访问器在位；该组合语义未定义，启动即拒 */
+    if (kvs_config.network_model == NET_NTYCO &&
+        kvs_config.repl_role != REPL_ROLE_OFF) {
+        fprintf(stderr, "[kvstore] network=ntyco 不支持复制（repl_role=%d），"
+                        "请改用 reactor/proactor 引擎\n", kvs_config.repl_role);
+        return 1;
+    }
+
     /*-------------------------------------------------------------------------
      *  3. 引擎初始化
      *-------------------------------------------------------------------------*/
     init_kvengine();
+    /* 启动内存快照：距空库基线最近的时点（此时尚未接受任何连接/数据，
+     * 已含池实例与分配器 arena 的固有开销） */
+    mem_report("startup");
     engine_reload();  /* 从持久化文件恢复数据 */
-    
+
     if (ENABLE_AOF) {
         kvs_aof_set_fsync_policy(kvs_config.aof_fsync_policy);
         kvs_aof_persist_start();  /* 启动 AOF 持久化 */
@@ -369,11 +434,12 @@ int main(int argc, char *argv[]) {
      *  repl_role off → 不 fork、不建 backlog
      *  repl_on_close / repl_tick 为直接函数，内部按 role 判断，无需布线
      *
-     *  角色接线（控制面入口即引擎三个回调：client_handler / tick / on_close）：
+     *  角色接线（控制面入口）：
      *    MASTER：
      *     启动   repl_backlog_init()            1MB 积压缓冲（仅 incr on）
-     *      运行时 client_handler 注入 repl_incr_master_client_handler（PSYNC 探测）：
-     *             PSYNC → +CONTINUE 流式 / +FULLRESYNC fork 数据面子进程
+     *      运行时 连接默认入口一律 kvs_drain_rbuf_commands；PSYNC 作为控制命令
+     *             在命令分发层（kvs_dispatch 的 PSYNC 分支，kvstore_dispatch.c）
+     *             接管 → +CONTINUE 流式 / +FULLRESYNC fork 数据面子进程
      *             repl_tick 无动作；repl_on_close 清理 streaming 从库
      *    SLAVE：
      *      启动   repl_incr_slave_start()        记录 Master 地址，状态置 IDLE
@@ -397,21 +463,20 @@ int main(int argc, char *argv[]) {
 
     /*-------------------------------------------------------------------------
      *  5. 网络引擎选择
-     *  命令解析入口注入：
-     *  - Master：用 repl 的 client handler 包一层（PSYNC 探测；
-     *    incr off 时无 backlog → 一律回 +FULLRESYNC）
-     *  - 其他：普通 RESP 解析器
+     *  三引擎全连接读缓冲统一 rbuf 节点队列；数据入口统一注入同一签名
+     *  kvs_rbuf_drain_fn（PSYNC 由命令分发层拦截，无需按角色选 handler）
      *-------------------------------------------------------------------------*/
-    kvs_drain_fn handler = kvs_drain_resp_commands_off;
-    if (kvs_config.repl_role == REPL_ROLE_MASTER)
-        handler = repl_incr_master_client_handler;
-
-    if (kvs_config.network_model == NET_REACTOR)
-        reactor_start(kvs_config.port, handler);
-    else if (kvs_config.network_model == NET_PROACTOR)
-        proactor_start(kvs_config.port, handler);
-    else if (kvs_config.network_model == NET_NTYCO)
-        ntyco_start(kvs_config.port, kvs_protocol_batch);
+    /* 命令解析入口按引擎注入，reactor/proactor/ntyco 一律 kvs_drain_rbuf_commands。
+     * master 的 PSYNC 握手作为控制命令经 dispatch 的 PSYNC 分支接管
+     * （gate = repl_engine_append != NULL && role==MASTER，见 kvstore_dispatch.c）。
+     * ntyco 不赋值 repl_engine_* → 门控恒短路，不参与复制（组合已由 fail-fast 拒） */
+    if (kvs_config.network_model == NET_REACTOR) {
+        reactor_start(kvs_config.port, kvs_drain_rbuf_commands);
+    } else if (kvs_config.network_model == NET_PROACTOR) {
+        proactor_start(kvs_config.port, kvs_drain_rbuf_commands);
+    } else if (kvs_config.network_model == NET_NTYCO) {
+        ntyco_start(kvs_config.port, kvs_drain_rbuf_commands);
+    }
 
     /*-------------------------------------------------------------------------
      *  6. 清理

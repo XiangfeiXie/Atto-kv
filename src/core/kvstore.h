@@ -26,7 +26,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "dynbuf.h"       /* DynBuf：msg_handler / 回复接口 */
+#include "dynbuf.h"       /* DynBuf：写缓冲 / 回复接口 */
 #include "config.h"
 #include "protocol.h"
 #include "kv_dict.h"
@@ -67,39 +67,27 @@ extern volatile sig_atomic_t g_kvs_stop;
 
 /*-------------------------------------------------------------------------
  *  回调函数类型定义
- *
- *  不同网络引擎使用不同的回调签名：
- *  - msg_handler：遗留 ntyco 协程引擎使用
- *  - kvs_drain_fn：proactor/reactor 引擎使用（定义在 protocol.h）
- *
- *  设计目的：隔离网络层与业务层，使引擎可以独立切换
+ *  统一签名 kvs_rbuf_drain_fn（protocol.h 定义）：reactor/proactor/ntyco
+ *  读缓冲全 rbuf，start(port, handler) 一律注入 kvs_drain_rbuf_commands。
+ *  （遗留 msg_handler / kvs_drain_fn 两种签名已随 ntyco 接入 rbuf 删除）
  *-------------------------------------------------------------------------*/
-
-/**
- * 消息处理函数类型（仅用于遗留 ntyco 引擎）
- *
- * @param msg 输入消息指针（注意：不保证是以 \0 结尾的字符串）
- * @param len 消息长度
- * @param write_buf 写缓冲（输出响应）
- * @return 0 成功，非 0 失败
- *
- * 注意：proactor/reactor 引擎使用 kvs_drain_fn（声明在 protocol.h）
- * 该类型保留仅为了兼容 ntyco 引擎
- */
-typedef int (*msg_handler)(char *msg, int len, DynBuf *write_buf);
 
 /*=============================================================================
  *  网络引擎入口函数
- *  三种模型：Reactor(epoll)、Proactor(io_uring)、NtyCo(协程遗留)
+ *  三种模型：Reactor(epoll)、Proactor(io_uring)、NtyCo(协程)
  *============================================================================*/
 
 /**
  * 启动 Reactor 引擎（epoll 水平触发）
+ * reactor 全连接读缓冲统一为 rbuf 节点队列，handler 即 accept 连接的默认
+ * 数据入口（kvs_rbuf_drain_fn）。master 与其余角色一律传 kvs_drain_rbuf_commands
+ * （PSYNC 握手作为控制命令在命令分发层被接管，无需按角色选 handler）；
+ * slave 出站链路连接由 repl 侧按需 eng_repl_register_rbuf 覆盖。
  * @param port 监听端口
- * @param handler 命令解析处理函数
+ * @param handler 默认命令解析函数（rbuf 形态）
  * @return 0 成功，-1 失败
  */
-extern int reactor_start(unsigned short port, kvs_drain_fn handler);
+extern int reactor_start(unsigned short port, kvs_rbuf_drain_fn handler);
 
 /**
  * 启动 Proactor 引擎（io_uring）
@@ -107,15 +95,18 @@ extern int reactor_start(unsigned short port, kvs_drain_fn handler);
  * @param handler 命令解析处理函数
  * @return 0 成功，-1 失败
  */
-extern int proactor_start(unsigned short port, kvs_drain_fn handler);
+extern int proactor_start(unsigned short port, kvs_rbuf_drain_fn handler);
 
 /**
- * 启动 NtyCo 引擎（协程，遗留引擎）
+ * 启动 NtyCo 引擎（协程引擎）
+ * ntyco 接入 rbuf 后与 reactor/proactor 统一：读缓冲 rbuf 节点队列、数据入口
+ * 一律 kvs_drain_rbuf_commands。引擎不参与复制（repl_engine_* 恒 NULL；
+ * network=ntyco + repl_role!=off 组合由 kvstore.c fail-fast 启动即拒）。
  * @param port 监听端口
- * @param handler 消息处理函数（旧接口签名）
+ * @param handler 命令解析处理函数（rbuf 形态，统一 kvs_drain_rbuf_commands）
  * @return 0 成功，-1 失败
  */
-extern int ntyco_start(unsigned short port, msg_handler handler);
+extern int ntyco_start(unsigned short port, kvs_rbuf_drain_fn handler);
 
 /*=============================================================================
  *  时间函数
@@ -164,17 +155,28 @@ static inline uint64_t now_monotonic_ns(void)
  *============================================================================*/
 
 /**
- * 命令分发器：解析并执行命令
+ * 命令分发器：解析并执行命令（缓冲无关，不持有任何读缓冲数据指针）
  * @param tokens 解析后的 token 数组
- * @param argc 参数个数
- * @param msg_raw 原始命令消息（用于日志和复制）
- * @param msg_len 消息长度
+ * @param argc 参数个数（第一个是命令名）
  * @param wb 写缓冲（输出响应）
+ * @param journaled 输出（必填）：本条命令是否产生需要落 AOF/复制的写效果
+ *        （SET 存成 / DEL 命中删除 / FLUSHALL / EXPIRE 命中设置）。
+ *        分发是"是否生效"的权威判定，只置 1、入口统一归零。
  * @return DISPATCH_OK/DISPATCH_ERROR/DISPATCH_CLOSE
  */
 dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
-                               const char *msg_raw, int msg_len,
-                               DynBuf *wb);
+                               DynBuf *wb, int *journaled);
+
+/**
+ * 写效果收口：drain 在 kvs_dispatch 返回 journaled=1 后、consume 前把整条
+ * 原始命令交给本函数，落 AOF 日志与增量复制（backlog + streaming 从库）。
+ * 配置门（ENABLE_AOF / master & incr / g_in_reload）统一在此判定一次，
+ * 调用方无需预判命令名——效果以 dispatch 的 journaled 回传为准。
+ * 字节必须由调用方持有（drain 的物化区/连续读缓冲），本函数同步拷贝、不滞留。
+ * @param cmd 整条 RESP 原始命令
+ * @param len 命令长度
+ */
+void kvs_journal_effect(const char *cmd, int len);
 
 /*=============================================================================
  *  数据管理
@@ -200,6 +202,12 @@ extern int g_in_reload;
 extern long long        g_kvs_start_time_ms;         /* 启动时间戳（只读） */
 extern uint64_t get_used_mem(void);                  /* allocator 存活分配字节（INFO used_memory） */
 
+/**
+ * 打印内存快照：一行 "[MEM] <tag> used=<bytes> rss=<KB>"
+ * 启动/关闭等关键时点使用（退出后 /proc 消失，关闭时内存只能由进程自报）
+ */
+void mem_report(const char *tag);
+
 /*=============================================================================
  *  复制 ↔ 引擎 访问接口
  *
@@ -214,7 +222,7 @@ extern uint64_t get_used_mem(void);                  /* allocator 存活分配�
  *
  *  调用方向：
  *  - 引擎 → repl：repl_on_close（连接关闭通知）、repl_tick（事件循环 tick）
- *  - repl → 引擎：repl_engine_register/append/release（连接管理和数据发送）
+ *  - repl → 引擎：repl_engine_register_rbuf/append（连接管理与数据发送）
  *============================================================================*/
 
 /**
@@ -222,13 +230,16 @@ extern uint64_t get_used_mem(void);                  /* allocator 存活分配�
  */
 
 /**
- * 注册连接为 repl 连接
- * 切换为 repl 专用的命令处理器
+ * 注册 repl 连接 handler
+ * 引擎接管 fd，后续数据走 repl 专用 handler（rbuf 形态）
+ * 全引擎读缓冲均为 rbuf，DynBuf 版 repl_engine_register 已删（M2），
+ * 两引擎的 start() 只赋本指针。
+ *
  * @param fd 连接 fd
- * @param handler repl 专用 handler
+ * @param handler repl 专用 handler（rbuf 形态）
  * @return 0 成功，-1 失败
  */
-extern int  (*repl_engine_register)(int fd, kvs_drain_fn handler);
+extern int  (*repl_engine_register_rbuf)(int fd, kvs_rbuf_drain_fn handler);
 
 /**
  * 向 repl 连接追加数据（如 +FULLRESYNC、复制流）
@@ -238,12 +249,6 @@ extern int  (*repl_engine_register)(int fd, kvs_drain_fn handler);
  * @return 0 成功，-1 失败
  */
 extern int  (*repl_engine_append)(int fd, const char *data, int len);
-
-/**
- * 释放 repl 连接
- * @param fd 连接 fd
- */
-extern void (*repl_engine_release)(int fd);
 
 /**
  * repl 提供的接口（由 repl 实现，engine 调用）

@@ -69,6 +69,17 @@ struct {
     __type(value, __u64);
 } drops SEC(".maps");
 
+/* 成功产出字节计数（速率监测：XDP 生产速率 = 用户态每秒差分本 map）。
+ * 口径 = 进 ring 的记录字节 sizeof(struct sock_rec)+len，与用户态 on_event
+ * 收到的 size 完全一致 → 累计 produced − 累计 consumed = ring 当前未消费存量
+ * （backlog）。drop 的记录（output 失败）不计入本 map，只计入 drops。 */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} produced SEC(".maps");
+
 /*=============================================================================
  *  Per-CPU 中转缓冲（bpf_ringbuf_reserve 尺寸须为编译期常量，
  *  运行期变长只能经 output 拷入）
@@ -109,6 +120,11 @@ static __always_inline void push_rec(unsigned int type, unsigned int sport,
         __u64 *d = bpf_map_lookup_elem(&drops, &zero);
         if (d)
             __sync_fetch_and_add(d, 1);
+    } else {
+        __u32 zero = 0;
+        __u64 *p = bpf_map_lookup_elem(&produced, &zero);
+        if (p)
+            __sync_fetch_and_add(p, (__u64)(sizeof(struct sock_rec) + len));
     }
 }
 

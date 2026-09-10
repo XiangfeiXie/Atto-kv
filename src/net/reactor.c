@@ -13,20 +13,25 @@
 #include "kvstore.h"
 #include "protocol.h"
 #include "config.h"
+#include "rbuf.h"
 
 /*=============================================================================
  *  连接状态结构体（epoll 引擎）
  *  使用 fd 即索引的池化设计，热路径零哈希查找
+ *
+ *  读缓冲统一为 rbuf 节点队列（普通客户端与 repl 链路同构）；消费端 on_data
+ *  只认逻辑字节流，普通/Repl 角色差异用切换 on_data 表达——没有读形态切换、
+ *  没有 r_off/memmove 账本（读侧账本全归 rbuf 内部）。写缓冲仍用 DynBuf。
  *============================================================================*/
 struct conn {
     int fd;                     /* socket 文件描述符，同时也是池索引 */
-    DynBuf read_buf;            /* 读缓冲：协议解析的原始数据 */
     DynBuf write_buf;           /* 写缓冲：待发送的响应数据 */
-    int r_off, w_off;           /* 读已消费偏移 / 写已发送偏移 */
+    rbuf_t rq;                  /* 读缓冲（节点队列）：唯一读形态 */
+    int w_off;                  /* 写已发送偏移 */
     int active;                 /* 连接是否活跃（用于幂等释放） */
     int status;                 /* 标记需要关闭（冲刷后关闭） */
     uint32_t cur_events;        /* epoll 缓存的事件掩码（避免重复 epoll_ctl） */
-    kvs_drain_fn on_data;       /* 数据处理函数，支持普通/Repl 动态切换 */
+    kvs_rbuf_drain_fn on_data;  /* 数据到达入口，支持普通/Repl 角色切换 */
 };
 
 /*=============================================================================
@@ -36,8 +41,9 @@ struct conn {
 int epfd = 0;                       /* epoll 文件描述符 */
 
 /* 默认数据处理函数，由 reactor_start(port, handler) 注入
- * 普通客户端连接沿用该默认，repl 连接按需覆盖 */
-static kvs_drain_fn g_default_handler = NULL;
+ * accept 的新连接沿用该默认；repl 连接（slave master-link）由 eng_repl_register_rbuf
+ * 按需覆盖为 repl 专用 handler */
+static kvs_rbuf_drain_fn g_default_handler = NULL;
 
 /* 连接池（Slab 风格复用，热路径零分配） */
 static struct conn *conn_pool = NULL;
@@ -93,17 +99,17 @@ int event_register(int fd) {
     c->fd = fd;
     c->active = 1;
     c->status = 0;
-    c->on_data = g_default_handler;    /* 默认使用普通客户端处理器 */
+    c->on_data = g_default_handler;    /* 数据到达入口（普通客户端解析器） */
 
-    /* 惰性分配缓冲，重连时复用（Slab 复用）
-     * accept 路径上只需复位长度/偏移游标，无需 malloc */
-    if (!c->read_buf.buf)
-        dynbuf_init(&c->read_buf, KVS_NET_BUF_INIT);
+    /* 惰性分配读缓冲，重连时复用（Slab 复用）；accept 路径零 malloc
+     * 读缓冲唯一形态 = rbuf：首用初始化节点池，复用槽位仅回池复位队列 */
+    if (c->rq.node_cap == 0)
+        rbuf_init(&c->rq, RBUF_NODE_SIZE);
+    else
+        rbuf_reset(&c->rq);
     if (!c->write_buf.buf)
         dynbuf_init(&c->write_buf, KVS_NET_BUF_INIT);
-    c->read_buf.len  = 0;
     c->write_buf.len = 0;
-    c->r_off = 0;
     c->w_off = 0;
 
     /* 设置非阻塞（epoll 必须） */
@@ -142,12 +148,16 @@ static void conn_release(int fd) {
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
     close(fd);
 
-    /* 清零槽位，但保留两个缓冲的底层内存以便复用 */
-    char *rb = c->read_buf.buf, *wb = c->write_buf.buf;
-    int   rc = c->read_buf.cap,  wc = c->write_buf.cap;
+    /* 清零槽位，但保留读写底层存储以便复用：
+     *  - 写缓冲：保留 malloc 的 buf 内存（Slab 复用）
+     *  - rbuf：保留整块结构（node_cap + 节点池；队列残留节点由下次
+     *    event_register 的 rbuf_reset 统一回池，无需在此逐个归还） */
+    char   *wb = c->write_buf.buf;
+    int     wc = c->write_buf.cap;
+    rbuf_t  rq = c->rq;
     memset(c, 0, sizeof(*c));
-    c->read_buf.buf  = rb;  c->read_buf.cap  = rc;
     c->write_buf.buf = wb;  c->write_buf.cap = wc;
+    c->rq = rq;
 }
 
 /*=============================================================================
@@ -187,6 +197,11 @@ int accept_cb(int fd) {
 /**
  * Recv 回调：读取并处理数据
  * 水平触发：一次性读空所有可用数据
+ *
+ * 读路径唯一（rbuf）：rbuf_reserve 暴露 iovec[] → recvmsg 多段 gather →
+ * rbuf_commit 入队；16MB 上限按"已收未消费逻辑字节"计。缓冲物理布局
+ * （节点、回池时机）归 rbuf 管，本函数不碰 r_off/memmove。
+ * 消费端 = c->on_data（kvs_rbuf_drain_fn），普通/Repl 角色差别只在 handler。
  * @param fd 连接 fd
  * @return 0 成功，-1 失败
  */
@@ -197,43 +212,43 @@ int recv_cb(int fd) {
 
     int eof = 0;
 
-    /* 水平触发：循环读直到 EAGAIN/EWOULDBLOCK */
+    /* reserve → recvmsg 多段 gather → commit；循环读到 EAGAIN */
     for (;;) {
-        int tail = c->r_off + c->read_buf.len;    /* 当前写入位置 */
-        int remain = c->read_buf.cap - tail;      /* 剩余空间 */
-
-        /* 空间不足：扩容（翻倍策略） */
-        if (remain <= 0) {
-            int new_cap = c->read_buf.cap * 2;
-            if (new_cap > 16 * 1024 * 1024) {  /* 单连接上限 16MB */
-                fprintf(stderr, "[reactor] fd %d read buffer overflow\n", fd);
-                conn_release(fd);
-                return -1;
-            }
-            char *new_buf = realloc(c->read_buf.buf, new_cap);
-            if (!new_buf) {
-                fprintf(stderr, "[reactor] fd %d realloc failed\n", fd);
-                conn_release(fd);
-                return -1;
-            }
-            c->read_buf.buf = new_buf;
-            c->read_buf.cap = new_cap;
-            remain = new_cap - tail;
+        struct iovec iov[RBUF_MAX_IOV];
+        int nseg = rbuf_reserve(&c->rq, iov, RBUF_MAX_IOV);
+        if (nseg <= 0) {   /* 池空且新节点分配失败：OOM 保护，断开 */
+            fprintf(stderr, "[reactor] fd %d rbuf reserve failed\n", fd);
+            conn_release(fd);
+            return -1;
         }
 
-        /* 从 socket 读取数据 */
-        int n = recv(fd, c->read_buf.buf + tail, remain, 0);
+        struct msghdr mh;
+        memset(&mh, 0, sizeof(mh));
+        mh.msg_iov    = iov;
+        mh.msg_iovlen = (size_t)nseg;
+        ssize_t n = recvmsg(fd, &mh, 0);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                break;      /* 无更多数据可读 */
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                rbuf_commit(&c->rq, 0);   /* 归还未用段（reserve/commit 须配对） */
+                break;                    /* 无更多数据可读 */
+            }
+            rbuf_commit(&c->rq, 0);
             conn_release(fd);
             return -1;
         }
         if (n == 0) {
+            rbuf_commit(&c->rq, 0);
             eof = 1;
-            break;          /* 对端关闭连接 */
+            break;                        /* 对端关闭连接 */
         }
-        c->read_buf.len += n;
+        rbuf_commit(&c->rq, (int)n);
+
+        /* 已收未消费逻辑字节上限（沿用原单连接 16MB 护栏） */
+        if (rbuf_len(&c->rq) > 16u * 1024u * 1024u) {
+            fprintf(stderr, "[reactor] fd %d read buffer overflow\n", fd);
+            conn_release(fd);
+            return -1;
+        }
     }
 
     /* 压缩写缓冲（回收已发送前缀） */
@@ -244,18 +259,15 @@ int recv_cb(int fd) {
         c->w_off = 0;
     }
 
-    /* 调用业务处理器解析缓冲中的所有命令 */
+    /* 调用业务处理器解析缓冲中的所有命令
+     * 消费端只认逻辑字节流：整段回池由 rbuf 内部完成，本路径无 r_off 账本 */
     int want_close = 0;
-    c->on_data(c->fd, &c->read_buf, &c->r_off, &c->write_buf, &want_close);
+    c->on_data(c->fd, &c->rq, &c->write_buf, &want_close);
     if (want_close) c->status = 1;
-    
+
     /* repl handler 可能在 on_data 内直接释放本连接（如 +FULLRESYNC 交接）
      * 此时槽位已清零，后续逻辑需跳过 */
     if (!c->active) return 0;
-
-    /* 完全消费的读缓冲：重置偏移 */
-    if (c->read_buf.len == 0)
-        c->r_off = 0;
 
     /* 处理关闭请求（QUIT / 协议错误）：冲刷后关闭 */
     if (__builtin_expect(c->status != 0, 0)) {
@@ -331,12 +343,17 @@ int send_cb(int fd) {
  *============================================================================*/
 
 /**
- * 注册一个连接为 repl 连接，切换到专用 handler
+ * 注册一个连接为 repl 连接，切换到 repl 专用 handler
+ *
+ * reactor 全连接读缓冲都是 rbuf，故这里只接受 rbuf 形态 handler，无需任何
+ * 读形态切换：新 fd 完整初始化，已活跃连接（如被接管）仅换 on_data。
+ * 该函数实例赋给 repl_engine_register_rbuf 全局（见 reactor_start）。
+ *
  * @param fd 连接 fd
- * @param handler repl 专用数据处理函数
+ * @param handler repl 专用数据处理函数（kvs_rbuf_drain_fn）
  * @return 0 成功，-1 失败
  */
-static int eng_repl_register(int fd, kvs_drain_fn handler) {
+static int eng_repl_register_rbuf(int fd, kvs_rbuf_drain_fn handler) {
     if (fd < 0 || fd >= conn_pool_size) return -1;
     struct conn *c = &conn_pool[fd];
     if (!c->active) {
@@ -377,13 +394,6 @@ static int eng_repl_append(int fd, const char *data, int len) {
     /* 追加后更新 epoll 事件（添加 EPOLLOUT） */
     conn_set_events(fd, c);
     return 0;
-}
-
-/**
- * 释放 repl 连接（通过引擎的统一释放路径）
- */
-static void eng_repl_release(int fd) {
-    conn_release(fd);
 }
 
 /*=============================================================================
@@ -442,14 +452,16 @@ int r_init_server(unsigned short port) {
  *  4. timeout 100ms 兼顾响应性和 CPU 开销
  *============================================================================*/
 
-int reactor_start(unsigned short port, kvs_drain_fn handler) {
-    /* 设置默认处理器 */
+int reactor_start(unsigned short port, kvs_rbuf_drain_fn handler) {
+    /* 设置默认处理器（accept 连接的数据入口；master 与其余角色一律注入
+     * kvs_drain_rbuf_commands，PSYNC 握手作为控制命令在命令分发层接管；
+     * slave 出站链路按需覆盖，见 repl_incr_slave.c） */
     g_default_handler = handler;
 
-    /* 注册 repl 引擎接口（供 replication 模块使用） */
-    repl_engine_register = eng_repl_register;
-    repl_engine_append   = eng_repl_append;
-    repl_engine_release  = eng_repl_release;
+    /* 注册 repl 引擎接口（供 replication 模块使用）。reactor 全连接 rbuf，
+     * 赋 rbuf 形态 register 即可（repl 的 link handler 挂载点，见 repl_incr_slave.c） */
+    repl_engine_register_rbuf = eng_repl_register_rbuf;
+    repl_engine_append        = eng_repl_append;
 
     /* 按 maxclients 配置分配连接池 */
     conn_pool_size = kvs_config.maxclients;

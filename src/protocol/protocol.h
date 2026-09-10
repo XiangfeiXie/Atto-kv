@@ -18,6 +18,10 @@
 #include <stdint.h>
 #include "dynbuf.h"
 
+/* rbuf 节点队列读缓冲（存储层在 src/net/rbuf.h；协议头只依赖类型名，
+ * 避免把网络存储头拉进纯协议头。协议层见到的永远是 rbuf 的逻辑字节流） */
+struct rbuf;
+
 /*=============================================================================
  *  协议常量
  *============================================================================*/
@@ -29,10 +33,11 @@
 
 /*=============================================================================
  *  零拷贝 Token 切片
- *  
+ *
  *  只引用原始数据中的位置和长度，不复制数据
- *  所有 token 都指向 RESP 解析缓冲区中的原始位置
- *  
+ *  所有 token 都指向解析源中的原始位置：段内命令指向 head 节点连续内存，
+ *  跨段命令指向拉平后的 flat——都是"切片引用"，不做逐参数拷贝
+ *
  *  优点：
  *  - 零拷贝，减少内存分配
  *  - CPU cache 友好
@@ -95,10 +100,12 @@ int resp_parse_slices(const char *buf, int buflen,
 
 /*=============================================================================
  *  命令解析处理函数类型
- *  
+ *
  *  这是网络引擎调用的命令解析入口点
- *  通过 *start(port, handler) 参数注入到 proactor/reactor
- *  
+ *  通过 *start(port, handler) 参数注入到 reactor/proactor/ntyco（rbuf 形态，
+ *  见下方 kvs_rbuf_drain_fn）。三个引擎统一注入 kvs_drain_rbuf_commands；
+ *  slave 出站链路连接由 repl 侧按需 eng_repl_register_rbuf 覆盖同签名 handler。
+ *
  *  设计说明：
  *  - fd 参数让 handler 能回调到引擎（repl_engine_* 访问器）
  *  - 复制模块的 per-connection handler 使用 fd
@@ -106,44 +113,48 @@ int resp_parse_slices(const char *buf, int buflen,
  *============================================================================*/
 
 /**
- * 命令解析回调函数类型
- * 
- * @param fd 连接文件描述符（用于 repl 回调）
- * @param rb 读缓冲（输入）
- * @param r_off 已消费偏移（输入/输出）
+ * rbuf 读缓冲命令消费回调类型（reactor/proactor/ntyco 引擎的统一数据入口签名）
+ *
+ * 引擎把收到的逻辑字节流交给本回调，回调内部解析并消费完整命令：段内命令
+ * 零拷贝解析，跨段命令整命令拉平一次（见 kvs_drain_rbuf_commands）。
+ *
+ * @param fd 连接 fd（用于 repl 回调）
+ * @param rb 读缓冲（节点队列；只认逻辑字节流，消费由本回调负责）
  * @param wb 写缓冲（输出）
- * @param want_close 输出：是否需要在发送完成后关闭连接
+ * @param want_close 输出：是否冲刷后关闭
  * @return 处理的命令数量，-1 表示协议错误
  */
-typedef int (*kvs_drain_fn)(int fd, DynBuf *rb, int *r_off, DynBuf *wb, int *want_close);
+typedef int (*kvs_rbuf_drain_fn)(int fd, struct rbuf *rb, DynBuf *wb, int *want_close);
 
 /**
- * 默认命令解析函数（仅 RESP 数组格式）
+ * rbuf 读缓冲命令消费（段内零拷贝 + 跨段整命令拉平）
  *
- * 功能：
- * 1. 解析 RESP 数组格式（*N\r\n$L\r\n...）
- * 2. 支持流式解析（不完整数据返回 0）
- * 3. 协议错误（非 RESP / 损坏）返回 -1，上层发送错误响应并关闭连接
- * 
- * @param fd 连接 fd（可用于 repl 回调）
- * @param rb 读缓冲
- * @param r_off 读偏移
- * @param wb 写缓冲
- * @param want_close 关闭标志
- * @return 处理的命令数，-1 表示协议错误
+ * 网络层读缓冲为节点队列（rbuf_t / struct rbuf）时的解析入口。
+ * 模型：每条完整命令要么整条落在队头连续段内，要么跨段；两种情形都只用连续
+ * 缓冲解析器 resp_parse_slices 出 token（与 AOF 重载同一解析器）：
+ *   - 段内命令：直接在队头连续段上解析，token 零拷贝直指节点内存；
+ *   - 跨段命令：量长游标只数长度 → 整命令一次 rbuf_copy 拉平进本 drain 复用的
+ *     flat → 统一解析。"是否跨段"由 resp_parse_slices 的返回值免费判定，无专门
+ *     扫描；命令不完整即停（队列原样保留等更多数据，分片零拷贝等待）。
+ *
+ * AOF / 增量复制整命令拷贝收口在 drain：dispatch 回传 journaled（写效果），
+ * drain 于 consume 前把本命令"整条原始命令"喂 kvs_journal_effect——段内命令
+ * 直读 head 节点连续内存，跨段命令读已拉平的 flat；除日志进自身缓冲的必要
+ * 内部拷贝外无二次物化。解析层无需命令名谓词预判。
+ * ENABLE_AOF 下日志语义与旧连续缓冲 drain 对齐。
+ *
+ * @param fd 连接 fd
+ * @param rb 节点队列读缓冲
+ * @param wb 写缓冲（输出）
+ * @param want_close 输出：是否冲刷后关闭
+ * @return 处理命令数，-1 表示协议错误
  */
-int kvs_drain_resp_commands_off(int fd, DynBuf *rb, int *r_off, DynBuf *wb, int *want_close);
+int kvs_drain_rbuf_commands(int fd, struct rbuf *rb, DynBuf *wb, int *want_close);
 
-/*=============================================================================
- *  遗留兼容接口
- *  
- *  仅供未启用的 ntyco 引擎使用（其 msg_handler 签名匹配）
- *  proactor/reactor 引擎使用 kvs_drain_resp_commands_off
- *  
- *  注意：新代码不应使用此接口
- *============================================================================*/
-
-int kvs_protocol_batch(char *msg, int len, DynBuf *write_buf);
+/* 当前正被 drain 的连接的 fd（协议层瞬态上下文：drain 入口设、出口清回 -1）。
+ * master 的 PSYNC 作为控制命令并入命令分发层后，repl 侧据此设 streaming 从库
+ * fd——不用把 fd 传进 kvs_dispatch 签名。单线程引擎下无并发，语义可靠 */
+extern int g_kvs_drain_fd;
 
 /*=============================================================================
  *  RESP 响应常量

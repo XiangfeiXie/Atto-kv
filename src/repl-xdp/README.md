@@ -4,8 +4,10 @@
 master 保持增量一致。挂在 master 侧的**旁路进程**，与 kvstore **零耦合**：
 XDP 只采样，内核 TCP 栈负责可靠传输，master 业务侧无任何改动、无额外开销。
 
-**实测（挂到 kvstore 上）：** 累计 40 万 SET + 跨机 DEL + FLUSHALL，master/slave
-DBSIZE 始终一致、逐 value 校验全对、BPF ring 丢采样 **0 条**；master 性能无影响。
+**实测（挂到 kvstore 上，proactor 引擎，客户端跨 veth）：** 十万 → 五十万 → 一百
+万 SET 增量填充，master/slave DBSIZE 始终一致、value 校验全过、BPF ring 丢采样
+**0 条**、produced==consumed。累计镜像 99MB 端到端零丢失，突发稳态 ~15MB/s。
+详见下方大流量实测。
 
 ## 原理
 
@@ -109,12 +111,67 @@ sudo pkill -x kvstore
 
 ## 实测结果（挂载到 kvstore 上）
 
+### 大流量实测数据
+
+master/slave 各自 netns、proactor 引擎，客户端从 slave netns 跨 veth 灌数据
+（XDP 只能采样网卡可见流量，见上「测试客户端必须从 slave netns 发起」）。每轮先
+FLUSHALL 归零（删类命令同样经 XDP 传播到 slave）：
+
+| 轮次 | 灌入量 | fill 耗时 | 主从 DBSIZE | 校验 | BPF 丢采样 | 突发窗口速率 |
+|---|---|---|---|---|---|---|
+| 10 万 | ~6 MB | 0.405s | 100000 == 100000 | 全量逐 value ✓ | 0 | 窗口摊薄 5.88 MB/s① |
+| 50 万 | ~30 MB | 2.044s | 500000 == 500000 | 全量逐 value ✓ | 0 | ~14 MB/s（13.54/14.11，recs ~10k/s） |
+| 100 万 | ~60 MB | 4.075s | **1000000 == 1000000** | 抽查 90万~99万 ✓ | 0 | **~15 MB/s**（15.56/14.96/13.04/14.98，recs ~11k/s）② |
+
+> ① 单轮 < 1 个 stat 窗口、含爬坡/收尾，速率被 1s 窗口摊薄；② 1M 突发 4s 覆盖
+> 4 个完整窗口 → 稳态基准。1M 期间出现过一次瞬时 backlog +34.3KB（生产略超前
+> 消费），下一窗口即 -34.3KB 排空，ring 一次未满。
+
+**消费是 work-conserving**：每个 [stat] 窗口 prod≈cons、backlog 回到 0，镜像消费
+跟得上生产——速率上限在 master 写路径 + veth/XDP 采样开销（~15MB/s），不在消费
+侧。因用户态按 seq 重组，**不要求 master 钉单核**（1M 轮未钉核仍全程零丢失）。
+镜像 SIGINT 退出累计汇总（含上述三轮全部流量）：
+
+```
+[sock] 退出：镜像 99200036 字节，待发峰值 524272 字节，BPF ring 丢采样 0 条
+[sock] 统计：生产总计 100299940 字节，消费总计 100299940 字节（差 = ring 残留存量）
+```
+
+### 为什么比 tcp_recvmsg 挂载点慢几个百分点（引擎差异 + 采样税，非消费端）
+
+XDP 在**生产 RX 路径**上逐包采样；tcp_recvmsg 的 kprobe 在 **recvmsg 出口**（应用
+已读到字节后）采样、不进生产路径，两者机制不同。用「换引擎 + 摘 mirror 裸灌」
+的对照实验把速率差的来源拆开（全为 1M SET ≈ 60MB）：
+
+| 引擎 | 数据面 | mirror | 1M 耗时 | 折合速率 |
+|---|---|---|---|---|
+| reactor | lo | tcp_recvmsg | 3.479s | ~17.2 MB/s |
+| reactor | veth | XDP | 3.740s | ~16.0 MB/s |
+| proactor | veth | XDP | 4.075s | ~14.7 MB/s |
+| reactor | veth | 无（裸灌基线） | 3.535s | ~17.0 MB/s |
+| proactor | veth | 无（裸灌基线） | 3.886s① | ~15.4 MB/s |
+
+> ① proactor 钉核 3.886s / 不钉 3.919s，钉核与否可忽略。
+
+差分解读（相对 tcp_recvmsg 的 17.2MB/s）：
+- **引擎差异 ~10%（主因）**：proactor 处理单连接大流 SET 反而不如 reactor——
+  reactor 一次 recvmsg gather 16×1KB 段；io_uring 的优势在大量并发连接省上下文
+  切换，单流上摊不上。换 reactor 后 XDP 立刻 4.075s → 3.740s（~16MB/s）。
+- **XDP 采样税 ~5%**：同引擎同面挂 mirror 前后裸灌对照（reactor+veth 3.535→
+  3.740s，proactor+veth 3.919→4.075s）——XDP 在 master RX 路径的逐包拷贝成本，
+  挂载点固有；tcp_recvmsg 的 kprobe 无此税，故天然快几个点。
+- **数据面 lo vs veth ~1.6%**：reactor 裸灌 3.479→3.535s，可忽略。
+
+**用户态消费端两个组件都远未到瓶颈**：两种 mirror 全程 prod==cons、backlog 收敛
+回 0、drops=0（XDP 仅一次 +34KB 瞬时落后即主动追平）。XDP 消费端没被推到
+17MB/s 不是它到顶，而是采样税让生产喂不了更快。
+
+### 功能场景
+
 | 场景 | 结果 |
 |---|---|
-| fill 10 万 × 3 轮（30 万）+ 末轮 10 万 | master=slave 每轮一致，逐 value 校验全对 |
 | 跨 veth DEL 3 个 key | slave 同步删除，DBSIZE 同步 -3 |
 | 跨 veth FLUSHALL | 两端同时归零 |
-| BPF ring 丢采样 | **0 条**（累计镜像约 4300 万字节） |
 | master 性能（镜像开/关 fill 10 万） | ~261ms / ~243ms，差异 ~7% 在抖动内，无影响 |
 | 干净 SIGINT 退出 | 无 stack smashing，统计正常，XDP 正常卸载 |
 

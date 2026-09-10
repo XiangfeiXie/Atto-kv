@@ -194,9 +194,8 @@ int repl_backlog_fetch(size_t start_offset, char *dst, int max_len,
  *  见 kvstore.h 中的注释说明
  *-------------------------------------------------------------------------*/
 
-int  (*repl_engine_register)(int fd, kvs_drain_fn handler) = NULL;  /* 注册连接 */
-int  (*repl_engine_append)(int fd, const char *data, int len) = NULL; /* 追加数据 */
-void (*repl_engine_release)(int fd) = NULL;                           /* 释放连接 */
+int  (*repl_engine_register_rbuf)(int fd, kvs_rbuf_drain_fn handler) = NULL; /* 收编连接 + 挂 handler */
+int  (*repl_engine_append)(int fd, const char *data, int len) = NULL;  /* 按 fd 向连接写数据 */
 
 /*-------------------------------------------------------------------------
  *  引擎调用点（engine → repl）：直接函数

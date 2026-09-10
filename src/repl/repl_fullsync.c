@@ -37,8 +37,9 @@
  * Slave 加载完快照后由 repl_fullsync_slave_start 写入，
  * 增量模块据此续传（repl_incr_slave_reset_offset 对齐）。
  *
- * 交接契约：与 master 回 +FULLRESYNC 回复文本中的 offset 在同一时刻取同一值，
- * 但以此处 token 为权威（见 repl_incr_master.c 的 master_start_fullsync）。
+ * 交接契约：本 token 是续传 offset 的唯一权威。控制面 +FULLRESYNC 回复不带
+ * offset（从库只做前缀匹配，从不解析数字），offset 只经数据面流头这一份拷贝
+ * 传递（见 repl_incr_master.c 的 master_start_fullsync）。
  */
 size_t g_repl_snapshot_offset = 0;
 

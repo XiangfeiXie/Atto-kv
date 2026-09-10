@@ -1,18 +1,25 @@
 /*=============================================================================
- *  rdma.c — kvstore 用 RDMA 做全量同步的控制层
+ *  rdma.c — RDMA 全量同步的控制层
  *
- *  职责：用 RDMA 传输引擎（rdma_transport.c）做全量同步
- *   - 服务端：整个 RDB 序列化进发送暂存块，一次性流水线推送
- *   - 客户端：等尾部 IMM 到达后，就地一次性解析加载
+ *  分层定位（自上而下，每层只依赖下一层）：
+ *    repl_fullsync.c    全量同步编排 + sendfile/RDMA 按配置分派（fork 传输子进程）
+ *    rdma.c（本文件）   业务控制：RDB 无盘流 序列化 / 加载 / 性能统计，不触碰 verbs
+ *    rdma_transport.c   verbs 数据面：连接 / 分块窗口 / IMM 通知
  *
- *  传输原语（连接/分块窗口/IMM 通知）都在 rdma_transport.c，
- *  本层只做 kvstore 业务控制（RDB 序列化 / 加载 / 性能统计），不触碰 verbs。
- *  上层由 repl_fullsync.c 按配置开关直接调用。
+ *  本文件对标 Redis diskless 全量同步：RDMA 只是本项目的一种传输方式。与
+ *  sendfile 路径（fork 子进程落盘 dump.rdb 后转送）同构——都是"fork 子进程
+ *  COW 快照 → 数据面子进程发送 → slave 就地加载"，差异只在数据面字节如何送达：
+ *    - 服务端（rdma_server_run）：整份 RDB 无盘流序列化进发送暂存块，
+ *      rdma_xport 一次性流水线直写对端
+ *    - 客户端（rdma_client_run）：等尾部 IMM 到达后就地一次性解析加载
  *
  *  线上格式（单块，大小上限 = RDMA_BUF_SIZE）：
- *   [流头 token 8B][RDB 流: key_count 4B + entries...]
- *   数据长度由 RDB 流头 key_count 自描述：只解析 key_count 条，
- *   数量不一致默认加载失败（无需 magic/total_len 等校验字段）
+ *   [流头 token 8B][RDB 无盘流: key_count 4B + entries...]
+ *   RDB 无盘流与磁盘 dump.rdb 字节序完全一致（③ 加载端同一解析，见
+ *   persist_rdb.c），唯一差别是不带 crc 槽：无盘传输不落盘、无防篡改需求，
+ *   完整性靠 RC 可靠有序 + key_count 数量核对。数据长度由 RDB 流头
+ *   key_count 自描述（slave 只解析 key_count 条），数量不一致即加载失败，
+ *   无需 magic/total_len 等额外校验字段。
  *============================================================================*/
 
 #define _GNU_SOURCE
@@ -32,20 +39,27 @@
  *  工具
  *============================================================================*/
 
-#define RDB_STREAM_HDR_LEN  4   /* RDB 流头：key_count uint32（序列化器先写 4B 头部） */
+/* RDB 无盘流头长度（RDMA 全量）：仅 key_count[4]，无 crc 槽
+ * 磁盘 dump.rdb 头是 RDB_FILE_HDR_LEN=8（key_count[4] + crc 槽[4]），那是
+ * SAVE 落盘路径的事，与 RDMA 无关。两格式条目字节序一致（同一 ③ 加载端
+ * 解析，见 persist_rdb.c），只差这个 crc 槽 */
+#define RDB_STREAM_HDR_LEN  4
 
 /*=============================================================================
  *  入口
  *============================================================================*/
 
 /**
- * RDMA 服务端入口
+ * RDMA 服务端入口（master 全量同步传输子进程，fork 由 repl_fullsync.c 触发）
  *
  * 流程：
- * 1. 整个 RDB 序列化进调用方自持的暂存块（流头 + key_count + entries）
- * 2. rdma_xport_send：监听 + 接受 + 分块流水线推送（内部含完成排空）
+ * 1. rdma_xport_conn_open：监听 + 接受 + 收对端接收缓冲凭证。
+ *    必须先于序列化（见调用点注释：对端 REQ 早到会被丢、双方挂死）
+ * 2. 整个 RDB 无盘流（key_count + entries，无 crc 槽）序列化进暂存块
+ *    （④ 序列化器，persist_rdb.c；装不下 RDMA_BUF_SIZE 即失败，不留半截快照）
+ * 3. rdma_xport_conn_send：分块流水线直写对端（内部含完成排空，末块 IMM 通知）
  *
- * @param token 快照 offset（会话元数据）
+ * @param token 快照 offset（会话元数据，随流头直传对端续传）
  * @param ready_fd 就绪管道 fd：监听成功后写 1 字节通知父进程
  * @return 0 成功，-1 失败
  */
@@ -81,7 +95,7 @@ int rdma_server_run(uint64_t token, int ready_fd)
     /* 流式序列化整个 RDB 写入暂存块 */
     uint64_t prep_ns = 0;
     rdb_serializer_t rs;
-    rdb_serialize_begin(&rs);
+    rdb_serialize_begin(&rs, 0);   /* RDMA 无盘流：无 crc 槽，纯 key_count + entries */
     while (1) {
         int done = 0;
         uint64_t s1 = now_monotonic_ns();
@@ -124,13 +138,18 @@ int rdma_server_run(uint64_t token, int ready_fd)
 }
 
 /**
- * RDMA 客户端入口
+ * RDMA 客户端入口（slave 端全量同步：+FULLRESYNC 握手后由 repl_fullsync.c 编排）
  *
  * 流程：
- * 1. rdma_xport_recv：连接 + 注册接收缓冲 + 发缓冲凭证 + 等尾部 IMM
- * 2. 解出流头 token → 按 RDB 流头 key_count 限条数加载 → 数量不一致即失败
+ * 1. rdma_xport_recv：连接 + 注册接收缓冲 + 发缓冲凭证 + 等尾部 IMM（整块落地）
+ * 2. 解出流头 token → 按 RDB 流头 key_count 限条数就地解析加载
+ *    （无盘流无 crc 槽：完整性 = RC 可靠有序 + loaded==expected 数量核对）
  *
- * @param out_token 输出：从流头解出的 token（快照 offset）
+ * 长度语义：真实数据字节数无法先验（条目变长），故 append_n 喂的是"流头后
+ * 的整块尾部缓冲"，以 limit=key_count 在第 key_count 条处截停，consumed 输出
+ * 真实消费字节；尾部未用缓冲是 calloc 的空白，不会被误解析。
+ *
+ * @param out_token 输出：从流头解出的 token（快照 offset，供增量续传对齐）
  * @return 0 成功，-1 失败
  */
 int rdma_client_run(uint64_t *out_token)
@@ -155,7 +174,7 @@ int rdma_client_run(uint64_t *out_token)
         return -1;
     }
 
-    /* 快照流头：token（快照 offset）+ RDB 流（key_count 头 + entries） */
+    /* 快照流头：token（快照 offset）+ RDB 无盘流（key_count + entries） */
     struct batch_hdr bh;
     memcpy(&bh, buf, sizeof(bh));
     uint64_t snap = be64toh(bh.token);

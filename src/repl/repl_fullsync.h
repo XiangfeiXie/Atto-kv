@@ -34,8 +34,9 @@
  * - 0：尚未完成全量同步
  * - >0：快照对应的 Master 偏移量
  *
- * 交接契约：与 master 回 +FULLRESYNC 回复文本中的 offset 同一时刻同一值，
- * 但以此处 token 为权威（master 侧的说明见 repl_incr_master.c）。
+ * 交接契约：本 token 是续传 offset 的唯一权威。+FULLRESYNC 控制面回复不带
+ * offset（从库只做前缀匹配），offset 只经数据面流头这一份拷贝传递
+ * （master 侧说明见 repl_incr_master.c 的 master_start_fullsync）。
  */
 extern size_t g_repl_snapshot_offset;
 

@@ -45,6 +45,7 @@ static void config_default(void) {
     kvs_config.persist_mode  = PERSIST_NONE;   /* 默认不持久化 */
     kvs_config.network_model = NET_REACTOR;    /* 默认 Reactor */
     kvs_config.maxclients    = 10000;          /* 最大 10000 客户端 */
+    kvs_config.kv_pool_enabled = 1;            /* 数据域内存池默认开启（与原编译期默认一致） */
     strncpy(kvs_config.aof_fsync_policy, "everysec", sizeof(kvs_config.aof_fsync_policy) - 1);
 
     /* 复制配置 */
@@ -209,6 +210,11 @@ int config_load(const char *path) {
             strncpy(kvs_config.aof_fsync_policy, val,
                     sizeof(kvs_config.aof_fsync_policy) - 1);
 
+        } else if (strcasecmp(key, "kv_pool") == 0) {
+            /* 数据域 entry 是否走自研内存池（须在 init_kvengine 注入前生效） */
+            int v = parse_bool(val, lineno, "kv_pool");
+            if (v >= 0) kvs_config.kv_pool_enabled = v;
+
         /*-------------------------------------------------------------------
          *  复制配置
          *-------------------------------------------------------------------*/
@@ -283,11 +289,12 @@ void config_print(void) {
            "  KVStore 10.0 — Configuration\n"
            "========================================\n"
            "  Service   : 0.0.0.0:%-5d  maxclients=%d\n"
-           "  Engine    : dict        persistence=%s\n"
+           "  Engine    : dict        persistence=%s  pool=%s\n"
            "  Network   : %s\n",
            kvs_config.port,
            kvs_config.maxclients,
            persist[kvs_config.persist_mode],
+           kvs_config.kv_pool_enabled ? "on" : "off",
            netmod[kvs_config.network_model]);
 
     if (kvs_config.repl_role == REPL_ROLE_OFF) {

@@ -9,33 +9,38 @@
  *  2. 内存布局连续（header + key + payload，CPU cache 友好）
  *  3. 阻塞式扩容（负载因子 >= 1 时整体搬迁）
  *  4. 单表设计，无渐进 rehash（适合单线程）
- *  5. 内存分配交给 jemalloc，不引入自定义内存池
+ *  5. 数据域 entry 分配/释放由自研内存池 kv_pool 接管（kvstore.c 注入）；
+ *     尺寸变化一律重建（块尺寸恒 == 头部推导值），free 携带尺寸即可还原
  *============================================================================*/
 
 #ifndef __KV_DICT_H__
 #define __KV_DICT_H__
 
+#include "kv_pool.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 /*=============================================================================
  *  设计理念说明
- *  
+ *
  *  面向当前使用场景（单线程 io_uring + redis-benchmark SET/GET）
- *  设计，不做工业级通用（无渐进 rehash / 无内存池），只求热路径最快：
- *  
+ *  设计，不做工业级通用（无渐进 rehash），只求热路径最快：
+ *
  *  - kv_fast_cmp：寄存器级 8/4 字节步长比对，替代 libc memcmp
  *  - dict_find：static inline 下沉到调用方，dispatch 热路径零函数调用
  *  - 链内先比对缓存 hash（一个 load + cmp 提前拒绝），再比长度、最后字节比对
  *  - likely/unlikely 分支提示（__builtin_expect）
- *  - 每个 entry 单次 malloc：header + key + payload（连续布局，CPU cache 友好）
+ *  - 每个 entry 单次整块分配：header + key + payload（连续布局，CPU cache 友好）
  *  - 阻塞式扩容（负载因子 >= 1 时整体搬迁到 2x 大表）
  *  - entry 内缓存 hash（扩容/查找时无需重算）
- *  - 内存分配/释放全部交给 jemalloc（USE_JEMALLOC 默认 ON）
- *  
+ *  - 数据域 entry 分配/释放走自研内存池 kv_pool（kvstore.c 注入，见下）；
+ *    未注入时回退底座 malloc（USE_JEMALLOC 时 jemalloc）
+ *
  *  Entry 布局: [header][key: key_len][payload: val_len]
- *  key 固定在 data[] 头部，扩容时永不移动；仅尾部 payload 会移位。
+ *  key 恒在 data[] 头部：内容不变、随块整体搬迁（尺寸变化时 dict_resize_entry
+ *  一律重建，不做原地 realloc —— 保证块尺寸恒等于头部推导值，供 kv_pool
+ *  「free 携带尺寸」契约推导）。
  *============================================================================*/
 
 /*=============================================================================
@@ -301,11 +306,13 @@ kv_entry_t *dict_add(kv_dict_t *d, const char *key, uint32_t key_len,
 int dict_delete(kv_dict_t *d, const char *key, uint32_t key_len, uint64_t hash);
 
 /**
- * 调整 payload 大小（原地或重建）
+ * 调整 payload 大小（一律重建：缩小/放大统一，不做原地 realloc）
+ * 保证「块尺寸恒 == sizeof(kv_entry_t)+key_len+val_len」，供 free 按头部
+ * 重算尺寸（kv_pool「free 携带尺寸」契约的严格前提）。
  * @param d 字典指针
- * @param e 待调整的 entry
+ * @param e 待调整的 entry（返回后原指针已释放，不得再用）
  * @param new_payload_len 新的 payload 长度
- * @return 调整后的 entry 指针（可能与原指针不同），失败返回 NULL
+ * @return 调整后的 entry 指针（新块），失败返回 NULL
  */
 kv_entry_t *dict_resize_entry(kv_dict_t *d, kv_entry_t *e, uint32_t new_payload_len);
 
@@ -361,6 +368,20 @@ uint32_t dict_count(kv_dict_t *d);
  * @return 随机 entry，空字典返回 NULL
  */
 kv_entry_t *dict_get_random_key(kv_dict_t *d);
+
+/*=============================================================================
+ *  内存池绑定（数据域 entry 分配器）
+ *
+ *  池实例由上层（kvstore.c）创建并注入；注入前/未注入时 entry 走底座
+ *  malloc/free。绑定须发生在任何 dict 写入之前（kvstore 在 engine_reload
+ *  加载数据前注入），解绑须在池销毁前。
+ *============================================================================*/
+
+/** 绑定数据域 entry 内存池（NULL = 解绑，回退底座 malloc/free） */
+void dict_set_pool(kv_pool_t *pool);
+
+/** 当前绑定的池（NULL = 未绑定）；取统计 / 后续 release_all 用 */
+kv_pool_t *dict_pool(void);
 
 /*=============================================================================
  *  全局字典实例

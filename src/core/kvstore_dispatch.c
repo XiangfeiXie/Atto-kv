@@ -53,6 +53,38 @@ static int string_set(const char *key, uint32_t key_len,
 }
 
 /*=============================================================================
+ *  写效果收口（journal = AOF 日志 + 增量复制）
+ *
+ *  由各读缓冲 drain 在 kvs_dispatch 返回 journaled=1（命令已产生需要落盘/
+ *  传播的写效果）后调用：把整条原始命令喂给 AOF 与增量复制消费方。
+ *  各消费方的配置门（ENABLE_AOF / master & incr）收拢在此处一次判定，调用方
+ *  无需预判"这是不是写命令"——效果判定以 kvs_dispatch 的 journaled 回传为准，
+ *  单一权威，消除了旧"命令名谓词须与 dispatch 分支保持同步"的漏判风险。
+ *  g_in_reload（slave 回放 / 启动重载）在此统一短路：重载期不产生新日志/传播。
+ *  拷贝粒度：整条原始命令（AOF 块 / backlog 环都只消费整命令字节，不看 token）。
+ *  超限 / persist 未启动由 kvs_aof_persist_append_raw 内部拒绝，命令本身已照常
+ *  执行（fail-soft，与消费侧拒绝同级）。
+ *
+ *  dispatch 不背数据指针/生命周期：整命令字节由 drain 在 consume 前持有并传入，
+ *  本函数只负责同步 memcpy 到各目标，不滞留指针。
+ *
+ * @param cmd 整条 RESP 原始命令
+ * @param len 命令长度
+ */
+void kvs_journal_effect(const char *cmd, int len) {
+    if (!cmd || len <= 0 || g_in_reload) return;
+
+    if (ENABLE_AOF) kvs_aof_persist_append_raw(cmd, (uint32_t)len);  /* AOF 块 */
+
+    /* 只有 master 且增量复制开启时才需要维护 backlog 和传播；
+     * repl_role 非 master、或 incr_sync 关闭时，维护 backlog 是纯浪费 */
+    if (kvs_config.repl_role == REPL_ROLE_MASTER && kvs_config.incr_sync) {
+        repl_backlog_append(cmd, len);      /* 追加到复制积压缓冲区 */
+        repl_incr_propagate(cmd, len);      /* 推送给 streaming 从库 */
+    }
+}
+
+/*=============================================================================
  *  命令分发主函数
  *  遍历命令表，匹配并执行对应命令
  *============================================================================*/
@@ -61,17 +93,19 @@ static int string_set(const char *key, uint32_t key_len,
  * 命令分发器：解析并执行 RESP 命令
  * @param tokens 解析出的 token 数组
  * @param argc 参数个数（第一个是命令名）
- * @param msg_raw 原始命令消息（用于日志和复制）
- * @param msg_len 原始消息长度
  * @param wb 写缓冲（输出响应）
+ * @param journaled 输出（必填）：本条命令是否产生需要落 AOF/复制的写效果
+ *        （SET 存成 / DEL 命中删除 / FLUSHALL / EXPIRE 命中设置）。分发是本
+ *        判定的权威，只置 1，入口统一归零。调用方据此在字节仍有效时把整条
+ *        命令交给 kvs_journal_effect，不再需要命令名谓词预判。
  * @return DISPATCH_OK 成功, DISPATCH_ERROR 错误, DISPATCH_CLOSE 关闭连接
  */
 dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
-                               const char *msg_raw, int msg_len,
-                               DynBuf *wb)
+                               DynBuf *wb, int *journaled)
 {
-    if (tokens == NULL || argc <= 0 || wb == NULL)
+    if (tokens == NULL || argc <= 0 || wb == NULL || journaled == NULL)
         return DISPATCH_ERROR;
+    *journaled = 0;   /* 无效果分支不逐个清，入口统一归零 */
 
     kvs_token_t cmd = tokens[0];
 
@@ -135,11 +169,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             dynbuf_cat(wb, RESP_ERROR, RESP_ERROR_LEN);
         } else {
             dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-            /* 持久化和复制（仅在非重载模式下） */
-            if (!g_in_reload) {
-                kvs_write_journal_append(msg_raw, msg_len);
-                kvs_repl_incr_hook(msg_raw, msg_len);
-            }
+            *journaled = 1;   /* 存成 → 回传效果，交由 drain 落 AOF/复制 */
         }
         return DISPATCH_OK;
     }
@@ -170,11 +200,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         kv_entry_t *ke = dict_find(&g_dict, kt.ptr, (uint32_t)kt.len, kh);
         if (ke && dict_delete(&g_dict, kt.ptr, (uint32_t)kt.len, kh) == 0) {
             reply_integer(wb, 1);
-            /* 有实际删除时才记录日志和复制 */
-            if (!g_in_reload) {
-                kvs_write_journal_append(msg_raw, msg_len);
-                kvs_repl_incr_hook(msg_raw, msg_len);
-            }
+            *journaled = 1;   /* 确有删除 → 回传效果，交由 drain 落 AOF/复制 */
         } else {
             reply_integer(wb, 0);
         }
@@ -197,6 +223,18 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     }
 
     /*=========================================================================
+     *  控制面命令：PSYNC（master 增量握手）—— 置于热路径之下
+     *  并入命令分发层（与 Redis 控制命令走命令表对齐）。门控 repl_engine_append
+     *  （rbuf 引擎在位，ntyco 与 AOF 重载期恒 NULL）&& 本机为 master；从库/重载
+     *  一律不进 → fall through 到 unknown，行为不变。journaled 保持 0：PSYNC
+     *  不产生需落 AOF/复制的写效果。
+     *=========================================================================*/
+    if (repl_engine_append != NULL &&
+        kvs_config.repl_role == REPL_ROLE_MASTER &&
+        TOKEN_EQ(cmd, "PSYNC"))
+        return repl_master_psync_handle(tokens, argc, wb);
+
+    /*=========================================================================
      *  管理命令
      *=========================================================================*/
     
@@ -207,8 +245,13 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
-    /* SAVE：阻塞落盘（同步序列化 + 写入，完成才回 +OK） */
+    /* SAVE：阻塞落盘（同步序列化 + 写入，完成才回 +OK）
+     * BGSAVE 在跑时拒绝：两路都写同一 dump.rdb.tmp + rename，避免竞态 */
     if (TOKEN_EQ(cmd, "SAVE")) {
+        if (rdb_bgsave_running()) {
+            dynbuf_lit(wb, "-ERR Background save already in progress\r\n");
+            return DISPATCH_OK;
+        }
         rdb_save_sync();
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         return DISPATCH_OK;
@@ -238,11 +281,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     if (TOKEN_EQ(cmd, "FLUSHALL")) {
         kvs_flush_all();
         dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-        /* 非重载模式下记录日志并复制 */
-        if (!g_in_reload) {
-            kvs_write_journal_append(msg_raw, msg_len);
-            kvs_repl_incr_hook(msg_raw, msg_len);
-        }
+        *journaled = 1;   /* 全库清空生效 → 交由 drain 落 AOF/复制 */
         return DISPATCH_OK;
     }
 
@@ -277,11 +316,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         }
         entry->expire = get_time_now() + secs * 1000;  /* 秒转毫秒 */
         reply_integer(wb, 1);
-        
-        if (!g_in_reload) {
-            kvs_write_journal_append(msg_raw, msg_len);
-            kvs_repl_incr_hook(msg_raw, msg_len);
-        }
+        *journaled = 1;   /* 命中设置 → 交由 drain 落 AOF/复制 */
         return DISPATCH_OK;
     }
 

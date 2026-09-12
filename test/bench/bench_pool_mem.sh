@@ -5,16 +5,24 @@
 #  4 形态 = 2 个二进制(底座) × 2 条 conf(运行期 kv_pool on|off):
 #    glibc / glibc+池 / jemalloc / jemalloc+池
 #
-#  三列数据(同一次测量里全部取自该进程自报的 [MEM] 行, 口径一致):
-#    启动  = [MEM] startup              (刚建好引擎、尚未起 reactor 的空库值)
-#    峰值  = [MEM] shutdown/pre-release (灌满 N×V、数据仍在)
-#    回收  = [MEM] shutdown/post-release(优雅退出路径里 FLUSHALL 全清归还之后)
-#  进程退出后 /proc 消失, 故"关闭时内存"只能由进程打印 —— kvstore.c 已加。
+#  报告分两个口径块, 各回答一个问题:
 #
-#  辅指标 RSS: 启动/回收取 [MEM] 行里的 rss, 峰值取 /proc VmHWM(物理水位)。
-#  注意 glibc 无任何 trim, 回收 RSS 必然居高(底座特性, 非池缺陷); jemalloc
-#  形态注入 MALLOC_CONF=dirty_decay_ms:0, 使 kvs_flush_all 的 arenas.purge
-#  真能把脏页还 OS, 否则 RSS 假性不降。
+#  A. used 口径 — "池省多少内存" (单位 B/key)
+#     启动  = [MEM] startup              (刚建好引擎、尚未起 reactor 的空库值)
+#     峰值  = INFO memory 的 used_memory (灌满 N×V、数据仍在)
+#     回收  = [MEM] shutdown/post-release(优雅退出路径里 FLUSHALL 全清归还之后)
+#     三者同源 get_used_mem(), 口径一致。但 jemalloc = Allocated 汇总行、
+#     glibc = mallinfo2 的 uordblks+hblkhd —— 两底座定义不同, 空库基线差两个
+#     数量级, 故 **绝对值只在同底座内相减**, 跨底座比大小无效。表里只出
+#     峰值/key 与同底座内的 Δ; 绝对值打到 stderr 的 raw 行备查。
+#
+#  B. RSS 口径 — "实际物理占用多少、回收后回到哪" (单位 KiB)
+#     启动/回收 = [MEM] 行里的 rss(VmRSS), 峰值 = /proc VmHWM(水位, 只增不减)。
+#     进程退出后 /proc 消失, 故"关闭时内存"只能由进程打印 —— kvstore.c 已加。
+#     回收−启动 即"回落量": 理想贴近 0, 正值 = 没还干净。
+#
+#  两底座均跑默认配置, 不注入 MALLOC_CONF —— glibc 无 trim、jemalloc 默认
+#  dirty_decay_ms=10s, 回收 RSS 居高都是各自默认行为, 不做单边调优。
 #
 #  为什么测三档 value(klen 固定 16 → entry total = 48+V)? 池档表与底座档表
 #  取整粒度不同, "省不省"取决于值落在哪段:
@@ -50,6 +58,8 @@ ARMS=(
 )
 
 require_tools
+# 两底座一律跑默认配置: 清掉外部可能已注入的 MALLOC_CONF, 保证对比公平
+unset MALLOC_CONF
 for b in "${BINS[@]}"; do
     [ -x "$b" ] || { echo "缺二进制: $b" >&2; exit 1; }
 done
@@ -84,6 +94,18 @@ log_mem() { # $1=标签
 # 读 /proc VmHWM (kB)
 read_hwm() { awk '/^VmHWM:/{print $2; exit}' "/proc/$1/status" 2>/dev/null; }
 
+# 左对齐补空格到指定"显示列宽"。printf 的 %-Ns 按字节算, 而 "池" 这类汉字 3 字节
+# 只占 2 显示列 —— 中文标签行会比英文行少占列, 表行错位。故按
+# 显示宽度 = 字符数 + 汉字数(每个汉字字节数−字符数=2) 手算。
+# 注: 仅适用于 BMP 汉字; 若标签引入 4 字节字符(如 emoji)需另行处理。
+pad_to() { # $1=串 $2=目标列宽
+    local c=${#1} b n
+    b=$(printf '%s' "$1" | wc -c)
+    n=$(( $2 - (c + (b - c) / 2) ))
+    [ "$n" -gt 0 ] || n=0
+    printf '%s%*s' "$1" "$n" ''
+}
+
 # 等进程退出(优雅关闭走 dest_kvengine 打印 [MEM], 最长等 5s)
 wait_gone() { # $1=pid
     for _ in $(seq 1 50); do
@@ -100,12 +122,6 @@ measure_round() { # $1=bin  $2=kv_pool值  $3=N  $4=stream
 
     write_kvs_conf "$CONF" "$PORT" proactor none
     echo "kv_pool $poolv" >> "$CONF"
-    # jemalloc 形态注入 dirty_decay_ms:0, 让 FLUSHALL 的 purge 真还页给 OS
-    if ldd "$bin" 2>/dev/null | grep -q jemalloc; then
-        export MALLOC_CONF="dirty_decay_ms:0"
-    else
-        unset MALLOC_CONF
-    fi
 
     stop_all
     KVS_BIN="$bin"
@@ -138,51 +154,64 @@ measure_round() { # $1=bin  $2=kv_pool值  $3=N  $4=stream
 > "$RESULT_FILE"
 {
     echo "bench_pool_mem — $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "纯插入 N×V, 每形态 1 轮; 三列均取自进程 [MEM] 自报"
-    echo "启动=[MEM]startup  峰值=[MEM]shutdown/pre-release  回收=[MEM]shutdown/post-release(FLUSHALL 后)"
-    echo "峰值/key = (峰值used − 启动used)/dbsize; 回收率 = (峰值used − 回收used)/(峰值used − 启动used)"
+    echo "纯插入 N×V (无覆盖写/删除), 每形态 1 轮"
+    echo "A. used 口径 — 池省多少: 启动/峰值/回收同源 get_used_mem()(jemalloc=Allocated, glibc=mallinfo2),"
+    echo "   两底座定义不同, 故只出 峰值/key=(峰值−启动)/dbsize 与同底座内 Δ, 不列跨底座绝对值"
+    echo "B. RSS 口径 — 物理占用: 启动/回收 = [MEM] 行 rss(VmRSS), 峰值 = /proc VmHWM(水位, 只增不减), 单位 KiB"
+    echo "两底座均跑默认配置, 不注入 MALLOC_CONF"
     echo ""
 } >> "$RESULT_FILE"
-
-printf "  %-13s %11s %12s %10s %11s %12s %11s %8s\n" \
-    "形态" "启动used" "峰值used" "峰值/key" "峰值HWM_kB" "回收used" "回收RSS_kB" "回收率%" | tee -a "$RESULT_FILE"
 
 for arm in "${ARMS[@]}"; do
     V=${arm%%:*}; rest=${arm#*:}; N=${rest%%:*}; NOTE=${rest#*:}
     STREAM="$WORK/arm_v${V}.resp"
     gen_stream "$V" "$N" "$STREAM"
-    echo ""
-    echo "── V=$V (N=$N, entry total=$((48+V)); $NOTE)"
-    echo "" >> "$RESULT_FILE"
-    echo "── V=$V (N=$N, entry total=$((48+V)); $NOTE)" >> "$RESULT_FILE"
 
-    declare -a SU PU PH QU QR PK RET   # 形态 → 各列
+    # 每档重置数组: 防上一档的值在失败轮里被当成"陈旧数据"打印
+    SR=(); PH=(); QR=(); PK=(); DEL=()
     for i in "${!BINS[@]}"; do
         row=$(measure_round "${BINS[$i]}" "${POOLV[$i]}" "$N" "$STREAM") \
             || { echo "  ${LABELS[$i]}: 该轮无效, 跳过" >&2; continue; }
 
         read -r s_u s_r p_u p_h q_u q_r _ <<< "$row"
-        SU[$i]=$s_u; PU[$i]=$p_u; PH[$i]=$p_h; QU[$i]=$q_u; QR[$i]=$q_r
+        SR[$i]=$s_r; PH[$i]=$p_h; QR[$i]=$q_r
         PK[$i]=$(awk -v p="$p_u" -v s="$s_u" -v d="$N" \
             'BEGIN{ printf "%.1f", (p-s)/d }')
-        RET[$i]=$(awk -v p="$p_u" -v s="$s_u" -v q="$q_u" \
-            'BEGIN{ if (p>s) printf "%.0f", (p-q)*100/(p-s); else print "-" }')
-
-        printf "  %-13s %11s %12s %10s %11s %12s %11s %8s\n" \
-            "${LABELS[$i]}" "${SU[$i]}" "${PU[$i]}" "${PK[$i]}" \
-            "${PH[$i]}" "${QU[$i]}" "${QR[$i]}" "${RET[$i]}" \
-            | tee -a "$RESULT_FILE"
-        echo "     raw: $row" >&2
+        # used 绝对值只进 raw 行(跨底座不可比, 不上表)
+        echo "     raw: 启动used=$s_u 启动rss=$s_r 峰值used=$p_u 峰值HWM=$p_h 回收used=$q_u 回收rss=$q_r" >&2
     done
 
-    # 同底座内 池-无池 的峰值/key 差(核心结论: 池省多少 / 亏多少)
-    for base in "jemalloc:0:1" "glibc:2:3"; do
-        b=${base%%:*}; r=${base#*:}; no=${r%%:*}; on=${r#*:}
+    # Δ 只在同底座内相减(0→1 = jemalloc, 2→3 = glibc); 任一侧缺测则留 "-"
+    DEL[0]="-"; DEL[2]="-"
+    for pair in "0:1" "2:3"; do
+        no=${pair%%:*}; on=${pair#*:}
         [ -n "${PK[$no]:-}" ] && [ -n "${PK[$on]:-}" ] || continue
-        d=$(awk -v a="${PK[$no]}" -v b="${PK[$on]}" 'BEGIN{ printf "%+.1f", b-a }')
-        line="  Δ峰值/key (池−无池) $b: ${d}B"
-        echo "$line" | tee -a "$RESULT_FILE"
+        DEL[$on]=$(awk -v a="${PK[$no]}" -v b="${PK[$on]}" 'BEGIN{ printf "%+.1f", b-a }')
     done
+
+    {
+        echo ""
+        echo "── V=$V (N=$N, entry total=$((48+V)); $NOTE)"
+        echo ""
+        echo "  A. used 口径 — 池省多少"
+        printf "  %s %12s %13s\n" "$(pad_to "形态" 14)" "峰值/key(B)" "Δ池−无池(B)"
+        for i in "${!BINS[@]}"; do
+            printf "  %s %12s %13s\n" \
+                "$(pad_to "${LABELS[$i]}" 14)" "${PK[$i]:--}" "${DEL[$i]:--}"
+        done
+        echo ""
+        echo "  B. RSS 口径 — 物理占用与回收 (KiB)"
+        printf "  %s %10s %10s %10s %11s\n" "$(pad_to "形态" 14)" \
+            "启动RSS" "峰值RSS" "回收RSS" "回收−启动"
+        for i in "${!BINS[@]}"; do
+            fb="-"
+            if [ -n "${QR[$i]:-}" ] && [ -n "${SR[$i]:-}" ]; then
+                fb=$(awk -v q="${QR[$i]}" -v s="${SR[$i]}" 'BEGIN{ printf "%+d", q-s }')
+            fi
+            printf "  %s %10s %10s %10s %11s\n" \
+                "$(pad_to "${LABELS[$i]}" 14)" "${SR[$i]:--}" "${PH[$i]:--}" "${QR[$i]:--}" "$fb"
+        done
+    } | tee -a "$RESULT_FILE"
 done
 
 stop_all

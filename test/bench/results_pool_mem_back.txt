@@ -1,0 +1,55 @@
+bench_pool_mem — 2026-09-11 04:20:45
+纯插入 N×V (无覆盖写/删除), 每形态 1 轮
+A. used 口径 — 池省多少: 启动/峰值/回收同源 get_used_mem()(jemalloc=Allocated, glibc=mallinfo2),
+   两底座定义不同, 故只出 峰值/key=(峰值−启动)/dbsize 与同底座内 Δ, 不列跨底座绝对值
+B. RSS 口径 — 物理占用: 启动/回收 = [MEM] 行 rss(VmRSS), 峰值 = /proc VmHWM(水位, 只增不减), 单位 KiB
+两底座均跑默认配置, 不注入 MALLOC_CONF
+
+
+── V=16 (N=1000000, entry total=64; 不省档 — 池64=je64(打平), 对 glibc 省16)
+
+  A. used 口径 — 池省多少
+  形态           峰值/key(B) Δ池−无池(B)
+  jemalloc               77.7             -
+  jemalloc+池            77.8          +0.1
+  glibc                  92.8             -
+  glibc+池               76.9         -15.9
+
+  B. RSS 口径 — 物理占用与回收 (KiB)
+  形态            启动RSS  峰值RSS  回收RSS 回收−启动
+  jemalloc             5696      85016      74692      +68996
+  jemalloc+池          5700      85308      48168      +42468
+  glibc                2580      89164      80760      +78180
+  glibc+池             2584      73680      16328      +13744
+
+── V=240 (N=400000, entry total=288; 省档   — 池288<je320(省32), 对 glibc 省16)
+
+  A. used 口径 — 池省多少
+  形态           峰值/key(B) Δ池−无池(B)
+  jemalloc              343.7             -
+  jemalloc+池           312.5         -31.2
+  glibc                 325.5             -
+  glibc+池              310.4         -15.1
+
+  B. RSS 口径 — 物理占用与回收 (KiB)
+  形态            启动RSS  峰值RSS  回收RSS 回收−启动
+  jemalloc             5696     138188      56124      +50428
+  jemalloc+池          5664     130208      58184      +52520
+  glibc                2580     125712     121404     +118824
+  glibc+池             2568     119860       7420       +4852
+
+── V=465 (N=200000, entry total=513; 亏损档 — 池576<je640(省64), 对 glibc 亏48)
+
+  A. used 口径 — 池省多少
+  形态           峰值/key(B) Δ池−无池(B)
+  jemalloc              676.9             -
+  jemalloc+池           616.8         -60.1
+  glibc                 560.5             -
+  glibc+池              612.7         +52.2
+
+  B. RSS 口径 — 物理占用与回收 (KiB)
+  形态            启动RSS  峰值RSS  回收RSS 回收−启动
+  jemalloc             5680     134104      51420      +45740
+  jemalloc+池          5696     128240      66884      +61188
+  glibc                2576     108024     105764     +103188
+  glibc+池             2584     118328       8012       +5428

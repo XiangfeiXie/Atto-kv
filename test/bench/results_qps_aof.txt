@@ -1,14 +1,14 @@
-bench_qps — 2026-08-30 11:55:36
-aof=on (AOF(aof everysec))  systems=proactor redis  test=set  nclients=2  conn=50  ops=500000  data=16
+bench_qps — 2026-09-11 08:51:47
+aof=on (AOF(aof everysec))  systems=proactor redis  test=set  nclients=1  conn=50  ops=500000  data=16
 pipelines: 1 4 8 16 20 40 80 160   (单位: SET QPS)
 
   P      |     proactor |        redis
-  P1    |        45493 |        28710
-  P4    |       162782 |        78450
-  P8    |       315966 |       118092
-  P16   |       530597 |       149824
-  P20   |       684229 |       160077
-  P40   |      1020989 |       172877
-  P80   |      1556580 |       210726
-  P160  |      1347709 |       195449
+  P1    |        17646 |        20758
+  P4    |        67806 |        68937
+  P8    |       129702 |       104932
+  P16   |       245339 |       144051
+  P20   |       291886 |       149209
+  P40   |       492126 |       181094
+  P80   |       739645 |       181620
+  P160  |      1416431 |       202265
 

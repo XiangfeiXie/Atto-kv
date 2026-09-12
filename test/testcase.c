@@ -22,6 +22,10 @@
  *      expire   — 填充 count 个带 ttl 秒过期的 key（key=expire:%012d），
  *                 填充完成后每秒发 DBSIZE 并打印，观察 key 随过期衰减；
  *                 服务器须以 'expire on' 启动（默认 off 时不会主动清理）
+ *      dbsize   — DBSIZE 计数正确性闭环，循环 loop 次（默认 10000）：
+ *                 每轮 FLUSHALL 归零 → 新增 / 等长覆盖 / 变长覆盖 / DEL /
+ *                 重复 DEL / DEL 不存在，每一步之后断言键数量。
+ *                 注意：会清空实例数据，只能对测试实例运行
  *
  *  编译：gcc -O2 -o build/testcase test/testcase.c
  *  退出码：0 全部通过；非 0 测试失败
@@ -453,6 +457,77 @@ void expire_cmds(int fd, int start, int count, int ttl) {
 }
 
 /*=============================================================================
+ *  dbsize_cmds — DBSIZE 计数正确性闭环
+ *
+ *  每轮以 FLUSHALL 归零（空库下 DBSIZE 必须是 0，绝对断言，无需基线），
+ *  再依次走 新增 / 等长覆盖 / 变长覆盖 / 删除 / 重复删除 / 删不存在 六步，
+ *  每一步之后断言 DBSIZE。整体循环 loop 次，设计同 basic_cmds。
+ *
+ *  覆盖写有两条取值分支（src/core/kvstore_dispatch.c 的 string_set）：
+ *    · 等长覆盖 → L38  memcpy 原地写
+ *    · 变长覆盖 → L41  dict_resize_entry 重新分配条目
+ *  两条都不允许 d->used 自增 —— src/engine/kv_dict.c:265 的自增在 dict_add 内
+ *  是无条件的，只有"键不存在"那条路径才该走到那里。
+ *
+ *  注意：本测试会 FLUSHALL 清空实例数据，只能对测试实例运行。
+ *============================================================================*/
+
+/** 发一条 DBSIZE 并断言等于 want；不符即失败退出 */
+static void expect_dbsize(int fd, int want, const char *what) {
+    int got = get_dbsize(fd);
+    if (got != want) {
+        printf("==> FAILED -> %s, EXPECTED DBSIZE: %d BUT GOT: %d\n",
+               what, want, got);
+        exit(1);
+    }
+}
+
+void dbsize_cmds(int fd, int loop) {
+    char cmd[256];
+    for (int i = 0; i < loop; i++) {
+        /* 1. 归零：FLUSHALL 后必须是 0 */
+        resp_cmd(cmd, sizeof cmd, 1, "FLUSHALL");
+        exec_cmd(fd, cmd, "+OK\r\n", "FLUSHALL");
+        expect_dbsize(fd, 0, "FLUSHALL 后归零");
+
+        /* 2. 新增 3 个新 key → 3 */
+        for (int j = 0; j < 3; j++) {
+            char k[32];
+            snprintf(k, sizeof k, "db:%d", j);
+            resp_cmd(cmd, sizeof cmd, 3, "SET", k, "v");
+            exec_cmd(fd, cmd, "+OK\r\n", "SET 新增");
+        }
+        expect_dbsize(fd, 3, "新增 3 个 key");
+
+        /* 3. 等长覆盖（v → w）→ 不增 */
+        resp_cmd(cmd, sizeof cmd, 3, "SET", "db:0", "w");
+        exec_cmd(fd, cmd, "+OK\r\n", "SET 等长覆盖");
+        expect_dbsize(fd, 3, "等长覆盖后不增");
+
+        /* 4. 变长覆盖（v → a-longer-value）→ 不增 */
+        resp_cmd(cmd, sizeof cmd, 3, "SET", "db:1", "a-longer-value");
+        exec_cmd(fd, cmd, "+OK\r\n", "SET 变长覆盖");
+        expect_dbsize(fd, 3, "变长覆盖后不增");
+
+        /* 5. 删除存在的 key → :1 且 -1 */
+        resp_cmd(cmd, sizeof cmd, 2, "DEL", "db:0");
+        exec_cmd(fd, cmd, ":1\r\n", "DEL 存在的 key");
+        expect_dbsize(fd, 2, "DEL 后 -1");
+
+        /* 6. 重复删除同一个 key → :0 且不再减 */
+        resp_cmd(cmd, sizeof cmd, 2, "DEL", "db:0");
+        exec_cmd(fd, cmd, ":0\r\n", "DEL 重复删除");
+        expect_dbsize(fd, 2, "重复 DEL 不减");
+
+        /* 7. 删除从未写过的 key → :0 且不变 */
+        resp_cmd(cmd, sizeof cmd, 2, "DEL", "db:never");
+        exec_cmd(fd, cmd, ":0\r\n", "DEL 不存在的 key");
+        expect_dbsize(fd, 2, "DEL 不存在不减");
+    }
+    printf("OK: dbsize %d 轮全部通过\n", loop);
+}
+
+/*=============================================================================
  *  入口
  *============================================================================*/
 
@@ -463,6 +538,7 @@ static void usage(const char *prog) {
     printf("  %s <ip> <port> fill     <start> <count>\n", prog);
     printf("  %s <ip> <port> verify   <start> <count>\n", prog);
     printf("  %s <ip> <port> expire   <start> <count> <ttl>\n", prog);
+    printf("  %s <ip> <port> dbsize   [loop]\n", prog);
 }
 
 int main(int argc, char *argv[]) {
@@ -522,6 +598,8 @@ int main(int argc, char *argv[]) {
         verify_cmds(g_rb.fd, fstart, fcount);
     } else if (strcmp(test, "expire") == 0) {
         expire_cmds(g_rb.fd, fstart, fcount, fttl);
+    } else if (strcmp(test, "dbsize") == 0) {
+        dbsize_cmds(g_rb.fd, loop);
     } else {
         fprintf(stderr, "未知测试: %s\n", test);
         usage(argv[0]);

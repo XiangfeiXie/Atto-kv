@@ -16,7 +16,7 @@
 #ifndef KVS_REPL_TCP_RECVMSG_H
 #define KVS_REPL_TCP_RECVMSG_H
 
-#define SLAVE_IP     "127.0.0.1"   /* 从机 IP（演示与 master 同机） */
-#define SLAVE_PORT   2001          /* 从机 kvstore 端口 */
+#define SLAVE_IP     "192.168.30.136"   /* 从机 IP（演示与 master 同机） */
+#define SLAVE_PORT   2000          /* 从机 kvstore 端口 */
 
 #endif /* KVS_REPL_TCP_RECVMSG_H */

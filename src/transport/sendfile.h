@@ -27,35 +27,37 @@
  *  4. 通过 sendfile 零拷贝发送 RDB 快照数据
  *  
  *  @param token 上层会话元数据（全量同步中 = 快照 offset）
- *  @param ready_fd 就绪管道 fd：listen 成功后写 1 字节通知父进程
  *  @return 0 成功，-1 失败
- *  
+ *
  *  调用者：repl_fullsync_master_trigger 中 fork 的子进程
- *  
+ *
  *  实现要点：
  *  - 使用 sendfile 避免用户态到内核态的数据拷贝
- *  - 支持大文件分块传输
- *  - 连接建立后立即发送 token，再发数据
+ *  - sendfile 可能只部分返回，循环发送直到发完（大 RDB/跨机必需）
+ *  - 流程：等客户端 ready 信号 → SAVE 落盘 → 发 token → 发 size → 发数据
+ *  - 计时：xfer 只夹 sendfile 循环（纯传输），落盘耗时单列 save=
  */
-int sendfile_server_run(uint64_t token, int ready_fd);
+int sendfile_server_run(uint64_t token);
 
 /*=============================================================================
  *  客户端入口
  *  
  *  功能：
- *  1. 连接服务端的 fullsync_port
- *  2. 接收流头 token（快照 offset）
- *  3. 接收 RDB 快照数据并加载
- *  
+ *  1. 连接服务端的 fullsync_port（带重试，等服务端监听就绪）
+ *  2. 发 ready 信号 → 接收流头 token(8B) + size(8B)
+ *  3. 接收 RDB 快照数据到 /tmp 临时文件，mmap 后用 rdb_load_from_buf 加载
+ *
  *  @param out_token 输出：从流头解出的 token（快照 offset）
  *  @return 0 成功，-1 失败
- *  
+ *
  *  调用者：repl_fullsync_slave_start
- *  
+ *
  *  实现要点：
- *  - 先接收 8 字节 token，再接收数据流
- *  - 数据通过 RDB 流式加载器（rdb_load_stream_begin/append）
- *  - 支持断线重连
+ *  - 流头顺序：token(8B) → size(8B) → 数据
+ *  - 数据先落 /tmp 临时文件再 mmap 加载（rdb_load_from_buf，非流式加载器）
+ *  - connect 重试 30 次 × 200ms：服务端 fork 子进程起监听有延迟
+ *  - 计时：接收端只报 [sendfile] recv-end（字节数 + 墙钟），不出速率——
+ *    这段等待里夹着本端写临时文件的耗时，速率一律以发送端为准
  */
 int sendfile_client_run(uint64_t *out_token);
 

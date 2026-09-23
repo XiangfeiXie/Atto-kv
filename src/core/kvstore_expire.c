@@ -19,9 +19,8 @@
  * 若过期比例高（>25%）则下一轮加倍抽样（自适应放大），否则结束。
  * 事件循环每次命令处理前调用，保证 TTL 键最终被清除。 */
 void active_expire_cycle(void) {
-    kv_dict_t *dict = &g_dict;
-    long long   start = get_time_now_real();   /* 墙钟时间（毫秒），时间预算基准 */
-    int         sample = EXPIRE_BASE_SAMPLE;
+    long long start  = get_time_now_real();   /* 墙钟时间（毫秒），时间预算基准 */
+    int       sample = EXPIRE_BASE_SAMPLE;
 
     do {
         int expired = 0;
@@ -33,16 +32,16 @@ void active_expire_cycle(void) {
                     return;                    /* 超预算，本轮收尾 */
             }
 
-            kv_entry_t *e = dict_get_random_key(dict);
-            if (!e) return;                    /* 字典已空 */
+            kv_node_t *e = dict_get_random_key();
+            if (!e) return;                    /* 表已空 */
 
-            if (e->expire && get_time_now() > e->expire) {
-                /* 键内联在 entry 里——删除前先保存指针/长度/哈希 */
+            int64_t exp = entry_expire(e);   /* 一次分派，别问两遍 */
+            if (exp && get_time_now() > exp) {
+                /* 键内联在记录里——删除会连记录一起释放，先保存键指针/长度 */
                 const char *kp = entry_key(e);
-                uint32_t    kl = e->key_len;
-                uint64_t    h  = e->hash;
+                uint32_t    kl = entry_key_len(e);
 
-                dict_delete(dict, kp, kl, h);
+                dict_delete(kp, kl);
                 expired++;
             }
         }

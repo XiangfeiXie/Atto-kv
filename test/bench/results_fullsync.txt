@@ -1,6 +1,0 @@
-rdma_fullsync_bench — 2026-08-30 09:44:08
-keys=400000  vsize=256  rdma_ip=10.0.0.1  指标: xfer 端到端速率 (sendfile 含落盘; rdma 含序列化+直写, 均不含连接建立)
-
-  transport |        bytes | 耗时(ms) |       MB/s
-  sendfile  |    115200004 |     1806.5 |      60.82
-  rdma      |    115200012 |     1109.1 |      99.05

@@ -23,17 +23,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <sys/time.h>
 #include <netinet/in.h>
-#include <arpa/inet.h>
 #include <netdb.h>
+#include <endian.h>   /* htobe64 / be64toh */
 #include <fcntl.h>
 
 /*=============================================================================
@@ -53,10 +51,9 @@
  * 7. 通过 sendfile 零拷贝发送 RDB 数据
  * 
  * @param token 快照 offset（会话元数据）
- * @param ready_fd 就绪管道 fd：监听成功后写 1 字节通知父进程
  * @return 0 成功，-1 失败
  */
-int sendfile_server_run(uint64_t token, int ready_fd) {
+int sendfile_server_run(uint64_t token) {
     setlinebuf(stdout); setlinebuf(stderr);
     int port = kvs_config.fullsync_port;   /* 全量数据端口 */
 
@@ -79,14 +76,6 @@ int sendfile_server_run(uint64_t token, int ready_fd) {
     if (listen(lfd, 1) < 0) { perror("listen"); close(lfd); return -1; }
     
     printf("[sendfile] listening :%d\n", port);
-    
-    /* 通知父进程：监听已就绪 */
-    if (ready_fd >= 0) { 
-        char r = 1; 
-        ssize_t _wr = write(ready_fd, &r, 1); 
-        (void)_wr; 
-        close(ready_fd); 
-    }
 
     /*-------------------------------------------------------------------------
      *  2. 接受客户端连接
@@ -100,9 +89,8 @@ int sendfile_server_run(uint64_t token, int ready_fd) {
      *     客户端连接后发送 1 字节确认，服务端收到后才开始 SAVE
      *     目的是让客户端先准备好接收，避免数据发送时客户端未就绪
      *-------------------------------------------------------------------------*/
-    printf("[sendfile] waiting for client ready signal...\n");
-    { 
-        char ready_sig; 
+    {
+        char ready_sig;
         if (recv(cfd, &ready_sig, 1, 0) != 1) { 
             perror("recv ready"); 
             goto out; 
@@ -111,18 +99,19 @@ int sendfile_server_run(uint64_t token, int ready_fd) {
 
     /*-------------------------------------------------------------------------
      *  4. 执行 RDB 保存（同步方式）
-     *     计时开始（与 RDMA 路径对齐，便于性能对比）
+     *     落盘耗时单列进 xfer-end 的 prep: 段（不计入速率），与 RDMA 侧的
+     *     conn/ser/reg 并列——两条线都把"传输前必须付的准备成本"放在同一处
      *-------------------------------------------------------------------------*/
-    uint64_t t1 = now_monotonic_ns();
+    uint64_t t_save = now_monotonic_ns();
 
     printf("[sendfile] SAVE ...\n");
     rdb_save_sync();
+    uint64_t save_ns = now_monotonic_ns() - t_save;
 
     /*-------------------------------------------------------------------------
      *  5. 打开 RDB 文件
      *-------------------------------------------------------------------------*/
     const char *path = persist_path("build/dump.rdb");
-    printf("[sendfile] opening %s ...\n", path);
     int fd = open(path, O_RDONLY);
     if (fd < 0) { 
         perror(path); 
@@ -132,7 +121,6 @@ int sendfile_server_run(uint64_t token, int ready_fd) {
     struct stat st; 
     fstat(fd, &st);
     uint64_t file_size = (uint64_t)st.st_size;
-    printf("[sendfile] RDB: %lu bytes\n", (unsigned long)file_size);
 
     /*-------------------------------------------------------------------------
      *  6. 发送数据：token(8B) + size(8B) + data
@@ -156,9 +144,11 @@ int sendfile_server_run(uint64_t token, int ready_fd) {
     }
 
     /* 6c. sendfile 零拷贝发送数据（循环发送）
-     *     xfer 计时从 t1(rdb_save_sync 之前)起算, 即含落盘+传输。
-     *     落盘是 sendfile 路径的固有耗时(序列化并写 dump.rdb); RDMA 无落盘
-     *     (内存直序列化), 同键 xfer 对比才能体现两端到端差异 */
+     *     xfer 计时只夹这个循环 = 纯传输（不含落盘，落盘单列 save=）。
+     *     已知偏差：阻塞 socket 上 sendfile 返回只表示这批字节进了本端内核
+     *     发送缓冲，末包可能仍在途；RDMA 侧的 send CQE 是对端 ACK，语义更严。
+     *     差值上界 ≈ 收发缓冲 + BDP，大快照下可忽略 */
+    uint64_t t1 = now_monotonic_ns();
     off_t off = 0;
     size_t remaining = (size_t)file_size;
     size_t sent = 0;
@@ -176,12 +166,12 @@ int sendfile_server_run(uint64_t token, int ready_fd) {
 
     uint64_t t2 = now_monotonic_ns();
 
-    /* 统计传输性能
-     * xfer = 落盘+传输耗时(从 t1 起算), mbps 按此计算;
-     * 与 RDMA 的 xfer=(纯直写, 无落盘) 同键对比 */
+    /* 汇总结论行：xfer 是纯传输（只夹 sendfile 循环），rate 由它算。
+     * 与 [rdma] xfer-end 排成同一形状 —— 前三个字段两线对齐、速率同列，
+     * 准备耗时一律收在 " | prep:" 之后，方便两条线并排看。 */
     double xfer_ms = (t2 > t1) ? (double)(t2 - t1) / 1e6 : 0.0;
-    double mbps    = (xfer_ms > 0) ? ((double)sent / (xfer_ms / 1000.0) / (1024.0 * 1024.0)) : 0;
-    printf("[sendfile] xfer-end: bytes=%zu xfer=%.1f mbps=%.2f\n", sent, xfer_ms, mbps);
+    printf("[sendfile] xfer-end: bytes=%zu xfer=%.1fms rate=%.2fMB/s | prep: save=%.1fms\n",
+           sent, xfer_ms, xfer_rate_mbs(sent, xfer_ms), (double)save_ns / 1e6);
 
 out:
     close(fd); 
@@ -346,11 +336,11 @@ int sendfile_client_run(uint64_t *out_token) {
         return -1;
     }
 
-    /* 传输性能统计 (接收端 ms 即纯 recv 耗时, xfer 与主/从端格式对齐) */
-    double ms = (t2 > t1) ? (double)(t2 - t1) / 1e6 : 0.0;
-    double mbps = (ms > 0) ? ((double)fsz / (ms / 1000.0) / (1024.0 * 1024.0)) : 0;
-    printf("[sendfile] xfer-end: bytes=%lu ms=%.1f xfer=%.1f mbps=%.2f\n",
-           (unsigned long)fsz, ms, ms, mbps);
+    /* 接收端只报字节数 + 墙钟，不出速率：这段等待里还夹着本端写临时文件的
+     * 耗时（/tmp 是 ext4，写盘就串在 recv 之间）。速率一律以发送端为准 */
+    double wait_ms = (t2 > t1) ? (double)(t2 - t1) / 1e6 : 0.0;
+    printf("[sendfile] recv-end: bytes=%lu wait=%.1f\n",
+           (unsigned long)fsz, wait_ms);
 
     /*-------------------------------------------------------------------------
      *  6. mmap + 加载 RDB 数据

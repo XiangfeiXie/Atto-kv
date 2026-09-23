@@ -194,13 +194,24 @@ int accept_cb(int fd) {
     return 0;
 }
 
+/* 写缓冲冲刷阈值（字节）：单次 recv_cb 内解析产生的回复累计到它就跳出读循环，
+ * 交给主循环紧随其后的 send_cb 冲刷（同一次 epoll 事件内就会发出去）。
+ * 目的：既保住写合并（管线化的批量回复合成一次 send），又给 write_buf 封顶 ——
+ * 不封顶的话 --pipe 灌百万条时 write_buf 会随输入线性涨到数 MB。
+ * 读事件是水平触发，未读完的数据下一轮 epoll 会再触发，跳出不会丢数据。 */
+#define WRITE_FLUSH_THRESHOLD  (64 * 1024)
+
 /**
  * Recv 回调：读取并处理数据
- * 水平触发：一次性读空所有可用数据
+ * 水平触发：循环读取直到读空（或攒够冲刷阈值）
  *
- * 读路径唯一（rbuf）：rbuf_reserve 暴露 iovec[] → recvmsg 多段 gather →
- * rbuf_commit 入队；16MB 上限按"已收未消费逻辑字节"计。缓冲物理布局
- * （节点、回池时机）归 rbuf 管，本函数不碰 r_off/memmove。
+ * 读路径唯一（rbuf）：rbuf_reserve 暴露一段可写空间 → recv 灌入 →
+ * rbuf_commit 入队。recv 一次只能灌一个连续缓冲，与 rbuf 的单段暴露
+ * 语义严丝合缝（三引擎同此一条路）。缓冲物理布局（节点、回池时机）归
+ * rbuf 管，本函数不碰 r_off/memmove。16MB 上限按"已收未消费逻辑字节"计，
+ * 防的是"客户端发一个永远拼不完整的大命令"。
+ *
+ * 边读边解析（与 ntyco 同构）：每轮读完立即 on_data 消费，rbuf_len 不累积。
  * 消费端 = c->on_data（kvs_rbuf_drain_fn），普通/Repl 角色差别只在 handler。
  * @param fd 连接 fd
  * @return 0 成功，-1 失败
@@ -212,46 +223,8 @@ int recv_cb(int fd) {
 
     int eof = 0;
 
-    /* reserve → recvmsg 多段 gather → commit；循环读到 EAGAIN */
-    for (;;) {
-        struct iovec iov[RBUF_MAX_IOV];
-        int nseg = rbuf_reserve(&c->rq, iov, RBUF_MAX_IOV);
-        if (nseg <= 0) {   /* 池空且新节点分配失败：OOM 保护，断开 */
-            fprintf(stderr, "[reactor] fd %d rbuf reserve failed\n", fd);
-            conn_release(fd);
-            return -1;
-        }
-
-        struct msghdr mh;
-        memset(&mh, 0, sizeof(mh));
-        mh.msg_iov    = iov;
-        mh.msg_iovlen = (size_t)nseg;
-        ssize_t n = recvmsg(fd, &mh, 0);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                rbuf_commit(&c->rq, 0);   /* 归还未用段（reserve/commit 须配对） */
-                break;                    /* 无更多数据可读 */
-            }
-            rbuf_commit(&c->rq, 0);
-            conn_release(fd);
-            return -1;
-        }
-        if (n == 0) {
-            rbuf_commit(&c->rq, 0);
-            eof = 1;
-            break;                        /* 对端关闭连接 */
-        }
-        rbuf_commit(&c->rq, (int)n);
-
-        /* 已收未消费逻辑字节上限（沿用原单连接 16MB 护栏） */
-        if (rbuf_len(&c->rq) > 16u * 1024u * 1024u) {
-            fprintf(stderr, "[reactor] fd %d read buffer overflow\n", fd);
-            conn_release(fd);
-            return -1;
-        }
-    }
-
-    /* 压缩写缓冲（回收已发送前缀） */
+    /* 压缩写缓冲（回收已发送前缀）。必须在解析之前：parser 用 dynbuf_cat 追加，
+     * 它只认 buf+len，不知道 w_off —— 待发数据约定落在 [w_off, w_off+len)。 */
     if (c->write_buf.len > 0 && c->w_off > 0) {
         memmove(c->write_buf.buf,
                 c->write_buf.buf + c->w_off,
@@ -259,15 +232,52 @@ int recv_cb(int fd) {
         c->w_off = 0;
     }
 
-    /* 调用业务处理器解析缓冲中的所有命令
-     * 消费端只认逻辑字节流：整段回池由 rbuf 内部完成，本路径无 r_off 账本 */
-    int want_close = 0;
-    c->on_data(c->fd, &c->rq, &c->write_buf, &want_close);
-    if (want_close) c->status = 1;
+    /* reserve(一段) → recv → commit；循环读到 EAGAIN 或攒够冲刷阈值 */
+    for (;;) {
+        char    *base;
+        uint32_t cap;
+        if (rbuf_reserve(&c->rq, &base, &cap) != 1) {  /* 池空且新节点分配失败：OOM */
+            fprintf(stderr, "[reactor] fd %d rbuf reserve failed\n", fd);
+            conn_release(fd);
+            return -1;
+        }
 
-    /* repl handler 可能在 on_data 内直接释放本连接（如 +FULLRESYNC 交接）
-     * 此时槽位已清零，后续逻辑需跳过 */
-    if (!c->active) return 0;
+        ssize_t n = recv(fd, base, cap, 0);
+        int err = (n < 0) ? errno : 0;
+        rbuf_commit(&c->rq, (int)n);   /* 负值由 rbuf 内部按 0 处理，配对必达 */
+
+        if (n == 0) {                        /* 对端关闭连接 */
+            eof = 1;
+            break;
+        }
+        if (n < 0) {
+            if (err == EAGAIN || err == EWOULDBLOCK)
+                break;                       /* 无更多数据可读 */
+            conn_release(fd);
+            return -1;
+        }
+
+        /* 已收未消费逻辑字节上限（16MB 护栏） */
+        if (rbuf_len(&c->rq) > 16u * 1024u * 1024u) {
+            fprintf(stderr, "[reactor] fd %d read buffer overflow\n", fd);
+            conn_release(fd);
+            return -1;
+        }
+
+        /* 调用业务处理器解析缓冲中的所有命令
+         * 消费端只认逻辑字节流：整段回池由 rbuf 内部完成，本路径无 r_off 账本 */
+        int want_close = 0;
+        c->on_data(c->fd, &c->rq, &c->write_buf, &want_close);
+        if (want_close) c->status = 1;
+
+        /* repl handler 可能在 on_data 内直接释放本连接（如 +FULLRESYNC 交接）
+         * 此时槽位已清零，后续逻辑需跳过 */
+        if (!c->active) return 0;
+
+        /* 回复攒够阈值 / 已请求关闭：跳出读循环去冲刷，给 write_buf 封顶 */
+        if (c->status != 0 || c->write_buf.len >= WRITE_FLUSH_THRESHOLD)
+            break;
+    }
 
     /* 处理关闭请求（QUIT / 协议错误）：冲刷后关闭 */
     if (__builtin_expect(c->status != 0, 0)) {

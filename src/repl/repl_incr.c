@@ -196,6 +196,9 @@ int repl_backlog_fetch(size_t start_offset, char *dst, int max_len,
 
 int  (*repl_engine_register_rbuf)(int fd, kvs_rbuf_drain_fn handler) = NULL; /* 收编连接 + 挂 handler */
 int  (*repl_engine_append)(int fd, const char *data, int len) = NULL;  /* 按 fd 向连接写数据 */
+/* 全量同步 fork 出的传输子进程里调（可空）：让引擎摘掉自身运行时状态，
+ * 理由见 kvstore.h 声明处。reactor/proactor 无此需要，保持 NULL */
+void (*repl_engine_postfork_child)(void) = NULL;
 
 /*-------------------------------------------------------------------------
  *  引擎调用点（engine → repl）：直接函数

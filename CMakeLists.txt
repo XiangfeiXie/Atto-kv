@@ -78,8 +78,15 @@ set(CORE_SRCS
     src/core/kvstore_info.c
 )
 
+# 存储引擎：kv_engine.c 只是路由层（选哪个引擎）；其余四个文件各是一个独立
+# 引擎 —— 自带节点类型、自己的增删改查、自己管自己节点的内存，彼此不可见。
+# （新增引擎 = 加一个 .c/.h 实现 14 个操作 + 6 个访问器，再挂进这里）
 set(ENGINE_SRCS
-    src/engine/kv_dict.c
+    src/engine/kv_engine.c
+    src/engine/kv_hash.c
+    src/engine/kv_array.c
+    src/engine/kv_rbtree.c
+    src/engine/kv_skiplist.c
 )
 
 set(NET_SRCS
@@ -116,30 +123,10 @@ set(KVSTORE_SRCS
     ${REPL_SRCS}
 )
 
-# ── repl-recv（旁路 eBPF 增量同步）──────────────────────────────────────
-# 独立进程，与 kvstore 零耦合：uprobe/uretprobe 挂 master 进程 libc `recv`
-# （recv 挂载点，仅 reactor 引擎适用——proactor 的 io_uring recv 不经过 libc），
-# 把镜像到的请求字节 TCP 原样转发从机，从机当普通客户端命令应用。BPF 侧
-# 用 clang 编成 repl-recv.bpf.o，用户态 loader 链 libbpf。
+# ── 旁路镜像组件共用的编译工具 ─────────────────────────────────────────
+# BPF 侧一律用 clang 编成 .bpf.o，用户态 loader 链 libbpf
 set(BPF_CLANG clang)
 set(UTIL_DIR    ${CMAKE_SOURCE_DIR}/src/util)   # 公共 vmlinux.h 单份存放于此
-set(REPL_RECV_DIR ${CMAKE_SOURCE_DIR}/src/repl-recv)
-
-add_custom_command(
-    OUTPUT ${CMAKE_BINARY_DIR}/repl-recv.bpf.o
-    COMMAND ${BPF_CLANG} -g -O2 -target bpf -D__TARGET_ARCH_x86
-            -I${REPL_RECV_DIR} -I${UTIL_DIR} -I/usr/include
-            -c ${REPL_RECV_DIR}/repl-recv.bpf.c
-            -o ${CMAKE_BINARY_DIR}/repl-recv.bpf.o
-    DEPENDS ${REPL_RECV_DIR}/repl-recv.bpf.c ${REPL_RECV_DIR}/repl-recv.h ${UTIL_DIR}/vmlinux.h
-    COMMENT "Compiling repl-recv.bpf.o (eBPF)"
-)
-add_custom_target(repl-recv-bpf DEPENDS ${CMAKE_BINARY_DIR}/repl-recv.bpf.o)
-
-add_executable(repl-recv ${REPL_RECV_DIR}/repl-recv.c)
-target_include_directories(repl-recv PRIVATE ${REPL_RECV_DIR})
-target_link_libraries(repl-recv PRIVATE Threads::Threads bpf elf ${ZLIB_LIBRARIES})
-add_dependencies(repl-recv repl-recv-bpf)
 
 # ── repl-xdp（XDP 旁路镜像同步）──────────────────────────────────────────
 # 独立进程，与 kvstore 零耦合：XDP 程序挂 kvstore master 客户端流量所经网卡
@@ -171,10 +158,13 @@ add_dependencies(repl-xdp repl-xdp-bpf)
 
 # ── repl-tcp_recvmsg（kprobe 读侧镜像同步）────────────────────────────────
 # 独立进程，与 kvstore 零耦合：kprobe/kretprobe 挂 tcp_recvmsg_locked（TCP 读
-# 路径统一收口，同时覆盖 reactor 的 recvmsg 与 proactor 的 io_uring recvmsg），
+# 路径统一收口，同时覆盖 reactor 的 recv 与 proactor 的 io_uring_prep_recv）。
+# 三引擎读路径已统一为单段 recv（msg_iter 为 ITER_UBUF，一次 recv = 一条记录），
+# 本组件入口即按此放行。
 # 按 tgid 过滤目标 master 进程，把其每次读到的字节镜像进 ring；用户态用内核
-# TCP socket 转发从机，从机当普通客户端命令应用。目标 PID 由命令行传入
-# （用法见 src/repl-tcp_recvmsg/README.md）。
+# TCP socket 转发从机，从机当普通客户端命令应用。目标进程由固定端口 MASTER_PORT
+# 反查（监听该端口的 socket inode → 属主进程），命令行零参数；.o 取可执行文件
+# 同目录。见 src/repl-tcp_recvmsg/README.md。
 set(REPL_TCP_DIR ${CMAKE_SOURCE_DIR}/src/repl-tcp_recvmsg)
 set(REPL_TCP_DEFINES "" CACHE STRING
     "repl-tcp_recvmsg 覆盖，例: -DMAX_REC=4096")
@@ -235,6 +225,16 @@ add_dependencies(kvstore ntyco)
 # 编译同原 `gcc -O2 -o build/testcase test/testcase.c`，随默认构建一起产出。
 add_executable(testcase ${CMAKE_SOURCE_DIR}/test/testcase.c)
 target_compile_options(testcase PRIVATE -Wall -Wextra)
+
+# ── engtest（引擎内存账本自检）─────────────────────────────────────────────
+# 不连网络，直接把四个引擎各驱动一遍增删改查 + 变长重建，以 kv_pool 的账本
+# 收尾必须回 0（live_objects / slab_count）当尺寸契约的哨兵。
+# 挂进默认构建：它是唯一直接盯着「每个引擎自己管内存」是否守约的测试，
+# 之前靠手工 gcc 编译，接口一变就悄悄失修（编译不过却没人发现）。
+add_executable(engtest ${CMAKE_SOURCE_DIR}/test/engtest.c
+               ${ENGINE_SRCS} src/util/kv_pool.c)
+target_include_directories(engtest PRIVATE src/util src/engine)
+target_compile_options(engtest PRIVATE -Wall -Wextra)
 
 
 

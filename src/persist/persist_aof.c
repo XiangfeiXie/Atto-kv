@@ -50,7 +50,7 @@
 #include <liburing.h>
 
 /*=============================================================================
- *  可调参数（宏；默认内存 = 旧版环形槽一致：16 x 512KB = 8MB）
+ *  可调参数（宏；块池默认内存 16 x 512KB = 8MB）
  *============================================================================*/
 
 #define AOF_POOL_BLOCKS        16                         /* 块池块数 = in-flight 上限 */
@@ -203,16 +203,14 @@ static int aof_submit_ready_all(void) {
     aof_block_t *b = head;
     while (b) {
         aof_block_t *nxt = b->next;
+        /* 取不到 SQE 是不可能的：一次最多取块池 16 个，深度 256；且每处取完
+         * 都紧跟 io_uring_submit（内核消费掉 SQ 环），下一轮必然从空环开始。
+         * 真取空也不重试——重试的失败分支会把这批已摘链的块漏掉，池一空
+         * 背压点就永久阻塞，不如就地报错 */
         struct io_uring_sqe *sqe = io_uring_get_sqe(&g_aof_ring);
         if (!sqe) {
-            /* SQ 满：submit+reap 腾位后重试（深度 256 >> 在飞块数 16，正常不触发） */
-            io_uring_submit(&g_aof_ring);
-            aof_reap_cqes();
-            sqe = io_uring_get_sqe(&g_aof_ring);
-            if (!sqe) {
-                fprintf(stderr, "[AOF] FATAL: no SQE, block lost\n");
-                break;
-            }
+            fprintf(stderr, "[AOF] no SQE\n");
+            break;
         }
         io_uring_prep_write(sqe, g_aof_fd, b->data, b->len, g_aof_offset);
         g_aof_offset += b->len;
@@ -232,36 +230,36 @@ static int aof_submit_ready_all(void) {
  *  主线程侧：封块（生产者；发布节奏归主线程）
  *============================================================================*/
 
-/**
- * 持锁：把主线程当前块（非空）封入 ready 尾，并取新 free 块作 g_cur。
- * free 链空则等 g_free_cv（cond_wait 释放锁）——唯一的有界背压点。
- * 停机时 g_cur 置 NULL。
- */
-static void aof_seal_current_locked(void) {
-    g_cur->next = NULL;
-    if (g_ready_tail) g_ready_tail->next = g_cur;
-    else              g_ready_head = g_cur;
-    g_ready_tail = g_cur;
-    pthread_cond_signal(&g_ready_cv);   /* 先入队唤醒 worker，再等 free（更早让出） */
-
-    while (!g_free_head && !g_shutdown)
-        pthread_cond_wait(&g_free_cv, &g_aof_lock);
-    if (g_shutdown) {
-        g_cur = NULL;                   /* 旧块已入队归 worker，主线程不再持有 */
-        return;
-    }
-    g_cur = g_free_head;
-    g_free_head = g_cur->next;
-    g_cur->len = 0;
+/** 持锁：把块接到 ready 链尾并唤醒 worker（全流程唯一一处链尾挂法） */
+static void aof_enqueue_locked(aof_block_t *b) {
+    b->next = NULL;
+    if (g_ready_tail) g_ready_tail->next = b;
+    else              g_ready_head = b;
+    g_ready_tail = b;
+    pthread_cond_signal(&g_ready_cv);
 }
 
-/** 主线程：封当前块入队并取新 free 块（可能阻塞 = 背压）。
- *  @return 0 成功（含空块无需封）；-1 停机/未启动 */
+/**
+ * 主线程：封当前块入队并取新 free 块（可能阻塞 = 背压）。
+ * free 链空则等 g_free_cv（cond_wait 释放锁）——唯一的有界背压点；
+ * 停机时 g_cur 置 NULL（旧块已入队归 worker，主线程不再持有）。
+ * @return 0 成功（含空块无需封）；-1 停机/未启动
+ */
 static int aof_seal_get_next(void) {
     if (!g_cur) return -1;
     if (g_cur->len == 0) return 0;      /* 空块：无需封，继续复用 */
+
     pthread_mutex_lock(&g_aof_lock);
-    aof_seal_current_locked();
+    aof_enqueue_locked(g_cur);          /* 先入队唤醒 worker，再等 free（更早让出） */
+    while (!g_free_head && !g_shutdown)
+        pthread_cond_wait(&g_free_cv, &g_aof_lock);
+    if (g_shutdown) {
+        g_cur = NULL;
+    } else {
+        g_cur = g_free_head;
+        g_free_head = g_cur->next;
+        g_cur->len = 0;
+    }
     pthread_mutex_unlock(&g_aof_lock);
     return g_cur ? 0 : -1;
 }
@@ -331,8 +329,7 @@ static void *aof_worker_main(void *arg) {
                 due = (aof_now_ms() - g_last_fsync_ms >= AOF_FSYNC_INTERVAL_MS);
             if (due) {
                 aof_wait_drain();
-                if (g_dirty && !g_fsync_in_flight)
-                    aof_submit_fsync();
+                aof_submit_fsync();   /* 两标志上面刚判过，本线程内不变，不必重判 */
             }
         }
     }
@@ -471,12 +468,8 @@ void kvs_aof_persist_stop(void) {
 
     /* 封残余块入 ready，置停机，唤醒落盘线程 */
     pthread_mutex_lock(&g_aof_lock);
-    if (g_cur && g_cur->len > 0) {
-        g_cur->next = NULL;
-        if (g_ready_tail) g_ready_tail->next = g_cur;
-        else              g_ready_head = g_cur;
-        g_ready_tail = g_cur;
-    }
+    if (g_cur && g_cur->len > 0)
+        aof_enqueue_locked(g_cur);
     g_cur = NULL;
     g_shutdown = 1;
     pthread_cond_broadcast(&g_ready_cv);

@@ -18,7 +18,6 @@
 #include <stddef.h>
 #include <stdint.h>      /* uint32_t：AOF 接口 */
 #include <sys/types.h>   /* pid_t */
-#include "kv_dict.h"
 
 /*=============================================================================
  *  模块概述
@@ -113,9 +112,9 @@ int file_read_full(const char *path, char **buf, size_t *size,
  * 启动 AOF 持久化
  *
  * 初始化：
- * - 环形缓冲区
  * - io_uring 实例
  * - AOF 文件（追加模式）
+ * - 块池 free 链 + 落盘线程
  *
  * @return 0 成功，-1 失败
  */
@@ -225,82 +224,34 @@ int rdb_load_from_buf(const char *buf, size_t len);
  * 流式 RDB 加载（RDMA 全量同步 Slave 端使用，纯流无 crc）
  * 流格式 [key_count:4][entry...]：begin 读 key_count，
  * append_n 从 buf+4 解析条目（磁盘文件带 crc 槽、条目在 +8，由 rdb_load_from_buf 处理）
+ * 调用方保证 buf 至少可读 sizeof(int) 字节，故 begin 不看长度
  */
-int rdb_load_stream_begin(const char *buf, size_t len);   /* 开始流式加载 */
-int rdb_load_stream_append_n(const char *buf, size_t len, int limit,
-                             size_t *consumed);  /* 追加数据块（限条数，可选输出消费字节数） */
+int rdb_load_stream_begin(const char *buf);   /* 开始流式加载 */
+int rdb_load_stream_append_n(const char *buf, size_t len, int limit);
+                                              /* 追加数据块（限条数） */
 
 /*=============================================================================
- *  增量 RDB 序列化器（RDMA 全量同步 Master 端用；RDMA 共享代码，零逻辑改动）
+ *  RDB 序列化（RDMA 全量同步 Master 端用）
  *
- *  设计目标：直接流式输出 RDB 批次到目标缓冲区，避免中间 DynBuf 拷贝
+ *  一次性装满：快照序列化进调用方那块暂存内存（rdma.c 的 512MB 块），
+ *  再由 rdma_transport.c 用一个 WR 整块推给对端。既然整份数据一次成块送往
+ *  一个固定大小的缓冲，"分批喂、每批一个 WR"的增量接口就没有存在理由了，
+ *  故只留下面这一个入口。
  *
- *  磁盘 dump.rdb 不再经本序列化器产生——改由 rdb_save_sync 逐条目 io_uring
- *  流水线直写（见 persist_rdb.c）；sendfile 传输的仍是该文件，格式带 crc 槽
- *  [key_count:4][crc32:4][entry...]，crc32 覆盖 key_count + 全部条目，由
- *  写入器排空后"末尾一次性补写 8B 头"产生。加载端（rdb_load_mmap 启动 /
- *  sendfile 对端）校验失败即拒绝，防 dump.rdb 被篡改/损坏后仍被成功加载。
- *
- *  本序列化器现仅被 RDMA 全量 Master 以 with_crc=0（无盘纯流）调用：
- *  流格式 [key_count:4][entry...]，与磁盘格式唯一差别是无 crc 槽。
- *  with_crc=1（磁盘文件格式，旧 rdb_save_sync 用，含 offset 4 回填 crc）为
- *  惰性残留分支，无当前调用方。
- *
- *  使用示例（RDMA 无盘流 with_crc=0）：
- *  rdb_serializer_t rs;
- *  rdb_serialize_begin(&rs, 0);
- *  int done = 0;
- *  while (!done) {
- *      size_t n = rdb_serialize_next(&rs, dst, max_bytes, &done);
- *      // dst 中有 n 字节的 RDB 数据，发送...
- *  }
- *  rdb_serialize_end(&rs);
+ *  流格式 [key_count:4][entry...]，与磁盘 dump.rdb 唯一差别是无 crc 槽：
+ *  无盘传输不落盘、无防篡改需求，完整性靠 RC 可靠有序 + key_count 数量核对。
+ *  磁盘那条路的 crc 由 rdb_writer_t 自己累计（见 rdb_save_sync），与本段无关。
  *============================================================================*/
 
 #define RDB_FILE_HDR_LEN  8   /* RDB 文件头长度：key_count[4] + crc32 槽[4]（磁盘格式用） */
 #define RDB_FILE_CRC_OFF  4   /* crc 槽相对文件头起点偏移（紧跟 key_count） */
 
-typedef struct {
-    kv_iter_t *iter;        /* 字典迭代器，结束为 NULL */
-    int        header_sent; /* 是否已发送流头（with_crc: 8B / 无 crc: 4B） */
-    int        exhausted;   /* 所有条目已消费 */
-    int        with_crc;    /* 0=RDMA 无盘纯流（全量 Master 用）；1=磁盘格式惰性残留 */
-    uint32_t   crc;         /* with_crc 时运行中的 crc32：key_count + 已序列化条目 */
-} rdb_serializer_t;
-
 /**
- * 开始 RDB 序列化（RDMA 无盘全量 Master 用；磁盘保存已不调用本序列化器）
- * @param rs 序列化器指针
- * @param with_crc 0=RDMA 无盘纯流（4B 头无 crc 槽，全量同步 Master 用）；
- *                 1=磁盘文件格式惰性残留分支（流头带 crc 槽并累计 crc，
- *                   旧 rdb_save_sync 用，现已无调用方）
- */
-void rdb_serialize_begin(rdb_serializer_t *rs, int with_crc);
-
-/**
- * 获取下一批 RDB 数据
- * @param rs 序列化器指针
+ * 把整份快照序列化进 dst
  * @param dst 目标缓冲区
- * @param max_bytes 缓冲区最大容量
- * @param done 输出：是否已完成（所有数据已序列化）
- * @return 写入 dst 的字节数
+ * @param cap 缓冲区容量
+ * @return 写入字节数；0 = 装不下（整份作废，不留半截快照）
  */
-size_t rdb_serialize_next(rdb_serializer_t *rs, char *dst,
-                          size_t max_bytes, int *done);
-
-/**
- * 结束 RDB 序列化
- * @param rs 序列化器指针
- */
-void rdb_serialize_end(rdb_serializer_t *rs);
-
-/**
- * 校验磁盘 RDB 文件头 crc（防篡改：dump.rdb 被篡改/损坏即拒绝加载）
- * 仅磁盘文件格式含 crc 槽；RDMA 无盘流不走本函数。
- * @param stream 文件头起点（key_count[4] + crc[4] + 条目...）
- * @param entry_bytes 条目区实际字节数（= 文件大小 - RDB_FILE_HDR_LEN）
- * @return 1 通过，0 不通过
- */
-int rdb_stream_crc_verify(const char *stream, size_t entry_bytes);
+size_t rdb_serialize_all(char *dst, size_t cap);
 
 #endif /* KVS_PERSISTENCE_H */

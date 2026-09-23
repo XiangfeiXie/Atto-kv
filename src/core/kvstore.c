@@ -28,18 +28,13 @@
 
 #include "repl.h"
 #include "persistence.h"
-#include "kv_pool.h"
+#include "kv_pool.h"      /* kv_pool_init / kv_pool_shutdown：数据域记录内存池 */
 
 /*=============================================================================
  *  全局状态
  *============================================================================*/
 
 int g_in_reload = 0;                              /* 是否在数据重载中（抑制日志/复制） */
-
-/* 数据域 kv entry 分配用的自研内存池（main 线程专属）
- * init_kvengine 按配置项 kv_pool 创建并注入 kv_dict、dest_kvengine 解绑后销毁。
- * 配置关（kv_pool off）时保持 NULL：整个数据域回退底座 malloc/free。 */
-static kv_pool_t *s_entry_pool;
 
 long long        g_kvs_start_time_ms      = 0;    /* 启动时间戳（毫秒） */
 volatile sig_atomic_t g_kvs_stop = 0;             /* 停止标志（信号触发） */
@@ -214,17 +209,21 @@ void reply_bulk(DynBuf *wb, const char *s, int len) {
  * @return 0 成功
  */
 int init_kvengine(void) {
-    dict_init(&g_dict);
-    /* 数据域 kv entry 分配接入自研内存池：必须在 engine_reload 加载数据
-     * 之前注入（否则首轮 entry 已走底座）。池实例主线程专属；配置关或
-     * 创建失败都回退底座 malloc（dict_set_pool(NULL)），不影响正确性。 */
-    if (kvs_config.kv_pool_enabled) {
-        s_entry_pool = kv_pool_create();
-        dict_set_pool(s_entry_pool);
-        if (!s_entry_pool)
-            fprintf(stderr, "[kvstore] kv_pool 创建失败，entry 分配回退底座 malloc\n");
+    /* 先定引擎，再动任何一条记录：dict_init 之后到进程结束，所有 dict_*
+     * 都路由到这一个引擎（conf 里 engine hash|array|rbtree|skiplist）。 */
+    if (kv_engine_select(kvs_config.storage_engine) < 0) {
+        fprintf(stderr, "[kvstore] 未知存储引擎 '%s'，回退 hash\n",
+                kvs_config.storage_engine);
+        kv_engine_select("hash");
     }
-    printf("Using string storage engine (single global dict)\n");
+    dict_init();
+    /* 数据域 kv 节点分配接入自研内存池：必须在 engine_reload 加载数据
+     * 之前初始化（否则首轮节点已走底座）。池主线程专属；配置关或初始化
+     * 失败都回退底座 malloc，不影响正确性。
+     * 四个引擎各自管自己的节点分配，但都向同一个池取块。 */
+    if (kvs_config.kv_pool_enabled && kv_pool_init() < 0)
+        fprintf(stderr, "[kvstore] kv_pool 创建失败，entry 分配回退底座 malloc\n");
+    printf("Using string storage engine: %s\n", kv_engine_name());
     return 0;
 }
 
@@ -239,12 +238,27 @@ void dest_kvengine(void) {
     mem_report("shutdown/pre-release");
     kvs_flush_all();
     mem_report("shutdown/post-release");
-    dict_destroy(&g_dict);
-    /* 解绑须在池销毁前：dict_destroy 内的 dict_clear 仍会向池归还 entry。
-     * 未启用（s_entry_pool == NULL）时两者都是 no-op。 */
-    dict_set_pool(NULL);
-    kv_pool_destroy(s_entry_pool);
-    s_entry_pool = NULL;
+    /* 池须在记录全部归还之后再销毁 —— 上面 kvs_flush_all 已把 dict 全清
+     * （各引擎的 clear 会调 kv_pool_release_all）。未启用时为 no-op。 */
+    kv_pool_shutdown();
+}
+
+/**
+ * 优雅停机的收尾（三个网络引擎共用）
+ *
+ * reactor / proactor 在 main 的第 6 段调用：它们的主循环读到 g_kvs_stop 就
+ * 返回，控制权自然落回 main。ntyco 没有这条路 —— 它进的是 NtyCo 的
+ * nty_schedule_run()，那个循环要四个协程队列全空才返回，而监听协程与 ticker
+ * 协程常驻 ⇒ 永不返回。所以 ntyco 由 ticker 协程直接调本函数再 exit(0)。
+ *
+ * 两条路径共用这一份，是为了让"停机做了什么"只有一个答案：目前只有 AOF 落盘
+ * + 引擎回收，不含 SAVE（RDB 只由显式 SAVE/BGSAVE 产生，三引擎一致）。
+ *
+ * 本函数不返回前的调用者须自行决定退出方式（main 返回 / ticker 里 exit）。
+ */
+void kvs_shutdown(void) {
+    kvs_aof_persist_stop();
+    dest_kvengine();
 }
 
 /**
@@ -252,7 +266,7 @@ void dest_kvengine(void) {
  * 使用 jemalloc 时额外 purge 释放内存
  */
 void kvs_flush_all(void) {
-    dict_clear(&g_dict);
+    dict_clear();
 #ifdef USE_JEMALLOC
     /* 先 flush 线程 tcache: free 的对象先进 tcache, 不清它 arenas.purge 无物可清;
      * 再 purge 脏页把内存还给 OS (实测踩坑) */
@@ -406,14 +420,8 @@ int main(int argc, char *argv[]) {
     config_load(conf_path);
     config_print();
 
-    /* ntyco 引擎不参与复制：repl_engine_* 恒 NULL（仅 reactor/proactor 赋值），
-     * PSYNC 控制命令需这两引擎的访问器在位；该组合语义未定义，启动即拒 */
-    if (kvs_config.network_model == NET_NTYCO &&
-        kvs_config.repl_role != REPL_ROLE_OFF) {
-        fprintf(stderr, "[kvstore] network=ntyco 不支持复制（repl_role=%d），"
-                        "请改用 reactor/proactor 引擎\n", kvs_config.repl_role);
-        return 1;
-    }
+    /* （原 network=ntyco + repl 组合的 fail-fast 已删：三引擎现均赋值
+     *   repl_engine_*，ntyco 侧见 src/net/ntyco.c 的 "repl 接线" 段） */
 
     /*-------------------------------------------------------------------------
      *  3. 引擎初始化
@@ -469,7 +477,8 @@ int main(int argc, char *argv[]) {
     /* 命令解析入口按引擎注入，reactor/proactor/ntyco 一律 kvs_drain_rbuf_commands。
      * master 的 PSYNC 握手作为控制命令经 dispatch 的 PSYNC 分支接管
      * （gate = repl_engine_append != NULL && role==MASTER，见 kvstore_dispatch.c）。
-     * ntyco 不赋值 repl_engine_* → 门控恒短路，不参与复制（组合已由 fail-fast 拒） */
+     * 三引擎都在自己的 start 里赋值 repl_engine_*（ntyco 见 src/net/ntyco.c），
+     * 故 repl_role 非 off 时门控一律可用 */
     if (kvs_config.network_model == NET_REACTOR) {
         reactor_start(kvs_config.port, kvs_drain_rbuf_commands);
     } else if (kvs_config.network_model == NET_PROACTOR) {
@@ -480,8 +489,11 @@ int main(int argc, char *argv[]) {
 
     /*-------------------------------------------------------------------------
      *  6. 清理
+     *
+     *  reactor / proactor：主循环看到 g_kvs_stop 返回 → 落到这里收尾。
+     *  ntyco：调度器不返回（见 kvs_shutdown 的说明），由 ticker 协程自己调
+     *  kvs_shutdown —— 那条路径到不了本行，两者共用同一段清理逻辑。
      *-------------------------------------------------------------------------*/
-    kvs_aof_persist_stop();
-    dest_kvengine();
+    kvs_shutdown();
     return 0;
 }

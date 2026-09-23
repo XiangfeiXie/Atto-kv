@@ -29,7 +29,7 @@
 #include "dynbuf.h"       /* DynBuf：写缓冲 / 回复接口 */
 #include "config.h"
 #include "protocol.h"
-#include "kv_dict.h"
+#include "kv_engine.h"
 
 #ifdef USE_JEMALLOC
 #include <jemalloc/jemalloc.h>
@@ -100,8 +100,9 @@ extern int proactor_start(unsigned short port, kvs_rbuf_drain_fn handler);
 /**
  * 启动 NtyCo 引擎（协程引擎）
  * ntyco 接入 rbuf 后与 reactor/proactor 统一：读缓冲 rbuf 节点队列、数据入口
- * 一律 kvs_drain_rbuf_commands。引擎不参与复制（repl_engine_* 恒 NULL；
- * network=ntyco + repl_role!=off 组合由 kvstore.c fail-fast 启动即拒）。
+ * 一律 kvs_drain_rbuf_commands。引擎参与复制（2026-09 接入）：本函数赋值
+ * repl_engine_register_rbuf / repl_engine_append，并在 repl_role!=off 时起一个
+ * 常驻 ticker 协程周期调 repl_tick + 冲刷 repl 链路（详见 src/net/ntyco.c）。
  * @param port 监听端口
  * @param handler 命令解析处理函数（rbuf 形态，统一 kvs_drain_rbuf_commands）
  * @return 0 成功，-1 失败
@@ -150,6 +151,19 @@ static inline uint64_t now_monotonic_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+/**
+ * 传输速率：ms 毫秒内搬了 bytes 字节 → MB/s
+ *
+ * 十进制 MB（1e6），不是 MiB（1024²）。打印写 "MB/s" 就必须除 1e6，
+ * 否则名字和数值对不上（旧字段叫 mbps 但除的是 1024²，是 MiB/s）。
+ * 全量同步两条路径（sendfile.c / rdma.c）共用这一处换算，避免两边各写
+ * 一遍除式之后单位悄悄跑偏。ms <= 0（区间没测到）返回 0。
+ */
+static inline double xfer_rate_mbs(size_t bytes, double ms)
+{
+    return (ms > 0.0) ? ((double)bytes / (ms / 1000.0) / 1e6) : 0.0;
+}
+
 /*=============================================================================
  *  命令分发
  *============================================================================*/
@@ -187,6 +201,17 @@ void kvs_journal_effect(const char *cmd, int len);
  * 使用 jemalloc 时额外 purge 释放内存
  */
 void kvs_flush_all(void);
+
+/**
+ * 优雅停机的收尾（AOF 落盘 + 引擎回收），三种网络模型共用
+ *
+ * reactor / proactor：主循环读到 g_kvs_stop 返回 → main 第 6 段调本函数。
+ * ntyco：调度器不返回（见实现处说明），由 ticker 协程调本函数后自行 exit。
+ * 调用方负责决定怎么退出；本函数只做清理，不 return 出进程。
+ *
+ * 不含 SAVE —— RDB 只由显式 SAVE/BGSAVE 产生，三个引擎一致。
+ */
+void kvs_shutdown(void);
 
 /*=============================================================================
  *  全局状态
@@ -249,6 +274,26 @@ extern int  (*repl_engine_register_rbuf)(int fd, kvs_rbuf_drain_fn handler);
  * @return 0 成功，-1 失败
  */
 extern int  (*repl_engine_append)(int fd, const char *data, int len);
+
+/**
+ * fork 出的传输子进程里重置引擎自身状态（可空，引擎不实现则保持 NULL）
+ *
+ * 全量同步 master 侧会 fork 出数据面传输子进程（repl_fullsync.c）。子进程
+ * 调用本指针**先把自己从父进程的运行时里摘出去**，再开始收发 RDB。
+ *
+ * 为什么必须要这一步：ntyco 用的 NtyCo 有一套 COROUTINE_HOOK，用全局强符号
+ * 重定义 socket/accept/connect/recv/send/write（见 ntyco.c 文件头）。这套劫持
+ * 在 fork 后会跟着子进程走，而 epoll fd 是**跨 fork 共享同一个内核对象**的：
+ * 子进程调一次 accept()（NtyCo 的 nty_accept 会无条件 nty_poll_inner），就把
+ * 自己的监听 fd EPOLL_CTL_ADD 进了**父进程的 epoll**。slave 连上数据面端口后
+ * 该 fd 变可读，父进程 epoll_wait 收到事件 → nty_schedule_search_wait 在父进程
+ * 的等待树里找不到任何等这个 fd 的协程 → assert(co != NULL) → **master 主进程
+ * 直接崩**（实测 2/3 复现）。子进程摘干净后，被劫持的调用全部回落到 libc
+ * 阻塞实现（NtyCo 每个 hook 都有 sched==NULL 的透传分支），父进程不再受扰。
+ *
+ * 只 fork 子进程需要处理；slave 侧全量是进程内内联接收，不涉及。
+ */
+extern void (*repl_engine_postfork_child)(void);
 
 /**
  * repl 提供的接口（由 repl 实现，engine 调用）

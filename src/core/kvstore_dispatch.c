@@ -12,47 +12,6 @@
 #include <string.h>
 
 /*=============================================================================
- *  SET 命令核心实现
- *  最简语义：SET key value —— 总是覆盖原值，无 NX/XX/EX/PX 选项
- *  过期时间通过独立 EXPIRE 命令设置（默认秒级）
- *============================================================================*/
-
-/**
- * SET 命令底层实现
- * @param key 键
- * @param key_len 键长度
- * @param val 值
- * @param val_len 值长度
- * @param hash 键的哈希值（预先计算，避免重复计算）
- * @param existing 预先查找的条目（NULL 表示不存在）
- * @return 0 成功, -1 内存分配错误
- */
-static int string_set(const char *key, uint32_t key_len,
-                      const char *val, uint32_t val_len,
-                      uint64_t hash, kv_entry_t *existing)
-{
-    if (existing) {
-        /* 键已存在：原地覆盖值（长度相同直接覆盖，否则重分配条目） */
-        kv_entry_t *e;
-        if (existing->val_len == val_len) {
-            memcpy(entry_payload(existing), val, val_len);
-            e = existing;
-        } else {
-            e = dict_resize_entry(&g_dict, existing, val_len);
-            if (!e) return -1;
-            memcpy(entry_payload(e), val, val_len);
-        }
-        e->expire = 0;   /* 覆盖清除旧过期；TTL 由 EXPIRE 命令设置 */
-        return 0;
-    }
-
-    /* 键不存在：添加新条目 */
-    kv_entry_t *e = dict_add(&g_dict, key, key_len, val, val_len, hash);
-    if (!e) return -1;
-    return 0;
-}
-
-/*=============================================================================
  *  写效果收口（journal = AOF 日志 + 增量复制）
  *
  *  由各读缓冲 drain 在 kvs_dispatch 返回 journaled=1（命令已产生需要落盘/
@@ -95,7 +54,7 @@ void kvs_journal_effect(const char *cmd, int len) {
  * @param argc 参数个数（第一个是命令名）
  * @param wb 写缓冲（输出响应）
  * @param journaled 输出（必填）：本条命令是否产生需要落 AOF/复制的写效果
- *        （SET 存成 / DEL 命中删除 / FLUSHALL / EXPIRE 命中设置）。分发是本
+ *        （SET 新增 / MOD 改写 / DEL 命中删除 / FLUSHALL）。分发是本
  *        判定的权威，只置 1，入口统一归零。调用方据此在字节仍有效时把整条
  *        命令交给 kvs_journal_effect，不再需要命令名谓词预判。
  * @return DISPATCH_OK 成功, DISPATCH_ERROR 错误, DISPATCH_CLOSE 关闭连接
@@ -136,9 +95,8 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         }
         
         kvs_token_t key_tok = tokens[1];
-        uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
-        kv_entry_t *entry = dict_find(&g_dict, key_tok.ptr, (uint32_t)key_tok.len, hash);
-        
+        kv_node_t *entry = dict_find(key_tok.ptr, (uint32_t)key_tok.len);
+
         if (!entry) {
             dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);  /* 键不存在：返回空 */
         } else {
@@ -148,36 +106,61 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     }
 
     /*=========================================================================
-     *  热路径 2：SET 命令
-     *  最简语义：SET key value —— 总是覆盖原值，无 NX/XX/EX/PX 选项
-     *  过期时间通过 EXPIRE 命令设置（默认秒级）
+     *  热路径 2：SET 命令 —— 新增或覆盖，两种情况都回 +OK
+     *  形参：<key> <value> [ttl秒]；省略 ttl = 永不过期，显式给了必须为正。
+     *  键在不在由 dict_add_or_find 自己查（见 kv_engine.h 契约 2）：键不存在
+     *  时它已经把 payload 写好了；键已存在时它只返回既有记录、记录一个字没动，
+     *  覆盖由下面的 exists 分支补写 —— 等长原地写，变长才 dict_resize_entry
+     *  重建（与 MOD 同一套写法）。于是数据路径仍然只碰一次引擎调用，哈希引擎
+     *  不会算两次哈希。
+     *  ttl 跟随本次写入：省略即清除过期。新增和覆盖一视同仁，不留上一条的残留。
      *=========================================================================*/
     if (TOKEN_EQ(cmd, "SET")) {
-        if (argc != 3) {
+        if (argc != 3 && argc != 4) {
             dynbuf_cat(wb, RESP_ERR_ARGS, RESP_ERR_ARGS_LEN);
             return DISPATCH_ERROR;
         }
 
-        kvs_token_t key_tok = tokens[1];
-        uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
-        kv_entry_t *entry = dict_find(&g_dict, key_tok.ptr, (uint32_t)key_tok.len, hash);
-
-        int ret = string_set(key_tok.ptr, (uint32_t)key_tok.len,
-                             tokens[2].ptr, (uint32_t)tokens[2].len,
-                             hash, entry);
-        if (ret < 0) {
-            dynbuf_cat(wb, RESP_ERROR, RESP_ERROR_LEN);
-        } else {
-            dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-            *journaled = 1;   /* 存成 → 回传效果，交由 drain 落 AOF/复制 */
+        long long ttl_secs = 0;
+        if (argc == 4) {
+            /* 显式的 ttl 必须是正数。把「0 秒过期」静默当成永不过期放行，
+             * 是最容易埋雷的写法，直接拒绝比猜调用方意图安全 */
+            if (token_to_ll(tokens[3], &ttl_secs) < 0 || ttl_secs <= 0) {
+                dynbuf_lit(wb, "-ERR invalid expire time in 'set' command\r\n");
+                return DISPATCH_ERROR;
+            }
         }
+
+        kvs_token_t key_tok = tokens[1];
+        uint32_t val_len = (uint32_t)tokens[2].len;
+        int exists = 0;
+        kv_node_t *e = dict_add_or_find(key_tok.ptr, (uint32_t)key_tok.len,
+                                        tokens[2].ptr, val_len, &exists);
+        if (!e) {
+            dynbuf_cat(wb, RESP_ERROR, RESP_ERROR_LEN);
+            return DISPATCH_OK;
+        }
+
+        if (exists) {   /* 覆盖：add_or_find 没动记录，这里补写 */
+            if (entry_payload_len(e) != val_len) {   /* 等长原地写，变长才重建 */
+                e = dict_resize_entry(e, val_len);
+                if (!e) {
+                    dynbuf_cat(wb, RESP_ERROR, RESP_ERROR_LEN);
+                    return DISPATCH_OK;
+                }
+            }
+            memcpy(entry_payload(e), tokens[2].ptr, val_len);
+        }
+        entry_set_expire(e, ttl_secs ? get_time_now() + ttl_secs * 1000 : 0);
+
+        dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        *journaled = 1;   /* 新增或覆盖都是写效果 → 回传，交由 drain 落 AOF/复制 */
         return DISPATCH_OK;
     }
 
     /*=========================================================================
-     *  热路径 3：PING / DEL 命令
+     *  热路径 3：PING 命令
      *=========================================================================*/
-    
     if (TOKEN_EQ(cmd, "PING")) {
         if (argc == 1)
             dynbuf_cat(wb, RESP_PONG, RESP_PONG_LEN);
@@ -188,6 +171,55 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         return DISPATCH_OK;
     }
 
+    /*=========================================================================
+     *  热路径 4：MOD 命令 —— 只修改，键不存在 → nil（不新增）
+     *  形参：<key> <value> [ttl秒]；省略 ttl = 清除过期（覆盖即重置，不留残留）。
+     *  改的前提是先拿到那条记录，所以定位省不掉：dict_find 再改；等长原地写
+     *  回原记录，变长才走 dict_resize_entry 重建（新指针顶替旧的）。
+     *  MOD 与 SET 的分工：SET 是 upsert（建键 + 覆盖），MOD 只改已存在的键，
+     *  未命中回 nil 不新增 —— 两者共用同一套「等长原地写 / 变长重建」写法。
+     *=========================================================================*/
+    if (TOKEN_EQ(cmd, "MOD")) {
+        if (argc != 3 && argc != 4) {
+            dynbuf_cat(wb, RESP_ERR_ARGS, RESP_ERR_ARGS_LEN);
+            return DISPATCH_ERROR;
+        }
+
+        long long ttl_secs = 0;
+        if (argc == 4) {
+            /* 同 SET：显式的 ttl 必须是正数 */
+            if (token_to_ll(tokens[3], &ttl_secs) < 0 || ttl_secs <= 0) {
+                dynbuf_lit(wb, "-ERR invalid expire time in 'mod' command\r\n");
+                return DISPATCH_ERROR;
+            }
+        }
+
+        kvs_token_t key_tok = tokens[1];
+        kv_node_t *e = dict_find(key_tok.ptr, (uint32_t)key_tok.len);
+        if (!e) {
+            dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);   /* 不存在：MOD 不新增 */
+            return DISPATCH_OK;
+        }
+
+        uint32_t val_len = (uint32_t)tokens[2].len;
+        if (entry_payload_len(e) != val_len) {   /* 等长原地写，变长才重建 */
+            e = dict_resize_entry(e, val_len);
+            if (!e) {
+                dynbuf_cat(wb, RESP_ERROR, RESP_ERROR_LEN);
+                return DISPATCH_OK;
+            }
+        }
+        memcpy(entry_payload(e), tokens[2].ptr, val_len);
+        entry_set_expire(e, ttl_secs ? get_time_now() + ttl_secs * 1000 : 0);
+
+        dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
+        *journaled = 1;   /* 确有改写 → 回传，交由 drain 落 AOF/复制 */
+        return DISPATCH_OK;
+    }
+
+    /*=========================================================================
+     *  热路径 5：DEL 命令
+     *=========================================================================*/
     if (TOKEN_EQ(cmd, "DEL")) {
         /* 只允许一条命令删一个 key：多 key 中间失败无回滚，本项目不做 */
         if (argc != 2) {
@@ -196,9 +228,9 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         }
 
         kvs_token_t kt = tokens[1];
-        uint64_t kh = kv_hash((const uint8_t *)kt.ptr, (uint32_t)kt.len);
-        kv_entry_t *ke = dict_find(&g_dict, kt.ptr, (uint32_t)kt.len, kh);
-        if (ke && dict_delete(&g_dict, kt.ptr, (uint32_t)kt.len, kh) == 0) {
+        /* 只需一次引擎调用：dict_delete 的返回值本身就区分了成败，
+         * 先 find 一次纯属白走一趟 */
+        if (dict_delete(kt.ptr, (uint32_t)kt.len) == 0) {
             reply_integer(wb, 1);
             *journaled = 1;   /* 确有删除 → 回传效果，交由 drain 落 AOF/复制 */
         } else {
@@ -225,7 +257,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     /*=========================================================================
      *  控制面命令：PSYNC（master 增量握手）—— 置于热路径之下
      *  并入命令分发层（与 Redis 控制命令走命令表对齐）。门控 repl_engine_append
-     *  （rbuf 引擎在位，ntyco 与 AOF 重载期恒 NULL）&& 本机为 master；从库/重载
+     *  （三引擎在自己 start 里赋值，启动后恒非 NULL）&& 本机为 master；从库
      *  一律不进 → fall through 到 unknown，行为不变。journaled 保持 0：PSYNC
      *  不产生需落 AOF/复制的写效果。
      *=========================================================================*/
@@ -240,25 +272,19 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     
     /* DBSIZE：返回当前键数量 */
     if (TOKEN_EQ(cmd, "DBSIZE")) {
-        long long count = (long long)dict_count(&g_dict);
+        long long count = (long long)dict_count();
         reply_integer(wb, count);
         return DISPATCH_OK;
     }
 
-    /* SAVE：阻塞落盘（同步序列化 + 写入，完成才回 +OK）
-     * BGSAVE 在跑时拒绝：两路都写同一 dump.rdb.tmp + rename，避免竞态 */
-    if (TOKEN_EQ(cmd, "SAVE")) {
-        if (rdb_bgsave_running()) {
-            dynbuf_lit(wb, "-ERR Background save already in progress\r\n");
-            return DISPATCH_OK;
-        }
-        rdb_save_sync();
-        dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
-        return DISPATCH_OK;
-    }
-
-    /* BGSAVE：独立进程落盘（fork 子进程 io_uring 写，不阻塞主循环） */
-    if (TOKEN_EQ(cmd, "BGSAVE")) {
+    /* SAVE / BGSAVE：两个拼写同一条路径 —— fork 子进程 io_uring 落盘，
+     * 主循环不阻塞，+OK 一律表示「已 fork」而非「已落盘」。
+     * 原先 SAVE 走的主线程同步落盘已删除：它和 BGSAVE 共用同一份
+     * dump.rdb.tmp + rename，两者并存却对同一个 +OK 给出不同含义
+     * （一个已落盘、一个已 fork），留着只会让调用方分不清。
+     * 仍需等落盘真正完成才继续的路径（全量同步）走 rdb_save_sync 自身，
+     * 不经过这里。 */
+    if (TOKEN_EQ(cmd, "SAVE") || TOKEN_EQ(cmd, "BGSAVE")) {
         if (rdb_save_async_uring() == 0)
             dynbuf_cat(wb, RESP_OK, RESP_OK_LEN);
         else
@@ -286,51 +312,29 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
     }
 
     /*=========================================================================
-     *  键过期管理命令
+     *  TTL：查询剩余生存时间（秒）—— 纯读，无副作用
+     *  过期时间只在 SET / MOD 写入时一次给定，没有独立的 EXPIRE 命令
      *=========================================================================*/
 
-    if (argc < 2) {
-        dynbuf_cat(wb, RESP_ERR_UNK, RESP_ERR_UNK_LEN);
-        return DISPATCH_ERROR;
-    }
-
-    /* 提取键和哈希（后续命令共用） */
-    kvs_token_t key_tok = tokens[1];
-    uint64_t hash = kv_hash((const uint8_t *)key_tok.ptr, (uint32_t)key_tok.len);
-    kv_entry_t *entry = dict_find(&g_dict, key_tok.ptr, (uint32_t)key_tok.len, hash);
-
-    /* EXPIRE：设置秒级过期时间 */
-    if (TOKEN_EQ(cmd, "EXPIRE")) {
-        if (argc < 3) {
-            dynbuf_lit(wb, "-ERR wrong number of arguments for 'expire' command\r\n");
-            return DISPATCH_ERROR;
-        }
-        long long secs;
-        if (token_to_ll(tokens[2], &secs) < 0) {
-            dynbuf_lit(wb, "-ERR value is not an integer or out of range\r\n");
-            return DISPATCH_ERROR;
-        }
-        if (!entry) { 
-            reply_integer(wb, 0);  /* 键不存在 */
-            return DISPATCH_OK; 
-        }
-        entry->expire = get_time_now() + secs * 1000;  /* 秒转毫秒 */
-        reply_integer(wb, 1);
-        *journaled = 1;   /* 命中设置 → 交由 drain 落 AOF/复制 */
-        return DISPATCH_OK;
-    }
-
-    /* TTL：查询剩余生存时间（秒） */
     if (TOKEN_EQ(cmd, "TTL")) {
-        if (!entry) { 
+        if (argc != 2) {
+            dynbuf_cat(wb, RESP_ERR_ARGS, RESP_ERR_ARGS_LEN);
+            return DISPATCH_ERROR;
+        }
+
+        kvs_token_t key_tok = tokens[1];
+        kv_node_t *entry = dict_find(key_tok.ptr, (uint32_t)key_tok.len);
+
+        if (!entry) {
             reply_integer(wb, -2);  /* 键不存在 */
-            return DISPATCH_OK; 
+            return DISPATCH_OK;
         }
-        if (!entry->expire) { 
+        int64_t exp = entry_expire(entry);   /* 一次分派，下面复用 */
+        if (!exp) {
             reply_integer(wb, -1);  /* 永不过期 */
-            return DISPATCH_OK; 
+            return DISPATCH_OK;
         }
-        long long rem_ms = entry->expire - get_time_now();
+        long long rem_ms = exp - get_time_now();
         if (rem_ms < 0) { 
             reply_integer(wb, -2);  /* 已过期 */
             return DISPATCH_OK; 

@@ -65,10 +65,10 @@ static pid_t g_child = -1;
  *
  * 调用时机：repl_fullsync_master_trigger fork 子进程
  */
-static int fullsync_server_run(uint64_t token, int ready_fd) {
+static int fullsync_server_run(uint64_t token) {
     if (strcmp(kvs_config.fullsync_transport, "sendfile") == 0)
-        return sendfile_server_run(token, ready_fd);
-    return rdma_server_run(token, ready_fd);  /* 默认 RDMA */
+        return sendfile_server_run(token);
+    return rdma_server_run(token);  /* 默认 RDMA */
 }
 
 /**
@@ -95,7 +95,7 @@ static int fullsync_client_run(uint64_t *out_token) {
  * 1. 清理上一轮残留子进程（非阻塞 kill，占数据面端口的旧进程直接终止）
  * 2. fork 传输子进程发送快照
  *
- * 不等待子进程就绪（ready_fd=-1）也不阻塞回收：
+ * 不等待子进程就绪也不阻塞回收：
  * - slave 数据面连接有重试兜底
  * - 子进程退出由全局 SIGCHLD handler 回收
  * - 避免事件循环被 RDMA 慢初始化（可长达数秒）阻塞
@@ -122,7 +122,13 @@ int repl_fullsync_master_trigger(void) {
     }
 
     if (pid == 0) {
-        _exit(fullsync_server_run(repl_backlog_offset(), -1));  /* 无就绪管道 */
+        /* 传输子进程：先把引擎自己的运行时状态摘掉再干活。
+         * ntyco 必须（劫持 libc 符号 + epoll 跨 fork 共享 → 会把子进程的
+         * 监听 fd 塞进父进程 epoll，父进程收到无协程等待的事件即 assert 崩），
+         * reactor/proactor 该指针为 NULL，不受影响。详见 kvstore.h 声明处。 */
+        if (repl_engine_postfork_child)
+            repl_engine_postfork_child();
+        _exit(fullsync_server_run(repl_backlog_offset()));
     }
 
     g_child = pid;

@@ -21,13 +21,14 @@
  *     RDMA 全量传输对标 Redis 无盘同步：RDMA 只是本项目的一种传输方式，
  *     本序列化器即为其服务——Master（rdma.c）用它把整份快照序列化进 MR
  *     缓冲直传，Slave（rdma.c）用 ③ 的流式加载消费同一流。磁盘落盘（②）
- *     已不再走本序列化器（with_crc=1 磁盘格式分支为惰性残留，RDMA 侧零改动）。
+ *     已不再走本序列化器（磁盘格式的 crc 分支随之删除，RDMA 侧零改动）。
  *
  *  子进程回收：BGSAVE fork 子进程 waitpid 探活（ECHILD=全局 handler 已回收）
  *============================================================================*/
 
 #define _GNU_SOURCE   /* close_range: 保存子进程关掉继承的服务端 fd */
 #include "persistence.h"
+#include "kv_engine.h"    /* dict_* / entry_* / kv_iter_t / kv_node_t */
 #include "kvstore.h"
 
 #include <stdio.h>
@@ -118,16 +119,17 @@ static uint32_t rdb_crc32(uint32_t crc, const void *p, size_t n) {
 
 /**
  * 把 buf[0..len) 写到 fd 的 off 处，并等该写完成
+ * 只在收尾路径用（唯一调用者），故不设 user_data 标记：本函数只认自己这条
+ * CQE，且只读 cqe->res，标记了也没人看。
  * @return 0 成功（调用方可安全复用 buf），-1 失败
  */
 static int rdb_save_flush(int fd, struct io_uring *ring,
-                          const char *buf, size_t len, size_t *off) {
+                          const char *buf, size_t len, off_t off) {
     if (len == 0) return 0;
 
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (!sqe) return -1;
-    io_uring_prep_write(sqe, fd, buf, len, *off);
-    sqe->user_data = len;
+    io_uring_prep_write(sqe, fd, buf, len, off);
     io_uring_submit(ring);
 
     struct io_uring_cqe *cqe = NULL;
@@ -143,19 +145,18 @@ static int rdb_save_flush(int fd, struct io_uring *ring,
                 res < 0 ? strerror(-res) : "short write");
         return -1;
     }
-    *off += len;
     return 0;
 }
 
 /**
- * 所有块写完后落盘一次（fsync 须覆盖之前所有写）
- * 各块写后都已等 CQE，ring 已空；加 IOSQE_IO_DRAIN 双保险并表明语义。
+ * 所有条目写完后落盘一次（fsync 须覆盖之前所有写）
+ * 走到这里必经 rdb_writer_drain（在飞清零）+ rdb_save_flush（等自己 CQE）
+ * 两步，ring 里已无先前请求，故不需要 IOSQE_IO_DRAIN 之类的排空标志。
  */
 static int rdb_save_fsync(int fd, struct io_uring *ring) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (!sqe) return -1;
     io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
-    sqe->flags |= IOSQE_IO_DRAIN;  /* 等待所有之前提交的请求完成 */
     io_uring_submit(ring);
 
     struct io_uring_cqe *cqe = NULL;
@@ -189,6 +190,16 @@ static int rdb_save_fsync(int fd, struct io_uring *ring) {
 
 typedef struct {
     struct iovec v[5];               /* 单条 entry 的 5 段 gather */
+    /* 头部 3 个标量的暂存区。
+     * 旧版直接取 &e->key_len / &e->val_len / &e->expire 摊进 iovec；记录类型
+     * 各引擎不同后取字段地址不再可能（访问器只能给值），于是先落到槽里。
+     * 写盘与 crc 都读这份副本 ⇒ 两者读的是同一块字节，比旧版「各读一次字段」
+     * 更严格（旧版一致只是靠约定）。载荷（v[1]/v[3]）仍然零拷贝。
+     * 生命周期：槽在本条写对应的 CQE 完成后才归还，旧版要求 e 活到 drain 之后，
+     * 现在只要槽不归还即可 —— 是变短，不是变长。 */
+    int32_t klen;
+    int32_t vlen;
+    int64_t expire;
 } rdb_iov_slot_t;
 
 typedef struct {
@@ -234,11 +245,14 @@ static void rdb_writer_reap_one(rdb_writer_t *w) {
  * 发出一条 entry：5 段 gather + 同序 crc 续算 + 窗口/批管理。
  * 全量快照语义：不做任何长度判断/丢弃，任意长度条目都完整落盘。
  * @param e 要落盘的 entry（SAVE 主线程阻塞期冻结 / BGSAVE 子进程 COW，
- *          源内存稳定到 drain，零拷贝安全）
+ *          源内存稳定到该条的 CQE 完成 —— key/payload 仍是零拷贝，头部 3 个
+ *          标量已暂存进槽，见 rdb_iov_slot_t）
  */
-static void rdb_writer_emit(rdb_writer_t *w, kv_entry_t *e) {
-    size_t klen = (size_t)e->key_len;
-    size_t vlen = (size_t)e->val_len;
+static void rdb_writer_emit(rdb_writer_t *w, kv_node_t *e) {
+    const char *key = entry_key(e);
+    char       *val = entry_payload(e);
+    size_t      klen = (size_t)entry_key_len(e);
+    size_t      vlen = (size_t)entry_payload_len(e);
 
     /* 无空闲槽：把排队批 submit 出去，再收割一个归还槽（背压闸门） */
     if (w->free_n == 0) {
@@ -248,27 +262,31 @@ static void rdb_writer_emit(rdb_writer_t *w, kv_entry_t *e) {
     }
 
     rdb_iov_slot_t *s = &w->slots[w->free_idx[--w->free_n]];
-    s->v[0].iov_base = &e->key_len;          s->v[0].iov_len = sizeof(int);
-    s->v[1].iov_base = (void *)entry_key(e); s->v[1].iov_len = klen;
-    s->v[2].iov_base = &e->val_len;          s->v[2].iov_len = sizeof(int);
-    s->v[3].iov_base = entry_payload(e);     s->v[3].iov_len = vlen;
-    s->v[4].iov_base = &e->expire;           s->v[4].iov_len = sizeof(long long);
+
+    /* 头部 3 个标量落槽暂存，写盘与 crc 都从槽里读（同一块字节） */
+    s->klen   = (int32_t)klen;
+    s->vlen   = (int32_t)vlen;
+    s->expire = entry_expire(e);
+
+    s->v[0].iov_base = &s->klen;   s->v[0].iov_len = sizeof(int);
+    s->v[1].iov_base = (void *)key; s->v[1].iov_len = klen;
+    s->v[2].iov_base = &s->vlen;   s->v[2].iov_len = sizeof(int);
+    s->v[3].iov_base = val;        s->v[3].iov_len = vlen;
+    s->v[4].iov_base = &s->expire; s->v[4].iov_len = sizeof(long long);
 
     /* crc 与写盘同序逐段续算：种子 = key_count（rdb_save_sync 已算入） */
-    w->crc = rdb_crc32(w->crc, &e->key_len, sizeof(int));
-    w->crc = rdb_crc32(w->crc, entry_key(e), klen);
-    w->crc = rdb_crc32(w->crc, &e->val_len, sizeof(int));
-    w->crc = rdb_crc32(w->crc, entry_payload(e), vlen);
-    w->crc = rdb_crc32(w->crc, &e->expire, sizeof(long long));
+    w->crc = rdb_crc32(w->crc, &s->klen, sizeof(int));
+    w->crc = rdb_crc32(w->crc, key, klen);
+    w->crc = rdb_crc32(w->crc, &s->vlen, sizeof(int));
+    w->crc = rdb_crc32(w->crc, val, vlen);
+    w->crc = rdb_crc32(w->crc, &s->expire, sizeof(long long));
 
+    /* 取不到 SQE 是不可能的：走到这里 free_n ≥ 1，而恒等式
+     * free_n + inflight == RDB_SAVE_WINDOW 给出 inflight ≤ 63；queued 攒满
+     * RDB_SUBMIT_BATCH 就 submit 清环，故 SQ 待处理 ≤ 31，深度 128 绰绰有余。
+     * 真取空也不必重试：置 err 即整库作废、不 rename（fail-closed） */
     struct io_uring_sqe *sqe = io_uring_get_sqe(&w->ring);
-    if (!sqe) {
-        /* SQ 满：深度 128 ≫ 窗口 64，正常不触发；submit+收割腾位后重试兜底 */
-        io_uring_submit(&w->ring);
-        rdb_writer_reap_one(w);
-        sqe = io_uring_get_sqe(&w->ring);
-        if (!sqe) { w->err = 1; return; }
-    }
+    if (!sqe) { w->err = 1; return; }
     io_uring_prep_writev(sqe, w->fd, s->v, 5, w->off);
     io_uring_sqe_set_data(sqe, s);      /* user_data = 槽指针 → 完成时安全归还 */
     w->inflight++;
@@ -303,7 +321,7 @@ static void rdb_writer_drain(rdb_writer_t *w) {
  *---------------------------------------------------------------------------*/
 
 void rdb_save_sync(void) {
-    int key_count = (int)dict_count(&g_dict);
+    int key_count = (int)dict_count();
 
     /* 写入临时文件 */
     char tmp_path[1024], dst_path[1024];
@@ -333,8 +351,8 @@ void rdb_save_sync(void) {
     w.crc = rdb_crc32(0, &key_count, sizeof(int));
 
     /* 一遍全量扫描：无尺寸判断，忠实保存每条 entry */
-    kv_iter_t *it = dict_iter_new(&g_dict, 1);
-    for (kv_entry_t *e; (e = dict_iter_next(it)) != NULL && !w.err; )
+    kv_iter_t *it = dict_iter_new();
+    for (kv_node_t *e; (e = dict_iter_next(it)) != NULL && !w.err; )
         rdb_writer_emit(&w, e);
     dict_iter_free(it);
 
@@ -347,8 +365,7 @@ void rdb_save_sync(void) {
         char hdr[RDB_FILE_HDR_LEN];
         memcpy(hdr, &key_count, sizeof(int));
         memcpy(hdr + RDB_FILE_CRC_OFF, &w.crc, sizeof(uint32_t));
-        size_t hdr_off = 0;
-        ok = (rdb_save_flush(fd, &w.ring, hdr, RDB_FILE_HDR_LEN, &hdr_off) == 0);
+        ok = (rdb_save_flush(fd, &w.ring, hdr, RDB_FILE_HDR_LEN, 0) == 0);
     }
     if (ok)                            /* 一次 fsync 覆盖头部 + 全部数据后才可 rename */
         ok = (rdb_save_fsync(fd, &w.ring) == 0);
@@ -441,7 +458,7 @@ int rdb_save_async_uring(void) {
  * @param entry_bytes 条目区实际字节数（= 文件大小 - RDB_FILE_HDR_LEN）
  * @return 1 通过，0 不通过
  */
-int rdb_stream_crc_verify(const char *stream, size_t entry_bytes) {
+static int rdb_stream_crc_verify(const char *stream, size_t entry_bytes) {
     uint32_t stored = 0;
     memcpy(&stored, stream + RDB_FILE_CRC_OFF, sizeof(stored));
 
@@ -466,9 +483,7 @@ static const char *mread(const char *p, const char *end, void *out, size_t n) {
  * RDMA 无盘流 / 磁盘文件（crc 槽在其后，由调用方跳过）。
  * @return key_count（成功），-1（失败）
  */
-int rdb_load_stream_begin(const char *buf, size_t len) {
-    if (len < sizeof(int)) return -1;   /* 至少要有 key_count */
-
+int rdb_load_stream_begin(const char *buf) {
     int key_count = 0;
     memcpy(&key_count, buf, sizeof(int));
 
@@ -493,11 +508,9 @@ int rdb_load_stream_begin(const char *buf, size_t len) {
  * 文件加载路径（rdb_load_from_buf）用 limit=-1 读到缓冲末尾。
  *
  * @param limit 最多解析条目数（-1 = 不限）
- * @param consumed 输出：实际消费字节数（可为 NULL）
  * @return 成功加载的条目数
  */
-int rdb_load_stream_append_n(const char *buf, size_t len, int limit,
-                             size_t *consumed) {
+int rdb_load_stream_append_n(const char *buf, size_t len, int limit) {
     const char *p   = buf;
     const char *end = buf + len;
     int loaded = 0;
@@ -518,19 +531,17 @@ int rdb_load_stream_append_n(const char *buf, size_t len, int limit,
         if (!(p = mread(p, end, &dlen, sizeof(int)))) break;
         if (p + dlen > end) break;
 
-        /* 添加条目到字典 */
-        uint64_t h = kv_hash((const uint8_t *)ks, (uint32_t)klen);
-        kv_entry_t *e = dict_add(&g_dict, ks, (uint32_t)klen,
-                                 p, (uint32_t)dlen, h);
+        /* 添加条目到字典：走不查重的 dict_add —— 上面 rdb_load_stream_begin
+         * 刚清过表，这批数据自身无重复键，逐条查重会把加载拖成 O(N²) */
+        kv_node_t *e = dict_add(ks, (uint32_t)klen, p, (uint32_t)dlen);
         p += dlen;
 
         /* 读取过期时间 */
         if (!(p = mread(p, end, &expire, sizeof(long long)))) break;
-        if (e && expire) e->expire = expire;
+        if (e && expire) entry_set_expire(e, expire);
         loaded++;
     }
 
-    if (consumed) *consumed = (size_t)(p - buf);
     return loaded;
 }
 
@@ -542,28 +553,25 @@ int rdb_load_stream_append_n(const char *buf, size_t len, int limit,
 int rdb_load_from_buf(const char *buf, size_t len) {
     if (len < RDB_FILE_HDR_LEN) return -1;  /* 至少要有文件头：key_count + crc 槽 */
 
-    int expected = rdb_load_stream_begin(buf, RDB_FILE_HDR_LEN);
+    int expected = rdb_load_stream_begin(buf);
     if (expected < 0) return -1;
 
+    /* append_n 的返回只增不减，不会为负 */
     int loaded = rdb_load_stream_append_n(buf + RDB_FILE_HDR_LEN,
-                                          len - RDB_FILE_HDR_LEN, -1, NULL);
-    if (loaded < 0) {
-        dict_clear(&g_dict);
-        return -1;
-    }
+                                          len - RDB_FILE_HDR_LEN, -1);
 
     /* 核心校验 1：加载数量必须等于头部声明的数量 */
     if (loaded != expected) {
         fprintf(stderr, "[RDB] corruption: expected %d keys, got %d\n",
                 expected, loaded);
-        dict_clear(&g_dict);
+        dict_clear();
         return -1;
     }
 
     /* 核心校验 2：crc 覆盖 key_count + 条目区，篡改/损坏即拒绝加载 */
     if (!rdb_stream_crc_verify(buf, len - RDB_FILE_HDR_LEN)) {
         fprintf(stderr, "[RDB] crc mismatch, refuse to load (tampered/corrupt)\n");
-        dict_clear(&g_dict);
+        dict_clear();
         return -1;
     }
 
@@ -596,50 +604,41 @@ void rdb_load_mmap(void) {
 }
 
 /*=============================================================================
- *  ④ RDMA 全量同步序列化器（Master 端无盘流；文件尾部辅助段）
+ *  ④ RDMA 全量同步序列化（Master 端无盘流；文件尾部辅助段）
  *
  *  RDMA 全量传输对标 Redis 无盘同步：RDMA 只是本项目的一种传输方式，本段
- *  序列化器即为该传输服务——Master（rdma.c）用它把整份快照按
- *  [key_count:4][条目...] 序列化进 MR 缓冲直传（with_crc=0，无 crc 槽）；
+ *  即为该传输服务——Master（rdma.c）把整份快照按 [key_count:4][条目...]
+ *  一次性序列化进它那块暂存内存，再由 rdma_transport.c 一个 WR 直传；
  *  Slave（rdma.c）用 ③ 的 rdb_load_stream_* 消费同一流。
  *
- *  磁盘落盘（②）已改逐条目 io_uring 直写，不再走本序列化器；with_crc=1
- *  （磁盘文件格式分支，流头带 crc 槽并累计）为惰性残留，无调用方，保持
- *  RDMA 侧零改动。本段与 ② 是两个独立编码器：当前字节序完全一致，改动须
- *  两侧镜像（详见 persistence.h 序列化器文档）。
+ *  磁盘落盘（②）已改逐条目 io_uring 直写，其 crc 由 rdb_writer_t 自己累计。
+ *  本段与 ② 是两个独立编码器：当前字节序完全一致，改动须两侧镜像
+ *  （详见 persistence.h 的 RDB 序列化文档）。
  *============================================================================*/
-
-/**
- * 写入 RDB 头部：单个 4 字节 key_count
- * 无 magic/version，文件路径与 RDMA 流路径共用
- * 解析端按 4 字节读回
- */
-static void rdb_write_header(char *dst, int key_count) {
-    memcpy(dst, &key_count, sizeof(int));
-}
 
 /**
  * 单个条目的序列化大小
  * 格式：[klen:4][key:klen][dlen:4][data:dlen][expire:8]
  */
-static inline size_t entry_serialized_size(kv_entry_t *e) {
-    return sizeof(int) + (size_t)e->key_len
+static inline size_t entry_serialized_size(kv_node_t *e) {
+    return sizeof(int) + (size_t)entry_key_len(e)
          + sizeof(int) + (size_t)entry_payload_len(e)
          + sizeof(long long);
 }
 
 /**
  * 序列化单个条目到缓冲区
+ * 写入长度由调用方用 entry_serialized_size 预算（放不下要整份作废），
+ * 故本函数不再重复算一遍。
  * @param dst 目标缓冲区
  * @param e 要序列化的 entry
- * @return 写入的字节数
  */
-static size_t serialize_entry_to_ptr(char *dst, kv_entry_t *e) {
+static void serialize_entry_to_ptr(char *dst, kv_node_t *e) {
     const char *key  = entry_key(e);
     const char *data = entry_payload(e);
-    int  klen = (int)e->key_len;
+    int  klen = (int)entry_key_len(e);
     int  dlen = (int)entry_payload_len(e);
-    long long expire = e->expire;
+    long long expire = entry_expire(e);
 
     char *p = dst;
     memcpy(p, &klen,   sizeof(int));   p += sizeof(int);
@@ -647,88 +646,34 @@ static size_t serialize_entry_to_ptr(char *dst, kv_entry_t *e) {
     memcpy(p, &dlen,   sizeof(int));   p += sizeof(int);
     memcpy(p, data,    (size_t)dlen);  p += dlen;
     memcpy(p, &expire, sizeof(long long));
-    return entry_serialized_size(e);
 }
 
 /**
- * 开始 RDB 序列化（RDMA 无盘全量用；磁盘保存已不调用本序列化器）
- * @param with_crc 0=RDMA 无盘纯流（全量同步 Master）；1=磁盘格式惰性分支
+ * 把整份快照序列化进 dst（一次性装满）
+ *
+ * 流头 [key_count:4] 无条件先写：空库也要发出 key_count=0，否则对端一个字节
+ * 都收不到，等不到尾部 IMM 而卡死。无 magic/version，解析端按 4 字节读回。
+ *
+ * 条目先消费再判断装不装得下 —— 一次性装满的模型下，装不下就整份作废，
+ * 「先看一眼、放不下就留给下一批」的语义不存在，所以迭代器不必带前瞻。
  */
-void rdb_serialize_begin(rdb_serializer_t *rs, int with_crc) {
-    rs->iter        = dict_iter_new(&g_dict, 1);
-    rs->header_sent = 0;
-    rs->with_crc    = with_crc;
-    /* 空库也必须发出 RDB 头（key_count=0；磁盘格式再带 crc 槽）
-     * 否则 RDMA 全量同步会因 exhausted 提前置位而 0 batch 收尾
-     * slave 收不到 IMM_DONE 卡死 */
-    rs->exhausted   = 0;
-    rs->crc         = 0;   /* crc 累积起点：crc32(0)（仅 with_crc 模式使用） */
-}
+size_t rdb_serialize_all(char *dst, size_t cap) {
+    if (cap < sizeof(int)) return 0;
 
-/**
- * 获取下一批 RDB 数据
- */
-size_t rdb_serialize_next(rdb_serializer_t *rs, char *dst,
-                          size_t max_bytes, int *done) {
-    size_t written = 0;
-    *done = 0;
+    int key_count = (int)dict_count();   /* O(1)：一遍扫描前先预知条数 */
+    memcpy(dst, &key_count, sizeof(int));
 
-    if (rs->exhausted) {
-        *done = 1;
-        return 0;
-    }
+    size_t off = sizeof(int);
+    kv_iter_t *it = dict_iter_new();
+    if (!it) return 0;
 
-    /* 发送流头（未发送时）：
-     *  with_crc=0（RDMA 无盘流）：key_count[4]
-     *  with_crc=1（惰性磁盘分支）：key_count[4] + crc 槽占位[4]，crc 槽先写 0
-     *  （旧磁盘路径由逐条目写入器取代后无调用方；本分支仅当被复用才生效） */
-    if (!rs->header_sent) {
-        size_t hdr = rs->with_crc ? RDB_FILE_HDR_LEN : sizeof(int);
-        if (max_bytes < hdr) return 0;     /* 空间不足，等待下一轮 */
-
-        int key_count = (int)dict_count(&g_dict);
-        rdb_write_header(dst, key_count);
-        if (rs->with_crc) {
-            memset(dst + RDB_FILE_CRC_OFF, 0, sizeof(uint32_t)); /* crc 槽占位 */
-            rs->crc = rdb_crc32(rs->crc, dst, RDB_FILE_CRC_OFF); /* key_count 计入覆盖 */
-        }
-        written   += hdr;
-        dst       += hdr;
-        max_bytes -= hdr;
-        rs->header_sent = 1;
-    }
-
-    /* 逐个序列化条目，直到缓冲区满或迭代结束 */
-    while (max_bytes >= 16) {  /* 最小一个条目：4+0+4+0+8=16 */
-        kv_entry_t *e = dict_iter_peek(rs->iter);
-        if (!e) {
-            rs->exhausted = 1;
-            break;
-        }
-
+    kv_node_t *e;
+    while ((e = dict_iter_next(it)) != NULL) {
         size_t sz = entry_serialized_size(e);
-        if (sz > max_bytes) break;         /* 条目放不下 → 下一批 */
-
-        dict_iter_next(rs->iter);          /* 消费条目 */
-        size_t n = serialize_entry_to_ptr(dst, e);
-        if (rs->with_crc)
-            rs->crc = rdb_crc32(rs->crc, dst, n);  /* 条目字节计入覆盖（磁盘格式） */
-        written   += n;
-        dst       += n;
-        max_bytes -= n;
+        if (off + sz > cap) { off = 0; break; }   /* 装不下 → 整份作废 */
+        serialize_entry_to_ptr(dst + off, e);
+        off += sz;
     }
-
-    if (rs->exhausted) *done = 1;
-    return written;
-}
-
-/**
- * 结束 RDB 序列化
- */
-void rdb_serialize_end(rdb_serializer_t *rs) {
-    if (rs->iter) {
-        dict_iter_free(rs->iter);
-        rs->iter = NULL;
-    }
-    rs->exhausted = 1;
+    dict_iter_free(it);
+    return off;
 }

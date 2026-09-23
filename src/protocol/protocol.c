@@ -2,6 +2,7 @@
 #include "config.h"
 #include "kvstore.h"
 #include "rbuf.h"
+#include "kv_key.h"   /* likely/unlikely：分支预测宏 */
 #include <string.h>
 
 /*=============================================================================

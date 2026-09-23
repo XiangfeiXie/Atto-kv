@@ -5,27 +5,39 @@
  *  - 命令统一走 RESP 报文（resp_cmd 构造），收完整 RESP 回复，strcmp 整串比较
  *  - exec_cmd / exec_cmd_prefix：发一条命令并校验回复（单命令场景）
  *  - expect_reply / expect_reply_prefix：只校验已收到的一条回复（批处理场景）
- *  - 每个测试函数内部自带循环，循环参数独立可调
+ *  - 每个测试函数结尾统一 report() 打印「命令条数 + 耗时 + 折算速率」
+ *
+ *  被测的写语义（见 src/core/kvstore_dispatch.c）：
+ *    SET key value [ttl秒]  —— upsert：键不存在即新增、已存在即覆盖，都回 +OK
+ *    MOD key value [ttl秒]  —— 只修改，键不存在回 nil（不新增）
+ *    过期时间只在写入时给定；无 EXPIRE 命令，TTL 为只读查询。
+ *    省略 ttl = 永不过期；不带 ttl 的 SET / MOD = 清除旧过期。
  *
  *  用法：
  *    ./build/testcase <ip> <port> basic    [loop]
  *    ./build/testcase <ip> <port> pipeline [loop] [P1 P2 ...]
  *    ./build/testcase <ip> <port> fill     <start> <count>
  *    ./build/testcase <ip> <port> verify   <start> <count>
- *      basic    — 基本命令 CRUD 闭环，循环 loop 次（默认 10000）
- *      pipeline — 打包发送 P 条命令，批量读回并校验回复；
- *                 对每个 P 值循环 loop 次（默认 10000），P 默认 1 4 16 32 64 128
+ *    ./build/testcase <ip> <port> expire   <start> <count> <ttl>
+ *    ./build/testcase <ip> <port> dbsize   [loop]
+ *    ./build/testcase <ip> <port> savebench <per_round> <rounds>
+ *      basic    — SET/MOD/DEL/TTL 的 CRUD 闭环（含冲突与 ttl 分支），循环 loop 次
+ *      pipeline — 打包发送 P 条 SET，批量读回并校验；对每个 P 循环 loop 次，
+ *                 每个 P 档之间 FLUSHALL 清库
  *      fill     — 填充 count 个 key（key=fill:%012d，value=value:%012d），
- *                 用于持久化/主从同步测试的数据准备
- *      verify   — 校验 fill 填充的数据：GET 每个 key，value 必须精确匹配；
- *                 配合 fill 做持久化/主从同步后的数据一致性检查
+ *                 用于持久化/主从同步测试的数据准备。SET 是 upsert，
+ *                 目标区间已有数据会被直接覆盖，不再要求区间为空
+ *      verify   — 校验 fill 填充的数据：GET 每个 key，value 精确匹配
  *      expire   — 填充 count 个带 ttl 秒过期的 key（key=expire:%012d），
- *                 填充完成后每秒发 DBSIZE 并打印，观察 key 随过期衰减；
- *                 服务器须以 'expire on' 启动（默认 off 时不会主动清理）
- *      dbsize   — DBSIZE 计数正确性闭环，循环 loop 次（默认 10000）：
- *                 每轮 FLUSHALL 归零 → 新增 / 等长覆盖 / 变长覆盖 / DEL /
- *                 重复 DEL / DEL 不存在，每一步之后断言键数量。
+ *                 随后每秒打印 DBSIZE，观察 key 随主动过期衰减；
+ *                 服务器须以 'expire on' 启动
+ *      dbsize   — DBSIZE 计数正确性闭环，循环 loop 次：
+ *                 每轮 FLUSHALL 归零 → 新增 / 等长改写 / 变长改写 /
+ *                 冲突 / 未命中 / DEL / 重复 DEL / DEL 不存在，逐步断言。
  *                 注意：会清空实例数据，只能对测试实例运行
+ *      savebench— 周期性 BGSAVE 对写入 QPS/延迟的影响：每写 per_round 条 SET
+ *                 发一次 BGSAVE，共 rounds 轮，最后报 QPS / P50 / P99。
+ *                 服务端由调用方自行启动；key 单调递增、全程不重复。
  *
  *  编译：gcc -O2 -o build/testcase test/testcase.c
  *  退出码：0 全部通过；非 0 测试失败
@@ -35,11 +47,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <unistd.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #define MAX_MSG_LENGTH   4096
 #define MAX_BATCH        (512 * 1024)
@@ -57,6 +72,46 @@ typedef struct {
 } rbuf_t;
 
 static rbuf_t g_rb;
+
+/* 已发出的命令条数。批处理按「条」累加（一次 send 可能装 P 条），
+ * 每个测试函数在入口取快照，收尾交给 report() 算出本函数的净条数 */
+static long long g_cmds;
+
+/** 单调递增的毫秒时钟（只用来量本进程内的耗时差） */
+static double now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+/** 单调递增的微秒时钟（savebench 逐条记延迟用）。
+ *  不用 now_ms()：gettimeofday 只到毫秒，本机回环亚毫秒的往返会被整个抹平，
+ *  P50 会退化成一堆 0 和 1。CLOCK_MONOTONIC 走 vDSO，一次约 20ns */
+static double now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+}
+
+/**
+ * 每个测试函数的统一收尾：打印命令条数 + 耗时 + 折算速率
+ * @param cmds0 进入测试时的 g_cmds 快照
+ * @param t0    进入测试时的 now_ms() 快照
+ * @param fmt   测试名（可带参数），如 "basic loop=%d"
+ */
+static void report(long long cmds0, double t0, const char *fmt, ...) {
+    char name[96];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(name, sizeof name, fmt, ap);
+    va_end(ap);
+
+    long long n  = g_cmds - cmds0;
+    double    ms = now_ms() - t0;
+    printf("OK: %-26s %9lld 条命令  %8.3f s  %9.0f 条/s\n",
+           name, n, ms / 1000.0, ms > 0 ? n * 1000.0 / ms : 0.0);
+    fflush(stdout);
+}
 
 /** 完整发送（处理部分发送） */
 static void send_all(int fd, const char *msg, int length) {
@@ -168,6 +223,7 @@ static void expect_reply_prefix(const char *prefix, const char *what) {
 /** 发送一条 RESP 命令并校验回复（精确匹配） */
 static void exec_cmd(int fd, const char *cmd, const char *expect, const char *what) {
     send_all(fd, cmd, (int)strlen(cmd));
+    g_cmds++;
     expect_reply(expect, what);
 }
 
@@ -175,6 +231,7 @@ static void exec_cmd(int fd, const char *cmd, const char *expect, const char *wh
 static void exec_cmd_prefix(int fd, const char *cmd, const char *prefix,
                             const char *what) {
     send_all(fd, cmd, (int)strlen(cmd));
+    g_cmds++;
     expect_reply_prefix(prefix, what);
 }
 
@@ -193,69 +250,137 @@ static int connect_tcpserver(const char *ip, unsigned short port) {
         perror("connect");
         return -1;
     }
+    /* 关 Nagle：本客户端是「发一条等一条」，与 redis-benchmark 同口径。
+     * 不关的话回复若被拆成两个小段，Nagle + 对端延迟 ACK 会每轮多塞 40ms */
+    int nodelay = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof nodelay);
     struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     return fd;
 }
 
 /*=============================================================================
- *  basic_cmds — 基本命令 CRUD 闭环，内部循环 loop 次
+ *  basic_cmds — 现有命令集的 CRUD 闭环，内部循环 loop 次
+ *
+ *  每轮的 21 条命令按「语义分组」排列，组内顺序即断言顺序：
+ *    SET upsert      SET 新键 → GET 命中 → SET 同名覆盖回 +OK → GET 新值
+ *    MOD 只修改      MOD 命中 → GET 新值 → MOD 未命中回 nil → GET 仍为空
+ *    ttl 跟随写入    TTL 无过期=-1 → SET 覆盖带 ttl（长度变了走重建）
+ *                    → TTL 动态秒数 → MOD 带 ttl → TTL 动态秒数
+ *                    → MOD 不带 ttl 清过期 → TTL 回到 -1
+ *                    → SET 新键带 ttl → TTL 动态 → DEL
+ *    DEL             DEL 命中 :1 → GET 空 → DEL 重复 :0
+ *
+ *  严格「一条在飞」，耗时完全由 RTT 决定：本机回环健康时 ~55us/条
+ *  （1 万轮约 9s），被宿主机抢占时能到 ~700us/条（同一万轮 ~110s）。
+ *  所以按 10% 报进度，免得「慢」被误读成「挂住」。
  *============================================================================*/
 
 void basic_cmds(int fd, int loop) {
     char cmd[MAX_MSG_LENGTH];
+    long long c0 = g_cmds;
+    double    t0 = now_ms();
+
+    int step = loop / 10;
+    if (step < 1) step = 1;
+
     for (int i = 0; i < loop; i++) {
+        /* --- SET upsert：新键建、同名覆盖，两种情况都回 +OK --- */
         resp_cmd(cmd, sizeof cmd, 3, "SET", "basic", "key");
-        exec_cmd(fd, cmd, "+OK\r\n", "SET");
+        exec_cmd(fd, cmd, "+OK\r\n", "SET 新增");
         resp_cmd(cmd, sizeof cmd, 2, "GET", "basic");
-        exec_cmd(fd, cmd, "$3\r\nkey\r\n", "GET");
+        exec_cmd(fd, cmd, "$3\r\nkey\r\n", "SET 后 GET");
         resp_cmd(cmd, sizeof cmd, 3, "SET", "basic", "val");
-        exec_cmd(fd, cmd, "+OK\r\n", "SET-overwrite");
+        exec_cmd(fd, cmd, "+OK\r\n", "SET 同名覆盖回 OK");
         resp_cmd(cmd, sizeof cmd, 2, "GET", "basic");
-        exec_cmd(fd, cmd, "$3\r\nval\r\n", "GET-overwrite");
-        resp_cmd(cmd, sizeof cmd, 3, "EXPIRE", "basic", "100");
-        exec_cmd(fd, cmd, ":1\r\n", "EXPIRE");
+        exec_cmd(fd, cmd, "$3\r\nval\r\n", "SET 覆盖生效（等长原地写）");
+
+        /* --- MOD 只修改：未命中回 nil，且不新建 --- */
+        resp_cmd(cmd, sizeof cmd, 3, "MOD", "basic", "val");
+        exec_cmd(fd, cmd, "+OK\r\n", "MOD 改写");
+        resp_cmd(cmd, sizeof cmd, 2, "GET", "basic");
+        exec_cmd(fd, cmd, "$3\r\nval\r\n", "MOD 后 GET");
+        resp_cmd(cmd, sizeof cmd, 3, "MOD", "nosuch", "v");
+        exec_cmd(fd, cmd, "$-1\r\n", "MOD 未命中回 nil");
+        resp_cmd(cmd, sizeof cmd, 2, "GET", "nosuch");
+        exec_cmd(fd, cmd, "$-1\r\n", "MOD 未命中不新建");
+
+        /* --- 过期时间只在写入时给定（无 EXPIRE 命令） --- */
         resp_cmd(cmd, sizeof cmd, 2, "TTL", "basic");
-        exec_cmd_prefix(fd, cmd, ":", "TTL");    /* 动态秒数 */
+        exec_cmd(fd, cmd, ":-1\r\n", "TTL 无过期");
+        resp_cmd(cmd, sizeof cmd, 4, "SET", "basic", "x", "100");
+        exec_cmd(fd, cmd, "+OK\r\n", "SET 覆盖带 ttl");
+        resp_cmd(cmd, sizeof cmd, 2, "TTL", "basic");
+        exec_cmd_prefix(fd, cmd, ":", "SET 覆盖 ttl 已生效");
+        resp_cmd(cmd, sizeof cmd, 4, "MOD", "basic", "val", "100");
+        exec_cmd(fd, cmd, "+OK\r\n", "MOD 带 ttl");
+        resp_cmd(cmd, sizeof cmd, 2, "TTL", "basic");
+        exec_cmd_prefix(fd, cmd, ":", "TTL 读回动态秒数");
+        resp_cmd(cmd, sizeof cmd, 3, "MOD", "basic", "val");
+        exec_cmd(fd, cmd, "+OK\r\n", "MOD 不带 ttl");
+        resp_cmd(cmd, sizeof cmd, 2, "TTL", "basic");
+        exec_cmd(fd, cmd, ":-1\r\n", "MOD 不带 ttl 即清过期");
+        resp_cmd(cmd, sizeof cmd, 4, "SET", "tkey", "v", "100");
+        exec_cmd(fd, cmd, "+OK\r\n", "SET 新键带 ttl");
+        resp_cmd(cmd, sizeof cmd, 2, "TTL", "tkey");
+        exec_cmd_prefix(fd, cmd, ":", "新键 TTL 动态秒数");
+        resp_cmd(cmd, sizeof cmd, 2, "DEL", "tkey");
+        exec_cmd(fd, cmd, ":1\r\n", "DEL 带 ttl 的键");
+
+        /* --- DEL --- */
         resp_cmd(cmd, sizeof cmd, 2, "DEL", "basic");
-        exec_cmd(fd, cmd, ":1\r\n", "DEL");
+        exec_cmd(fd, cmd, ":1\r\n", "DEL 命中");
         resp_cmd(cmd, sizeof cmd, 2, "GET", "basic");
-        exec_cmd(fd, cmd, "$-1\r\n", "GET-nil");
+        exec_cmd(fd, cmd, "$-1\r\n", "DEL 后 GET");
         resp_cmd(cmd, sizeof cmd, 2, "DEL", "basic");
-        exec_cmd(fd, cmd, ":0\r\n", "DEL-nil");
-        resp_cmd(cmd, sizeof cmd, 1, "PING");
-        exec_cmd(fd, cmd, "+PONG\r\n", "PING");
-        resp_cmd(cmd, sizeof cmd, 2, "ECHO", "hello");
-        exec_cmd(fd, cmd, "$5\r\nhello\r\n", "ECHO");
-        resp_cmd(cmd, sizeof cmd, 1, "NOSUCHCMD");
-        exec_cmd_prefix(fd, cmd, "-ERR", "unknown-cmd");
-        resp_cmd(cmd, sizeof cmd, 2, "SET", "onlykey");
-        exec_cmd_prefix(fd, cmd, "-ERR", "SET-wrong-args");
+        exec_cmd(fd, cmd, ":0\r\n", "DEL 重复删除");
+
+        if ((i + 1) % step == 0) {
+            printf("  ... basic %d/%d 轮\n", i + 1, loop);
+            fflush(stdout);   /* 输出重定向到文件时是全缓冲，不刷看不见 */
+        }
     }
-    printf("OK: basic_cmds %d 轮全部通过\n", loop);
+    report(c0, t0, "basic loop=%d", loop);
 }
 
 /*=============================================================================
  *  pipeline_cmds — 打包发送 P 条命令，批量读回并校验回复
- *  对每个 P ∈ pipes[] 循环 loop 次
+ *  对每个 P ∈ pipes[] 循环 loop 次，每个 P 单独计时
+ *
+ *  键名必须带轮次（pipe:<P>:<全局序号>）：SET 如今是 upsert，键名固定也不会
+ *  回 nil，但那样第 2 轮起每批都变成纯覆盖，走不到新增路径（也就压不到
+ *  扩容/再哈希）。要测的是 pipeline 深度下的写入，不是覆盖。
+ *
+ *  每个 P 档跑完发一条 FLUSHALL 清库：不清理的话键数 = loop × P，默认参数
+ *  下能堆到百万级，库越大后面的档越吃亏，测的就不是 pipeline 深度了。
+ *  这条 FLUSHALL 在该档 report 之后发，不混进该档的命令数/耗时。
  *============================================================================*/
 
 void pipeline_cmds(int fd, int loop, const int *pipes, int npipes) {
     char batch[MAX_BATCH];
+    char name[32];
+
     for (int pi = 0; pi < npipes; pi++) {
         int P = pipes[pi];
+        long long c0 = g_cmds;
+        double    t0 = now_ms();
+
         for (int i = 0; i < loop; i++) {
-            /* 一次性打包 P 条 SET 命令（RESP） */
+            /* 一次性打包 P 条 SET（RESP） */
             size_t len = 0;
             char key[32];
             for (int j = 0; j < P; j++) {
-                snprintf(key, sizeof key, "pipe:%d:%d", P, j);
+                snprintf(key, sizeof key, "pipe:%d:%d", P, i * P + j);
                 int w = resp_cmd(batch + len, (int)(sizeof batch - len),
                                  3, "SET", key, "v");
-                if (w < 0 || len + (size_t)w >= sizeof batch) exit(1);
+                if (w < 0 || len + (size_t)w >= sizeof batch) {
+                    fprintf(stderr, "==> FAILED -> pipeline P=%d: 批次缓冲溢出\n", P);
+                    exit(1);
+                }
                 len += (size_t)w;
             }
             send_all(fd, batch, (int)len);
+            g_cmds += P;
 
             /* 读回 P 条回复，逐条校验 +OK */
             for (int j = 0; j < P; j++) {
@@ -264,28 +389,13 @@ void pipeline_cmds(int fd, int loop, const int *pipes, int npipes) {
                 expect_reply("+OK\r\n", what);
             }
         }
-        printf("  [OK] pipeline P=%-3d × %d 轮\n", P, loop);
-    }
+        snprintf(name, sizeof name, "pipeline P=%d", P);
+        report(c0, t0, "%s", name);
 
-    /* 清理测试 key（批量 DEL，RESP） */
-    size_t len = 0;
-    char key[32];
-    for (int pi = 0; pi < npipes; pi++)
-        for (int j = 0; j < pipes[pi]; j++) {
-            snprintf(key, sizeof key, "pipe:%d:%d", pipes[pi], j);
-            int w = resp_cmd(batch + len, (int)(sizeof batch - len),
-                             2, "DEL", key);
-            if (w < 0 || len + (size_t)w >= sizeof batch) exit(1);
-            len += (size_t)w;
-        }
-    send_all(fd, batch, (int)len);
-    for (int pi = 0; pi < npipes; pi++)
-        for (int j = 0; j < pipes[pi]; j++) {
-            char what[64];
-            snprintf(what, sizeof what, "pipeline P=%d DEL", pipes[pi]);
-            expect_reply(":1\r\n", what);
-        }
-    printf("OK: pipeline 全部通过 (loop=%d, pipes=%d 档)\n", loop, npipes);
+        /* 清掉本档写下的 loop×P 个键，别让库规模拖累后面的档 */
+        resp_cmd(batch, sizeof batch, 1, "FLUSHALL");
+        exec_cmd(fd, batch, "+OK\r\n", "pipeline FLUSHALL");
+    }
 }
 
 /*=============================================================================
@@ -307,6 +417,9 @@ static void pair(int i, const char *prefix, char *key, int kcap, char *val, int 
 
 void fill_cmds(int fd, int start, int count) {
     char batch[MAX_BATCH];
+    long long c0 = g_cmds;
+    double    t0 = now_ms();
+
     int filled = 0;
     while (filled < count) {
         size_t len = 0;
@@ -323,6 +436,7 @@ void fill_cmds(int fd, int start, int count) {
         }
         if (nthis == 0) break;
         send_all(fd, batch, (int)len);
+        g_cmds += nthis;
         for (int k = 0; k < nthis; k++) {
             char what[64];
             snprintf(what, sizeof what, "fill[%d]",
@@ -330,11 +444,14 @@ void fill_cmds(int fd, int start, int count) {
             expect_reply("+OK\r\n", what);
         }
     }
-    printf("OK: fill %d 个 key (start=%d)\n", count, start);
+    report(c0, t0, "fill start=%d count=%d", start, count);
 }
 
 void verify_cmds(int fd, int start, int count) {
     char batch[MAX_BATCH];
+    long long c0 = g_cmds;
+    double    t0 = now_ms();
+
     int verified = 0;
     while (verified < count) {
         size_t len = 0;
@@ -351,6 +468,7 @@ void verify_cmds(int fd, int start, int count) {
         }
         if (nthis == 0) break;
         send_all(fd, batch, (int)len);
+        g_cmds += nthis;
         for (int k = 0; k < nthis; k++) {
             char key[24], val[24], expect[64];
             pair(start + verified - nthis + k,
@@ -360,17 +478,20 @@ void verify_cmds(int fd, int start, int count) {
             expect_reply(expect, "verify");
         }
     }
-    printf("OK: verify %d 个 key 全部正确 (start=%d)\n", count, start);
+    report(c0, t0, "verify start=%d count=%d", start, count);
 }
 
 /*=============================================================================
  *  expire_cmds — 过期功能测试
- *  1. 一次性填充 count 个带过期时间的 key（SET + EXPIRE 成对打包发送）
+ *  1. 一次性填充 count 个带过期时间的 key（SET key val <ttl>，一条命令搞定）
  *  2. 填充完成后每隔一秒发 DBSIZE 并打印，观察 key 随过期被抽样清理的衰减
  *
  *  依赖：服务器须以 'expire on' 启动（active_expire_cycle 抽样删除，
  *  expire off 时已过期 key 不会被主动清理，DBSIZE 不会下降）。
  *  key = expire:%012d，value = value:%012d；范围由命令行指定：<start> <count> <ttl>
+ *
+ *  计时只覆盖阶段 1：阶段 2 是观测，耗时由 ttl 和抽样清理速度决定，
+ *  与客户端能力无关，报出来只会误导。
  *============================================================================*/
 
 /** 发送 DBSIZE 并返回当前键数量（整数回复 :N\r\n） */
@@ -382,6 +503,7 @@ static int get_dbsize(int fd) {
         exit(1);
     }
     send_all(fd, cmd, n);
+    g_cmds++;
     if (recv_reply(&g_rb, rep, sizeof rep) < 0) {
         fprintf(stderr, "==> FAILED -> DBSIZE: 读取回复失败\n");
         exit(1);
@@ -393,43 +515,41 @@ void expire_cmds(int fd, int start, int count, int ttl) {
     /* 基线：填充前的 dbsize（剔除服务器其它数据的干扰） */
     int base = get_dbsize(fd);
 
-    /* 阶段 1：一次性填充（SET + EXPIRE 成对打包，逻辑同 fill_cmds） */
+    /* 阶段 1：一次性填充（打包发送，逻辑同 fill_cmds，只是多带一个 ttl 参数） */
     char batch[MAX_BATCH];
+    char ttlstr[16];
+    snprintf(ttlstr, sizeof ttlstr, "%d", ttl);
+
+    long long c0 = g_cmds;
+    double    t0 = now_ms();
+
     int filled = 0;
     while (filled < count) {
         size_t len = 0;
         int nthis = 0;
         while (filled < count) {
-            char key[24], val[24], ttlstr[16];
+            char key[24], val[24];
             pair(start + filled, "expire", key, sizeof key, val, sizeof val);
-            snprintf(ttlstr, sizeof ttlstr, "%d", ttl);
-            /* SET 与 EXPIRE 成对提交：两者都能容纳才发，避免半条命令 */
-            int w1 = resp_cmd(batch + len, (int)(sizeof batch - len),
-                              3, "SET", key, val);
-            int w2 = (w1 > 0) ? resp_cmd(batch + len + w1,
-                                         (int)(sizeof batch - len - w1),
-                                         3, "EXPIRE", key, ttlstr) : -1;
-            if (w1 <= 0 || w2 <= 0 ||
-                len + (size_t)w1 + (size_t)w2 >= sizeof batch)
-                break;                          /* 批满：整对都不发，下轮重试 */
-            len += (size_t)w1 + (size_t)w2;
+            int w = resp_cmd(batch + len, (int)(sizeof batch - len),
+                             4, "SET", key, val, ttlstr);
+            if (w < 0 || len + (size_t)w >= sizeof batch) break;   /* 批满 */
+            len += (size_t)w;
             nthis++;
             filled++;
         }
         if (nthis == 0) break;
         send_all(fd, batch, (int)len);
+        g_cmds += nthis;
         for (int k = 0; k < nthis; k++) {
             char what[64];
-            snprintf(what, sizeof what, "expire[%d]-SET",
+            snprintf(what, sizeof what, "expire[%d]",
                      start + filled - nthis + k);
             expect_reply("+OK\r\n", what);
-            snprintf(what, sizeof what, "expire[%d]-EXPIRE",
-                     start + filled - nthis + k);
-            expect_reply(":1\r\n", what);
         }
     }
+    report(c0, t0, "expire fill ttl=%ds", ttl);
+
     int after = get_dbsize(fd);
-    printf("OK: expire 填充 %d 个 key (start=%d, ttl=%ds)\n", count, start, ttl);
     printf("expire: dbsize=%d（基线 %d，新增 %d）\n", after, base, after - base);
 
     /* 阶段 2：每秒轮询 DBSIZE 打印，一直循环直到新增的测试 key 全部过期
@@ -460,14 +580,15 @@ void expire_cmds(int fd, int start, int count, int ttl) {
  *  dbsize_cmds — DBSIZE 计数正确性闭环
  *
  *  每轮以 FLUSHALL 归零（空库下 DBSIZE 必须是 0，绝对断言，无需基线），
- *  再依次走 新增 / 等长覆盖 / 变长覆盖 / 删除 / 重复删除 / 删不存在 六步，
- *  每一步之后断言 DBSIZE。整体循环 loop 次，设计同 basic_cmds。
+ *  再依次走下面各步，每一步之后断言 DBSIZE。整体循环 loop 次，设计同 basic_cmds。
  *
- *  覆盖写有两条取值分支（src/core/kvstore_dispatch.c 的 string_set）：
- *    · 等长覆盖 → L38  memcpy 原地写
- *    · 变长覆盖 → L41  dict_resize_entry 重新分配条目
- *  两条都不允许 d->used 自增 —— src/engine/kv_dict.c:265 的自增在 dict_add 内
- *  是无条件的，只有"键不存在"那条路径才该走到那里。
+ *  真正要守的不变量：**记录数只在「键不存在 → 走到 add」时自增**。
+ *  改写走两条分支（src/core/kvstore_dispatch.c 的 SET 覆盖 / MOD）：
+ *    · 等长改写 → memcpy 原地写
+ *    · 变长改写 → dict_resize_entry 重建条目
+ *  两条都不许改记录数；SET 覆盖虽进了写路径但没 add，MOD 未命中则根本不进
+ *  引擎写路径，更不该动记录数。各引擎的 xxx_add 是无条件自增的，一旦哪条
+ *  路径误入，这里就会漏出来。
  *
  *  注意：本测试会 FLUSHALL 清空实例数据，只能对测试实例运行。
  *============================================================================*/
@@ -484,6 +605,9 @@ static void expect_dbsize(int fd, int want, const char *what) {
 
 void dbsize_cmds(int fd, int loop) {
     char cmd[256];
+    long long c0 = g_cmds;
+    double    t0 = now_ms();
+
     for (int i = 0; i < loop; i++) {
         /* 1. 归零：FLUSHALL 后必须是 0 */
         resp_cmd(cmd, sizeof cmd, 1, "FLUSHALL");
@@ -499,32 +623,133 @@ void dbsize_cmds(int fd, int loop) {
         }
         expect_dbsize(fd, 3, "新增 3 个 key");
 
-        /* 3. 等长覆盖（v → w）→ 不增 */
+        /* 3. SET 撞已存在的键 → 覆盖（进写路径但没 add）→ 不增 */
         resp_cmd(cmd, sizeof cmd, 3, "SET", "db:0", "w");
-        exec_cmd(fd, cmd, "+OK\r\n", "SET 等长覆盖");
-        expect_dbsize(fd, 3, "等长覆盖后不增");
+        exec_cmd(fd, cmd, "+OK\r\n", "SET 覆盖已存在的键");
+        expect_dbsize(fd, 3, "SET 覆盖后不增");
 
-        /* 4. 变长覆盖（v → a-longer-value）→ 不增 */
-        resp_cmd(cmd, sizeof cmd, 3, "SET", "db:1", "a-longer-value");
-        exec_cmd(fd, cmd, "+OK\r\n", "SET 变长覆盖");
-        expect_dbsize(fd, 3, "变长覆盖后不增");
+        /* 4. 等长改写（v → w）→ 不增 */
+        resp_cmd(cmd, sizeof cmd, 3, "MOD", "db:0", "w");
+        exec_cmd(fd, cmd, "+OK\r\n", "MOD 等长改写");
+        expect_dbsize(fd, 3, "等长改写后不增");
 
-        /* 5. 删除存在的 key → :1 且 -1 */
+        /* 5. 变长改写（v → a-longer-value）→ 走 resize_entry，仍不增 */
+        resp_cmd(cmd, sizeof cmd, 3, "MOD", "db:1", "a-longer-value");
+        exec_cmd(fd, cmd, "+OK\r\n", "MOD 变长改写");
+        expect_dbsize(fd, 3, "变长改写后不增");
+
+        /* 6. MOD 未命中 → nil，且不新建 → 不增 */
+        resp_cmd(cmd, sizeof cmd, 3, "MOD", "db:never", "v");
+        exec_cmd(fd, cmd, "$-1\r\n", "MOD 未命中");
+        expect_dbsize(fd, 3, "MOD 未命中不新建");
+
+        /* 7. 删除存在的 key → :1 且 -1 */
         resp_cmd(cmd, sizeof cmd, 2, "DEL", "db:0");
         exec_cmd(fd, cmd, ":1\r\n", "DEL 存在的 key");
         expect_dbsize(fd, 2, "DEL 后 -1");
 
-        /* 6. 重复删除同一个 key → :0 且不再减 */
+        /* 8. 重复删除同一个 key → :0 且不再减 */
         resp_cmd(cmd, sizeof cmd, 2, "DEL", "db:0");
         exec_cmd(fd, cmd, ":0\r\n", "DEL 重复删除");
         expect_dbsize(fd, 2, "重复 DEL 不减");
 
-        /* 7. 删除从未写过的 key → :0 且不变 */
+        /* 9. 删除从未写过的 key → :0 且不变 */
         resp_cmd(cmd, sizeof cmd, 2, "DEL", "db:never");
         exec_cmd(fd, cmd, ":0\r\n", "DEL 不存在的 key");
         expect_dbsize(fd, 2, "DEL 不存在不减");
     }
-    printf("OK: dbsize %d 轮全部通过\n", loop);
+    report(c0, t0, "dbsize loop=%d", loop);
+}
+
+/*=============================================================================
+ *  savebench_cmds — 周期性 BGSAVE 对写入 QPS / 延迟的影响
+ *
+ *  结构：每写 per_round 条 SET，发一次 BGSAVE，如此 rounds 轮。
+ *  key 用全局单调递增计数（key:0、key:1…），全程不重复。
+ *
+ *  与 shell 版 bench_save.sh 的关键差别：BGSAVE 和 SET 走**同一条连接、
+ *  同一个循环**。shell 版每段起一个 redis-benchmark、用 redis-cli 另起进程发
+ *  SAVE，中间那 ~170ms 空隙正是 fork 停顿掉落的地方 —— 那个停顿从来进不了
+ *  任何测量窗口。这里没有空隙，服务端每一刻都在被测。
+ *
+ *  口径：
+ *   · QPS 的墙钟只累加 SET 段，BGSAVE 自身的往返夹在两段之间、不计入。
+ *     否则轮数多的低档位会因为多跑几次 BGSAVE 而吃亏，档与档就不可比。
+ *   · 子进程落盘的 I/O 竞争落在**下一轮**的 SET 段里，会被如实计入 ——
+ *     那才是「SAVE 对写入的影响」里持续的那部分。
+ *   · BGSAVE 回 -ERR（上一次还没落完）是正常行为：只发和读，不判成败、
+ *     不计数。所以「每 per_round 条一次 BGSAVE」的准确含义是「尝试一次」。
+ *
+ *  循环内零分配、零 I/O、零 printf —— 记录本身不能污染测量。延迟数组在循环
+ *  外一次分配，跑完才排序。每条命令严格「一条在飞」：发一条、收完回复、记
+ *  时间，即 c=1 P=1，与 redis-benchmark 同口径。
+ *============================================================================*/
+
+#define SB_VAL_LEN 16          /* value 定长 16B，与 bench_save.sh 的 VSIZE 一致 */
+
+static int cmp_u32(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+
+void savebench_cmds(int fd, long long per_round, int rounds) {
+    if (per_round <= 0 || rounds <= 0) {
+        fprintf(stderr, "per_round/rounds 必须 > 0\n");
+        exit(2);
+    }
+
+    long long total = per_round * rounds;
+    uint32_t *lat = malloc(sizeof(uint32_t) * (size_t)total);
+    if (lat == NULL) { perror("malloc"); exit(1); }
+
+    char val[SB_VAL_LEN + 1];
+    memset(val, 'x', SB_VAL_LEN);
+    val[SB_VAL_LEN] = '\0';
+
+    char cmd[MAX_MSG_LENGTH], rep[MAX_MSG_LENGTH];
+    long long idx = 0;
+    double work_us = 0.0;
+
+    for (int r = 0; r < rounds; r++) {
+        double ts = now_us();
+
+        for (long long i = 0; i < per_round; i++) {
+            char key[32];
+            snprintf(key, sizeof key, "key:%lld", idx);
+
+            int len = resp_cmd(cmd, sizeof cmd, 3, "SET", key, val);
+            if (len < 0) { fprintf(stderr, "resp_cmd 失败\n"); exit(1); }
+
+            double t0 = now_us();
+            send_all(fd, cmd, len);
+            recv_reply(&g_rb, rep, sizeof rep);   /* 读掉即扔，不比较内容 */
+            lat[idx] = (uint32_t)(now_us() - t0);
+            idx++;
+            g_cmds++;
+        }
+
+        work_us += now_us() - ts;                 /* 只累加 SET 段 */
+
+        resp_cmd(cmd, sizeof cmd, 1, "BGSAVE");   /* 发了就继续，不计时、不看回复 */
+        send_all(fd, cmd, (int)strlen(cmd));
+        recv_reply(&g_rb, rep, sizeof rep);
+        g_cmds++;
+    }
+
+    qsort(lat, (size_t)total, sizeof(uint32_t), cmp_u32);
+
+    /* 百分位按下标取（不插值）：排序后第 total*P/100 个 */
+    long long i50 = total * 50 / 100;
+    long long i99 = total * 99 / 100;
+
+    printf("savebench 每轮 %lld 条 × %d 轮 = %lld 条\n", per_round, rounds, total);
+    printf("QPS %lld   P50 %.3f ms   P99 %.3f ms\n",
+           work_us > 0.0 ? (long long)(total / (work_us / 1e6)) : 0,
+           (double)lat[i50] / 1000.0,
+           (double)lat[i99] / 1000.0);
+    fflush(stdout);
+
+    free(lat);
 }
 
 /*=============================================================================
@@ -539,6 +764,7 @@ static void usage(const char *prog) {
     printf("  %s <ip> <port> verify   <start> <count>\n", prog);
     printf("  %s <ip> <port> expire   <start> <count> <ttl>\n", prog);
     printf("  %s <ip> <port> dbsize   [loop]\n", prog);
+    printf("  %s <ip> <port> savebench <per_round> <rounds>\n", prog);
 }
 
 int main(int argc, char *argv[]) {
@@ -560,6 +786,19 @@ int main(int argc, char *argv[]) {
             static const int def[] = { 1, 4, 16, 32, 64, 128 };
             npipes = 6;
             for (int i = 0; i < 6; i++) pipes[i] = def[i];
+        }
+    }
+
+    /* savebench 的 <每轮条数> <轮数> */
+    long long sb_per = 0;
+    int       sb_rounds = 0;
+    if (strcmp(test, "savebench") == 0) {
+        if (argc < 6) { usage(argv[0]); return 2; }
+        sb_per    = atoll(argv[4]);
+        sb_rounds = atoi(argv[5]);
+        if (sb_per <= 0 || sb_rounds <= 0) {
+            fprintf(stderr, "per_round/rounds 必须 > 0\n");
+            return 2;
         }
     }
 
@@ -600,6 +839,8 @@ int main(int argc, char *argv[]) {
         expire_cmds(g_rb.fd, fstart, fcount, fttl);
     } else if (strcmp(test, "dbsize") == 0) {
         dbsize_cmds(g_rb.fd, loop);
+    } else if (strcmp(test, "savebench") == 0) {
+        savebench_cmds(g_rb.fd, sb_per, sb_rounds);
     } else {
         fprintf(stderr, "未知测试: %s\n", test);
         usage(argv[0]);

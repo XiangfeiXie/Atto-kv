@@ -1,13 +1,8 @@
-# repl-xdp — XDP 旁路镜像增量同步（挂载到 kvstore）
+# repl-xdp — XDP 旁路镜像增量同步
 
 把 kvstore **master 的客户端写流量在网卡层原样镜像一份给 slave**，使 slave 与
 master 保持增量一致。挂在 master 侧的**旁路进程**，与 kvstore **零耦合**：
 XDP 只采样，内核 TCP 栈负责可靠传输，master 业务侧无任何改动、无额外开销。
-
-**实测（挂到 kvstore 上，proactor 引擎，客户端跨 veth）：** 十万 → 五十万 → 一百
-万 SET 增量填充，master/slave DBSIZE 始终一致、value 校验全过、BPF ring 丢采样
-**0 条**、produced==consumed。累计镜像 99MB 端到端零丢失，突发稳态 ~15MB/s。
-详见下方大流量实测。
 
 ## 原理
 
@@ -20,29 +15,21 @@ XDP 只采样，内核 TCP 栈负责可靠传输，master 业务侧无任何改�
 - **顺序保证**：BPF ring 是 per-CPU 的，veth 多 RX 队列会跨 CPU 乱序。每条采样
   带**首个负载字节的 TCP seq + 客户端源端口**，用户态按 seq 重组（顺序段直发、
   乱序段暂存、重复段丢弃）；每个连接 SYN 发锚点（seq=ISN+1）处理连接切换。
+  因用户态做了重组，**不要求 master 钉单核**（这一点与 repl-tcp_recvmsg 相反）。
 - **背压**：socket 非阻塞 + 用户态待发缓冲 `g_pend`，ring 永远即时消费；从机
   暂时跟不上时 `g_pend` 增长，跟上了自动排空。ring 满才丢采样（有 `drops` 计数）。
 
-## 与 raw socket 版（早期 repl-xdp.c）的区别
+## 使用方法
 
-| | raw socket 版（已删） | 本组件（repl-xdp-sock） |
-|---|---|---|
-| 发送方 | 用户态重建 TCP 段：手动 seq/校验和/RTO/窗口/缓存 | **内核 TCP 栈**，write() 即完成 |
-| 发送可靠 | 用户态 RTO 重传 + 缓存 | 内核 RTO/重传 |
-| 复杂度 | 约 900 行 | 约 500 行 |
-| 从机应答 | 用户态解析 ACK 推窗口 | 内核自动回 ACK，用户态读掉 +OK |
+> 默认参数：`MASTER_PORT=2000`、`SLAVE_PORT=2001`、`IFACE=veth0`、
+> `SLAVE_IP=10.0.1.2`。需换端口/网卡见文末「配置项」。
 
-## 挂载到 kvstore 上的使用方法
-
-> 默认参数已对齐 kvstore 主从端口：`MASTER_PORT=2000`、`SLAVE_PORT=2001`、
-> `IFACE=veth0`、`SLAVE_IP=10.0.1.2`。需换端口/网卡用 `-D` 覆盖编译（见文末）。
-
-### 1. 编译（组件与 kvstore 一起编译）
+### 1. 编译
 
 ```bash
 cd /home/xxf/9.1-kvstore/build
-cmake .. && make -j
-# 产物：build/kvstore  build/repl-xdp  build/repl-xdp.bpf.o
+cmake .. && cmake --build . --target repl-xdp repl-xdp-bpf -j"$(nproc)"
+# 产物：build/repl-xdp  build/repl-xdp.bpf.o
 ```
 
 ### 2. 网络环境（master / slave 两个 netns + veth）
@@ -61,17 +48,25 @@ sudo ip netns exec slv ip link set lo up
 
 ### 3. 启动 kvstore master + slave
 
-```bash
-sudo ip netns exec red bash -c 'prlimit --pid $$ --memlock=unlimited; nohup \
-  /home/xxf/9.1-kvstore/build/kvstore \
-  /home/xxf/9.1-kvstore/conf/kvstore-xdp-master.conf > /tmp/kvs-master.log 2>&1 &'
-sudo ip netns exec slv bash -c 'prlimit --pid $$ --memlock=unlimited; nohup \
-  /home/xxf/9.1-kvstore/build/kvstore \
-  /home/xxf/9.1-kvstore/conf/kvstore-xdp-slave.conf > /tmp/kvs-slave.log 2>&1 &'
+两个实例都 `repl_role off` —— **增量同步完全由 XDP 镜像完成**，不启用 PSYNC 双写。
+
+```
+# master.conf                # slave.conf
+port 2000                    port 2001
+network proactor             network proactor
+maxclients 1000              maxclients 1000
+persistence none             persistence none
+engine hash                  engine hash
+repl_role off                repl_role off
+expire off                   expire off
 ```
 
-`kvstore-xdp-master.conf` / `kvstore-xdp-slave.conf`：master 2000、slave 2001，
-`repl_role off` —— **增量同步完全由 XDP 镜像完成**，不启用 PSYNC 双写。
+```bash
+sudo ip netns exec red bash -c 'prlimit --pid $$ --memlock=unlimited; nohup \
+  /home/xxf/9.1-kvstore/build/kvstore /tmp/xdp/master.conf > /tmp/kvs-master.log 2>&1 &'
+sudo ip netns exec slv bash -c 'prlimit --pid $$ --memlock=unlimited; nohup \
+  /home/xxf/9.1-kvstore/build/kvstore /tmp/xdp/slave.conf > /tmp/kvs-slave.log 2>&1 &'
+```
 
 ### 4. 挂载 repl-xdp（master netns，需 root + memlock）
 
@@ -87,8 +82,6 @@ sudo ip netns exec red bash -c 'prlimit --pid $$ --memlock=unlimited; nohup \
 
 > **测试客户端必须从 slave netns（或任何跨 veth 的地方）发起**：客户端若在
 > master netns 内连本机 IP，走本地回环路径不经 veth0，XDP 采样不到。
-> （把 `IFACE` 改挂 `lo` 想直接镜像本机填充同样采不到——回环大块写的 frag 问题，
-> 见下文「已知问题」。）
 
 ```bash
 # 向 master 写 10 万 key（跨 veth → master 10.0.1.1:2000）
@@ -96,7 +89,7 @@ sudo ip netns exec slv /home/xxf/9.1-kvstore/build/testcase 10.0.1.1 2000 fill 0
 # slave 上逐 value 校验（数据一致性 = 增量同步成功）
 sudo ip netns exec slv /home/xxf/9.1-kvstore/build/testcase 10.0.1.2 2001 verify 0 100000
 # DBSIZE 两端一致
-sudo ip netns exec red  redis-cli -p 2000 DBSIZE
+sudo ip netns exec red redis-cli -p 2000 DBSIZE
 sudo ip netns exec slv redis-cli -p 2001 DBSIZE
 # DEL / FLUSHALL 同样跨 veth 传播（增删改全量镜像）
 sudo ip netns exec slv redis-cli -p 2000 -h 10.0.1.1 FLUSHALL
@@ -109,113 +102,6 @@ sudo pkill -INT -x repl-xdp     # 优雅退出：打印镜像字节/待发峰值
 sudo pkill -x kvstore
 ```
 
-## 实测结果（挂载到 kvstore 上）
-
-### 大流量实测数据
-
-master/slave 各自 netns、proactor 引擎，客户端从 slave netns 跨 veth 灌数据
-（XDP 只能采样网卡可见流量，见上「测试客户端必须从 slave netns 发起」）。每轮先
-FLUSHALL 归零（删类命令同样经 XDP 传播到 slave）：
-
-| 轮次 | 灌入量 | fill 耗时 | 主从 DBSIZE | 校验 | BPF 丢采样 | 突发窗口速率 |
-|---|---|---|---|---|---|---|
-| 10 万 | ~6 MB | 0.405s | 100000 == 100000 | 全量逐 value ✓ | 0 | 窗口摊薄 5.88 MB/s① |
-| 50 万 | ~30 MB | 2.044s | 500000 == 500000 | 全量逐 value ✓ | 0 | ~14 MB/s（13.54/14.11，recs ~10k/s） |
-| 100 万 | ~60 MB | 4.075s | **1000000 == 1000000** | 抽查 90万~99万 ✓ | 0 | **~15 MB/s**（15.56/14.96/13.04/14.98，recs ~11k/s）② |
-
-> ① 单轮 < 1 个 stat 窗口、含爬坡/收尾，速率被 1s 窗口摊薄；② 1M 突发 4s 覆盖
-> 4 个完整窗口 → 稳态基准。1M 期间出现过一次瞬时 backlog +34.3KB（生产略超前
-> 消费），下一窗口即 -34.3KB 排空，ring 一次未满。
-
-**消费是 work-conserving**：每个 [stat] 窗口 prod≈cons、backlog 回到 0，镜像消费
-跟得上生产——速率上限在 master 写路径 + veth/XDP 采样开销（~15MB/s），不在消费
-侧。因用户态按 seq 重组，**不要求 master 钉单核**（1M 轮未钉核仍全程零丢失）。
-镜像 SIGINT 退出累计汇总（含上述三轮全部流量）：
-
-```
-[sock] 退出：镜像 99200036 字节，待发峰值 524272 字节，BPF ring 丢采样 0 条
-[sock] 统计：生产总计 100299940 字节，消费总计 100299940 字节（差 = ring 残留存量）
-```
-
-### 为什么比 tcp_recvmsg 挂载点慢几个百分点（引擎差异 + 采样税，非消费端）
-
-XDP 在**生产 RX 路径**上逐包采样；tcp_recvmsg 的 kprobe 在 **recvmsg 出口**（应用
-已读到字节后）采样、不进生产路径，两者机制不同。用「换引擎 + 摘 mirror 裸灌」
-的对照实验把速率差的来源拆开（全为 1M SET ≈ 60MB）：
-
-| 引擎 | 数据面 | mirror | 1M 耗时 | 折合速率 |
-|---|---|---|---|---|
-| reactor | lo | tcp_recvmsg | 3.479s | ~17.2 MB/s |
-| reactor | veth | XDP | 3.740s | ~16.0 MB/s |
-| proactor | veth | XDP | 4.075s | ~14.7 MB/s |
-| reactor | veth | 无（裸灌基线） | 3.535s | ~17.0 MB/s |
-| proactor | veth | 无（裸灌基线） | 3.886s① | ~15.4 MB/s |
-
-> ① proactor 钉核 3.886s / 不钉 3.919s，钉核与否可忽略。
-
-差分解读（相对 tcp_recvmsg 的 17.2MB/s）：
-- **引擎差异 ~10%（主因）**：proactor 处理单连接大流 SET 反而不如 reactor——
-  reactor 一次 recvmsg gather 16×1KB 段；io_uring 的优势在大量并发连接省上下文
-  切换，单流上摊不上。换 reactor 后 XDP 立刻 4.075s → 3.740s（~16MB/s）。
-- **XDP 采样税 ~5%**：同引擎同面挂 mirror 前后裸灌对照（reactor+veth 3.535→
-  3.740s，proactor+veth 3.919→4.075s）——XDP 在 master RX 路径的逐包拷贝成本，
-  挂载点固有；tcp_recvmsg 的 kprobe 无此税，故天然快几个点。
-- **数据面 lo vs veth ~1.6%**：reactor 裸灌 3.479→3.535s，可忽略。
-
-**用户态消费端两个组件都远未到瓶颈**：两种 mirror 全程 prod==cons、backlog 收敛
-回 0、drops=0（XDP 仅一次 +34KB 瞬时落后即主动追平）。XDP 消费端没被推到
-17MB/s 不是它到顶，而是采样税让生产喂不了更快。
-
-### 功能场景
-
-| 场景 | 结果 |
-|---|---|
-| 跨 veth DEL 3 个 key | slave 同步删除，DBSIZE 同步 -3 |
-| 跨 veth FLUSHALL | 两端同时归零 |
-| master 性能（镜像开/关 fill 10 万） | ~261ms / ~243ms，差异 ~7% 在抖动内，无影响 |
-| 干净 SIGINT 退出 | 无 stack smashing，统计正常，XDP 正常卸载 |
-
-## 已知边界
-
-- **单客户端流**：只保证一条客户端流的 RESP 命令边界；多客户端合流会破坏命令
-  边界（kvstore slave 按 RESP 解析，边界错会断连重试，但不在本组件保证范围）。
-- **干净链路前提**：ring 永不溢出的前提下 seq 重组无空洞。若 ring 满丢采样
-  （4MB ring 在本规模不触发），有 `drops` 计数 + 待发记录数上限兜底退出，不
-  会默默错位。
-- **待发缓冲无上限**：从机长期跟不上时 `g_pend` 无限增长（本规模实测峰值
-  ~500KB 且自动排空）。
-- **客户端重传**：同一包被客户端重传时 BPF 采到同 seq 重复段，用户态按
-  `seq < g_next_seq` 丢弃，不影响正确性。
-
-## 已知问题：IFACE=lo 镜像本机填充采不到数据（未修复）
-
-**场景**：把 `IFACE` 从网卡改挂 `lo`，想镜像「master 本机向 127.0.0.1 填充」的流量。
-
-**症状**：repl-xdp 启动正常（`[xdp] 已挂 lo`、已连从机、开始镜像），但客户端
-`fill` 大块写入期间，退出统计为 `镜像 0 字节`。抓 BPF ring 发现**只采到连接 SYN，
-DATA 记录一条没有**（`drops` 计数为 0，排除 ring 溢出）。
-
-**根因**（2026-08-31 实测定位，未修复）：回环路径上，**大块 `send()` 的 TCP 负载
-挂在 skb 的 page frags（非线形）里**。generic（SKB 模式）XDP 的 `ctx->data ~
-data_end` 只覆盖 skb 线性头；payload 在 frag 中时，repl-xdp-sock.bpf.c 里
-`payload < data_end` 不成立，DATA 分支被静默跳过 → ring 里只有 SYN 锚点。
-
-| 客户端发送方式 | lo 上 XDP 能否采到 DATA |
-|---|---|
-| 大块 send（testcase fill 512KB 一次） | ✗ 只有 SYN |
-| 单条小 send（62B） | ✓ |
-| 单连接逐条小 send（27B×500 + TCP_NODELAY） | ✓ |
-
-**排除项**：不是 GSO/GRO——`ethtool -K lo gro off gso off tso off` 后依旧丢。
-lo 专属：`IFACE=ens33` 的跨机镜像正常（网卡驱动 RX 重建线形 skb，payload 可见）；
-lo 不走驱动，发送端 frag skb 原样进 RX，XDP 只能看到线性头。
-
-**修复方向（未实施）**：
-- **最小**：testcase fill 改小分块 send + `TCP_NODELAY`，让每个 send 独立成小线性段。
-  只对本 demo 的客户端生效。
-- **通用**：改用 TC eBPF 挂 lo，用 `bpf_skb_load_bytes()` 穿透 frag 读 payload。
-  注意 lo 的 MSS=65483（单段可达 64KB）> `MAX_REC=2048`，需处理大段切块或压 MTU。
-
 ## 配置项（`-D` 覆盖，改后需重新编译）
 
 | 宏 | 默认值 | 含义 |
@@ -226,7 +112,23 @@ lo 不走驱动，发送端 frag skb 原样进 RX，XDP 只能看到线性头。
 | `IFACE` | `"veth0"` | master 侧客户端流量所经网卡 |
 
 ```bash
-# 例：换端口后重新编译（REPL_XDP_DEFINES 同时作用于 BPF 与用户态）
 cd /home/xxf/9.1-kvstore/build
-cmake .. -DREPL_XDP_DEFINES="-DMASTER_PORT=6380 -DSLAVE_PORT=6381" && make repl-xdp
+cmake -DREPL_XDP_DEFINES="-DMASTER_PORT=6380 -DSLAVE_PORT=6381" .. && make -j
 ```
+
+> 只有数字宏能经 `REPL_XDP_DEFINES` 安全传递。字符串宏（`SLAVE_IP` / `IFACE`）
+> 覆盖会粘参，要改就直接改 `.c` 与 `.bpf.c` 里的默认值。
+
+## 已知问题：`IFACE=lo` 镜像本机填充采不到数据（未修复）
+
+把 `IFACE` 改挂 `lo`、想镜像「master 本机向 127.0.0.1 填充」的流量时，组件启动
+一切正常，但**只采到连接 SYN，DATA 记录一条都没有**（`drops` 为 0，排除 ring 溢出）。
+
+**根因**：回环路径上大块 `send()` 的 TCP 负载挂在 skb 的 page frags（非线形）里。
+SKB 模式 XDP 的 `ctx->data ~ data_end` 只覆盖 skb 线性头，`payload < data_end`
+不成立，DATA 分支被静默跳过。**不是 GSO/GRO**（关掉依旧丢）；网卡（如 ens33）不
+受影响——驱动 RX 会重建线形 skb。
+
+**规避**：本组件挂网卡用（`IFACE=veth0` 或真实网卡），客户端从对侧 netns / 另一
+台机发起。要镜像 lo 得改 TC eBPF + `bpf_skb_load_bytes()` 穿透 frag，且 lo 的
+MSS=65483 超过 `MAX_REC=2048`，还需处理大段切块。

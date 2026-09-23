@@ -2,13 +2,14 @@
  *  rbuf.c — 节点队列读缓冲实现
  *
  *  数据结构：一串固定大小节点（单链队列）。
- *    - 生产：reserve 把"队尾剩余 + 池中新节点"暴露成 iovec[] → recvmsg 直接灌，
- *      commit 把实际字节入队；填不满的段自动回池。
- *    - 消费：只认逻辑字节流。peek 拿当前段、consume 按字节吃（整段回池）、
+ *    - 生产：reserve 暴露一段连续可写空间（队尾节点剩余空间，或池中一个
+ *      新节点）→ recv / io_uring_prep_recv 直接灌，commit 把实际字节入队；
+ *      没用上的节点自动回池。
+ *    - 消费：只认逻辑字节流。contig 拿连续段、consume 按字节吃（整段回池）、
  *      copy 任意逻辑偏移跨段读。节点边界对消费者不可见。
  *
  *  节点生命周期：alloc 时 malloc 一次；整段消费完回 free-list 复用；
- *  destroy 时统一释放。稳态下（流量平稳）pool_alloc 应不增长。
+ *  destroy 时统一释放。
  *============================================================================*/
 
 #include "rbuf.h"
@@ -17,7 +18,7 @@
 #include <string.h>
 
 struct rbuf_node {
-    rbuf_node_t *next;      /* 队列/空闲/保留三段链共用（节点同一时刻只在一段） */
+    rbuf_node_t *next;      /* 链指针：队列链 / 空闲链共用（节点同一时刻只在一处） */
     uint32_t     len;       /* 有效字节数 */
     uint32_t     cap;       /* 容量（= node_cap，留便于调试） */
     char         data[];    /* 数据（柔性数组，紧随头部） */
@@ -33,7 +34,6 @@ static rbuf_node_t *node_alloc(rbuf_t *rb) {
     n->next = NULL;
     n->len  = 0;
     n->cap  = rb->node_cap;
-    rb->pool_alloc++;
     return n;
 }
 
@@ -43,7 +43,6 @@ static rbuf_node_t *pool_pop(rbuf_t *rb) {
     if (!n)
         return node_alloc(rb);
     rb->free = n->next;
-    rb->pool_free--;
     n->next = NULL;
     n->len  = 0;    /* 复位：可能来自已满节点 */
     return n;
@@ -53,7 +52,6 @@ static void pool_push(rbuf_t *rb, rbuf_node_t *n) {
     n->next = rb->free;
     n->len  = 0;
     rb->free = n;
-    rb->pool_free++;
 }
 
 /*-------------------------------------------------------------------------
@@ -69,9 +67,10 @@ int rbuf_init(rbuf_t *rb, uint32_t node_cap) {
 void rbuf_destroy(rbuf_t *rb) {
     rbuf_node_t *n, *nx;
 
-    /* 队列链（含保留段中未提交的新节点） */
+    /* 队列链 */
     for (n = rb->head; n; n = nx) { nx = n->next; free(n); }
-    for (n = rb->resv_head; n; n = nx) { nx = n->next; free(n); }
+    /* 在途保留节点（尚未入队，不在任何链上） */
+    if (rb->resv_node) free(rb->resv_node);
     /* 空闲链 */
     for (n = rb->free; n; n = nx) { nx = n->next; free(n); }
     memset(rb, 0, sizeof(*rb));
@@ -81,110 +80,65 @@ void rbuf_destroy(rbuf_t *rb) {
  *  生产侧
  *-------------------------------------------------------------------------*/
 
-int rbuf_reserve(rbuf_t *rb, struct iovec *iov, int max_iov) {
-    if (max_iov > (int)RBUF_MAX_IOV) max_iov = (int)RBUF_MAX_IOV;
-    if (max_iov < 1)                max_iov = 1;
-
-    int      cnt   = 0;
-    uint32_t total = 0;
-
-    /* 1) 队尾剩余空间（若队尾节点没写满） */
-    uint32_t tail_free = 0;
+int rbuf_reserve(rbuf_t *rb, char **base, uint32_t *cap) {
+    /* 1) 队尾还有剩余空间：直接给它，不取新节点 */
     if (rb->tail && rb->tail->len < rb->tail->cap) {
-        tail_free = rb->tail->cap - rb->tail->len;
-        iov[cnt].iov_base = rb->tail->data + rb->tail->len;
-        iov[cnt].iov_len  = tail_free;
-        total += tail_free;
-        cnt++;
+        uint32_t f = rb->tail->cap - rb->tail->len;
+        *base = rb->tail->data + rb->tail->len;
+        *cap  = f;
+        rb->resv_node = NULL;            /* NULL = 保留的是队尾剩余空间 */
+        rb->resv_cap  = f;
+        return 1;
     }
 
-    /* 2) 从池取新节点补齐段数 */
-    while (cnt < max_iov) {
-        rbuf_node_t *nd = pool_pop(rb);
-        if (!nd) break;                      /* 分配失败：给多少用多少 */
-        if (rb->resv_tail)
-            rb->resv_tail->next = nd;
-        else
-            rb->resv_head = nd;
-        rb->resv_tail = nd;
-        iov[cnt].iov_base = nd->data;
-        iov[cnt].iov_len  = rb->node_cap;
-        total += rb->node_cap;
-        cnt++;
+    /* 2) 队尾写满或为空：从池取一个新节点 */
+    rbuf_node_t *nd = pool_pop(rb);
+    if (!nd) {                           /* 池空且分配失败：OOM */
+        rb->resv_node = NULL;            /* 显式复位：不留上一次的保留态 */
+        rb->resv_cap  = 0;
+        return 0;
     }
-
-    rb->resv_tail_free = tail_free;          /* 记下 iov[0] 属队尾多少字节 */
-    rb->resv_cap       = total;
-    return cnt;
+    *base = nd->data;
+    *cap  = rb->node_cap;
+    rb->resv_node = nd;
+    rb->resv_cap  = rb->node_cap;
+    return 1;
 }
 
 void rbuf_commit(rbuf_t *rb, int got) {
-    /* 防御：负值（误把 recv 错误当结果提交）按 0 处理，保留段整体回池 */
+    /* 防御：负值（误把 recv 错误当结果提交）按 0 处理，保留段整体回池。
+     * resv_cap 同时是"有无在途保留"的判据 —— 无保留时它把 n 钳成 0，
+     * 本函数据此退化为 no-op（多余的 commit 不会凭空计数）。 */
     uint32_t n = (got < 0) ? 0u : (uint32_t)got;
     if (n > rb->resv_cap)
         n = rb->resv_cap;
 
-    /* 1) 先填队尾剩余（reserve 时暴露的那段） */
-    if (n && rb->resv_tail_free) {
-        uint32_t f = rb->tail->cap - rb->tail->len;
-        if (f > n) f = n;
-        rb->tail->len += f;
-        rb->len       += f;
-        n             -= f;
-    }
-
-    /* 2) 逐节点填满保留的新节点并链接入队（尾节点可为部分填充） */
-    while (n && rb->resv_head) {
-        rbuf_node_t *nd = rb->resv_head;
-        rb->resv_head = nd->next;
-        uint32_t f = rb->node_cap;
-        if (f > n) f = n;
-        nd->len  = f;
-        nd->next = NULL;
-        if (rb->tail)
-            rb->tail->next = nd;
-        else
-            rb->head = nd;
-        rb->tail = nd;
-        rb->len += f;
-        n       -= f;
-    }
-
-    /* 3) 没用上的新节点回池 */
-    while (rb->resv_head) {
-        rbuf_node_t *nd = rb->resv_head;
-        rb->resv_head = nd->next;
-        pool_push(rb, nd);
-    }
-    rb->resv_tail  = NULL;
-    rb->resv_tail_free = 0;
-    rb->resv_cap   = 0;
-}
-
-int rbuf_write(rbuf_t *rb, const void *data, uint32_t n) {
-    const char *src = (const char *)data;
-    uint32_t    rem = n;
-
-    while (rem) {
-        /* 队尾写满或空 → 取新节点 */
-        if (!rb->tail || rb->tail->len == rb->tail->cap) {
-            rbuf_node_t *nd = pool_pop(rb);
-            if (!nd) return -1;              /* 分配失败（可能已部分写入） */
+    if (rb->resv_node == NULL) {
+        /* 保留的是队尾剩余空间：填进去。n 已 ≤ 保留时的剩余容量，这里再按
+         * 当前剩余重算钳制 —— 契约若被破坏也只安全丢弃，不越界写坏账本。 */
+        if (n && rb->tail) {
+            uint32_t f = rb->tail->cap - rb->tail->len;
+            if (f > n) f = n;
+            rb->tail->len += f;
+            rb->len       += f;
+        }
+    } else {
+        rbuf_node_t *nd = rb->resv_node;
+        rb->resv_node = NULL;            /* 先摘除：下面两条路都已把它消化掉 */
+        if (n == 0) {
+            pool_push(rb, nd);           /* 没用上：回池 */
+        } else {
+            nd->len  = n;                /* n ≤ node_cap */
+            nd->next = NULL;
             if (rb->tail)
                 rb->tail->next = nd;
             else
                 rb->head = nd;
             rb->tail = nd;
+            rb->len += n;
         }
-        uint32_t f = rb->tail->cap - rb->tail->len;
-        if (f > rem) f = rem;
-        memcpy(rb->tail->data + rb->tail->len, src, f);
-        rb->tail->len += f;
-        rb->len       += f;
-        src += f;
-        rem -= f;
     }
-    return 0;
+    rb->resv_cap = 0;
 }
 
 /*-------------------------------------------------------------------------
@@ -193,14 +147,6 @@ int rbuf_write(rbuf_t *rb, const void *data, uint32_t n) {
 
 uint32_t rbuf_len(const rbuf_t *rb) {
     return rb->len;
-}
-
-int rbuf_peek(const rbuf_t *rb, const char **ptr, uint32_t *n) {
-    if (!rb->head || rb->head_off >= rb->head->len)
-        return 0;
-    *ptr = rb->head->data + rb->head_off;
-    *n   = rb->head->len - rb->head_off;
-    return 1;
 }
 
 uint32_t rbuf_copy(const rbuf_t *rb, uint32_t off, void *dst, uint32_t len) {
@@ -282,6 +228,15 @@ void rbuf_consume(rbuf_t *rb, uint32_t n) {
 }
 
 void rbuf_reset(rbuf_t *rb) {
+    /* 在途保留节点既不在队列也不在空闲链上，必须先归还 ——
+     * 连接槽位复用路径（conn_release 保留整个 rbuf_t 后重进本函数）若不清理，
+     * 该节点会在下次 reserve 覆盖 resv_node 后永久泄漏。 */
+    if (rb->resv_node) {
+        pool_push(rb, rb->resv_node);
+        rb->resv_node = NULL;
+    }
+    rb->resv_cap = 0;
+
     rbuf_node_t *nd = rb->head;
     while (nd) {
         rbuf_node_t *nx = nd->next;
@@ -292,16 +247,4 @@ void rbuf_reset(rbuf_t *rb) {
     rb->tail = NULL;
     rb->head_off = 0;
     rb->len      = 0;
-}
-
-/*-------------------------------------------------------------------------
- *  观测
- *-------------------------------------------------------------------------*/
-
-uint32_t rbuf_pool_free(const rbuf_t *rb) {
-    return rb->pool_free;
-}
-
-uint32_t rbuf_pool_alloc(const rbuf_t *rb) {
-    return rb->pool_alloc;
 }

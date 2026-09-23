@@ -88,6 +88,16 @@ void repl_incr_master_on_close(int fd) {
     g_slave_fd = -1;
 }
 
+/**
+ * 查询当前 streaming 从库连接 fd
+ *
+ * g_slave_fd 是本文件的 static 状态，引擎需要它在 drain 返回后判断
+ * "本连接刚刚被 master_enter_streaming 记成了从库链路"，见 repl.h 声明。
+ */
+int repl_incr_master_streaming_fd(void) {
+    return g_slave_fd;
+}
+
 /*=============================================================================
  *  PSYNC 握手处理
  *============================================================================*/

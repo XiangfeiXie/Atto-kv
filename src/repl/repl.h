@@ -256,6 +256,17 @@ dispatch_result_t repl_master_psync_handle(kvs_token_t *tokens, int argc, DynBuf
  */
 void repl_incr_master_on_close(int fd);
 
+/**
+ * 查询当前 streaming 从库连接 fd（无则 -1）
+ *
+ * 用途：引擎在自己那条连接上处理完 PSYNC 后，据此判断"本连接刚变成从库链路"，
+ * 从而把出站字节流的冲刷权收归自己（ntyco：改由不让出的 ticker 独占冲刷，
+ * 详见 src/net/ntyco.c 的 repl 段注释）。
+ *
+ * @return streaming 从库 fd；-1 = 无
+ */
+int repl_incr_master_streaming_fd(void);
+
 /*-------------------------------------------------------------------------
  *  Slave 侧接口
  *-------------------------------------------------------------------------*/

@@ -1,29 +1,38 @@
 // SPDX-License-Identifier: GPL-2.0
 /*=============================================================================
- *  repl-tcp_recvmsg.c — kprobe 镜像组件的用户态 loader（最小 demo）
+ *  repl-tcp_recvmsg.c — kprobe 镜像组件的用户态 loader
+ *
+ *  用法: repl-tcp_recvmsg [bpf.o]        （无参数即可启动）
  *
  *  用户态只做几件事：
- *    a) 加载 repl-tcp_recvmsg.bpf.o，把 kprobe/kretprobe 挂到
- *       tcp_recvmsg_locked，并把目标 master PID 写入 cfg map（tgid 过滤）；
- *    b) 开一个普通 TCP socket 连从机，把 ring 里镜像到的字节写过去；
- *    c) 读掉从机的 +OK 应答（见 drain_responses 注释，关键）；
- *    d) 每秒打印生产/消费速率统计（produced map vs 本进程消费字节数）。
+ *    a) 定位目标：按固定端口 MASTER_PORT（repl-tcp_recvmsg.h）找到监听它的
+ *       socket inode，再找持有该 inode 的进程。**不解析 conf、不传 PID** ——
+ *       端口写死一个宏就够了，原先那套从 conf 抠 port 的解析是多余的。
+ *    b) 定位 bpf.o：默认取可执行文件同目录（/proc/self/exe 推导），argv 可覆盖。
+ *    c) 加载 BPF，挂 kprobe/kretprobe 到 tcp_recvmsg_locked，把目标 PID 写进
+ *       cfg map（tgid 过滤）。
+ *    d) 开普通 TCP socket 连从机，把 ring 里镜像到的字节转发过去，并读掉
+ *       从机的 +OK 应答（见 drain_responses，关键）。
+ *    e) 按 seq 核对顺序：对不上就报错退出（见下）。
  *
- *  用法: repl-tcp_recvmsg <master-pid> [repl-tcp_recvmsg.bpf.o]
+ *  运行期不周期打印，只在退出时打一次汇总（附属组件不需要周期打印）。
  *
- *  顺序保证：镜像点是内核把 TCP 重组好的字节拷进应用缓冲那一刻，字节本身已
- *  按序无重复，消费侧只需按记录序拼接转发。BPF 给每条记录打全局单调 seq，
- *  本进程按序核对——seq 不连续说明 ring 跨 CPU 乱序（master 线程在 CPU 间迁
- *  移）或丢采样，直接报错退出（fail-closed，不静默错序）。演示用
- *  `taskset -c N` 固定 master 到单 CPU 即可保证不乱序。
+ *  顺序保证：**master 必须 taskset 固定到单核**。
+ *    ring 是 per-CPU 的，libbpf 按 subring 下标顺序排空。master 单线程又被钉
+ *    在一个核上 → 所有记录只进那一个 subring → 到达序 == 排空序，顺序是结构性
+ *    成立的。一旦跨核迁移，"先到的记录进了 CPU3 的 subring、后到的进了 CPU0"
+ *    就会出现，而排空是 0 排在 3 前面 —— 顺序就翻了，从库跟着错位。
+ *    这里不做重排：乱序在定义上是罕见事件，写出来的重排路径几乎不会被走到，
+ *    等于往"一个字节都不许错"的数据面上放一段没被测过的代码。只按 BPF 打的
+ *    全局单调 seq 核对（每条记录都走，是热路径），对不上立刻报错退出并提示
+ *    固定单核。镜像宁可停，不可错。
  *
  *  背压设计（ring → 待发缓冲 → socket）：
  *    - socket 非阻塞，ring 每条记录只追加进 g_pend 待发缓冲，绝不在事件回调
  *      里阻塞 → ring 永远即时消费，BPF 采样永不丢弃。
  *    - 每轮循环先尽力 flush g_pend（写不出就下次再写），再 drain 从机应答。
  *      若只发不读，从机 +OK 会把本端 rcvbuf 撑满 → 窗口 0 → 从机写不出去 →
- *      从机停摆（实测死锁，XDP 版踩过）。从机跟不上时 g_pend 增长，demo 规模
- *      有界。
+ *      从机停摆（实测死锁，XDP 版踩过）。
  *============================================================================*/
 
 #include <stdio.h>
@@ -33,12 +42,11 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <dirent.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <poll.h>
-#include <time.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
@@ -47,21 +55,24 @@
 /* Ring 记录头（与 BPF 侧逐字节一致：16B 头 + 变长负载） */
 struct tcp_rec {
     unsigned long long seq;      /* 全局单调记录序号 */
-    unsigned int len;            /* 负载字节数 */
+    unsigned int len;            /* 负载字节数；0 = 毒丸，见 on_event */
     unsigned int __pad;
 };
+
+static const char BPF_OBJ_NAME[] = "repl-tcp_recvmsg.bpf.o";
 
 static volatile int g_run = 1;
 static int g_sock = -1;                 /* 到从机的连接 */
 static unsigned long g_mirrored = 0;    /* 已写入从机的镜像字节数 */
 
-/* 速率监测：本进程从 ring 消费的字节数/记录数（口径 = 记录 size = 16B 头 +
- * 负载，与 BPF produced map 逐字节一致 → 每秒差分两者即生产/消费速率）。 */
-static unsigned long g_cons_bytes = 0;
+/* 统计：本进程从 ring 消费的记录条数。退出时汇总一次。 */
 static unsigned long g_cons_recs = 0;
 
 /* 顺序核对：下一个应到记录序号（BPF 从 0 起、每成功进 ring 一条 +1） */
 static unsigned long long g_expect_seq = 0;
+
+/* BPF 侧丢采样计数 map 的 fd（<0 = 没找到，读值兜底为 0），seq 报错时区分成因 */
+static int g_drops_fd = -1;
 
 static struct bpf_link *g_link_ent = NULL;
 static struct bpf_link *g_link_ret = NULL;
@@ -70,6 +81,27 @@ static void on_sigint(int sig)
 {
     (void)sig;
     g_run = 0;
+}
+
+/* 读 per-CPU u64 计数并跨 CPU 求和（drops 用）。
+ * per-CPU map 的 LOOKUP_ELEM 会写 value_size*可用CPU数 字节到用户 buffer
+ * （只给 8 字节会越界踩栈，历史 bug），必须按 libbpf_num_possible_cpus()
+ * 分配数组再逐 CPU 求和。map_fd 无效时返回 0。 */
+static unsigned long read_percpu_sum(int map_fd)
+{
+    __u32 zero = 0;
+    int nr_cpus = libbpf_num_possible_cpus();
+    if (nr_cpus <= 0 || map_fd < 0)
+        return 0;
+    __u64 *vals = calloc((size_t)nr_cpus, sizeof(__u64));
+    if (!vals)
+        return 0;
+    unsigned long sum = 0;
+    if (bpf_map_lookup_elem(map_fd, &zero, vals) == 0)
+        for (int i = 0; i < nr_cpus; i++)
+            sum += (unsigned long)vals[i];
+    free(vals);
+    return sum;
 }
 
 /*=============================================================================
@@ -97,10 +129,9 @@ static void pend_append(const void *data, size_t len)
         g_pend_peak = g_pend_len - g_pend_head;
 }
 
-static FILE *g_tee;    /* 诊断：REPL_TCP_RECV_TEE 指向的文件，写入的字节同步落盘 */
-
-/* 尽力把待发缓冲写进 socket（写不出 EAGAIN 就留到下次） */
-static void pend_flush(void)
+/* 尽力把待发缓冲写进 socket（写不出 EAGAIN 就留到下次）。
+ * 返回 0 = 还能再试（写完了，或只是暂时写不动），-1 = 从机已断，再试没意义。 */
+static int pend_flush(void)
 {
     while (g_pend_head < g_pend_len) {
         ssize_t n = write(g_sock, g_pend + g_pend_head,
@@ -108,19 +139,18 @@ static void pend_flush(void)
         if (n > 0) {
             g_pend_head += (size_t)n;
             g_mirrored += (size_t)n;
-            if (g_tee)
-                fwrite(g_pend + g_pend_head - (size_t)n, 1, (size_t)n, g_tee);
             continue;
         }
         if (n < 0 && errno == EINTR)
             continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-            return;                     /* 内核发送缓冲满，下次再发 */
+            return 0;                   /* 内核发送缓冲满，下次再发 */
         fprintf(stderr, "[sock] write: %s（从机可能已断）\n", strerror(errno));
         g_run = 0;
-        return;
+        return -1;
     }
     g_pend_head = g_pend_len = 0;       /* 腾空复用 */
+    return 0;
 }
 
 /*=============================================================================
@@ -163,24 +193,163 @@ static void drain_responses(void)
 static int on_event(void *ctx, void *data, size_t size)
 {
     (void)ctx;
+    /* size 不判界：BPF 侧 reserve 的就是 sizeof(rec) + len（见 .bpf.c 的
+     * emit_rec），故 size 恒等于 16 + rec->len，没有越界可防 */
+    (void)size;
     const struct tcp_rec *rec = data;
-    if (size < sizeof(*rec))
+
+    g_cons_recs++;
+
+    if (rec->len == 0) {
+        /* 毒丸：BPF 侧只有 bpf_probe_read_user 失败才会发出 len=0。正常路径
+         * ret > 0 保证 len 恒 > 0。少一段字节 = 从库永久错位，必须停。 */
+        fprintf(stderr, "[mirror] 收到 len=0 的非法记录（用户内存读取失败）"
+                        "—— 镜像流已不完整，fail-closed 退出\n");
+        g_run = 0;
         return 0;
-    g_cons_bytes += size;                /* 消费字节（= BPF produced 同口径） */
-    g_cons_recs++;                       /* 消费记录条数 */
-    if (rec->len > size - sizeof(*rec))
-        return 0;                        /* 坏记录：防御性跳过 */
+    }
+    if (rec->len > size - sizeof(*rec)) {
+        fprintf(stderr, "[mirror] 记录长度 %u 超过实际 %zu\n",
+                rec->len, size - sizeof(*rec));
+        g_run = 0;
+        return 0;
+    }
+
+    /* 顺序核对：BPF 每成功进 ring 一条记录就把全局 seq +1，所以这里必须严格
+     * 连续。对不上只有两种成因，且都意味着镜像流已经不可信：
+     *   ① 丢采样 > 0 —— ring 满或记录越界，那一条永久没进 ring；
+     *   ② 丢采样 = 0 —— master 线程跨了 CPU，记录落进不同 subring，
+     *      libbpf 按 subring 下标排空把到达序打乱了。
+     * 不重排、不跳过、不续传，直接停：宁可停，不可错。 */
     if (rec->seq != g_expect_seq) {
         fprintf(stderr,
-                "[mirror] seq 乱序：期望 %llu 实际 %llu ——"
-                " master 线程在 CPU 间迁移？用 taskset 固定 master 后重跑\n",
-                g_expect_seq, rec->seq);
+                "[mirror] seq 不连续：期望 %llu 实际 %llu（BPF ring 丢采样 %lu "
+                "条）\n"
+                "[mirror] 丢采样为 0 则说明 master 跨了 CPU —— 用 "
+                "taskset -c N 固定 master 单核后重跑\n"
+                "[mirror] 镜像流已不完整，fail-closed 退出\n",
+                g_expect_seq, rec->seq, read_percpu_sum(g_drops_fd));
         g_run = 0;
         return 0;
     }
     g_expect_seq++;
+
     pend_append((const unsigned char *)data + sizeof(*rec), rec->len);
     return 0;
+}
+
+/*=============================================================================
+ *  自动定位
+ *============================================================================*/
+
+/* 在 /proc/net/tcp{,6} 里找监听 <port> 的 socket inode（找不到返回 0） */
+static unsigned long listen_inode(unsigned short port)
+{
+    static const char *files[] = { "/proc/net/tcp", "/proc/net/tcp6" };
+
+    for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        FILE *f = fopen(files[i], "r");
+        char line[512];
+        if (!f)
+            continue;
+
+        while (fgets(line, sizeof(line), f)) {
+            /* sl local_address rem_address st tx:rx tr:tm retrnsmt uid timeout inode
+             * 只取 local_address / st / inode，其余字段用 %* 吞掉（rem_address 之类
+             * 此前也读进了一个缓冲区，但从来没被用过）。 */
+            char local[128];
+            unsigned int st;
+            unsigned long ino;
+
+            if (sscanf(line, " %*d: %127s %*127s %x %*s %*s %*s %*u %*u %lu",
+                       local, &st, &ino) != 3)
+                continue;
+            if (st != 0x0A)             /* TCP_LISTEN */
+                continue;
+            char *colon = strrchr(local, ':');
+            if (colon && (unsigned short)strtoul(colon + 1, NULL, 16) == port) {
+                fclose(f);
+                return ino;
+            }
+        }
+        fclose(f);
+    }
+    return 0;
+}
+
+/* 扫 /proc 下每个进程的 fd 目录，找持有该 socket inode 的进程（-1 = 没找到）。
+ * 读别人的 fd 目录要 root —— 本组件加载 BPF 本来就要 root。 */
+static long pid_of_inode(unsigned long inode)
+{
+    char want[64];
+    snprintf(want, sizeof(want), "socket:[%lu]", inode);
+
+    DIR *pd = opendir("/proc");
+    if (!pd)
+        return -1;
+
+    long found = -1;
+    struct dirent *pe;
+    while (found < 0 && (pe = readdir(pd))) {
+        if (pe->d_name[0] < '0' || pe->d_name[0] > '9')
+            continue;
+
+        char fddir[300];
+        snprintf(fddir, sizeof(fddir), "/proc/%s/fd", pe->d_name);
+        DIR *fd = opendir(fddir);
+        if (!fd)
+            continue;                   /* 读不到（别人的进程）就跳过 */
+
+        struct dirent *fe;
+        while ((fe = readdir(fd))) {
+            char link[320], tgt[512];
+            /* fddir 最长 299、fd 名最长 255，合起来可能撑爆 link。截断的路径
+             * readlink 必然失败，直接跳过，不拿半截路径去撞 */
+            int w = snprintf(link, sizeof(link), "%s/%s", fddir, fe->d_name);
+            if (w < 0 || w >= (int)sizeof(link))
+                continue;
+            ssize_t n = readlink(link, tgt, sizeof(tgt) - 1);
+            if (n <= 0)
+                continue;
+            tgt[n] = '\0';
+            if (strcmp(tgt, want) == 0) {
+                found = atol(pe->d_name);
+                break;
+            }
+        }
+        closedir(fd);
+    }
+    closedir(pd);
+    return found;
+}
+
+/* 定位 bpf.o：可执行文件同目录 → 当前目录。
+ * 用 /proc/self/exe 推导而不是写死路径 —— CMake 把可执行文件和 .o 产在同一个
+ * build/ 下，这个关系挪目录、换机器、换用户都成立；写死绝对路径一换就废。 */
+static const char *find_bpf_obj(const char *argv_path, char *buf, size_t cap)
+{
+    char exe[512];
+
+    if (argv_path)
+        return argv_path;
+
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) {
+        exe[n] = '\0';
+        char *slash = strrchr(exe, '/');
+        if (slash) {
+            *slash = '\0';
+            /* exe 最长 511，加 "/" 和 22 字节的 bpf.o 名可能超 cap。截断的
+             * 路径 access 必失败，跳过这个候选，落到下面的 ./ 分支 */
+            int w = snprintf(buf, cap, "%s/%s", exe, BPF_OBJ_NAME);
+            if (w > 0 && (size_t)w < cap && access(buf, R_OK) == 0)
+                return buf;
+        }
+    }
+    snprintf(buf, cap, "./%s", BPF_OBJ_NAME);
+    if (access(buf, R_OK) == 0)
+        return buf;
+    return NULL;
 }
 
 /*=============================================================================
@@ -223,65 +392,85 @@ static int connect_slave(void)
     return fd;
 }
 
-/* 读 per-CPU u64 计数并跨 CPU 求和（produced / drops 同构）。
- * per-CPU map 的 LOOKUP_ELEM 会写 value_size*可用CPU数 字节到用户 buffer
- * （只给 8 字节会越界踩栈，历史 bug），必须按 libbpf_num_possible_cpus()
- * 分配数组再逐 CPU 求和。map_fd 无效时返回 0。 */
-static unsigned long read_percpu_sum(int map_fd)
+static void usage(const char *argv0)
 {
-    __u32 zero = 0;
-    int nr_cpus = libbpf_num_possible_cpus();
-    if (nr_cpus <= 0)
-        return 0;
-    __u64 *vals = calloc((size_t)nr_cpus, sizeof(__u64));
-    if (!vals)
-        return 0;
-    unsigned long sum = 0;
-    if (bpf_map_lookup_elem(map_fd, &zero, vals) == 0)
-        for (int i = 0; i < nr_cpus; i++)
-            sum += (unsigned long)vals[i];
-    free(vals);
-    return sum;
+    fprintf(stderr,
+            "用法: %s [repl-tcp_recvmsg.bpf.o]\n"
+            "  master 进程按固定端口 %d 反查（见 repl-tcp_recvmsg.h 的 "
+            "MASTER_PORT），无需传 conf 或 PID；\n"
+            "  bpf.o 省略则取可执行文件同目录下的 %s。\n"
+            "\n"
+            "注意：master 必须固定到单核（taskset -c N ./kvstore <conf>），\n"
+            "      否则 ring 跨 CPU 乱序，本组件会 fail-closed 退出。\n",
+            argv0, MASTER_PORT, BPF_OBJ_NAME);
 }
 
 int main(int argc, char **argv)
 {
-    if (argc < 2) {
-        fprintf(stderr,
-                "用法: %s <master-pid> [repl-tcp_recvmsg.bpf.o]\n"
-                "  master-pid 目标 kvstore master 进程 PID（每次换进程传）\n"
-                "  提示：用 taskset 固定 master 到单 CPU 保证 ring 顺序\n",
-                argv[0]);
+    if (argc > 2) {
+        usage(argv[0]);
         return 1;
     }
-    long target_pid = atol(argv[1]);
+
+    /* ---- 1. 定位目标 master PID：固定端口 → 监听它的 socket inode → 属主进程 ---- */
+    unsigned long ino = listen_inode(MASTER_PORT);
+    if (!ino) {
+        fprintf(stderr, "[main] 没有进程在监听端口 %d（master 起了吗？）\n",
+                MASTER_PORT);
+        return 1;
+    }
+    long target_pid = pid_of_inode(ino);
     if (target_pid <= 0) {
-        fprintf(stderr, "无效 master pid: %s\n", argv[1]);
+        fprintf(stderr, "[main] 端口 %d 的属主进程找不到（需要 root 读 "
+                        "/proc/*/fd）\n", MASTER_PORT);
         return 1;
     }
-    const char *bpf_path = (argc > 2) ? argv[2] : "repl-tcp_recvmsg.bpf.o";
+    fprintf(stderr, "[main] port %d → pid %ld\n", MASTER_PORT, target_pid);
+
+    /* ---- 2. 定位 bpf.o ---- */
+    char obj_buf[512];
+    const char *bpf_path = find_bpf_obj(argc > 1 ? argv[1] : NULL,
+                                        obj_buf, sizeof(obj_buf));
+    if (!bpf_path) {
+        fprintf(stderr, "[main] 找不到 %s（放在可执行文件同目录，或用命令行"
+                        "参数指定）\n", BPF_OBJ_NAME);
+        return 1;
+    }
 
     signal(SIGINT, on_sigint);
     signal(SIGPIPE, SIG_IGN);           /* 从机断连时 write 触发 EPIPE 而非自杀 */
 
-    const char *tee_path = getenv("REPL_TCP_RECV_TEE");
-    if (tee_path)
-        g_tee = fopen(tee_path, "wb");
-
-    /* 1. 打开 + 加载 BPF 对象 */
+    /* ---- 3. 打开 + 加载 BPF 对象 ---- */
     struct bpf_object *obj = bpf_object__open_file(bpf_path, NULL);
     if (!obj) {
         fprintf(stderr, "[bpf] open %s: %s\n", bpf_path, strerror(errno));
         return 1;
     }
     if (bpf_object__load(obj)) {
-        fprintf(stderr, "[bpf] load 失败\n");
+        fprintf(stderr, "[bpf] load 失败（需要 root / CAP_BPF，且 memlock 要够）\n");
+        bpf_object__close(obj);
+        return 1;
+    }
+    fprintf(stderr, "[bpf] 已加载 %s (tgid=%ld)\n", bpf_path, target_pid);
+
+    /* ---- 4. 先写 cfg 再挂探针：反过来的话探针已开、cfg 还是 0，那一小段
+     *         窗口里的读会被 tgid 过滤挡掉，白丢字节 ---- */
+    int cfg_fd = bpf_object__find_map_fd_by_name(obj, "cfg");
+    if (cfg_fd < 0) {
+        fprintf(stderr, "[bpf] 找不到 cfg map\n");
+        bpf_object__close(obj);
+        return 1;
+    }
+    __u32 key0 = 0;
+    __u64 pid = (__u64)target_pid;
+    if (bpf_map_update_elem(cfg_fd, &key0, &pid, BPF_ANY) != 0) {
+        fprintf(stderr, "[bpf] cfg map 写入失败: %s\n", strerror(errno));
         bpf_object__close(obj);
         return 1;
     }
 
-    /* 2. 挂 kprobe/kretprobe 到 tcp_recvmsg_locked（TCP 读路径统一收口，
-     *    同时覆盖 reactor 的 recvmsg 与 proactor 的 io_uring_recvmsg） */
+    /* ---- 5. 挂 kprobe/kretprobe 到 tcp_recvmsg_locked（TCP 读路径统一收口，
+     *         同时覆盖 reactor 的 recv 与 proactor 的 io_uring_prep_recv） ---- */
     struct bpf_program *p_ent =
         bpf_object__find_program_by_name(obj, "kprobe_tcp_recvmsg_locked");
     struct bpf_program *p_ret =
@@ -306,22 +495,8 @@ int main(int argc, char **argv)
         bpf_object__close(obj);
         return 1;
     }
-    fprintf(stderr, "[bpf] 已挂 tcp_recvmsg_locked (tgid=%ld)\n", target_pid);
 
-    /* 3. 写入目标 master PID → cfg map（BPF 侧按 tgid 过滤） */
-    int cfg_fd = bpf_object__find_map_fd_by_name(obj, "cfg");
-    if (cfg_fd < 0) {
-        fprintf(stderr, "[bpf] 找不到 cfg map\n");
-        return 1;
-    }
-    __u32 key0 = 0;
-    __u64 pid = (__u64)target_pid;
-    if (bpf_map_update_elem(cfg_fd, &key0, &pid, BPF_ANY) != 0) {
-        fprintf(stderr, "[bpf] cfg map 写入失败: %s\n", strerror(errno));
-        return 1;
-    }
-
-    /* 4. 连从机 */
+    /* ---- 6. 连从机 ---- */
     g_sock = connect_slave();
     if (g_sock < 0) {
         bpf_link__destroy(g_link_ent);
@@ -330,7 +505,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* 5. ring 消费者 */
+    /* ---- 7. ring 消费者 ---- */
     int rb_fd = bpf_object__find_map_fd_by_name(obj, "events");
     if (rb_fd < 0) {
         fprintf(stderr, "[bpf] 找不到 events map\n");
@@ -342,68 +517,41 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* 速率监测用的两个 per-CPU 计数 map（fd<0 时 read_percpu_sum 兜底为 0） */
-    int prod_fd  = bpf_object__find_map_fd_by_name(obj, "produced");
-    int drops_fd = bpf_object__find_map_fd_by_name(obj, "drops");
+    /* 丢采样计数 map（fd<0 时 read_percpu_sum 兜底为 0） */
+    g_drops_fd = bpf_object__find_map_fd_by_name(obj, "drops");
 
     fprintf(stderr, "[mirror] 开始镜像（Ctrl-C 退出）\n");
 
-    /* 每秒统计：生产速率（BPF produced）vs 消费速率（本进程）。
-     * 口径统一为 ring 记录字节：produced/consumed 累计差 = ring 未消费存量。
-     * 消费 work-conserving，稳态两者秒差应≈0；backlog>0 表示 ring 积压，
-     * drops>0 才真正丢采样。 */
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    long long stat_ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-    unsigned long prod_base  = prod_fd  >= 0 ? read_percpu_sum(prod_fd)  : 0;
-    unsigned long cons_base  = g_cons_bytes;
-    unsigned long recs_base  = g_cons_recs;
-
     while (g_run) {
-        ring_buffer__poll(rb, 20);          /* 消费 ring → 进待发缓冲 */
-        pend_flush();                       /* 尽力发往从机 */
-        drain_responses();                  /* 读掉从机应答，绝不让它堵 */
-
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        long long now_ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-        if (now_ms - stat_ms >= 1000) {
-            double dt = (now_ms - stat_ms) / 1000.0;
-            unsigned long prod  = prod_fd  >= 0 ? read_percpu_sum(prod_fd)  : 0;
-            unsigned long drops = drops_fd >= 0 ? read_percpu_sum(drops_fd) : 0;
-            long long d_prod = (long long)(prod - prod_base);
-            long long d_cons = (long long)(g_cons_bytes - cons_base);
-            fprintf(stderr,
-                    "[stat] prod=%8.2f MB/s  cons=%8.2f MB/s  "
-                    "backlog=%+7.1f KB  drops=%lu  recs=%lu/s\n",
-                    d_prod / dt / (1024.0 * 1024.0),
-                    d_cons / dt / (1024.0 * 1024.0),
-                    (double)(d_prod - d_cons) / 1024.0,
-                    drops,
-                    (unsigned long)((g_cons_recs - recs_base) / dt));
-            stat_ms = now_ms;
-            prod_base = prod;
-            cons_base = g_cons_bytes;
-            recs_base = g_cons_recs;
-        }
+        ring_buffer__poll(rb, 20);      /* 消费 ring → 顺序核对 → 待发缓冲 */
+        pend_flush();                   /* 尽力发往从机 */
+        drain_responses();              /* 读掉从机应答，绝不让它堵 */
     }
 
-    /* 6. 清理 + 统计 */
+    /* ---- 8. 收尾：Ctrl-C 不该吞掉已经采到的镜像，把待发缓冲剩下的尽力冲完。
+     *         socket 是非阻塞的，写不动就等一会儿再试，最多 2s ---- */
+    for (int i = 0; i < 200 && g_pend_len > g_pend_head; i++) {
+        if (pend_flush() < 0)
+            break;                      /* 从机断了，再等也没用 */
+        if (g_pend_len > g_pend_head)
+            usleep(10 * 1000);
+    }
+
+    /* ---- 9. 清理 + 一次性汇总 ---- */
     ring_buffer__free(rb);
     close(g_sock);
     bpf_link__destroy(g_link_ret);
     bpf_link__destroy(g_link_ent);
 
-    unsigned long drops = drops_fd >= 0 ? read_percpu_sum(drops_fd) : 0;
-    unsigned long prod  = prod_fd  >= 0 ? read_percpu_sum(prod_fd)  : 0;
+    unsigned long drops = read_percpu_sum(g_drops_fd);
 
-    if (g_tee)
-        fclose(g_tee);
     bpf_object__close(obj);
 
-    fprintf(stderr, "[mirror] 退出：镜像 %lu 字节，待发峰值 %lu 字节，"
-            "BPF ring 丢采样 %lu 条\n"
-            "[mirror] 统计：生产总计 %lu 字节，消费总计 %lu 字节"
-            "（差 = ring 残留存量）\n",
-            g_mirrored, g_pend_peak, drops, prod, g_cons_bytes);
-    return 0;
+    /* "还剩多少没送出去"直接读待发缓冲的未读尾部，不再维护两套字节账去相减 */
+    fprintf(stderr,
+            "[mirror] 退出：镜像 %lu 字节（%lu 条记录），待发峰值 %lu 字节，"
+            "退出时还剩 %zu 字节没送出去，BPF ring 丢采样 %lu 条\n",
+            g_mirrored, g_cons_recs, g_pend_peak,
+            g_pend_len - g_pend_head, drops);
+    return g_run ? 0 : 1;
 }

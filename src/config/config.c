@@ -46,6 +46,8 @@ static void config_default(void) {
     kvs_config.network_model = NET_REACTOR;    /* 默认 Reactor */
     kvs_config.maxclients    = 10000;          /* 最大 10000 客户端 */
     kvs_config.kv_pool_enabled = 1;            /* 数据域内存池默认开启（与原编译期默认一致） */
+    strncpy(kvs_config.storage_engine, "hash",
+            sizeof(kvs_config.storage_engine) - 1);   /* 存储引擎默认哈希 */
     strncpy(kvs_config.aof_fsync_policy, "everysec", sizeof(kvs_config.aof_fsync_policy) - 1);
 
     /* 复制配置 */
@@ -215,6 +217,18 @@ int config_load(const char *path) {
             int v = parse_bool(val, lineno, "kv_pool");
             if (v >= 0) kvs_config.kv_pool_enabled = v;
 
+        } else if (strcasecmp(key, "engine") == 0) {
+            /* 存储引擎（须在 init_kvengine 选中前生效）；名单与
+             * kv_engine_select 保持一份，这里只做拼写校验 */
+            if (strcasecmp(val, "hash")     == 0 ||
+                strcasecmp(val, "array")    == 0 ||
+                strcasecmp(val, "rbtree")   == 0 ||
+                strcasecmp(val, "skiplist") == 0) {
+                strncpy(kvs_config.storage_engine, val,
+                        sizeof(kvs_config.storage_engine) - 1);
+            } else printf("[CONFIG] line %d: unknown engine '%s' "
+                          "(expected hash|array|rbtree|skiplist)\n", lineno, val);
+
         /*-------------------------------------------------------------------
          *  复制配置
          *-------------------------------------------------------------------*/
@@ -289,10 +303,11 @@ void config_print(void) {
            "  KVStore 10.0 — Configuration\n"
            "========================================\n"
            "  Service   : 0.0.0.0:%-5d  maxclients=%d\n"
-           "  Engine    : dict        persistence=%s  pool=%s\n"
+           "  Engine    : %-12s persistence=%s  pool=%s\n"
            "  Network   : %s\n",
            kvs_config.port,
            kvs_config.maxclients,
+           kvs_config.storage_engine,   /* 按配置原样显示；选不中时 init_kvengine 回退 hash */
            persist[kvs_config.persist_mode],
            kvs_config.kv_pool_enabled ? "on" : "off",
            netmod[kvs_config.network_model]);
@@ -306,16 +321,18 @@ void config_print(void) {
                role, kvs_config.fullsync_transport,
                kvs_config.incr_sync ? "on" : "off");
         if (kvs_config.repl_role == REPL_ROLE_MASTER) {
+            /* 本端监听端口 = kvs_config.port；master_port 是从库侧字段，此处不可用 */
             printf("    Service port : %d  (PSYNC 握手, +FULLRESYNC 驱动全量)\n"
                    "    Fullsync     : %s:%d  (数据端口, 两种传输共用)\n",
-                   kvs_config.master_port,
+                   kvs_config.port,
                    kvs_config.fullsync_listen_ip,
                    kvs_config.fullsync_port);
         } else {
+            /* 主端握手端口 = master_port；kvs_config.port 是本从库自己的端口 */
             printf("    Master       : %s:%d  (PSYNC 握手, +FULLRESYNC 驱动全量)\n"
                    "    Fullsync     : %s:%d  (数据端口, 两种传输共用)\n",
                    kvs_config.fullsync_master_ip,
-                   kvs_config.port,
+                   kvs_config.master_port,
                    kvs_config.fullsync_master_ip,
                    kvs_config.fullsync_port);
         }

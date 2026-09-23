@@ -61,11 +61,6 @@ typedef struct {
     DynBuf  write_buf;          /* 写缓冲：待发送的响应数据 */
     int     w_off;              /* 写缓冲已发送偏移（未压缩） */
 
-    /* io_uring recvmsg 的 msghdr/iovec：须存活到 CQE 完成（单连接同一时刻仅一个
-     * recv 在飞），per-conn 持久复用，热路径零分配 */
-    struct iovec iov[RBUF_MAX_IOV];
-    struct msghdr msg;
-
     /* 状态控制 */
     int     status;             /* 标记需要关闭（QUIT / 协议错误），发完再关 */
     uint8_t event;              /* 在飞 I/O 掩码：EV_RECV/EV_SEND（可并存） */
@@ -160,35 +155,32 @@ static void conn_pool_destroy(void) {
 
 /**
  * 提交 recv SQE（非阻塞）
- * 读缓冲唯一形态 = rbuf 节点队列（与 reactor 同构）：rbuf_reserve 暴露现有队尾
- * 空闲空间 + 池新节点的 iovec[]，io_uring_recvmsg 多段 gather 直灌节点内存（零
- * 拷贝）；收到字节数由 handle_read 的 rbuf_commit 入队。
- * msghdr/iovec 为 per-conn 持久（conn_t 字段），存活到 CQE 完成；单连接同一时刻
- * 仅一个 recv 在飞，字段复用安全。
+ * 读缓冲唯一形态 = rbuf 节点队列（与 reactor/ntyco 同构）：rbuf_reserve 暴露
+ * 一段连续可写空间，io_uring_prep_recv 直灌节点内存（零拷贝）；收到字节数由
+ * handle_read 的 rbuf_commit 入队。
+ * 缓冲区生命周期：base 指向的节点在本 SQE 在飞期间由 rbuf 保留（既未链入队列、
+ * 也不在空闲池），而单连接同一时刻仅一个 recv 在飞，故存活到 CQE 安全。
  * @param c 连接对象
- * @return 0 成功，-1 失败（池空且新节点分配失败/无 SQE；已配对 rbuf_commit(0)）
+ * @return 0 成功，-1 失败（池空且新节点分配失败 / 无 SQE，后者已配对 commit(0)）
  */
 static int arm_recv(conn_t *c) {
     /* 前置检查：连接活跃、未在飞、未标记关闭 */
     if (!c->active || (c->event & EV_RECV) || c->status)
         return 0;
 
-    /* 取可写段（现有 tail 空闲 + 池新节点）；reserve 后必须 commit 配对 */
-    int nseg = rbuf_reserve(&c->rq, c->iov, RBUF_MAX_IOV);
-    if (nseg <= 0) return -1;      /* 池空且新节点分配失败：OOM */
+    /* 取一段可写空间；reserve 后必须 commit 配对 */
+    char    *base;
+    uint32_t cap;
+    if (rbuf_reserve(&c->rq, &base, &cap) != 1)
+        return -1;                 /* 池空且新节点分配失败：OOM，未产生保留 */
 
-    /* 组装 msghdr（recvmsg 一次灌多段） */
-    memset(&c->msg, 0, sizeof(c->msg));
-    c->msg.msg_iov    = c->iov;
-    c->msg.msg_iovlen = (size_t)nseg;
-
-    /* 获取 SQE 并提交 recvmsg 请求 */
+    /* 获取 SQE 并提交 recv 请求 */
     struct io_uring_sqe *sqe = io_uring_get_sqe(&g_ring);
     if (!sqe) {
         rbuf_commit(&c->rq, 0);    /* 归还保留段（reserve/commit 硬约定） */
         return -1;
     }
-    io_uring_prep_recvmsg(sqe, c->fd, &c->msg, 0);
+    io_uring_prep_recv(sqe, c->fd, base, cap, 0);
     sqe->user_data = ((uint64_t)TYPE_RECV << 32) | (uint32_t)c->fd;
     c->event |= EV_RECV;           /* 标记在飞 */
     return 0;
@@ -292,7 +284,7 @@ static void handle_accept(struct io_uring_cqe *cqe) {
 /**
  * 处理读完成事件
  * 核心逻辑：
- * 1. recvmsg 直灌节点内存，收到字节经 rbuf_commit 入队（reserve/commit 配对收尾）
+ * 1. recv 直灌节点内存，收到字节经 rbuf_commit 入队（reserve/commit 配对收尾）
  * 2. 调用业务处理器（kvs_rbuf_drain_fn）解析并消费缓冲中的完整命令
  * 3. 串行模型：有回复先 arm send，send 完成后再 arm 下一次读
  * 4. 同一连接上 recv 与 send 不同时在飞

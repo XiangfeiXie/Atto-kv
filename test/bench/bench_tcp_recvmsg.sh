@@ -1,13 +1,9 @@
 #!/bin/bash
 # =============================================================================
-# bench_tcp_recvmsg.sh — repl-tcp_recvmsg 组件开/关的 SET QPS
+# bench_tcp_recvmsg.sh — repl-tcp_recvmsg 组件的 SET QPS
 #
 # 在项目根目录执行（主机 192.168.30.137；从机 192.168.30.136 需自己先起好）：
-#   ./test/bench/bench_tcp_recvmsg.sh 40          # P=40，开组件（默认）
-#   ./test/bench/bench_tcp_recvmsg.sh 40 off      # P=40，关组件
-#
-# 第二参数 off 用来取"没有组件"的基线。留这个口子也给以后对比直接 TCP 增量
-# 同步留位置，现在只管组件。
+#   ./test/bench/bench_tcp_recvmsg.sh 40          # P=40
 #
 # 主从都用 conf/kvstore-none.conf：repl_role off → 不挂复制回调、不 fork、
 # 不监听复制端口，主循环零复制开销。全程只有组件这一条增量同步。
@@ -16,7 +12,7 @@
 #   1. 清场：杀掉残留的 kvstore 与 repl-tcp_recvmsg
 #   2. 等从机就绪：轮询 PING，通了才往下走（从机由你手动起）
 #   3. 起 master（绑核 1）
-#   4. 按第二参数决定是否起组件（绑核 0）
+#   4. 起组件（绑核 0）
 #   5. 跑 redis-benchmark（绑核 3）
 #   6. 把起过的东西杀掉
 #
@@ -38,7 +34,6 @@
 # =============================================================================
 
 P=$1
-MIRROR=${2:-on}
 n=$((100000 * P))
 
 PORT=2000
@@ -46,14 +41,14 @@ SLAVE_IP=192.168.30.136
 WAIT=180                        # 等从机就绪的最长秒数
 SPW=1234                        # sudo 密码
 
-echo "=== P=$P  mirror=$MIRROR  n=$n ==="
+echo "=== P=$P  n=$n ==="
 
 echo "$SPW" | sudo -S -p '' pkill -x kvstore
-echo "$SPW" | sudo -S -p '' pkill -x repl-tcp_recvms   # 上轮没杀干净会污染 off 轮
+echo "$SPW" | sudo -S -p '' pkill -x repl-tcp_recvms   # 上轮没杀干净会污染这轮
 sleep 0.5
 
 # 等从机就绪。放在起 master 之前，好让 master 从启动到开压的间隔固定
-# （下面 1s + 1s），不因为你手起从机的快慢而飘——两臂要只差组件那一个进程。
+# （下面 1s + 1s），不因为你手起从机的快慢而飘。
 # 从机只起一次、跨多轮一直在，所以除了第一轮，这里都是瞬间通过。
 echo "等待从机 $SLAVE_IP:$PORT（先在那边用 kvstore-none.conf 起，最多 ${WAIT}s）..."
 for _ in $(seq "$WAIT"); do
@@ -69,16 +64,14 @@ echo "从机就绪"
 echo "$SPW" | taskset -c 1 sudo -S -p '' build/kvstore conf/kvstore-none.conf &
 sleep 1
 
-if [ "$MIRROR" = on ]; then
-    # 不吞 stderr：组件连不上从机会立刻退出，报错就在这里，看得见才查得动
-    echo "$SPW" | taskset -c 0 sudo -S -p '' build/repl-tcp_recvmsg &
-    sleep 1
-    pgrep -x repl-tcp_recvms >/dev/null || {
-        echo "组件没起来，中止"
-        echo "$SPW" | sudo -S -p '' pkill -x kvstore
-        exit 1
-    }
-fi
+# 不吞 stderr：组件连不上从机会立刻退出，报错就在这里，看得见才查得动
+echo "$SPW" | taskset -c 0 sudo -S -p '' build/repl-tcp_recvmsg &
+sleep 1
+pgrep -x repl-tcp_recvms >/dev/null || {
+    echo "组件没起来，中止"
+    echo "$SPW" | sudo -S -p '' pkill -x kvstore
+    exit 1
+}
 
 taskset -c 3 redis-benchmark -p "$PORT" -c 1 -n "$n" -P "$P" -t set
 

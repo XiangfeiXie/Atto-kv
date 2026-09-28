@@ -35,8 +35,14 @@
 #ifndef MASTER_PORT
 #define MASTER_PORT 2000   /* kvstore master 端口，据此识别客户端负载 */
 #endif
+/* 单条采样上限 = **单个 TCP 段的负载**上限。段负载超过它的会被 push_rec 整段
+ * 静默丢弃（不计数，drops 仍为 0）。MTU 1500 的网卡段 ≤1460，本用不着这么大；
+ * 但回环 MSS 65483 下一次 write 就是一个段，所以它同时也是"客户端单次 write
+ * 的上限"，开不够就一个字节都采不到。
+ * 不能再往上加：scratch 是 PERCPU_ARRAY，value 超 ~32KB 创建会 E2BIG。
+ * 详见 README「单条 TCP 段超过 MAX_REC 会被静默丢弃」。 */
 #ifndef MAX_REC
-#define MAX_REC     2048   /* 单条采样上限（veth MTU 1500 → 负载 ≤1460） */
+#define MAX_REC     16384
 #endif
 #ifndef RING_SIZE
 #define RING_SIZE   (4 << 20)

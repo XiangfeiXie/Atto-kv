@@ -406,6 +406,13 @@ void pipeline_cmds(int fd, int loop, const int *pipes, int npipes) {
  *
  *  命令统一走 RESP（resp_cmd）：kvstore 的 AOF 重放和主从传播只认原始
  *  RESP 字节（msg_raw 原样存），内联命令不会被日志化，写路径必须 RESP
+ *
+ *  管道深度：命令攒满 batch[MAX_BATCH]（512KB）才 send 一次 —— 每条 SET
+ *  62 字节（RESP 开销 27 + key 17 + value 18），故一次 send ≈ 8456 条 /
+ *  ≈512KB，单次 write 极大。repl-xdp 镜像取的是**单个 TCP 段的负载**：
+ *  回环（MSS 65483）上这条 write 就是一个 ~64KB 的段，超过 MAX_REC 即整段
+ *  被丢（slave 一个 key 都收不到）；MTU 1500 的网卡/veth 会先切成 ≤1460B
+ *  的段，故不受影响。redis-benchmark 路径不涉及（单次 write 仅 P×45 字节）。
  *============================================================================*/
 
 /** 测试数据集 key/value 构造（fill/verify/expire 共用，保证两端一致）

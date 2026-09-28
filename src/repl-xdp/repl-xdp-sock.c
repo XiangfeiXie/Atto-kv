@@ -47,22 +47,25 @@
 #include <linux/if_link.h>
 
 /* 与 BPF 侧保持一致（MASTER_PORT 由 BPF 采样生效；用户态经 -D 覆盖）。
- * 默认值对齐 kvstore 主从端口 + veth demo 拓扑（见 src/repl-xdp/README.md）：
- * MASTER_PORT=2000、SLAVE_PORT=2001、IFACE=veth0、SLAVE_IP=10.0.1.2。
+ * 默认值对齐本机主从拓扑（master .137 / slave .136，压测客户端也在 master
+ * 本机、走回环）：MASTER_PORT=2000、SLAVE_PORT=2000、IFACE=lo、
+ * SLAVE_IP=192.168.30.136。
  * 换端口/网卡用 -D 覆盖编译（注意：仅数字宏可经 REPL_XDP_DEFINES 安全传递，
  * 字符串宏 SLAVE_IP/IFACE 的覆盖须改本默认值——CMake 对含引号 -D 的 make
- * 展开会粘参数）。 */
+ * 展开会粘参数）。
+ * 挂网卡跑（如 README 的 netns+veth demo）要把这三个字符串宏改成
+ * veth0 / 10.0.1.2 / 2001；跨机则 IFACE 改 ens33、SLAVE_IP 保持 .136。 */
 #ifndef MASTER_PORT
 #define MASTER_PORT 2000          /* kvstore master 端口 */
 #endif
 #ifndef SLAVE_IP
-#define SLAVE_IP    "192.168.30.136"    /* 从机 veth1 IP */
+#define SLAVE_IP    "192.168.30.136"   /* 从机 IP */
 #endif
 #ifndef SLAVE_PORT
 #define SLAVE_PORT  2000          /* kvstore slave 端口 */
 #endif
 #ifndef IFACE
-#define IFACE       "ens33"       /* master 侧客户端流量所经网卡 */
+#define IFACE       "lo"          /* master 侧客户端流量所经网卡 */
 #endif
 
 struct sock_rec {

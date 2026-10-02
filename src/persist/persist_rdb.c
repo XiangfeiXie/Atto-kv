@@ -608,7 +608,7 @@ void rdb_load_mmap(void) {
  *
  *  RDMA 全量传输对标 Redis 无盘同步：RDMA 只是本项目的一种传输方式，本段
  *  即为该传输服务——Master（rdma.c）把整份快照按 [key_count:4][条目...]
- *  一次性序列化进它那块暂存内存，再由 rdma_transport.c 一个 WR 直传；
+ *  一次性序列化进它那块暂存内存，再由 rdma.c 的数据面一个 WR 直传；
  *  Slave（rdma.c）用 ③ 的 rdb_load_stream_* 消费同一流。
  *
  *  磁盘落盘（②）已改逐条目 io_uring 直写，其 crc 由 rdb_writer_t 自己累计。

@@ -234,7 +234,7 @@ int rdb_load_stream_append_n(const char *buf, size_t len, int limit);
  *  RDB 序列化（RDMA 全量同步 Master 端用）
  *
  *  一次性装满：快照序列化进调用方那块暂存内存（rdma.c 的 512MB 块），
- *  再由 rdma_transport.c 用一个 WR 整块推给对端。既然整份数据一次成块送往
+ *  再由 rdma.c 的数据面用一个 WR 整块推给对端。既然整份数据一次成块送往
  *  一个固定大小的缓冲，"分批喂、每批一个 WR"的增量接口就没有存在理由了，
  *  故只留下面这一个入口。
  *

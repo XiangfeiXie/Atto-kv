@@ -105,7 +105,6 @@ set(PERSIST_SRCS
 set(REPL_SRCS
     src/transport/sendfile.c
     src/transport/rdma.c
-    src/transport/rdma_transport.c
     src/repl/repl_fullsync.c
     src/repl/repl_incr.c
     src/repl/repl_incr_master.c
@@ -236,5 +235,24 @@ add_executable(engtest ${CMAKE_SOURCE_DIR}/test/engtest.c
 target_include_directories(engtest PRIVATE src/util src/engine)
 target_compile_options(engtest PRIVATE -Wall -Wextra)
 
+# ── xfer-*（传输速率测试组件）───────────────────────────────────────────────
+# sendfile / rdma 两条路各一个自包含的 .c：喂同一个文件，只测"传输能跑多快"。
+# 与 kvstore 零耦合（不链 jemalloc / io_uring / 引擎 / ntyco，不 include 项目
+# 任何头文件），在这里量出来的结论再往 kvstore 上搬。见 src/xfer/README.md。
+set(XFER_DIR ${CMAKE_SOURCE_DIR}/src/xfer)
+
+add_executable(xfer-sendfile ${XFER_DIR}/xfer-sendfile.c)
+target_compile_options(xfer-sendfile PRIVATE -Wall -Wextra)
+
+add_executable(xfer-rdma ${XFER_DIR}/xfer-rdma.c)
+target_include_directories(xfer-rdma PRIVATE
+    ${IBVERBS_INCLUDE_DIRS}
+    ${RDMACM_INCLUDE_DIR}
+)
+target_link_libraries(xfer-rdma PRIVATE
+    ${IBVERBS_LIBRARIES}
+    ${RDMACM_LIBRARY}
+)
+target_compile_options(xfer-rdma PRIVATE -Wall -Wextra)
 
 

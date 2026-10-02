@@ -140,7 +140,7 @@ void update_cached_time(void);
  * 单调时钟当前时刻（纳秒）
  * CLOCK_MONOTONIC：vDSO 用户态读取，不陷入内核；单调时钟不受
  * NTP / 校时跳变影响，适合耗时测量
- * 传输层计时（sendfile.c / rdma.c / rdma_transport.c）统一走这里，
+ * 传输层计时（sendfile.c / rdma.c）统一走这里，
  * 替代各文件重复的 clock_gettime + 手工换算
  * 注意：单调时钟（相对时刻），不是墙钟；需要 epoch 时间戳请用 get_time_now()
  */

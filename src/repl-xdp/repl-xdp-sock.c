@@ -2,10 +2,15 @@
 /*=============================================================================
  *  repl-xdp-sock.c — XDP 采样 + 内核 TCP socket 发送（最小 demo）
  *
+ *  用法: repl-xdp [bpf.o]        （无参数即可启动）
+ *
  *  用户态只做三件事：
- *    a) 挂 XDP 到 veth0（只采样客户端 → 主服务的 TCP 负载）
+ *    a) 挂 XDP 到 IFACE（只采样客户端 → 主服务的 TCP 负载）
  *    b) 开一个普通 TCP socket 连从机，把 ring 里采到的负载写过去
  *    c) 读掉从机的 +OK 应答（见 drain_responses 注释，关键）
+ *
+ *  bpf.o 默认取可执行文件同目录（/proc/self/exe 推导），argv 可覆盖 —— CMake
+ *  把它和可执行文件产在同一个 build/ 下，这套定位与 repl-tcp_recvmsg 一致。
  *
  *  可靠传输（seq / ACK / 重传 / 窗口）全部交给内核 TCP 栈。
  *  与 raw socket 版（repl-xdp.c）相比，没有手动 TCP 头 / 校验和 /
@@ -77,6 +82,9 @@ struct sock_rec {
 
 #define REC_DATA 0
 #define REC_SYN  1
+
+/* CMake 产物名（源码叫 repl-xdp-sock.bpf.c，出来的 .o 是 repl-xdp.bpf.o） */
+static const char BPF_OBJ_NAME[] = "repl-xdp.bpf.o";
 
 static volatile int g_run = 1;
 static int g_sock = -1;
@@ -464,13 +472,60 @@ static unsigned long read_percpu_sum(int map_fd)
     return sum;
 }
 
+/* 定位 bpf.o：可执行文件同目录 → 当前目录。
+ * 用 /proc/self/exe 推导而不是写死路径 —— CMake 把可执行文件和 .o 产在同一个
+ * build/ 下，这个关系挪目录、换机器、换用户都成立；写死绝对路径一换就废。 */
+static const char *find_bpf_obj(const char *argv_path, char *buf, size_t cap)
+{
+    char exe[512];
+
+    if (argv_path)
+        return argv_path;
+
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) {
+        exe[n] = '\0';
+        char *slash = strrchr(exe, '/');
+        if (slash) {
+            *slash = '\0';
+            /* exe 最长 511，加 "/" 和 .o 名可能超 cap。截断的路径 access 必
+             * 失败，跳过这个候选，落到下面的 ./ 分支 */
+            int w = snprintf(buf, cap, "%s/%s", exe, BPF_OBJ_NAME);
+            if (w > 0 && (size_t)w < cap && access(buf, R_OK) == 0)
+                return buf;
+        }
+    }
+    snprintf(buf, cap, "./%s", BPF_OBJ_NAME);
+    if (access(buf, R_OK) == 0)
+        return buf;
+    return NULL;
+}
+
+static void usage(const char *argv0)
+{
+    fprintf(stderr,
+            "用法: %s [repl-xdp.bpf.o]\n"
+            "  挂 XDP 到 %s，采客户端 → master 的 TCP 负载，镜像到 "
+            "%s:%d（网卡/端口见本文件顶部的宏）。\n"
+            "  bpf.o 省略则取可执行文件同目录下的 %s。\n",
+            argv0, IFACE, SLAVE_IP, SLAVE_PORT, BPF_OBJ_NAME);
+}
+
 int main(int argc, char **argv)
 {
-    if (argc < 2) {
-        fprintf(stderr, "用法: %s <repl-xdp-sock.bpf.o>\n", argv[0]);
+    if (argc > 2) {
+        usage(argv[0]);
         return 1;
     }
-    const char *bpf_path = argv[1];
+
+    char obj_buf[512];
+    const char *bpf_path = find_bpf_obj(argc > 1 ? argv[1] : NULL,
+                                        obj_buf, sizeof(obj_buf));
+    if (!bpf_path) {
+        fprintf(stderr, "[xdp] 找不到 %s（放在可执行文件同目录，或用命令行"
+                        "参数指定）\n", BPF_OBJ_NAME);
+        return 1;
+    }
 
     signal(SIGINT, on_sigint);
     signal(SIGPIPE, SIG_IGN);               /* 从机断连时 write 触发 EPIPE 而非自杀 */

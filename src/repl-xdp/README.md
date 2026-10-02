@@ -26,6 +26,9 @@ XDP 只采样，内核 TCP 栈负责可靠传输，master 业务侧无任何改�
 > 拓扑）。**下面第 2–5 节的 netns+veth demo 与默认值不同**，要先按第 4 节把
 > `IFACE`/`SLAVE_IP`/`SLAVE_PORT` 改成 `veth0`/`10.0.1.2`/`2001` 再编译。
 > 端口/网卡见文末「配置项」。
+>
+> 命令行：`repl-xdp [bpf.o]` —— **零参数即可启动**，`.bpf.o` 默认取可执行文件
+> 同目录下的 `repl-xdp.bpf.o`；给个参数可以覆盖（调试用）。
 
 ### 1. 编译
 
@@ -75,9 +78,11 @@ sudo ip netns exec slv bash -c 'prlimit --pid $$ --memlock=unlimited; nohup \
 
 ```bash
 sudo ip netns exec red bash -c 'prlimit --pid $$ --memlock=unlimited; nohup \
-  /home/xxf/9.1-kvstore/build/repl-xdp \
-  /home/xxf/9.1-kvstore/build/repl-xdp.bpf.o > /tmp/repl-xdp.log 2>&1 &'
+  /home/xxf/9.1-kvstore/build/repl-xdp > /tmp/repl-xdp.log 2>&1 &'
 ```
+
+> `.bpf.o` 不用指定：组件默认取可执行文件同目录下的 `repl-xdp.bpf.o`
+> （`/proc/self/exe` 推导，与 repl-tcp_recvmsg 同一套）；给个参数可以覆盖（调试用）。
 
 > 本 demo 要求 `IFACE=veth0`、`SLAVE_IP=10.0.1.2`、`SLAVE_PORT=2001`，与组件
 > 默认值（`lo` / `192.168.30.136` / `2000`）**不同**，须先改 `.c` 里的这三个

@@ -4,7 +4,7 @@
  *  功能：提供复制模块的所有对外入口
  *
  *  分层架构：
- *    src/transport/  传输实现层（sendfile.c / rdma.c / rdma_transport.c）
+ *    src/transport/  传输实现层（sendfile.c / rdma.c）
  *                    —— 只负责搬字节，由 repl_fullsync 按配置开关直接调用
  *    src/repl/       同步逻辑层（repl_fullsync / repl_backlog / repl_incr）
  *                    —— 传输分派收敛在 repl_fullsync.c，其余同步逻辑传输无关

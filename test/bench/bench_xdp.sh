@@ -80,9 +80,9 @@ echo "从机就绪"
 echo "$SPW" | taskset -c 1 sudo -S -p '' build/kvstore conf/kvstore-none.conf &
 sleep 1
 
-# 组件要带 BPF 目标文件当参数（repl-tcp_recvmsg 不用，这是两者唯一的形式差别）。
+# 零参数启动：.bpf.o 由组件按 /proc/self/exe 取可执行文件同目录（与 repl-tcp_recvmsg 一致）。
 # 不吞 stderr：组件连不上从机会立刻退出，报错就在这里，看得见才查得动。
-echo "$SPW" | taskset -c 0 sudo -S -p '' build/repl-xdp build/repl-xdp.bpf.o &
+echo "$SPW" | taskset -c 0 sudo -S -p '' build/repl-xdp &
 sleep 1
 pgrep -x repl-xdp >/dev/null || {
     echo "组件没起来，中止"

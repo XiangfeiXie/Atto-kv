@@ -515,10 +515,12 @@ int rdma_server_run(uint64_t token)
     /* 汇总结论行：形状与 [sendfile] xfer-end 完全一致 —— 前三个字段对齐、
      * 速率同列，准备成本收在 " | prep:" 之后（sendfile 是 save，本线是
      * conn/ser/reg）。rate 与 sendfile 同走 xfer_rate_mbs（十进制 MB/s） */
+    char tb[24];
     printf("[rdma] xfer-end: bytes=%zu xfer=%.1fms rate=%.2fMB/s | prep: "
-           "conn=%.1fms ser=%.1fms reg=%.1fms\n",
+           "conn=%.1fms ser=%.1fms reg=%.1fms | at=%s\n",
            off, xfer_ms, xfer_rate_mbs(off, xfer_ms),
-           conn_ms, ser_ms, reg_ms);
+           conn_ms, ser_ms, reg_ms,
+           xfer_wall_str(get_time_now_real(), tb, sizeof(tb)));
 
     return 0;
 }

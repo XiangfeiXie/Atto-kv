@@ -2,17 +2,21 @@
  *  sendfile.c — sendfile（TCP 零拷贝）传输方式
  *  
  *  职责：通过 Linux sendfile() 系统调用实现全量同步的零拷贝传输
- *  
+ *
  *  设计原则：
  *  1. 只负责传输字节，不含同步语义
  *  2. 服务端和客户端都在本文件实现
  *  3. 由 repl_fullsync.c 按配置开关直接调用
- *  
+ *
  *  协议格式（流头 + 数据）：
  *  - token（8 字节）：快照 offset，对端据此续传
  *  - size（8 字节）：RDB 文件大小
  *  - data：RDB 文件内容（通过 sendfile 零拷贝发送）
- *  
+ *
+ *  带宽形状：主端 sendfile 从 page cache 推、从端收到大块内存里就地加载 ——
+ *  零拷贝只在主端，从端是"一次 copy_to_user + 就地解析"（RDMA 侧则是网卡直写
+ *  对端内存，两端都不经过 CPU 拷贝）。快照上限见本头文件的 SENDFILE_BUF_SIZE。
+ *
  *  适用场景：本地网络或低延迟要求不高的环境
  *============================================================================*/
 
@@ -28,7 +32,6 @@
 #include <sys/socket.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
-#include <sys/mman.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <endian.h>   /* htobe64 / be64toh */
@@ -118,9 +121,21 @@ int sendfile_server_run(uint64_t token) {
         close(cfd); close(lfd); 
         return -1; 
     }
-    struct stat st; 
+    struct stat st;
     fstat(fd, &st);
     uint64_t file_size = (uint64_t)st.st_size;
+
+    /* 快照硬上限（与 RDMA 同值）：超了直接放弃。从端的接收缓冲就是这么大，
+     * 传过去也装不下。检查放在发流头之前 —— 从端在 recv(token) 上拿到 EOF
+     * 立刻失败，不会先花几百 ms 摸完缓冲才知道装不下 */
+    if (file_size > SENDFILE_BUF_SIZE) {
+        fprintf(stderr,
+                "[sendfile] snapshot %llu B exceeds transport buffer (%llu B), aborting\n",
+                (unsigned long long)file_size,
+                (unsigned long long)SENDFILE_BUF_SIZE);
+        close(fd); close(cfd); close(lfd);
+        return -1;
+    }
 
     /*-------------------------------------------------------------------------
      *  6. 发送数据：token(8B) + size(8B) + data
@@ -170,8 +185,10 @@ int sendfile_server_run(uint64_t token) {
      * 与 [rdma] xfer-end 排成同一形状 —— 前三个字段两线对齐、速率同列，
      * 准备耗时一律收在 " | prep:" 之后，方便两条线并排看。 */
     double xfer_ms = (t2 > t1) ? (double)(t2 - t1) / 1e6 : 0.0;
-    printf("[sendfile] xfer-end: bytes=%zu xfer=%.1fms rate=%.2fMB/s | prep: save=%.1fms\n",
-           sent, xfer_ms, xfer_rate_mbs(sent, xfer_ms), (double)save_ns / 1e6);
+    char tb[24];
+    printf("[sendfile] xfer-end: bytes=%zu xfer=%.1fms rate=%.2fMB/s | prep: save=%.1fms | at=%s\n",
+           sent, xfer_ms, xfer_rate_mbs(sent, xfer_ms), (double)save_ns / 1e6,
+           xfer_wall_str(get_time_now_real(), tb, sizeof(tb)));
 
 out:
     close(fd); 
@@ -185,44 +202,43 @@ out:
  *============================================================================*/
 
 /**
- * 接收所有数据到文件
+ * 接收所有数据到大块内存缓冲
  * 使用 MSG_WAITALL 阻塞接收，直到收到 total 字节或连接关闭
- * 
+ *
  * @param sfd socket fd
- * @param dfd 目标文件 fd
+ * @param dst 目标缓冲（调用方保证 ≥ total 字节）
  * @param total 期望接收的总字节数
  * @return 实际收到的字节数，-1 表示错误
  */
-static ssize_t recv_all(int sfd, int dfd, size_t total) {
-    char buf[65536];
-    size_t left = total;
+static ssize_t recv_all(int sfd, char *dst, size_t total) {
     size_t got = 0;
-    
-    while (left > 0) {
-        size_t chunk = left < sizeof(buf) ? left : sizeof(buf);
-        ssize_t n = recv(sfd, buf, chunk, MSG_WAITALL);
+
+    /* 分块上限 1MiB：只让每次 syscall 的等待有界，与速率无关 */
+    while (got < total) {
+        size_t left  = total - got;
+        size_t chunk = left < (1u << 20) ? left : (1u << 20);
+        ssize_t n = recv(sfd, dst + got, chunk, MSG_WAITALL);
         if (n < 0) {
             if (errno == EINTR) continue;
             return -1;
         }
         if (n == 0) break;  /* EOF：连接提前关闭，数据不完整 */
-        if (write(dfd, buf, (size_t)n) != n) return -1;
-        left -= (size_t)n;
-        got  += (size_t)n;
+        got += (size_t)n;
     }
     return (ssize_t)got;
 }
 
 /**
  * sendfile 客户端入口
- * 
+ *
  * 流程：
  * 1. 连接服务端的 fullsync_port（带重试）
  * 2. 发送就绪信号
- * 3. 接收 token（快照 offset）
- * 4. 接收文件大小
- * 5. 接收 RDB 数据到临时文件
- * 6. mmap 加载 RDB 数据
+ * 3. 准备接收缓冲：malloc 整块 + 触页
+ * 4. 接收 token（快照 offset）
+ * 5. 接收文件大小
+ * 6. 接收 RDB 数据到大块内存缓冲（不经 /tmp）
+ * 7. 就地加载 RDB 数据
  * 
  * @param out_token 输出：从流头解出的 token（快照 offset）
  * @return 0 成功，-1 失败
@@ -273,17 +289,39 @@ int sendfile_client_run(uint64_t *out_token) {
      *  2. 发送就绪信号
      *     通知服务端可以开始 SAVE + sendfile
      *-------------------------------------------------------------------------*/
-    { 
-        char ready = 1; 
-        if (send(fd, &ready, 1, 0) != 1) { 
-            perror("send ready"); 
-            close(fd); 
-            return -1; 
-        } 
+    {
+        char ready = 1;
+        if (send(fd, &ready, 1, 0) != 1) {
+            perror("send ready");
+            close(fd);
+            return -1;
+        }
     }
 
     /*-------------------------------------------------------------------------
-     *  3. 接收 token（快照 offset）
+     *  3. 准备接收缓冲：整份快照就地收进内存，不再经 /tmp 中转
+     *
+     *  位置：紧跟 ready，先于 recv(token)。服务端收到 ready 即开始 SAVE
+     *  （秒级），本端这段触页耗时正好藏在它后面，两端计时字段都不受影响。
+     *  这正是 RDMA 侧 rdma_reg_write 的位置与作用（预触 + 钉页，不入任何上报字段）。
+     *
+     *  触页是这块缓冲的关键动作，不是可省的优化：158MB 是 3.9 万个 4KB 页，
+     *  不预触的话每一次缺页 + 清零都落在 recv 的 copy_to_user 途中，从端一慢
+     *  就往回压住主端的发送窗口。本机实测同一份快照、同为 4KB 页：
+     *  不预触 36.89 MB/s，预触 1480.90 MB/s（40×）。
+     *
+     *  大页（mmap + MADV_HUGEPAGE）实测没有可分辨的额外贡献（4KB 页 + 预触
+     *  1480.90 vs 大页 + 预触 1613.29，在后者自身的散布区间内），所以不用 ——
+     *  也就不需要 mmap（madvise 要求页对齐，malloc 返回值带 glibc 头部），
+     *  缓冲区回归普通 malloc。
+     *-------------------------------------------------------------------------*/
+    char *buf = malloc(SENDFILE_BUF_SIZE);
+    if (!buf) { perror("malloc"); close(fd); return -1; }
+    for (size_t off = 0; off < SENDFILE_BUF_SIZE; off += 4096)
+        buf[off] = 0;
+
+    /*-------------------------------------------------------------------------
+     *  4. 接收 token（快照 offset）
      *     交还上层，增量模块据此续传
      *-------------------------------------------------------------------------*/
     uint64_t tok = 0;
@@ -296,7 +334,7 @@ int sendfile_client_run(uint64_t *out_token) {
     printf("[sendfile] token=%lu\n", (unsigned long)be64toh(tok));
 
     /*-------------------------------------------------------------------------
-     *  4. 接收文件大小
+     *  5. 接收文件大小
      *-------------------------------------------------------------------------*/
     uint64_t fsz = 0;
     if (recv(fd, &fsz, 8, MSG_WAITALL) != 8) { 
@@ -307,61 +345,57 @@ int sendfile_client_run(uint64_t *out_token) {
     fsz = be64toh(fsz);
     printf("[sendfile] %lu bytes\n", (unsigned long)fsz);
 
-    /*-------------------------------------------------------------------------
-     *  5. 接收数据到临时文件
-     *-------------------------------------------------------------------------*/
-    char tmp[256]; 
-    snprintf(tmp, sizeof(tmp), "/tmp/kvstore_fs_%d.rdb", getpid());
-    int tfd = open(tmp, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    if (tfd < 0) { 
-        perror("open tmp"); 
-        close(fd); 
-        return -1; 
+    /* 快照硬上限（与 RDMA 同值）：装不下直接失败，不往下收 */
+    if (fsz > SENDFILE_BUF_SIZE) {
+        fprintf(stderr,
+                "[sendfile] snapshot %lu B exceeds transport buffer (%llu B)\n",
+                (unsigned long)fsz, (unsigned long long)SENDFILE_BUF_SIZE);
+        free(buf);
+        close(fd);
+        return -1;
     }
 
+    /*-------------------------------------------------------------------------
+     *  6. 接收数据到大块内存缓冲（不经 /tmp）
+     *-------------------------------------------------------------------------*/
     uint64_t t1 = now_monotonic_ns();
-    ssize_t got = recv_all(fd, tfd, (size_t)fsz);
+    ssize_t got = recv_all(fd, buf, (size_t)fsz);
     uint64_t t2 = now_monotonic_ns();
-    close(fd); 
-    close(tfd);
+    close(fd);
 
     /* 验证接收完整性 */
-    if (got < 0) { 
-        perror("recv data"); 
-        return -1; 
+    if (got < 0) {
+        perror("recv data");
+        free(buf);
+        return -1;
     }
     if ((size_t)got != fsz) {
         fprintf(stderr, "[sendfile] connection closed early: got %zd/%lu bytes\n",
                 got, (unsigned long)fsz);
+        free(buf);
         return -1;
     }
 
-    /* 接收端只报字节数 + 墙钟，不出速率：这段等待里还夹着本端写临时文件的
-     * 耗时（/tmp 是 ext4，写盘就串在 recv 之间）。速率一律以发送端为准 */
+    /* 接收端只报字节数 + 墙钟，不出速率：这段等待里还夹着本端 copy_to_user
+     * 的耗时。速率一律以发送端为准 */
     double wait_ms = (t2 > t1) ? (double)(t2 - t1) / 1e6 : 0.0;
-    printf("[sendfile] recv-end: bytes=%lu wait=%.1f\n",
-           (unsigned long)fsz, wait_ms);
+    char tb[24];
+    printf("[sendfile] recv-end: bytes=%lu wait=%.1f | at=%s\n",
+           (unsigned long)fsz, wait_ms,
+           xfer_wall_str(get_time_now_real(), tb, sizeof(tb)));
 
     /*-------------------------------------------------------------------------
-     *  6. mmap + 加载 RDB 数据
+     *  7. 就地加载 RDB 数据
+     *     线上格式与落盘版完全一致（磁盘格式，带 crc 槽），故仍走
+     *     rdb_load_from_buf —— 省掉的是 /tmp 落盘 + 从文件 mmap 两级，
+     *     不是解析路径
      *-------------------------------------------------------------------------*/
-    int rfd = open(tmp, O_RDONLY);
-    if (rfd < 0) { 
-        perror("open tmp load"); 
-        return -1; 
+    int loaded = rdb_load_from_buf(buf, (size_t)fsz);
+    free(buf);
+    if (loaded < 0) {
+        fprintf(stderr, "[sendfile] load failed\n");
+        return -1;
     }
-    struct stat st; 
-    fstat(rfd, &st);
-    char *mbuf = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, rfd, 0);
-    close(rfd); 
-    unlink(tmp);  /* 立即删除临时文件（mmap 后数据仍在内存） */
-    if (mbuf == MAP_FAILED) { 
-        perror("mmap"); 
-        return -1; 
-    }
-
-    int loaded = rdb_load_from_buf(mbuf, (size_t)st.st_size);
-    munmap(mbuf, (size_t)st.st_size);
     printf("[sendfile] loaded %d keys\n", loaded);
     return 0;
 }

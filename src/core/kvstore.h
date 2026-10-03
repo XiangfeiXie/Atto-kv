@@ -164,6 +164,38 @@ static inline double xfer_rate_mbs(size_t bytes, double ms)
     return (ms > 0.0) ? ((double)bytes / (ms / 1000.0) / 1e6) : 0.0;
 }
 
+/**
+ * 结果行的时间戳：本地墙钟 "MM-DD HH:MM:SS.mmm"（定长 18 字符）
+ *
+ * 速率是相对量，光看数字没法事后对齐机器状态 —— 同一份代码在不同时刻能
+ * 差出 2 倍（宿主机调度 / 负载），出问题时必须知道每条数据是什么时候取的。
+ * 这也是唯一能把两条传输路的数字放回同一根时间轴上的东西。
+ *
+ * 用 get_time_now_real()（epoch 毫秒），不另开一次 syscall；不动
+ * now_monotonic_ns —— 那是耗时测量用的单调时钟，两者用途不同不能互替。
+ * 形如 "10-02 13:20:41.123"，定长便于按列对齐、按字典序排序。
+ * 调用方自备缓冲（≥20 字节），返回 buf 便于直接当 printf 参数。
+ */
+static inline const char *xfer_wall_str(long long ms, char *buf, size_t n)
+{
+    /* epoch 毫秒恒为正，走无符号 */
+    unsigned long long ums = (unsigned long long)ms;
+    time_t sec = (time_t)(ums / 1000ULL);
+    struct tm tm;
+    localtime_r(&sec, &tm);
+    /* 每个字段先 %100 钳成两位、毫秒 %1000 钳成三位：编译器因此能证出
+     * 整行恒为 18 字节，不会为可能的超长误报 -Wformat-truncation
+     * （tm 各字段是 int，直接 %02d 证不出范围） */
+    snprintf(buf, n, "%02u-%02u %02u:%02u:%02u.%03u",
+             (unsigned)(tm.tm_mon + 1) % 100U,
+             (unsigned)tm.tm_mday % 100U,
+             (unsigned)tm.tm_hour % 100U,
+             (unsigned)tm.tm_min  % 100U,
+             (unsigned)tm.tm_sec  % 100U,
+             (unsigned)(ums % 1000ULL));
+    return buf;
+}
+
 /*=============================================================================
  *  命令分发
  *============================================================================*/

@@ -18,6 +18,15 @@
 #include <stdint.h>
 
 /*=============================================================================
+ *  传输参数
+ *============================================================================*/
+
+/* 客户端接收缓冲大小 = 快照硬上限（整份快照必须先收进这块缓冲才能就地加载）。
+ * 与 RDMA 的 RDMA_BUF_SIZE 目前同值，但两条路各自独立定义 ——
+ * 缓冲尺寸没有必须相等的理由，之后要分开调就直接改这里 */
+#define SENDFILE_BUF_SIZE   (512ULL * 1024 * 1024)
+
+/*=============================================================================
  *  服务端入口
  *  
  *  功能：
@@ -45,7 +54,7 @@ int sendfile_server_run(uint64_t token);
  *  功能：
  *  1. 连接服务端的 fullsync_port（带重试，等服务端监听就绪）
  *  2. 发 ready 信号 → 接收流头 token(8B) + size(8B)
- *  3. 接收 RDB 快照数据到 /tmp 临时文件，mmap 后用 rdb_load_from_buf 加载
+ *  3. 接收 RDB 快照数据到大块内存缓冲，就地 rdb_load_from_buf 加载
  *
  *  @param out_token 输出：从流头解出的 token（快照 offset）
  *  @return 0 成功，-1 失败
@@ -53,11 +62,16 @@ int sendfile_server_run(uint64_t token);
  *  调用者：repl_fullsync_slave_start
  *
  *  实现要点：
- *  - 流头顺序：token(8B) → size(8B) → 数据
- *  - 数据先落 /tmp 临时文件再 mmap 加载（rdb_load_from_buf，非流式加载器）
+ *  - 流头顺序：token(8B) → size(8B) → 数据；线上格式与落盘版完全一致
+ *    （磁盘格式，带 crc 槽），只是不再经 /tmp 中转
+ *  - 接收缓冲 = SENDFILE_BUF_SIZE，malloc + 触页：把缺页代价挪到传输窗口
+ *    之外（RDMA 侧是 rdma_reg_write，同理）。不用大页 —— 实测无额外贡献，
+ *    预触才是那个关键动作
+ *  - 触页排在发 ready 之后：服务端收到 ready 即开始 SAVE（秒级），
+ *    从端触页正好藏在这段时间里，两端计时字段都不受影响
  *  - connect 重试 30 次 × 200ms：服务端 fork 子进程起监听有延迟
  *  - 计时：接收端只报 [sendfile] recv-end（字节数 + 墙钟），不出速率——
- *    这段等待里夹着本端写临时文件的耗时，速率一律以发送端为准
+ *    这段等待里夹着本端 copy_to_user 的耗时，速率一律以发送端为准
  */
 int sendfile_client_run(uint64_t *out_token);
 

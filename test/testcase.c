@@ -38,6 +38,9 @@
  *      savebench— 周期性 BGSAVE 对写入 QPS/延迟的影响：每写 per_round 条 SET
  *                 发一次 BGSAVE，共 rounds 轮，最后报 QPS / P50 / P99。
  *                 服务端由调用方自行启动；key 单调递增、全程不重复。
+ *      nosave   — savebench 的无 BGSAVE 对照：单轮 10000 条 SET，其余逐行同形。
+ *                 两者相减 = 周期性 BGSAVE 对写入的影响。同样不清理数据集，
+ *                 做对照时每次运行前须让服务端回到同一初始状态。
  *
  *  编译：gcc -O2 -o build/testcase test/testcase.c
  *  退出码：0 全部通过；非 0 测试失败
@@ -760,6 +763,64 @@ void savebench_cmds(int fd, long long per_round, int rounds) {
 }
 
 /*=============================================================================
+ *  nosave_cmds — savebench 的无 BGSAVE 对照
+ *
+ *  与 savebench 同形：同一条连接、同一个 key 序列（key:%lld）、严格 P=1
+ *  （发一条、收完回复、记时间）、同一套延迟数组与百分位取法。唯一差别是
+ *  全程不发 BGSAVE。两者各跑一遍相减，才是「周期性 BGSAVE 对写入的影响」。
+ *
+ *  单轮 100000 条，不设轮循环：量小、跑得快，才好和 savebench 同轮交替多跑。
+ *
+ *  和 savebench 一样不清理数据集：SET 是 upsert，两次运行不复位的话，第二次
+ *  写的是已存在的 key（只改写、不分配），行为和第一次不同。做对照时每次运行
+ *  前必须让服务端回到同一初始状态（重启实例 / 清库）。
+ *============================================================================*/
+
+#define NS_TOTAL  200000
+
+void nosave_cmds(int fd) {
+    long long total = NS_TOTAL;
+    uint32_t *lat = malloc(sizeof(uint32_t) * (size_t)total);
+    if (lat == NULL) { perror("malloc"); exit(1); }
+
+    char val[SB_VAL_LEN + 1];
+    memset(val, 'x', SB_VAL_LEN);
+    val[SB_VAL_LEN] = '\0';
+
+    char cmd[MAX_MSG_LENGTH], rep[MAX_MSG_LENGTH];
+
+    double ts = now_us();
+    for (long long idx = 0; idx < total; idx++) {
+        char key[32];
+        snprintf(key, sizeof key, "key:%lld", idx);
+
+        int len = resp_cmd(cmd, sizeof cmd, 3, "SET", key, val);
+        if (len < 0) { fprintf(stderr, "resp_cmd 失败\n"); exit(1); }
+
+        double t0 = now_us();
+        send_all(fd, cmd, len);
+        recv_reply(&g_rb, rep, sizeof rep);   /* 读掉即扔，不比较内容 */
+        lat[idx] = (uint32_t)(now_us() - t0);
+        g_cmds++;
+    }
+    double work_us = now_us() - ts;
+
+    qsort(lat, (size_t)total, sizeof(uint32_t), cmp_u32);
+
+    long long i50 = total * 50 / 100;
+    long long i99 = total * 99 / 100;
+
+    printf("nosave %lld 条（全程无 BGSAVE）\n", total);
+    printf("QPS %lld   P50 %.3f ms   P99 %.3f ms\n",
+           work_us > 0.0 ? (long long)(total / (work_us / 1e6)) : 0,
+           (double)lat[i50] / 1000.0,
+           (double)lat[i99] / 1000.0);
+    fflush(stdout);
+
+    free(lat);
+}
+
+/*=============================================================================
  *  入口
  *============================================================================*/
 
@@ -772,6 +833,7 @@ static void usage(const char *prog) {
     printf("  %s <ip> <port> expire   <start> <count> <ttl>\n", prog);
     printf("  %s <ip> <port> dbsize   [loop]\n", prog);
     printf("  %s <ip> <port> savebench <per_round> <rounds>\n", prog);
+    printf("  %s <ip> <port> nosave\n", prog);
 }
 
 int main(int argc, char *argv[]) {
@@ -848,6 +910,8 @@ int main(int argc, char *argv[]) {
         dbsize_cmds(g_rb.fd, loop);
     } else if (strcmp(test, "savebench") == 0) {
         savebench_cmds(g_rb.fd, sb_per, sb_rounds);
+    } else if (strcmp(test, "nosave") == 0) {
+        nosave_cmds(g_rb.fd);
     } else {
         fprintf(stderr, "未知测试: %s\n", test);
         usage(argv[0]);

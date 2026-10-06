@@ -263,7 +263,10 @@ void kvs_shutdown(void) {
 
 /**
  * 清空所有数据
- * 使用 jemalloc 时额外 purge 释放内存
+ * 两个 allocator 各补一句「立即归还」把 free 掉的内存还给 OS，语义对称：
+ *   jemalloc  mallctl("arenas.purge")   —— 但要先 flush 线程 tcache，否则无物可清
+ *   glibc     malloc_trim(0)            —— 走完全部 free list 把页还给内核
+ * 不调的话 free 的内存只留在各自的空闲链/arena 里，RSS 不回落。
  */
 void kvs_flush_all(void) {
     dict_clear();
@@ -272,6 +275,11 @@ void kvs_flush_all(void) {
      * 再 purge 脏页把内存还给 OS (实测踩坑) */
     mallctl("thread.tcache.flush", NULL, NULL, NULL, 0);
     mallctl("arenas.purge", NULL, NULL, NULL, 0);
+#else
+    /* glibc 没有 purge，malloc_trim(0) 是它对等的接口。注意环境变量
+     * MALLOC_TRIM_THRESHOLD_ 在这条路径上是多余的：实测带不带它 trim(0) 结果
+     * 逐字节相同，因为 trim(0) 自己就会扫完整个 free list */
+    malloc_trim(0);
 #endif
 }
 

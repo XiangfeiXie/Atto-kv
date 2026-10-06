@@ -36,6 +36,7 @@
 #include <netdb.h>
 #include <endian.h>   /* htobe64 / be64toh */
 #include <fcntl.h>
+#include <poll.h>
 
 /*=============================================================================
  *  服务端实现
@@ -203,7 +204,11 @@ out:
 
 /**
  * 接收所有数据到大块内存缓冲
- * 使用 MSG_WAITALL 阻塞接收，直到收到 total 字节或连接关闭
+ *
+ * 不能指望 MSG_WAITALL：从端走 ntyco 引擎时，这个 fd 是 NtyCo 的 socket() 钩子
+ * 设出来的非阻塞 fd（没有任何地方在用前恢复），而非阻塞 fd 上 MSG_WAITALL 不生效
+ * —— 收到多少返回多少，一旦数据出现毫秒级空档就返回 EAGAIN。那是"暂时无数据"
+ * 而不是错误，poll 等下一批再收即可。
  *
  * @param sfd socket fd
  * @param dst 目标缓冲（调用方保证 ≥ total 字节）
@@ -220,6 +225,11 @@ static ssize_t recv_all(int sfd, char *dst, size_t total) {
         ssize_t n = recv(sfd, dst + got, chunk, MSG_WAITALL);
         if (n < 0) {
             if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd = { .fd = sfd, .events = POLLIN };
+                if (poll(&pfd, 1, 100) < 0 && errno != EINTR) return -1;
+                continue;       /* 最多等 100ms 一轮，超时再收一次 */
+            }
             return -1;
         }
         if (n == 0) break;  /* EOF：连接提前关闭，数据不完整 */

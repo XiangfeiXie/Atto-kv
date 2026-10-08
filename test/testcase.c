@@ -404,7 +404,7 @@ void pipeline_cmds(int fd, int loop, const int *pipes, int npipes) {
 /*=============================================================================
  *  fill_cmds / verify_cmds — 数据填充与校验
  *  用于自行测试 RDB/AOF 持久化和主从同步（两端独立可重现，无需传数据）
- *  范围由命令行指定：fill <start> <count>
+ *  范围由命令行指定：fill <start> <count> [-P <n>]
  *  key = fill:%012d，value = value:%012d
  *
  *  命令统一走 RESP（resp_cmd）：kvstore 的 AOF 重放和主从传播只认原始
@@ -416,6 +416,11 @@ void pipeline_cmds(int fd, int loop, const int *pipes, int npipes) {
  *  回环（MSS 65483）上这条 write 就是一个 ~64KB 的段，超过 MAX_REC 即整段
  *  被丢（slave 一个 key 都收不到）；MTU 1500 的网卡/veth 会先切成 ≤1460B
  *  的段，故不受影响。redis-benchmark 路径不涉及（单次 write 仅 P×45 字节）。
+ *
+ *  -P <n> 把管道深度压到 n 条命令一次 send（单次 write ≈ n×62 字节）：回环上
+ *  只要 n×62 ≤ MAX_REC 就采得到，用来在不改组件的前提下验证镜像通路。
+ *  不带 -P 时仍是「攒满 512KB」的老行为（bulk 填充 / 压测口径），一字未变。
+ *  verify 不加这个开关：它的命令是只读查询，通常不经 XDP 挂载的那块网卡。
  *============================================================================*/
 
 /** 测试数据集 key/value 构造（fill/verify/expire 共用，保证两端一致）
@@ -425,7 +430,7 @@ static void pair(int i, const char *prefix, char *key, int kcap, char *val, int 
     snprintf(val, vcap, "value:%012d", i);
 }
 
-void fill_cmds(int fd, int start, int count) {
+void fill_cmds(int fd, int start, int count, int pipe) {
     char batch[MAX_BATCH];
     long long c0 = g_cmds;
     double    t0 = now_ms();
@@ -443,6 +448,7 @@ void fill_cmds(int fd, int start, int count) {
             len += (size_t)w;
             nthis++;
             filled++;
+            if (pipe > 0 && nthis >= pipe) break;                  /* -P：攒够 n 条 */
         }
         if (nthis == 0) break;
         send_all(fd, batch, (int)len);
@@ -454,7 +460,11 @@ void fill_cmds(int fd, int start, int count) {
             expect_reply("+OK\r\n", what);
         }
     }
-    report(c0, t0, "fill start=%d count=%d", start, count);
+    /* 不带 -P 时输出行保持原样，别让老记录多出一个恒为 0 的字段 */
+    if (pipe > 0)
+        report(c0, t0, "fill start=%d count=%d P=%d", start, count, pipe);
+    else
+        report(c0, t0, "fill start=%d count=%d", start, count);
 }
 
 void verify_cmds(int fd, int start, int count) {
@@ -828,7 +838,7 @@ static void usage(const char *prog) {
     printf("用法:\n");
     printf("  %s <ip> <port> basic    [loop]\n", prog);
     printf("  %s <ip> <port> pipeline [loop] [P1 P2 ...]\n", prog);
-    printf("  %s <ip> <port> fill     <start> <count>\n", prog);
+    printf("  %s <ip> <port> fill     <start> <count> [-P <n>]\n", prog);
     printf("  %s <ip> <port> verify   <start> <count>\n", prog);
     printf("  %s <ip> <port> expire   <start> <count> <ttl>\n", prog);
     printf("  %s <ip> <port> dbsize   [loop]\n", prog);
@@ -873,6 +883,7 @@ int main(int argc, char *argv[]) {
 
     /* fill/verify/expire 的范围参数：<start> <count> [<ttl>] */
     int fstart = 0, fcount = 0, fttl = 0;
+    int fpipe  = 0;   /* fill 的 -P：0 = 不指定，攒满 MAX_BATCH(512KB) 才 send */
     if (strcmp(test, "fill") == 0 || strcmp(test, "verify") == 0) {
         if (argc < 6) { usage(argv[0]); return 2; }
         fstart = atoi(argv[4]);
@@ -880,6 +891,14 @@ int main(int argc, char *argv[]) {
         if (fcount <= 0) {
             fprintf(stderr, "count 必须 > 0\n");
             return 2;
+        }
+        /* 只有 fill 认 -P，且只认紧跟其后的那一对：fill <s> <n> -P <m> */
+        if (strcmp(test, "fill") == 0 && argc >= 8 && strcmp(argv[6], "-P") == 0) {
+            fpipe = atoi(argv[7]);
+            if (fpipe <= 0) {
+                fprintf(stderr, "-P 必须 > 0\n");
+                return 2;
+            }
         }
     } else if (strcmp(test, "expire") == 0) {
         if (argc < 7) { usage(argv[0]); return 2; }
@@ -901,7 +920,7 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(test, "pipeline") == 0) {
         pipeline_cmds(g_rb.fd, loop, pipes, npipes);
     } else if (strcmp(test, "fill") == 0) {
-        fill_cmds(g_rb.fd, fstart, fcount);
+        fill_cmds(g_rb.fd, fstart, fcount, fpipe);
     } else if (strcmp(test, "verify") == 0) {
         verify_cmds(g_rb.fd, fstart, fcount);
     } else if (strcmp(test, "expire") == 0) {

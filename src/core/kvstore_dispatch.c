@@ -100,14 +100,38 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
         if (!entry) {
             dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);  /* 键不存在：返回空 */
         } else {
-            reply_bulk(wb, entry_payload(entry), (int)entry_payload_len(entry));
+            /* 过期检查。这一步以前漏了：GET 能读到已经过期的值，而 TTL 却报 -2 ——
+             * 同一个键，一个命令说"没了"、另一个说"还在"，自相矛盾。
+             *
+             * 这里**只回空、不删除**，是刻意的：读路径只负责读对，回收是过期模块
+             * （active_expire_cycle）的职责。让 GET 产生写效果，会把 AOF 和复制的
+             * 语义绕进来，而收益（早一点回收）在主动过期开着时不明显。
+             *
+             * entry_expire 返回 0 表示"永不过期"，不能当时间戳用 ——
+             * 这个判断和 TTL 命令完全一致。 */
+            int64_t exp = entry_expire(entry);
+            if (exp && exp <= get_time_now()) {
+                dynbuf_cat(wb, RESP_NIL, RESP_NIL_LEN);  /* 已过期：和"不存在"一样 */
+            } else {
+                reply_bulk(wb, entry_payload(entry), (int)entry_payload_len(entry));
+            }
         }
         return DISPATCH_OK;
     }
 
     /*=========================================================================
-     *  热路径 2：SET 命令 —— 新增或覆盖，两种情况都回 +OK
-     *  形参：<key> <value> [ttl秒]；省略 ttl = 永不过期，显式给了必须为正。
+     *  热路径 2：SET / SETEX —— 新增或覆盖，两种情况都回 +OK
+     *
+     *  两个命令只差中间两个参数的位置：
+     *      SET   <key> <值>  [秒]    argc 3 或 4，省略秒 = 永不过期
+     *      SETEX <key> <秒>  <值>    argc 恒为 4，秒必给且必须为正
+     *
+     *  所以放同一个分支里，写入逻辑只写一份 —— 免得以后改一处忘一处。
+     *  参数位置一律走 val_i / ttl_i 两个下标，底下十几行原样不动。
+     *
+     *  为什么不把 SETEX "翻译"成 `SET k v ttl` 了事：自研 KV 要借 Redis 生态，
+     *  就得兼容标准命令。而"标准"在这里的定义是 —— Redis 能跑的，我们也得能跑。
+     *
      *  键在不在由 dict_add_or_find 自己查（见 kv_engine.h 契约 2）：键不存在
      *  时它已经把 payload 写好了；键已存在时它只返回既有记录、记录一个字没动，
      *  覆盖由下面的 exists 分支补写 —— 等长原地写，变长才 dict_resize_entry
@@ -115,27 +139,39 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
      *  不会算两次哈希。
      *  ttl 跟随本次写入：省略即清除过期。新增和覆盖一视同仁，不留上一条的残留。
      *=========================================================================*/
-    if (TOKEN_EQ(cmd, "SET")) {
-        if (argc != 3 && argc != 4) {
+    if (TOKEN_EQ(cmd, "SET") || TOKEN_EQ(cmd, "SETEX")) {
+        const int is_setex = TOKEN_EQ(cmd, "SETEX");
+
+        if (is_setex ? (argc != 4) : (argc != 3 && argc != 4)) {
             dynbuf_cat(wb, RESP_ERR_ARGS, RESP_ERR_ARGS_LEN);
             return DISPATCH_ERROR;
         }
 
+        /* 参数位置：SETEX 把秒放在值前面 */
+        const int val_i = is_setex ? 3 : 2;
+        const int ttl_i = is_setex ? 2 : 3;
+
         long long ttl_secs = 0;
-        if (argc == 4) {
+        if (is_setex || argc == 4) {
             /* 显式的 ttl 必须是正数。把「0 秒过期」静默当成永不过期放行，
              * 是最容易埋雷的写法，直接拒绝比猜调用方意图安全 */
-            if (token_to_ll(tokens[3], &ttl_secs) < 0 || ttl_secs <= 0) {
-                dynbuf_lit(wb, "-ERR invalid expire time in 'set' command\r\n");
+            if (token_to_ll(tokens[ttl_i], &ttl_secs) < 0 || ttl_secs <= 0) {
+                /* dynbuf_lit 是宏，靠字符串字面量拼接算长度，吃不了三元表达式，
+                 * 所以这里必须分开写。错误文案里带上实际命令名，方便对着 RESP 排查。 */
+                if (is_setex) {
+                    dynbuf_lit(wb, "-ERR invalid expire time in 'setex' command\r\n");
+                } else {
+                    dynbuf_lit(wb, "-ERR invalid expire time in 'set' command\r\n");
+                }
                 return DISPATCH_ERROR;
             }
         }
 
         kvs_token_t key_tok = tokens[1];
-        uint32_t val_len = (uint32_t)tokens[2].len;
+        uint32_t val_len = (uint32_t)tokens[val_i].len;
         int exists = 0;
         kv_node_t *e = dict_add_or_find(key_tok.ptr, (uint32_t)key_tok.len,
-                                        tokens[2].ptr, val_len, &exists);
+                                        tokens[val_i].ptr, val_len, &exists);
         if (!e) {
             dynbuf_cat(wb, RESP_ERROR, RESP_ERROR_LEN);
             return DISPATCH_OK;
@@ -149,7 +185,7 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
                     return DISPATCH_OK;
                 }
             }
-            memcpy(entry_payload(e), tokens[2].ptr, val_len);
+            memcpy(entry_payload(e), tokens[val_i].ptr, val_len);
         }
         entry_set_expire(e, ttl_secs ? get_time_now() + ttl_secs * 1000 : 0);
 

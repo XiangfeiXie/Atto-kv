@@ -6,6 +6,8 @@ kprobe 只采样，内核 TCP 栈负责可靠传输，master 业务侧无任何�
 
 组件不带任何参数，PID 和 `.bpf.o` 都自动定位，运行期不打印任何东西。
 **唯一的外部要求：master 必须 `taskset` 钉单核**（理由见「顺序保证」）。
+注意钉的是 **master**，不是本组件 —— 本组件自己钉不钉核不影响正确性（钉了只是
+少抢 master 的核）；把组件钉到某个核**不能**替代钉 master。
 
 ## 快速上手
 
@@ -42,8 +44,10 @@ expire off                   expire off
 ```
 
 > 端口和从机地址都写在 `repl-tcp_recvmsg.h` 里（`MASTER_PORT` / `SLAVE_IP` /
-> `SLAVE_PORT`），当前默认值就是同机演示用的 `127.0.0.1` / `2001`。字符串宏经
-> CMake `-D` 会粘参（与 repl-xdp 同坑），要改成跨机地址就直接改源码默认值。
+> `SLAVE_PORT`），**当前默认值是跨机用的 `192.168.30.136` / `2000`**。上面那段
+> 同机演示要把 `SLAVE_IP` / `SLAVE_PORT` 改回 `127.0.0.1` / `2001`；跨机时从机
+> 在 `.136:2000` 起一个普通实例（`repl_role off`）即可。字符串宏经 CMake `-D`
+> 会粘参（与 repl-xdp 同坑），要改就直接改源码默认值。
 
 ### 命令行
 
@@ -70,36 +74,63 @@ repl-tcp_recvmsg [repl-tcp_recvmsg.bpf.o]
 - **按 tgid 过滤**：BPF 对全系统 TCP 读都触发（入口一次数组查找即退），只镜像
   `cfg` map 里那个 master 进程。master 作为服务器只读客户端连接 → 采到的就是
   客户端写入的命令字节流。
-- **入口暂存（pending hash）**：kretprobe 拿不到入口参数，且 `msg_iter.ubuf` 在
-  `tcp_recvmsg_locked` 执行中会被 `iov_iter_advance` 推进（出口读到的是
-  base + ret）。所以入口把基址快照进按 tid 索引的 `pending`，出口取用后删除。
-- **scratch 中转缓冲**：用户内存 → ring 必须经 per-CPU map 中转，因为
-  `bpf_ringbuf_reserve` 的 size 必须是**编译期常量**（传运行期长度被验证器拒：
-  `R2 is not a known constant`）。`MAX_REC=1024` 对齐 `RBUF_NODE_SIZE`；
-  per-CPU map 的 value 超过约 32KB 创建会 `E2BIG`，所以不能靠加大 `MAX_REC` 买保险。
+- **入口暂存（pending，per-CPU 单槽）**：kretprobe 拿不到入口参数，且
+  `msg_iter.ubuf` 在 `tcp_recvmsg_locked` 执行中会被 `iov_iter_advance` 推进
+  （出口读到的是 base + ret）。所以入口把基址写进 per-CPU 的 `pending` 槽，出口
+  取用后清 `valid`。简化前是按 tid 索引的哈希（跨核也能对上，但每次读要
+  update/lookup/delete）；现在省掉了哈希，代价是**入口/出口必须落在同一 CPU**，
+  见「顺序保证」。
+- **直接 reserve，无 scratch**：`bpf_ringbuf_reserve` 的 size 必须是**编译期
+  常量**（传运行期长度被验证器拒：`R2 is not a known constant`），所以按
+  `sizeof(struct tcp_rec) + MAX_REC` 预留一条记录，用户内存只拷一次进 ring。
+  简化前是「用户内存 → per-CPU scratch → `bpf_ringbuf_output`」的两次拷贝。
+  `MAX_REC=1024` 对齐 `RBUF_NODE_SIZE`（一次 recv 最多吃一个节点）；每条记录
+  固定占 1040B，4MB ring 约可缓存 4000 条。
 - **背压**：socket 非阻塞 + 用户态待发缓冲 `g_pend`，ring 永远即时消费。每轮先
   尽力 flush 再从机应答，**只发不读会把本端 rcvbuf 撑满 → 窗口 0 → 从机写不出
   应答就停摆**。退出前同样要边发边读地收尾（最多 2s）。
 
 ## 顺序保证（本组件的核心约束）
 
-**master 必须 `taskset` 钉到单核。**
+**master 必须 `taskset` 钉到单核；本组件进程不需要绑核。**
 
 ring 是 per-CPU 的，libbpf 按 subring 下标顺序排空。master 单线程又被钉在一个核
 上 → 所有记录只进那一个 subring → 到达序 == 排空序，顺序是**结构性**成立的，不是
 概率。一旦跨核迁移，"先到的记录进了 CPU3 的 subring、后到的进了 CPU0"就会出现，
 而排空是 0 排在 3 前面 —— 顺序就翻了，从库跟着错位。
 
-BPF 给每条成功进 ring 的记录打**全局单调 seq**，用户态逐条核对，对不上立刻报错
-退出并提示钉核。seq 不连续只有两种成因，且都意味着镜像流已不可信：
+简化后 seq 是 **per-CPU 自增**（去掉全局原子操作）。钉核时 per-CPU 值就是全局值；
+跨核时新 CPU 上的计数器从 0 开始，用户态会看到
+`seq 不连续：期望 N 实际 0/1/2…` 并 fail-closed 退出。此时 `drops=0` 说明不是
+ring 满，而是 master 换了 CPU。
 
-1. `drops` 计数 > 0 —— ring 满或记录越界，那一条永久没进 ring；
-2. `drops` 计数 = 0 —— master 跨了 CPU。
+还有一条更隐蔽的：pending 是 **per-CPU 单槽**。一次 recv 若在 CPU A 进入、在 CPU B
+返回，出口查的是 B 的槽：
+
+- B 槽 `valid=0` → 这次读**静默不镜像，seq 也不递增**，用户态的顺序核对发现不了；
+- B 槽残留上一条 `valid=1` → 出口会拿旧 `ub` 去读，镜像出错字节，而 seq 依然连续。
+
+这两种静默错误**无法由组件自检发现**，只能靠钉核从结构上排除。所以「不绑核也能
+跑」是错觉：没迁移时侥幸正确，迁移时可能报错，也可能悄悄错数据。
+
+此外，per-CPU 单槽还隐含「**同一时刻只有一个目标 recv 在飞**」：当前三个引擎都是
+单线程事件循环（AOF 线程不读客户端 socket），成立；若以后 master 改成多线程收
+命令，即使钉在同一核上，多个线程也会互相覆盖这个槽。
 
 **不做用户态有界重排**：重排只在"master 恰好在两次 poll 之间跨了核"时才走到，
 是条几乎测不到的路径，等于往"一个字节都不许错"的数据面上放一段没被测过的代码；
 而 `taskset -c N` 是零代码的。真到必须在多核上跑的那天再加重排，那时有真实触发
 场景可以验证。
+
+### 看到 `seq 不连续` 时先查谁没绑核
+
+`drops=0` 且实际 seq 从 0 起，基本就是 master 跨了 CPU。确认钉的是 master：
+
+```bash
+grep Cpus_allowed_list /proc/$(pgrep -x kvstore)/status   # 应只有一个 CPU 编号
+```
+
+`taskset -c 3 ./repl-tcp_recvmsg` 钉的是组件，**不能**替代钉 master。
 
 ## 设计取舍
 
@@ -109,12 +140,15 @@ BPF 给每条成功进 ring 的记录打**全局单调 seq**，用户态逐条�
 - **失败-关闭**：`seq` 不连续、收到 `len=0` 的毒丸记录，都直接报错退出，不静默错序。
   `len=0` 只有 `bpf_probe_read_user` 失败才会发出 —— 正常路径 `ret > 0` 保证
   `len` 恒 `> 0`，所以它是可靠的"这条读没采到"信号。不这么做的话那条记录会凭空
-  消失而 seq 照常递增，从库静默错位，是最坏的一种。
-- **`on_event` 不判记录长度**：BPF 侧 `bpf_ringbuf_output` 预留的就是
-  `16 + n`，libbpf 回调原样把 reserve 的长度当 `size` 传下来，故 `size` 恒等于
-  `sizeof(*rec) + rec->len`，判界是恒假分支。真出事（长度错）只可能来自 `.bpf.o`
-  与用户态 `struct tcp_rec` 不一致，那是 rec 头里 `seq` 会对不上号、被顺序核对
-  当场拦下，判界挡不住也测不出。
+  消失而 seq 照常递增，从库静默错位，是最坏的一种。它覆盖的是"记录到了但对不上
+  号"和"记录里没数据"；per-CPU pending 跨核时的静默漏采不在自检范围内（见
+  「顺序保证」），所以钉核是前提，不是优化。
+- **`on_event` 的长度判界是恒假兜底**：BPF 侧固定 reserve
+  `sizeof(*rec) + MAX_REC`（1040B），libbpf 回调把 reserve 长度原样作为 `size`
+  传下来，故 `size` 恒为 1040；而 `rec->len ≤ MAX_REC`，所以
+  `rec->len > size - sizeof(*rec)` 永不成立。保留这行只是为了 `.bpf.o` 与用户态
+  `struct tcp_rec` 布局不一致时不至于越界读；镜像流本身的一致性仍由 `seq` 核对
+  负责。
 - **不做周期打印**：附属组件不需要常驻输出，只在退出时打一行汇总（镜像字节与
   条数、待发峰值、退出时未送出的字节、丢采样）。
 
@@ -127,3 +161,8 @@ BPF 给每条成功进 ring 的记录打**全局单调 seq**，用户态逐条�
 | 网络环境 | veth + netns + XDP | 无特殊要求（lo 即可） |
 | 采样内容 | TCP 负载（需按 seq 重组） | 应用读到的字节（天然按序） |
 | 对 master 的要求 | 无（用户态做重组） | **必须 `taskset` 钉单核** |
+| 管道深度（P）上限 | **有**：单段负载 > `MAX_REC`(16384) 整段丢；回环上 `P×45B ≤ 16KB`（约 P≤360） | **无**：采样点在应用读之后，一次 recv ≤ `RBUF_NODE_SIZE`(1024) |
+
+> 本组件没有 P 上限：客户端一次 `write` 再大，内核也只会按 master 的
+> `RBUF_NODE_SIZE=1024` 一段段喂给 `recv`，组件按 recv 切片镜像，从库拼回原流。
+> repl-xdp 的上限来自"按 TCP 段采样"，两者别混。

@@ -8,6 +8,7 @@ sudo ./build/kvstore conf/kvstore-none.conf
 ./build/testcase 127.0.0.1 2000 fill 1 50000
 
 sudo ./build/repl-tcp_recvmsg
+sudo taskset -c 3 build/repl-tcp_recvmsg
 sudo ./build/repl-xdp build/repl-xdp.bpf.o
 
 sudo chmod o+w build/dump.rdb

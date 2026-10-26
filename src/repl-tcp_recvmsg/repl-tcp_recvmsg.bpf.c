@@ -86,9 +86,10 @@ struct {
     __type(value, __u64);
 } cfg SEC(".maps");
 
-/* 记录序号源：每条成功进 ring 的记录 +1（原子），用户态按它核对顺序 */
+/* 记录序号源：每条成功进 ring 的记录 +1。master 钉单核，per-CPU 值即全局值，
+ * 不需要原子操作。 */
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, __u64);
@@ -102,35 +103,30 @@ struct {
     __type(value, __u64);
 } drops SEC(".maps");
 
+/* 不再需要 scratch 中转：emit_rec 直接 bpf_ringbuf_reserve(常量 MAX_REC)，
+ * 用户内存只拷一次进 ring。 */
+
 /*=============================================================================
- *  Per-CPU 中转缓冲（用户内存 → 中转 → ring）
+ *  pending：入口暂存的本次读目标（per-CPU 单槽，出口取用）
+ *
+ *  为什么需要：kretprobe 拿不到入口参数。且 msg_iter.ubuf 在
+ *  tcp_recvmsg_locked 执行中会被 iov_iter_advance 推进（ubuf += n），出口
+ *  读到的是 base + ret，所以必须在入口把基址照下来。
+ *
+ *  master 被 taskset 钉在单核，入口/出口在同一 CPU 上，用 per-CPU 单槽即可，
+ *  不必按 tid 哈希；入口先清 valid，非目标读的出口不会取到上一条。
  *============================================================================*/
 
-struct scratch_rec {
-    struct tcp_rec hdr;
-    unsigned char data[MAX_REC];
+struct pending_rec {
+    __u64 ub;                        /* 本次读的用户缓冲基址 */
+    __u64 valid;
 };
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, struct scratch_rec);
-} scratch SEC(".maps");
-
-/*=============================================================================
- *  pending：入口暂存的本次读目标（按 tid 索引，出口取用）
- *
- *  为什么需要：kretprobe 拿不到入口参数。且 msg_iter.ubuf 在
- *  tcp_recvmsg_locked 执行中会被 iov_iter_advance 推进（ubuf += n），出口
- *  读到的是 base + ret，所以必须在入口把基址照下来。
- *============================================================================*/
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
-    __type(key, __u64);              /* tid */
-    __type(value, __u64);            /* 本次读的用户缓冲基址 */
+    __type(value, struct pending_rec);
 } pending SEC(".maps");
 
 /*=============================================================================
@@ -140,8 +136,12 @@ struct {
 SEC("kprobe")
 int kprobe_tcp_recvmsg_locked(struct pt_regs *ctx)
 {
-    __u64 tgid = bpf_get_current_pid_tgid() >> 32;
     __u32 zero = 0;
+    struct pending_rec *p = bpf_map_lookup_elem(&pending, &zero);
+    if (p)
+        p->valid = 0;                    /* 先清：非目标读的出口不会取到上一条 */
+
+    __u64 tgid = bpf_get_current_pid_tgid() >> 32;
     __u64 *want = bpf_map_lookup_elem(&cfg, &zero);
     if (!want || tgid != *want)
         return 0;                        /* 非目标进程：全系统读都会触发，这里放行 */
@@ -163,8 +163,10 @@ int kprobe_tcp_recvmsg_locked(struct pt_regs *ctx)
     __u64 ub = 0;
     bpf_probe_read_kernel(&ub, 8, &msg->msg_iter.ubuf);
 
-    __u64 tid = bpf_get_current_pid_tgid();
-    bpf_map_update_elem(&pending, &tid, &ub, BPF_ANY);
+    if (p) {
+        p->ub = ub;
+        p->valid = 1;
+    }
     return 0;
 }
 
@@ -182,37 +184,42 @@ int kprobe_tcp_recvmsg_locked(struct pt_regs *ctx)
  * 符号扩展值留在判正负的分支上，而把**原始 RAX** 当长度传进来 —— 验证器眼里
  * 那个值符号未知，直接以 "R2 min value is negative, either use unsigned or
  * 'var &= const'" 拒收（实测踩过）。*/
-static __always_inline void emit_rec(struct scratch_rec *scr, __u64 *seqp,
-                                     const void *ub, __u32 n)
+static __always_inline void emit_rec(__u64 *seqp, const void *ub, __u32 n)
 {
     __u32 zero = 0;
+
+    /* 直接 reserve ring 内存：size 用编译期常量（MAX_REC），用户内存只拷一次，
+     * 省掉 scratch 中转和第二次拷贝。 */
+    struct tcp_rec *rec = bpf_ringbuf_reserve(&events,
+                                              sizeof(struct tcp_rec) + MAX_REC, 0);
+    if (!rec) {
+        /* ring 满：seq 尚未递增，用户态不会等这条；计丢采样 */
+        __u64 *d = bpf_map_lookup_elem(&drops, &zero);
+        if (d)
+            (*d)++;
+        return;
+    }
 
     /* 用户内存读不动：发一条 len=0 的记录当"毒丸"。正常路径 ret > 0 ⇒ len
      * 恒 > 0，所以 len==0 是非法值，用户态见到即 fail-closed 退出。不这么做
      * 的话，这条记录会凭空消失而 seq 照常递增 —— 从库静默错位，最坏的一种。 */
-    if (bpf_probe_read_user(scr->data, n, ub))
+    if (bpf_probe_read_user((char *)rec + sizeof(*rec), n, ub))
         n = 0;
 
-    scr->hdr.len = (__u32)n;
-    scr->hdr.seq = __sync_fetch_and_add(seqp, 1);
-    if (bpf_ringbuf_output(&events, scr, sizeof(struct tcp_rec) + n, 0)) {
-        /* ring 满：seq 已递增而记录没进 ring ⇒ 出现永久空洞，用户态最终
-         * 会因等不到该 seq 而 fail-closed 退出 */
-        __u64 *d = bpf_map_lookup_elem(&drops, &zero);
-        if (d)
-            __sync_fetch_and_add(d, 1);
-    }
+    rec->len = (__u32)n;
+    rec->seq = (*seqp)++;
+    bpf_ringbuf_submit(rec, 0);
 }
 
 SEC("kretprobe")
 int kretprobe_tcp_recvmsg_locked(struct pt_regs *ctx)
 {
-    __u64 tid = bpf_get_current_pid_tgid();
-    __u64 *ubp = bpf_map_lookup_elem(&pending, &tid);
-    if (!ubp)
+    __u32 zero = 0;
+    struct pending_rec *p = bpf_map_lookup_elem(&pending, &zero);
+    if (!p || !p->valid)
         return 0;                        /* 入口没放行（非目标进程 / 非 UBUF） */
-    __u64 ub = *ubp;
-    bpf_map_delete_elem(&pending, &tid);
+    __u64 ub = p->ub;
+    p->valid = 0;
 
     /* 长度判界。tcp_recvmsg_locked 返回 int，先用 64 位无符号比较做粗筛
      * （挡掉 EOF 与所有错误码），真伪由下面那个 if 按 32 位定。
@@ -233,23 +240,20 @@ int kretprobe_tcp_recvmsg_locked(struct pt_regs *ctx)
          * 超过 MAX_REC 字节才命中 —— 那是配置漂移（MAX_REC < rbuf 节点容量），
          * 一条本该镜像的记录没能镜像，计丢采样。 */
         if ((int)raw > MAX_REC) {
-            __u32 k = 0;
-            __u64 *d = bpf_map_lookup_elem(&drops, &k);
+            __u64 *d = bpf_map_lookup_elem(&drops, &zero);
             if (d)
-                __sync_fetch_and_add(d, 1);
+                (*d)++;
         }
         return 0;
     }
     if (raw == 0)
         return 0;                        /* EOF：对端关闭，无字节可镜像 */
 
-    __u32 zero = 0;
     __u64 *seqp = bpf_map_lookup_elem(&seqc, &zero);
-    struct scratch_rec *scr = bpf_map_lookup_elem(&scratch, &zero);
-    if (!seqp || !scr)
+    if (!seqp)
         return 0;
 
-    emit_rec(scr, seqp, (const void *)ub, (__u32)raw);
+    emit_rec(seqp, (const void *)ub, (__u32)raw);
     return 0;
 }
 

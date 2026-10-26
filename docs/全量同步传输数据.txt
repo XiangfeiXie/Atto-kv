@@ -1,0 +1,202 @@
+iperf3
+
+[  5]   0.00-10.00  sec  1.03 GBytes   885 Mbits/sec    1             sender
+[  5]   0.00-10.02  sec  1.03 GBytes   886 Mbits/sec                  receiver
+
+
+[  5]   0.00-10.00  sec   960 MBytes   805 Mbits/sec    5             sender
+[  5]   0.00-10.01  sec   960 MBytes   804 Mbits/sec                  receiver
+
+
+[  5]   0.00-10.00  sec  1.02 GBytes   880 Mbits/sec    5             sender
+[  5]   0.00-10.02  sec  1.03 GBytes   880 Mbits/sec                  receiver
+
+
+[  5]   0.00-10.00  sec   994 MBytes   834 Mbits/sec   22             sender
+[  5]   0.00-10.02  sec   996 MBytes   833 Mbits/sec                  receiver
+
+
+[  5]   0.00-10.00  sec  1.01 GBytes   865 Mbits/sec    5             sender
+[  5]   0.00-10.02  sec  1.01 GBytes   865 Mbits/sec                  receiver
+
+
+ib_write_bw
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    46               0.00               7.63   		   0.000008
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    54               0.00               8.88   		   0.000009
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    52               0.00               8.36   		   0.000008
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    56               0.00               9.28   		   0.000009
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    43               0.00               6.94   		   0.000007
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    52               0.00               8.57   		   0.000009
+
+sendfile
+
+
+[sendfile] recv-end: bytes=158400008 wait=1867.6ms rate=84.81MB/s  (discard)
+
+[sendfile] recv-end: bytes=158400008 wait=1847.0ms rate=85.76MB/s  (discard)
+
+[sendfile] recv-end: bytes=158400008 wait=1954.0ms rate=81.06MB/s  (discard)
+
+[sendfile] recv-end: bytes=158400008 wait=1673.9ms rate=94.63MB/s  (discard)
+
+[sendfile] recv-end: bytes=158400008 wait=1542.8ms rate=102.67MB/s  (discard)
+
+
+rdma
+
+[rdma] xfer-end: bytes=158400008 xfer=18979.8ms rate=8.35MB/s | prep: conn=320289.9ms read4529.6ms
+
+
+[rdma] xfer-end: bytes=158400008 xfer=20329.2ms rate=7.79MB/s | prep: conn=3339.1ms read=1284.6ms
+
+
+[rdma] xfer-end: bytes=158400008 xfer=19273.1ms rate=8.22MB/s | prep: conn=3547.2ms read=325.5ms
+
+
+[rdma] xfer-end: bytes=158400008 xfer=18107.9ms rate=8.75MB/s | prep: conn=2951.9ms read=219.8ms
+
+
+[rdma] xfer-end: bytes=158400008 xfer=18329.3ms rate=8.64MB/s | prep: conn=3009.0ms read=293.7ms
+
+预热sendfile
+
+[sendfile] xfer-end: bytes=158400008 xfer=1899.3ms rate=83.40MB/s | tail=41.8ms
+
+[sendfile] xfer-end: bytes=158400008 xfer=1901.5ms rate=83.30MB/s | tail=29.2ms
+
+[sendfile] xfer-end: bytes=158400008 xfer=1885.9ms rate=83.99MB/s | tail=39.4ms
+
+[sendfile] xfer-end: bytes=158400008 xfer=1843.1ms rate=85.94MB/s | tail=46.1ms
+
+[sendfile] xfer-end: bytes=158400008 xfer=1860.2ms rate=85.15MB/s | tail=40.4ms
+
+同尺寸iperf3
+
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-2.00   sec   152 MBytes   636 Mbits/sec  134             sender
+[  5]   0.00-2.04   sec   152 MBytes   626 Mbits/sec                  receiver
+
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-2.01   sec   152 MBytes   636 Mbits/sec   88             sender
+[  5]   0.00-2.01   sec   152 MBytes   635 Mbits/sec                  receiver
+
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-2.01   sec   152 MBytes   636 Mbits/sec   23             sender
+[  5]   0.00-2.01   sec   152 MBytes   635 Mbits/sec                  receiver
+
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-2.01   sec   152 MBytes   636 Mbits/sec   86             sender
+[  5]   0.00-2.01   sec   152 MBytes   635 Mbits/sec                  receiver
+
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-2.01   sec   152 MBytes   636 Mbits/sec   87             sender
+[  5]   0.00-2.01   sec   152 MBytes   635 Mbits/sec                  receiver
+
+
+2Q
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    57               0.00               9.39   		   0.000009
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    58               0.00               9.63   		   0.000010
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    58               0.00               9.63   		   0.000010
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    57               0.00               9.46   		   0.000009
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    56               0.00               9.24   		   0.000009
+
+
+8Q
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    253              0.00               42.17  		   0.000042
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    243              0.00               40.50  		   0.000041
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    244              0.00               40.45  		   0.000040
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    247              0.00               41.17  		   0.000041
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    244              0.00               40.66  		   0.000041
+
+
+4 QP + 深度 4
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    243              0.00               40.50  		   0.000040
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    248              0.00               41.33  		   0.000041
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    230              0.00               38.33  		   0.000038
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    238              0.00               39.60  		   0.000040
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    227              0.00               37.83  		   0.000038
+
+
+kvstore-rdma
+
+[rdma] xfer-end: bytes=158400012 xfer=19877.4ms rate=7.97MB/s | prep: conn=10895.8ms ser=1669.5ms reg=25.1ms | at=10-25 12:18:01.540
+
+[rdma] xfer-end: bytes=158400012 xfer=21880.5ms rate=7.24MB/s | prep: conn=398.2ms ser=1244.6ms reg=6.4ms | at=10-25 12:18:58.503
+
+[rdma] xfer-end: bytes=158400012 xfer=18864.5ms rate=8.40MB/s | prep: conn=378.3ms ser=534.6ms reg=6.6ms | at=10-25 12:20:10.351
+
+[rdma] xfer-end: bytes=158400012 xfer=23021.0ms rate=6.88MB/s | prep: conn=344.0ms ser=466.2ms reg=6.2ms | at=10-25 12:20:56.515
+
+[rdma] xfer-end: bytes=158400012 xfer=19673.3ms rate=8.05MB/s | prep: conn=470.8ms ser=474.7ms reg=4.9ms | at=10-25 12:21:45.104
+
+
+kvstore-sendfile
+
+[sendfile] xfer-end: bytes=158400008 xfer=1377.0ms rate=115.04MB/s | prep: save=2789.8ms | at=10-25 13:11:09.484
+
+[sendfile] xfer-end: bytes=158400008 xfer=1437.8ms rate=110.17MB/s | prep: save=2708.7ms | at=10-25 13:11:36.467
+
+[sendfile] xfer-end: bytes=158400008 xfer=1535.7ms rate=103.15MB/s | prep: save=2829.0ms | at=10-25 13:11:52.896
+
+[sendfile] xfer-end: bytes=158400008 xfer=1386.9ms rate=114.21MB/s | prep: save=2629.6ms | at=10-25 13:12:07.766
+
+[sendfile] xfer-end: bytes=158400008 xfer=1436.4ms rate=110.28MB/s | prep: save=2786.1ms | at=10-25 13:12:22.743
+
+
+

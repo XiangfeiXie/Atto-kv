@@ -1,0 +1,79 @@
+taskset -c 1 redis-server --port 2000 --save "" --appendonly no
+
+taskset -c 1 redis-server --port 2000 --save "" --appendonly yes --appendfsync everysec
+
+taskset -c 1 build/kvstore conf/kvstore-none.conf
+
+
+taskset -c 3 redis-benchmark -p 2000 -c 1 -n 100000 -t ping_mbulk
+
+taskset -c 3 redis-benchmark -p 2000 -c 1 -n 100000 -P 1 -t set
+
+bash ./test/bench/bench_pipeline.sh 80
+
+bash ./test/bench/bench_redis.sh 80
+
+./test/bench/bench_mem.sh
+
+./test/bench/bench_tcp_recvmsg.sh 40
+
+./test/bench/bench_xdp.sh 40
+
+./test/bench/bench_incr_sync.sh 40
+
+
+taskset -c 3 build/testcase 127.0.0.1 2000 savebench   1000 20
+taskset -c 3 build/testcase 127.0.0.1 2000 nosave
+sudo rm -rf build/dump.rdb
+
+
+taskset -c 1 iperf3 -s -p 2000
+taskset -c 3 iperf3 -c 192.168.30.137 -p 2000 -Z -t 10 -O 3 -i 1  -l 1M
+
+
+./build/xfer-sendfile server build/dump.rdb 2100
+./build/xfer-sendfile client 192.168.30.137 2100 --discard
+
+
+ib_write_bw -d rxe0 -R -i 1 -p 18515 -s 1048576 -t 128 -q 1
+ib_write_bw -d rxe0 -R -i 1 -p 18515 -s 1048576 -t 128 -q 1 192.168.30.137
+
+ib_write_bw -p 18515 -s 1048576 -t 1 -q 1
+ib_write_bw -p 18515 -s 1048576 -t 1 -q 1 192.168.30.137
+
+./build/xfer-rdma server build/dump.rdb 2200
+./build/xfer-rdma client 192.168.30.137 2200 --discard
+
+
+taskset -c 3 redis-benchmark -p 2000 -c 1 -n 100000 -t ping_mbulk
+
+taskset -c 1 build/kvstore conf/kvstore-master.conf
+
+taskset -c 1 build/kvstore conf/kvstore-slave.conf
+
+
+
+ldd build/kvstore | grep -i jemalloc
+
+
+
+
+sudo rm -f /var/lib/redis/appendonly.aof
+
+sudo rm -f /var/lib/redis/dump.rdb
+
+
+
+cat /proc/[PID]/status | grep -i vm
+
+sudo perf record -F 99 -p 5000 -g -- sleep 20
+
+sudo perf script -i perf.data &> perf.unfold
+
+sudo ~/FlameGraph/stackcollapse-perf.pl perf.unfold &> perf.folded
+
+sudo ~/FlameGraph/flamegraph.pl perf.folded > test_oncpu.svg
+
+
+cmake .. -DUSE_JEMALLOC=OFF
+

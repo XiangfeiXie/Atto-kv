@@ -333,24 +333,26 @@ int sendfile_client_run(uint64_t *out_token) {
     /*-------------------------------------------------------------------------
      *  4. 接收 token（快照 offset）
      *     交还上层，增量模块据此续传
+     *     与数据区同走 recv_all：服务端先 SAVE（数秒）再发流头，而这里
+     *     在 ntyco 下是非阻塞 fd，MSG_WAITALL 不等数据，会直接返回 EAGAIN
      *-------------------------------------------------------------------------*/
     uint64_t tok = 0;
-    if (recv(fd, &tok, 8, MSG_WAITALL) != 8) { 
-        perror("recv token"); 
-        close(fd); 
-        return -1; 
+    if (recv_all(fd, (char *)&tok, sizeof(tok)) != (ssize_t)sizeof(tok)) {
+        perror("recv token");
+        close(fd);
+        return -1;
     }
     if (out_token) *out_token = be64toh(tok);
     printf("[sendfile] token=%lu\n", (unsigned long)be64toh(tok));
 
     /*-------------------------------------------------------------------------
-     *  5. 接收文件大小
+     *  5. 接收文件大小（同上，必须处理 EAGAIN）
      *-------------------------------------------------------------------------*/
     uint64_t fsz = 0;
-    if (recv(fd, &fsz, 8, MSG_WAITALL) != 8) { 
-        perror("recv size"); 
-        close(fd); 
-        return -1; 
+    if (recv_all(fd, (char *)&fsz, sizeof(fsz)) != (ssize_t)sizeof(fsz)) {
+        perror("recv size");
+        close(fd);
+        return -1;
     }
     fsz = be64toh(fsz);
     printf("[sendfile] %lu bytes\n", (unsigned long)fsz);

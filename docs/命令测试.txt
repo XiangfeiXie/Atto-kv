@@ -1,0 +1,45 @@
+sudo ./build/kvstore conf/kvstore-master.conf
+
+sudo ./build/kvstore conf/kvstore-slave.conf
+
+sudo ./build/kvstore conf/kvstore-none.conf
+
+./build/testcase 127.0.0.1 2000 basic 50000
+./build/testcase 127.0.0.1 2000 fill 1 50000
+
+sudo ./build/repl-tcp_recvmsg
+sudo ./build/repl-xdp build/repl-xdp.bpf.o
+
+sudo chmod o+w build/dump.rdb
+
+
+sudo vim /etc/security/limits.conf
+
+* soft memlock unlimited
+* hard memlock unlimited
+
+
+
+sudo bpftool prog list
+
+sudo bpftool net list
+
+
+
+
+
+git clone --recurse-submodules http://gitlab.0voice.com/xiexiangfei/ai-chat.git
+
+
+
+
+
+
+
+
+
+
+
+
+
+

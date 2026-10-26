@@ -79,6 +79,7 @@ static int          g_master_port     = 0;   /* Master 端口 */
 
 static int          g_incr_enabled    = 1;   /* incr_sync off → 只做一次全量 */
 static long long    g_next_retry      = 0;   /* 下一次允许 tick 行动的时间戳（退避语义见文件头） */
+static int          g_fullsync_in_progress = 0; /* 1=全量进行中：tick 禁止并发 PSYNC */
 
 /*=============================================================================
  *  Master 链路 Handler（slave 出站链路，引擎挂载）
@@ -175,7 +176,15 @@ static int slave_handshake_rbuf(struct rbuf *rb, int *want_close) {
         g_repl_fd = -1;        /* 提前摘链：on_close 将因 fd 不匹配而早退 */
         if (want_close) *want_close = 1;
 
-        if (repl_fullsync_slave_start() == 0) {
+        /* 全量期间控制面已摘链（g_repl_fd < 0），而 ntyco 的 ticker 是独立
+         * 协程：全量客户端在 recv/poll 上让出时它会跑起来，看到“无链路”
+         * 就再发 PSYNC，master 随即 kill 掉正在传输的子进程。用标志把 tick
+         * 挡在全量之外（reactor/proactor 下无此并发，标志同样无害）。 */
+        g_fullsync_in_progress = 1;
+        int fs_ok = (repl_fullsync_slave_start() == 0);
+        g_fullsync_in_progress = 0;
+
+        if (fs_ok) {
             g_fullsync_done = 1;
             repl_incr_slave_reset_offset(); /* 对齐到快照 offset */
             if (!g_incr_enabled) {
@@ -285,17 +294,20 @@ static void slave_adopt(int fd) {
 
 /*=============================================================================
  *  事件循环 Tick（引擎每轮调用）
- *  无链路时推进：连接 / 重连（全量在握手内联完成，tick 不感知）
+ *  无链路时推进：连接 / 重连。全量在握手内联完成；ntyco 的 ticker 是独立
+ *  协程，全量客户端让出时它仍会跑，必须用 g_fullsync_in_progress 挡住并发
+ *  PSYNC（否则 master 会 kill 掉正在传输的子进程）。
  *============================================================================*/
 
 /**
  * Slave 端 Tick（引擎每轮事件循环调用）
  *
- * 行动门槛：非终结（!g_sync_done）、无链路（g_repl_fd < 0）且过了重试时间戳才推进；
- * 链路已建立（g_repl_fd >= 0）时 tick 不做事，等引擎事件。
+ * 行动门槛：非终结（!g_sync_done）、非全量进行中、无链路（g_repl_fd < 0）
+ * 且过了重试时间戳才推进；链路已建立（g_repl_fd >= 0）时 tick 不做事，等引擎事件。
  */
 void repl_incr_slave_tick(void) {
     if (g_sync_done || g_master_ip[0] == '\0') return;  /* 终结 / 未配置 Master */
+    if (g_fullsync_in_progress) return;                 /* 全量进行中：禁止并发 PSYNC */
     if (g_repl_fd >= 0) return;                         /* 链路已建立，等引擎事件 */
 
     long long now = get_time_now();

@@ -112,7 +112,7 @@ FIN 回来时本端 `recv` 返回 0。**协议一个字没改。**
 | ib_write_bw | `-s 1M -t 128 -q 1 -R` | 198.18 / 200.07 / 210.05 | 200.07 | 1.06× |
 | （早先）iperf3 | `-Z`，`-l` 默认、无 `-O` | 2500 / 2575 | — | — |
 
-## 三、全量同步速率汇总
+## 三、全量同步速率汇总（本机回环，dev lo）
 
 150000 键 / 158400008 B。`192.168.30.137` 在本机走 `dev lo`（不出网卡）。
 
@@ -241,3 +241,240 @@ sendfile 全量同步的关键不在主端、也不在网线上，在**从端接
 512 MB 的冷区，才回到零拷贝顶的 93.5%。**大页不是必需品，RFO 才是最后那 15%。**
 RDMA 那条路已顶到 rxe 的软件天花板（209 MB/s，项目落在带内），单条大 WR 传整份 RDB
 没有代价 —— 本机两条路都没有进一步优化的空间。
+
+---
+
+## 四、两台主机间（跨机）原始数据（2026-10-25）
+
+> **本节全部是 `.137`（master）→ `.136`（slave）的跨机数据**，与本文前面的本机回环
+> （`dev lo`）数据是两套环境，**不可混用**。回环没有网卡，跨机受 1 GbE 与 SoftRoCE 限制。
+
+环境：两台相同 VMware VM，`ens33` 1 Gb/s / MTU 1500；RDMA 只有 SoftRoCE `rxe0`
+挂在 `ens33` 上，无真实 RDMA 网卡；4 vCPU、3 GB RAM。iperf3 7.0.15、perftest 24.01。
+快照 150000 键 / 158400008 B。以下为原始读数（`数据.txt` 原样收录）。
+
+### 4.1 原始日志
+
+```text
+iperf3
+
+[  5]   0.00-10.00  sec  1.03 GBytes   885 Mbits/sec    1             sender
+[  5]   0.00-10.02  sec  1.03 GBytes   886 Mbits/sec                  receiver
+
+
+[  5]   0.00-10.00  sec   960 MBytes   805 Mbits/sec    5             sender
+[  5]   0.00-10.01  sec   960 MBytes   804 Mbits/sec                  receiver
+
+
+[  5]   0.00-10.00  sec  1.02 GBytes   880 Mbits/sec    5             sender
+[  5]   0.00-10.02  sec  1.03 GBytes   880 Mbits/sec                  receiver
+
+
+[  5]   0.00-10.00  sec   994 MBytes   834 Mbits/sec   22             sender
+[  5]   0.00-10.02  sec   996 MBytes   833 Mbits/sec                  receiver
+
+
+[  5]   0.00-10.00  sec  1.01 GBytes   865 Mbits/sec    5             sender
+[  5]   0.00-10.02  sec  1.01 GBytes   865 Mbits/sec                  receiver
+
+
+ib_write_bw
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    46               0.00               7.63   		   0.000008
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    54               0.00               8.88   		   0.000009
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    52               0.00               8.36   		   0.000008
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    56               0.00               9.28   		   0.000009
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    43               0.00               6.94   		   0.000007
+
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    52               0.00               8.57   		   0.000009
+
+sendfile
+
+[sendfile] recv-end: bytes=158400008 wait=1867.6ms rate=84.81MB/s  (discard)
+
+[sendfile] recv-end: bytes=158400008 wait=1847.0ms rate=85.76MB/s  (discard)
+
+[sendfile] recv-end: bytes=158400008 wait=1954.0ms rate=81.06MB/s  (discard)
+
+[sendfile] recv-end: bytes=158400008 wait=1673.9ms rate=94.63MB/s  (discard)
+
+[sendfile] recv-end: bytes=158400008 wait=1542.8ms rate=102.67MB/s  (discard)
+
+
+rdma
+
+[rdma] xfer-end: bytes=158400008 xfer=18979.8ms rate=8.35MB/s | prep: conn=320289.9ms read4529.6ms
+
+[rdma] xfer-end: bytes=158400008 xfer=20329.2ms rate=7.79MB/s | prep: conn=3339.1ms read=1284.6ms
+
+[rdma] xfer-end: bytes=158400008 xfer=19273.1ms rate=8.22MB/s | prep: conn=3547.2ms read=325.5ms
+
+[rdma] xfer-end: bytes=158400008 xfer=18107.9ms rate=8.75MB/s | prep: conn=2951.9ms read=219.8ms
+
+[rdma] xfer-end: bytes=158400008 xfer=18329.3ms rate=8.64MB/s | prep: conn=3009.0ms read=293.7ms
+
+
+预热sendfile
+
+[sendfile] xfer-end: bytes=158400008 xfer=1899.3ms rate=83.40MB/s | tail=41.8ms
+
+[sendfile] xfer-end: bytes=158400008 xfer=1901.5ms rate=83.30MB/s | tail=29.2ms
+
+[sendfile] xfer-end: bytes=158400008 xfer=1885.9ms rate=83.99MB/s | tail=39.4ms
+
+[sendfile] xfer-end: bytes=158400008 xfer=1843.1ms rate=85.94MB/s | tail=46.1ms
+
+[sendfile] xfer-end: bytes=158400008 xfer=1860.2ms rate=85.15MB/s | tail=40.4ms
+
+同尺寸iperf3
+
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-2.00   sec   152 MBytes   636 Mbits/sec  134             sender
+[  5]   0.00-2.04   sec   152 MBytes   626 Mbits/sec                  receiver
+
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-2.01   sec   152 MBytes   636 Mbits/sec   88             sender
+[  5]   0.00-2.01   sec   152 MBytes   635 Mbits/sec                  receiver
+
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-2.01   sec   152 MBytes   636 Mbits/sec   23             sender
+[  5]   0.00-2.01   sec   152 MBytes   635 Mbits/sec                  receiver
+
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-2.01   sec   152 MBytes   636 Mbits/sec   86             sender
+[  5]   0.00-2.01   sec   152 MBytes   635 Mbits/sec                  receiver
+
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-2.01   sec   152 MBytes   636 Mbits/sec   87             sender
+[  5]   0.00-2.01   sec   152 MBytes   635 Mbits/sec                  receiver
+
+
+2Q
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    57               0.00               9.39   		   0.000009
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    58               0.00               9.63   		   0.000010
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    58               0.00               9.63   		   0.000010
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    57               0.00               9.46   		   0.000009
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    56               0.00               9.24   		   0.000009
+
+8Q
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    253              0.00               42.17  		   0.000042
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    243              0.00               40.50  		   0.000041
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    244              0.00               40.45  		   0.000040
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    247              0.00               41.17  		   0.000041
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    244              0.00               40.66  		   0.000041
+
+4 QP + 深度 4
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    243              0.00               40.50  		   0.000040
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    248              0.00               41.33  		   0.000041
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    230              0.00               38.33  		   0.000038
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    238              0.00               39.60  		   0.000040
+
+ #bytes     #iterations    BW peak[MB/sec]    BW average[MB/sec]   MsgRate[Mpps]
+ 1048576    227              0.00               37.83  		   0.000038
+
+kvstore-rdma
+
+[rdma] xfer-end: bytes=158400012 xfer=19877.4ms rate=7.97MB/s | prep: conn=10895.8ms ser=1669.5ms reg=25.1ms | at=10-25 12:18:01.540
+
+[rdma] xfer-end: bytes=158400012 xfer=21880.5ms rate=7.24MB/s | prep: conn=398.2ms ser=1244.6ms reg=6.4ms | at=10-25 12:18:58.503
+
+[rdma] xfer-end: bytes=158400012 xfer=18864.5ms rate=8.40MB/s | prep: conn=378.3ms ser=534.6ms reg=6.6ms | at=10-25 12:20:10.351
+
+[rdma] xfer-end: bytes=158400012 xfer=23021.0ms rate=6.88MB/s | prep: conn=344.0ms ser=466.2ms reg=6.2ms | at=10-25 12:20:56.515
+
+[rdma] xfer-end: bytes=158400012 xfer=19673.3ms rate=8.05MB/s | prep: conn=470.8ms ser=474.7ms reg=4.9ms | at=10-25 12:21:45.104
+
+kvstore-sendfile
+
+[sendfile] xfer-end: bytes=158400008 xfer=1377.0ms rate=115.04MB/s | prep: save=2789.8ms | at=10-25 13:11:09.484
+
+[sendfile] xfer-end: bytes=158400008 xfer=1437.8ms rate=110.17MB/s | prep: save=2708.7ms | at=10-25 13:11:36.467
+
+[sendfile] xfer-end: bytes=158400008 xfer=1535.7ms rate=103.15MB/s | prep: save=2829.0ms | at=10-25 13:11:52.896
+
+[sendfile] xfer-end: bytes=158400008 xfer=1386.9ms rate=114.21MB/s | prep: save=2629.6ms | at=10-25 13:12:07.766
+
+[sendfile] xfer-end: bytes=158400008 xfer=1436.4ms rate=110.28MB/s | prep: save=2786.1ms | at=10-25 13:12:22.743
+```
+
+> 读法：`iperf3` / `ib_write_bw` 是第三方基线；`sendfile`（客户端 `recv-end`）和
+> `rdma` 是 `xfer-*` **组件**，`预热sendfile` 是组件服务端 `xfer-end`；
+> `kvstore-rdma` / `kvstore-sendfile` 是 kvstore **应用路径**（master 端 `xfer-end`）。
+> `2Q` / `8Q` / `4 QP + 深度 4` 是 `ib_write_bw` 的多 QP 补充。
+
+### 4.2 四个部分与组件速率
+
+四个部分：TCP 网络（iperf3）、sendfile、ib_write_bw、虚拟 RDMA（SoftRoCE）；下表每行是一项独立测试。
+
+| 测试项 | 中位 | 说明 |
+|---|---|---|
+| **TCP 基线**：iperf3 `-Z -l 1M -t 10 -O 3`（10 s 稳态） | 108.1 MB/s（865 Mbit/s） | 1 GbE 网络顶 |
+| **TCP 同尺寸**：iperf3 `-Z -l 1M -n 158400008`（158 MB 单发） | 79.5 MB/s（636 Mbit/s） | 含慢启动/重传 |
+| **sendfile 组件·客户端**：`xfer-sendfile --discard`（64 KB 栈缓冲） | 85.8 MB/s | 组件纯接收 |
+| **sendfile 组件·服务端**：`xfer-sendfile`（`xfer-end`） | 84.0 MB/s | 含 tail |
+| **sendfile 应用**：kvstore sendfile（master `xfer-end`） | **110.3 MB/s** | `bytes=158400008` |
+| **RDMA 裸 verbs·1 QP**：`ib_write_bw -q 1` | 8.47 MB/s | 1 QP 顶 |
+| **RDMA 裸 verbs·2 QP**：`ib_write_bw -q 2` | 9.46 MB/s | 2 QP 几乎不涨 |
+| **RDMA 裸 verbs·8 QP**：`ib_write_bw -q 8` | 40.66 MB/s | 4.8×，4 vCPU 顶 |
+| **RDMA 裸 verbs·4 QP×深度4**：`ib_write_bw -q 4 -t 4` | 39.60 MB/s | 与 8 QP 同顶 |
+| **RDMA 组件·1 QP**：`xfer-rdma --discard` | 8.35 MB/s | 单 QP |
+| **RDMA 应用·1 QP**：kvstore rdma | 7.97 MB/s | `bytes=158400012` |
+
+### 4.3 观察
+
+- **kvstore sendfile 110.3 MB/s = iperf3 10 秒稳态的 102%**，已贴住 1 GbE。同尺寸
+  iperf3 只有 79.5，说明 158 MB 单发本身到不了 10 秒稳态。
+- **组件 85.8 是同尺寸 iperf3 的 108%**，不是“慢”；它相对 10 秒稳态的 79% 主要来自
+  64 KB 接收缓冲、服务端 tail、源文件缓存状态。kvstore 从端是 512 MB 预触 + 1 MiB
+  `recv_all`，master 的 RDB 又刚由 `rdb_save_sync` 写出（page cache 热），所以应用
+  路径比组件快约 29%。
+- **RDMA 单 QP 已到顶**：perftest 8.47、组件 8.35、kvstore 7.97（94%）。多 QP 8 个到
+  40.66（4.8×），是 4 vCPU/软中断的顶；项目当前仍是 1 QP，本次未改代码。
+- **回环 vs 跨机不可混用**：本节跨机是 1 GbE 的 110/8；前面回环是 1999.5/201.8
+  （不走 `ens33`）。跨机 sendfile 到线速，RDMA 受 rxe 每包 CPU/软中断限制。
+- 本次 kvstore sendfile 的 5 轮数据是修复「流头 token/size 在 ntyco 非阻塞 fd 上
+  EAGAIN」与「slave tick 在全量期间并发 PSYNC 导致 master kill 传输子进程」之后的结果；
+  修复前的两条中断数据（44.98 MB/s、`bytes=108592`）已排除。RDMA 未受这两处修复影响。

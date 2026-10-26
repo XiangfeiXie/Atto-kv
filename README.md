@@ -24,20 +24,34 @@
 | 160 | 189922.25 | −13.9% | 115494.27 | −47.6% | 161134.39 | −26.9% |
 
 
-## 三、全量同步速率汇总
+## 三、全量同步速率汇总（两台主机间）
 
-150000 键 / 158400008 B。`192.168.30.137` 在本机走 `dev lo`（不出网卡）。
+两台相同 VMware VM：`.137`（master）/ `.136`（slave），`ens33` 1 Gb/s、MTU 1500；RDMA 只有 SoftRoCE `rxe0` 挂在 `ens33` 上，**无真实 RDMA 网卡**。快照 150000 键 / 158400008 B。下面为 2026-10-25 跨机实测，原始日志见 `src/xfer/README.md` 第四节；本机回环（`dev lo`）数据见同文件前半部分，两套环境不可直接比较。
 
-| 传输方式 | 被测项 | 接收侧 | 数据分块 | MB/s | 占本路顶 |
-|---|---|---|---|---|---|
-| TCP 零拷贝 | iperf3 `-Z -l 1M`（对照顶） | 1 MB 复用缓冲 | 1 MiB | **2138** | 100% |
-| TCP 零拷贝 | xfer-sendfile 组件 `--discard` | 64 KB 复用栈缓冲 | 64 KB | 1999.50 | 93.5% |
-| TCP 零拷贝 | 项目 sendfile（malloc + 预触） | 512 MB malloc + 预触 | 1 MiB | 1669.22 | 78.1% |
-| TCP 零拷贝 | xfer-sendfile 组件（落 /tmp） | 64 KB 复用栈缓冲 → 文件 | 64 KB | 399.77 | 18.7% |
-| RDMA | ib_write_bw `-t 1`（对照顶） | perftest 注册缓冲 | 1 MiB × 1 | **210.29** | 100% |
-| RDMA | 项目 rdma | 512 MB 注册缓冲（钉页 = 预触） | 整文件 1 个 WR | 201.83 | 96.0% |
+### 3.1 四个部分与组件速率
 
+四个部分：TCP 网络（iperf3）、sendfile、ib_write_bw、虚拟 RDMA（SoftRoCE）。下表把每行被测项写全，不再单列“部分”。
 
+| 测试项 | 中位 (MB/s) | 原始值（MB/s / Mbit/s） | 说明 |
+|---|---|---|---|
+| **TCP 基线**：iperf3 `-Z -l 1M -t 10 -O 3`（10 s 稳态） | **108.1** | 885 / 805 / 880 / 834 / 865 Mbit/s | 1 GbE 网络顶 |
+| **TCP 同尺寸**：iperf3 `-Z -l 1M -n 158400008`（158 MB 单发） | 79.5 | 636 Mbit/s ×5 | 含慢启动/重传 |
+| **sendfile 组件·客户端**：`xfer-sendfile --discard`（`recv-end`，64 KB 栈缓冲） | **85.8** | 84.81 / 85.76 / 81.06 / 94.63 / 102.67 | 组件纯接收 |
+| **sendfile 组件·服务端**：`xfer-sendfile`（`xfer-end`） | 84.0 | 83.40 / 83.30 / 83.99 / 85.94 / 85.15 | 含 tail 29–46 ms |
+| **sendfile 应用**：kvstore sendfile（master `xfer-end`，纯 sendfile 循环） | **110.3** | 115.04 / 110.17 / 103.15 / 114.21 / 110.28 | `bytes=158400008` |
+| **RDMA 裸 verbs·1 QP**：`ib_write_bw -d rxe0 -R -s 1M -q 1` | **8.47** | 7.63 / 8.88 / 8.36 / 9.28 / 6.94 / 8.57 | 1 QP 顶 |
+| **RDMA 裸 verbs·2 QP**：`ib_write_bw ... -q 2` | 9.46 | 9.39 / 9.63 / 9.63 / 9.46 / 9.24 | 2 QP 几乎不涨 |
+| **RDMA 裸 verbs·8 QP**：`ib_write_bw ... -q 8` | **40.66** | 42.17 / 40.50 / 40.45 / 41.17 / 40.66 | 4.8×；4 vCPU/软中断顶 |
+| **RDMA 裸 verbs·4 QP×深度4**：`ib_write_bw ... -q 4 -t 4` | 39.60 | 40.50 / 41.33 / 38.33 / 39.60 / 37.83 | 与 8 QP 同顶 |
+| **RDMA 组件·1 QP**：`xfer-rdma --discard` | 8.35 | 8.35 / 7.79 / 8.22 / 8.75 / 8.64 | 单 QP |
+| **RDMA 应用·1 QP**：kvstore rdma（master `xfer-end`） | **7.97** | 7.97 / 7.24 / 8.40 / 6.88 / 8.05 | `bytes=158400012` |
+
+### 3.2 结论
+
+- kvstore sendfile **110.3 MB/s = iperf3 10 秒稳态的 102%**，已贴住 1 GbE；同尺寸 iperf3 只有 79.5，说明 158 MB 单发本身到不了 10 秒稳态。组件 85.8 是同尺寸 iperf3 的 **108%**，并不慢；它相对 10 秒稳态的 79% 主要来自 64 KB 接收缓冲、服务端 tail 和源文件缓存状态。kvstore 从端是 512 MB 预触 + 1 MiB `recv_all`，master 的 RDB 又刚由 `rdb_save_sync` 写出（page cache 热），所以应用路径比组件快约 29%。
+- RDMA 单 QP：perftest 8.47、组件 8.35、kvstore 7.97（perftest 的 **94%**），单 QP 已到顶；多 QP 8 个到 40.66（4.8×），是 4 vCPU/软中断的顶。项目当前仍是 1 QP，本次未改代码；多 QP 是后续可选项。
+- 本次 kvstore sendfile 的 5 轮数据是修复「流头 token/size 在 ntyco 非阻塞 fd 上 EAGAIN」与「slave tick 在全量期间并发 PSYNC 导致 master kill 传输子进程」之后的结果；修复前的两条中断数据（44.98 MB/s、`bytes=108592`）已排除。RDMA 数据未受这两处修复影响。
+- 1 GbE 上 TCP 108 vs RDMA 单 QP 8，限制在 rxe 的每包 CPU/软中断处理，不是网线；回环 1999.5 / 201.8 的数据不走 `ens33`，不能与本节跨机数据混用。
 ## 四、BGSAVE 对写入性能的影响
 
 `testcase savebench <每轮条数> <轮数>` / `testcase nosave`，配置 `conf/kvstore-none.conf`（ntyco + hash + kv_pool off），P=1 逐条一进一出。每格为多轮 QPS 的**中位数**。

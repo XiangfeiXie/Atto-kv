@@ -74,12 +74,13 @@ repl-tcp_recvmsg [repl-tcp_recvmsg.bpf.o]
 - **按 tgid 过滤**：BPF 对全系统 TCP 读都触发（入口一次数组查找即退），只镜像
   `cfg` map 里那个 master 进程。master 作为服务器只读客户端连接 → 采到的就是
   客户端写入的命令字节流。
-- **入口暂存（pending，per-CPU 单槽）**：kretprobe 拿不到入口参数，且
-  `msg_iter.ubuf` 在 `tcp_recvmsg_locked` 执行中会被 `iov_iter_advance` 推进
-  （出口读到的是 base + ret）。所以入口把基址写进 per-CPU 的 `pending` 槽，出口
-  取用后清 `valid`。简化前是按 tid 索引的哈希（跨核也能对上，但每次读要
-  update/lookup/delete）；现在省掉了哈希，代价是**入口/出口必须落在同一 CPU**，
-  见「顺序保证」。
+- **入口暂存（pending，per-CPU 单槽）**：kretprobe 拿不到入口参数（返回时
+  `msg` 已不在寄存器里），所以入口必须把本次读的用户缓冲基址暂存下来：读
+  `msg_iter.ubuf` 写进 per-CPU 的 `pending` 槽，出口取用后清 `valid`。
+  （6.8 内核的 `ITER_UBUF` 推进的是 `iov_offset`、`count`，`ubuf` 保持基址；
+  入口快照依然是基址。实测见 `P40bench-experiment.md`。）简化前是按 tid 索引的哈希
+  （跨核也能对上，但每次读要 update/lookup/delete）；现在省掉了哈希，代价是
+  **入口/出口必须落在同一 CPU**，见「顺序保证」。
 - **直接 reserve，无 scratch**：`bpf_ringbuf_reserve` 的 size 必须是**编译期
   常量**（传运行期长度被验证器拒：`R2 is not a known constant`），所以按
   `sizeof(struct tcp_rec) + MAX_REC` 预留一条记录，用户内存只拷一次进 ring。
@@ -166,3 +167,53 @@ grep Cpus_allowed_list /proc/$(pgrep -x kvstore)/status   # 应只有一个 CPU 
 > 本组件没有 P 上限：客户端一次 `write` 再大，内核也只会按 master 的
 > `RBUF_NODE_SIZE=1024` 一段段喂给 `recv`，组件按 recv 切片镜像，从库拼回原流。
 > repl-xdp 的上限来自"按 TCP 段采样"，两者别混。
+
+## 性能结论（P=40 实测，2026-10-27）
+
+完整变体定义、逐轮原始数据和环境见 [P40bench-experiment.md](P40bench-experiment.md)。
+下面是便于复盘的结论。
+
+### 损耗模型
+
+```
+loss(P) ≈ A / C(P) + B
+```
+
+- `A`：**每次 recv** 的固定开销（两次 trap、map 查找、ring reserve/copy/submit、
+  用户态 per-record 处理）；
+- `C(P)`：一次 recv 平均装多少条命令。master 的 rbuf 节点固定 1024B，SET 约 45B，
+  所以 `C(P)` 最大约 20；P=1 时 `C=1`，P=10 时约 10，P≥20 后不再增长；
+- `B`：**每条命令**都要付的复制成本（转发到从机、从机执行、额外网络/应答、
+  同宿主竞争），不随 P 摊薄。
+
+### 同批次 P=40 分档（交错 3 轮中位）
+
+| 档 | QPS | 相对 S0 | 说明 |
+|---|---|---|---|
+| S0 无组件 | 55655 | — | 基准 |
+| S1 空挂载（程序立刻返回） | 52387 | −5.9% | 两次 trap 本身 |
+| S2 完整逻辑、不做 ring 拷贝 | 51624 | −7.2% | 程序逻辑再 −1.3% |
+| S4 当前完整组件 | 46440 | **−16.6%** | ring + 用户态转发 + 从机再 −9.4% |
+| S5 fexit 单点原型 | 47579 | −14.5% | 比 S4 快约 2.5% |
+
+### 结论
+
+1. **eBPF 程序逻辑很便宜**（约 1.3%）；两次 trap 约 6%；ring + 用户态转发 +
+   从机约 9–10%。继续微调 BPF 程序逻辑不会有明显收益。
+2. **高 P 的平台不是 eBPF per-recv 开销**。那部分在 P≥20 已被摊薄到约
+   `A/20 ≈ 0.4` 个百分点；平台的大头是每条命令的复制/从机/宿主成本，eBPF 侧
+   优化动不了它。
+3. **P=1 / ping 最差**：每条命令一次 recv，per-recv 开销全额付；P≥20 一次 recv
+   装约 20 条，曲线走平。曲线形状由 `RBUF_NODE_SIZE=1024` 决定。
+4. **简化（删 hash/scratch/原子 seq）主要砍 `A`**：P=1/ping 改善约 7–8 个百分点，
+   高 P 只改善约 1–2 个百分点，所以新版折损曲线看起来比旧版平。
+5. **fexit 单点可行**：当前 6.8.0-147 上可挂载，功能已验证；该内核 `ITER_UBUF`
+   的 `ubuf` 保持基址、`iov_offset += ret`、`count -= ret`，单点取数公式为
+   `base = ubuf + iov_offset - ret`。P=40 约 +2.5%，P=1 预期更明显。**本轮未落地
+   到仓库代码**。
+6. **`BPF_RB_NO_WAKEUP` + 现有 `ring_buffer__poll(20)` 不可用**：超时返回不会主动
+   排空 ring，会填满并丢采样（实测 195999/200001 条），功能失效；不要走这条路。
+7. **折损率要看清基准批次**：README 根目录表里的折损率是拿新组件数据除以另一
+   批次的基准，P=40 显示 −28.7%；同批次交错只有 −16.6%。曲线形状可信，P=20/40
+   的 1–3 个百分点凸起在噪声范围内。
+8. **master 绑核的结论不变**；组件进程本身仍不需要绑核。

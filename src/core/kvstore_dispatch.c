@@ -5,6 +5,7 @@
  *============================================================================*/
 
 #include "kvstore_internal.h"
+#include "kvstore_vector.h"   /* 向量命令：VSET / VGET / VDEL / VSEARCH */
 #include "repl.h"
 #include "persistence.h"
 
@@ -273,6 +274,27 @@ dispatch_result_t kvs_dispatch(kvs_token_t *tokens, int argc,
             reply_integer(wb, 0);
         }
         return DISPATCH_OK;
+    }
+
+    /*=========================================================================
+     *  向量命令：VSET / VGET / VDEL / VSEARCH（实现在 kvstore_vector.c）
+     *
+     *  向量就是 payload 带 16B 头的普通 KV 记录，所以这里只做路由：
+     *  VSET/VDEL 置 journaled=1，把整条原始命令交给 AOF/增量复制；
+     *  VGET/VSEARCH 纯读，journaled 保持 0。
+     *
+     *  先用「长度 ≥ 4 且首字母 V」收口，普通 GET/SET 热路径只多一次
+     *  cmd.len 比较和一次 cmd.ptr[0] 比较，不会走四次 memcmp。
+     *=========================================================================*/
+    if (cmd.len >= 4 && cmd.ptr[0] == 'V') {
+        if (TOKEN_EQ(cmd, "VSET"))
+            return vec_cmd_vset(tokens, argc, wb, journaled);
+        if (TOKEN_EQ(cmd, "VGET"))
+            return vec_cmd_vget(tokens, argc, wb, journaled);
+        if (TOKEN_EQ(cmd, "VDEL"))
+            return vec_cmd_vdel(tokens, argc, wb, journaled);
+        if (TOKEN_EQ(cmd, "VSEARCH"))
+            return vec_cmd_vsearch(tokens, argc, wb, journaled);
     }
 
     /* QUIT：关闭连接（响应后由上层关闭） */

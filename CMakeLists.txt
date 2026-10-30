@@ -76,6 +76,7 @@ set(CORE_SRCS
     src/core/kvstore_config.c
     src/core/kvstore_dispatch.c
     src/core/kvstore_info.c
+    src/core/kvstore_vector.c
 )
 
 # 存储引擎：kv_engine.c 只是路由层（选哪个引擎）；其余四个文件各是一个独立
@@ -206,6 +207,7 @@ target_include_directories(kvstore PRIVATE
 )
 
 target_link_libraries(kvstore PRIVATE
+    m                # sqrt：向量归一化（kvstore_vector.c）
     pthread          # ① NtyCo 协程库传递依赖（pthread TLS）；② AOF 专用落盘线程（persist_aof.c）
     ${NTYCO_LIB}
     ${URING_LIBRARIES}
@@ -224,6 +226,7 @@ add_dependencies(kvstore ntyco)
 # 编译同原 `gcc -O2 -o build/testcase test/testcase.c`，随默认构建一起产出。
 add_executable(testcase ${CMAKE_SOURCE_DIR}/test/testcase.c)
 target_compile_options(testcase PRIVATE -Wall -Wextra)
+target_link_libraries(testcase PRIVATE m)   # sqrt：vector 用例算相近向量点积
 
 # ── engtest（引擎内存账本自检）─────────────────────────────────────────────
 # 不连网络，直接把四个引擎各驱动一遍增删改查 + 变长重建，以 kv_pool 的账本

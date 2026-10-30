@@ -20,6 +20,7 @@
  *    ./build/testcase <ip> <port> verify   <start> <count>
  *    ./build/testcase <ip> <port> expire   <start> <count> <ttl>
  *    ./build/testcase <ip> <port> dbsize   [loop]
+ *    ./build/testcase <ip> <port> vector   [loop]
  *    ./build/testcase <ip> <port> savebench <per_round> <rounds>
  *      basic    — SET/MOD/DEL/TTL 的 CRUD 闭环（含冲突与 ttl 分支），循环 loop 次
  *      pipeline — 打包发送 P 条 SET，批量读回并校验；对每个 P 循环 loop 次，
@@ -35,6 +36,9 @@
  *                 每轮 FLUSHALL 归零 → 新增 / 等长改写 / 变长改写 /
  *                 冲突 / 未命中 / DEL / 重复 DEL / DEL 不存在，逐步断言。
  *                 注意：会清空实例数据，只能对测试实例运行
+ *      vector   — VSET/VGET/VDEL/VSEARCH 的读写与 top-k 检索闭环
+ *                 （二进制 float blob、同分排序、MINSIM、过期跳过）；
+ *                 同样会 FLUSHALL 清空实例数据，只能对测试实例运行
  *      savebench— 周期性 BGSAVE 对写入 QPS/延迟的影响：每写 per_round 条 SET
  *                 发一次 BGSAVE，共 rounds 轮，最后报 QPS / P50 / P99。
  *                 服务端由调用方自行启动；key 单调递增、全程不重复。
@@ -51,6 +55,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <math.h>
 #include <unistd.h>
 #include <time.h>
 #include <arpa/inet.h>
@@ -344,6 +349,272 @@ void basic_cmds(int fd, int loop) {
         }
     }
     report(c0, t0, "basic loop=%d", loop);
+}
+
+/*=============================================================================
+ *  vector_cmds — VSET / VGET / VDEL / VSEARCH 的循环 CRUD 测试
+ *
+ *  testcase 原有的 resp_cmd 用 %s + strlen 拼 RESP，放不了含 \0 的 float
+ *  blob；这里按长度构造命令，并用 recv_reply 逐段读数组回复。
+ *  只做基本闭环：写入 → 读回 → 覆盖清 TTL → 检索 → 删除，不测参数错误、
+ *  过期和同分顺序，保持和 basic_cmds 同量级。
+ *
+ *  注意：会 FLUSHALL 清空实例数据，只能对测试实例运行。
+ *============================================================================*/
+
+/** RESP 参数切片：按长度传，二进制安全（float blob 含 \0） */
+typedef struct { const void *ptr; int len; } rarg_t;
+
+/** 构造一条 RESP 命令，参数按 (ptr,len) 传；返回总长度；失败 -1 */
+static int resp_cmd_bin(char *buf, int cap, int argc, const rarg_t *args) {
+    int n = snprintf(buf, cap, "*%d\r\n", argc);
+    if (n < 0 || n >= cap) return -1;
+    for (int i = 0; i < argc; i++) {
+        int len = args[i].len;
+        int w = snprintf(buf + n, cap - n, "$%d\r\n", len);
+        if (w < 0 || n + w + len + 2 > cap) return -1;
+        n += w;
+        if (len) memcpy(buf + n, args[i].ptr, (size_t)len);
+        n += len;
+        buf[n++] = '\r';
+        buf[n++] = '\n';
+    }
+    return n;
+}
+
+static void vec_send(int fd, const rarg_t *a, int argc, const char *what) {
+    char cmd[256];
+    int n = resp_cmd_bin(cmd, sizeof cmd, argc, a);
+    if (n < 0) {
+        fprintf(stderr, "==> FAILED -> %s: 命令构造失败\n", what);
+        exit(1);
+    }
+    send_all(fd, cmd, n);
+    g_cmds++;
+}
+
+/** 从一条 bulk 回复里取 body 指针/长度；0 成功 */
+static int bulk_body(const char *rep, int n, const char **body, int *blen) {
+    const char *nl = strchr(rep, '\n');
+    if (!nl) return -1;
+    int hl = (int)(nl - rep) + 1;
+    *body = rep + hl;
+    *blen = n - hl - 2;          /* 去掉 body 尾部 CRLF */
+    return (*blen < 0) ? -1 : 0;
+}
+
+/** VSET key dim blob [META meta] [EX sec]；meta/ex 传 NULL 表示省略 */
+static void vec_vset(int fd, const char *key, const char *dim,
+                     const void *blob, int blen,
+                     const char *meta, const char *ex) {
+    rarg_t a[8];
+    int n = 0;
+    a[n++] = (rarg_t){ "VSET", 4 };
+    a[n++] = (rarg_t){ key, (int)strlen(key) };
+    a[n++] = (rarg_t){ dim, (int)strlen(dim) };
+    a[n++] = (rarg_t){ blob, blen };
+    if (meta) {
+        a[n++] = (rarg_t){ "META", 4 };
+        a[n++] = (rarg_t){ meta, (int)strlen(meta) };
+    }
+    if (ex) {
+        a[n++] = (rarg_t){ "EX", 2 };
+        a[n++] = (rarg_t){ ex, (int)strlen(ex) };
+    }
+    vec_send(fd, a, n, "VSET");
+    expect_reply("+OK\r\n", "VSET");
+}
+
+/** VGET 并校验 [dim, 归一化向量, meta]；want_meta 为空串表示空 meta */
+static void vec_vget(int fd, const char *key, int dim,
+                     const float *want, const char *want_meta) {
+    rarg_t a[2] = { { "VGET", 4 }, { key, (int)strlen(key) } };
+    vec_send(fd, a, 2, "VGET");
+
+    char rep[MAX_MSG_LENGTH];
+    expect_reply("*3\r\n", "VGET 数组头");
+    if (recv_reply(&g_rb, rep, sizeof rep) < 0 ||
+        rep[0] != ':' || atoi(rep + 1) != dim) {
+        printf("==> FAILED -> VGET dim 不符\n");
+        exit(1);
+    }
+
+    int n = recv_reply(&g_rb, rep, sizeof rep);
+    const char *body;
+    int blen;
+    if (n < 0 || bulk_body(rep, n, &body, &blen) < 0 || blen != dim * 4) {
+        printf("==> FAILED -> VGET vector bulk 不符\n");
+        exit(1);
+    }
+    for (int i = 0; i < dim; i++) {
+        float got;
+        memcpy(&got, body + i * 4, sizeof got);
+        if (fabsf(got - want[i]) > 1e-5f) {
+            printf("==> FAILED -> VGET vector[%d] 不符\n", i);
+            exit(1);
+        }
+    }
+
+    n = recv_reply(&g_rb, rep, sizeof rep);
+    if (n < 0 || bulk_body(rep, n, &body, &blen) < 0 ||
+        blen != (int)strlen(want_meta) ||
+        memcmp(body, want_meta, (size_t)blen) != 0) {
+        printf("==> FAILED -> VGET meta 不符\n");
+        exit(1);
+    }
+}
+
+static void vec_vget_nil(int fd, const char *key) {
+    rarg_t a[2] = { { "VGET", 4 }, { key, (int)strlen(key) } };
+    vec_send(fd, a, 2, "VGET nil");
+    expect_reply("$-1\r\n", "VGET nil");
+}
+
+typedef struct {
+    char   key[64];
+    double score;
+} vhit_t;
+
+/** VSEARCH 并收集结果；返回条数（结果多于 max 视为失败） */
+static int vec_vsearch(int fd, const char *topk, const char *dim,
+                       const void *blob, int blen, const char *minsim,
+                       vhit_t *out, int max) {
+    rarg_t a[6];
+    int n = 0;
+    a[n++] = (rarg_t){ "VSEARCH", 7 };
+    a[n++] = (rarg_t){ topk, (int)strlen(topk) };
+    a[n++] = (rarg_t){ dim, (int)strlen(dim) };
+    a[n++] = (rarg_t){ blob, blen };
+    if (minsim) {
+        a[n++] = (rarg_t){ "MINSIM", 6 };
+        a[n++] = (rarg_t){ minsim, (int)strlen(minsim) };
+    }
+    vec_send(fd, a, n, "VSEARCH");
+
+    char rep[MAX_MSG_LENGTH];
+    if (recv_reply(&g_rb, rep, sizeof rep) < 0 || rep[0] != '*') {
+        printf("==> FAILED -> VSEARCH 数组头不符\n");
+        exit(1);
+    }
+    int cnt = atoi(rep + 1);
+    if (cnt < 0 || cnt > max) {
+        printf("==> FAILED -> VSEARCH 结果条数 %d 超过 %d\n", cnt, max);
+        exit(1);
+    }
+
+    for (int i = 0; i < cnt; i++) {
+        const char *body;
+        int blen;
+        expect_reply("*2\r\n", "VSEARCH item");
+
+        n = recv_reply(&g_rb, rep, sizeof rep);
+        if (n < 0 || bulk_body(rep, n, &body, &blen) < 0 ||
+            blen >= (int)sizeof out[i].key) {
+            printf("==> FAILED -> VSEARCH key 不符\n");
+            exit(1);
+        }
+        memcpy(out[i].key, body, (size_t)blen);
+        out[i].key[blen] = '\0';
+
+        char sbuf[64];
+        n = recv_reply(&g_rb, rep, sizeof rep);
+        if (n < 0 || bulk_body(rep, n, &body, &blen) < 0 ||
+            blen >= (int)sizeof sbuf) {
+            printf("==> FAILED -> VSEARCH score 不符\n");
+            exit(1);
+        }
+        memcpy(sbuf, body, (size_t)blen);
+        sbuf[blen] = '\0';
+        out[i].score = strtod(sbuf, NULL);
+    }
+    return cnt;
+}
+
+static void vec_vdel(int fd, const char *key, const char *expect) {
+    rarg_t a[2] = { { "VDEL", 4 }, { key, (int)strlen(key) } };
+    vec_send(fd, a, 2, "VDEL");
+    expect_reply(expect, "VDEL");
+}
+
+void vector_cmds(int fd, int loop) {
+    char cmd[MAX_MSG_LENGTH];
+    long long c0 = g_cmds;
+    double    t0 = now_ms();
+
+    static const float A[4]    = { 1, 0, 0, 0 };
+    static const float NEAR[4] = { 0.9f, 0.1f, 0, 0 };
+    static const float B[4]    = { 0, 1, 0, 0 };
+    char blobA[16], blobNear[16], blobB[16];
+    memcpy(blobA, A, sizeof blobA);
+    memcpy(blobNear, NEAR, sizeof blobNear);
+    memcpy(blobB, B, sizeof blobB);
+
+    /* NEAR 归一化后与 A 的点积 */
+    double near_dot = 0.9 / sqrt(0.9 * 0.9 + 0.1 * 0.1);
+    const char *dim = "4";
+    vhit_t hit[8];
+
+    resp_cmd(cmd, sizeof cmd, 1, "FLUSHALL");
+    exec_cmd(fd, cmd, "+OK\r\n", "vector FLUSHALL");
+    if (vec_vsearch(fd, "10", dim, blobA, 16, NULL, hit, 8) != 0) {
+        printf("==> FAILED -> 空索引 VSEARCH 应返回空数组\n");
+        exit(1);
+    }
+
+    int step = loop / 10;
+    if (step < 1) step = 1;
+
+    for (int i = 0; i < loop; i++) {
+        /* 增：VSET 带 META/EX；查：VGET；TTL 生效 */
+        vec_vset(fd, "v:k1", dim, blobA, 16, "m1", "60");
+        vec_vget(fd, "v:k1", 4, A, "m1");
+        resp_cmd(cmd, sizeof cmd, 2, "TTL", "v:k1");
+        exec_cmd_prefix(fd, cmd, ":", "VSET EX 后 TTL");
+
+        /* 改：不带 EX 覆盖，TTL 清除 */
+        vec_vset(fd, "v:k1", dim, blobA, 16, NULL, NULL);
+        resp_cmd(cmd, sizeof cmd, 2, "TTL", "v:k1");
+        exec_cmd(fd, cmd, ":-1\r\n", "覆盖后 TTL=-1");
+
+        vec_vset(fd, "v:k2", dim, blobNear, 16, "m2", NULL);
+        vec_vset(fd, "v:k3", dim, blobB, 16, NULL, NULL);
+
+        /* 查：top-2 分数降序 */
+        int n = vec_vsearch(fd, "2", dim, blobA, 16, NULL, hit, 8);
+        if (n != 2 ||
+            strcmp(hit[0].key, "v:k1") != 0 || fabs(hit[0].score - 1.0) > 1e-4 ||
+            strcmp(hit[1].key, "v:k2") != 0 ||
+            fabs(hit[1].score - near_dot) > 1e-4) {
+            printf("==> FAILED -> VSEARCH top2 结果不符\n");
+            exit(1);
+        }
+
+        /* 查：MINSIM 过滤掉正交向量 */
+        n = vec_vsearch(fd, "5", dim, blobA, 16, "0.999", hit, 8);
+        if (n != 1 || strcmp(hit[0].key, "v:k1") != 0) {
+            printf("==> FAILED -> VSEARCH MINSIM 结果不符\n");
+            exit(1);
+        }
+
+        /* 普通键：VGET nil、VDEL 不删 */
+        resp_cmd(cmd, sizeof cmd, 3, "SET", "v:plain", "hello");
+        exec_cmd(fd, cmd, "+OK\r\n", "SET 普通键");
+        vec_vget_nil(fd, "v:plain");
+        vec_vdel(fd, "v:plain", ":0\r\n");
+        resp_cmd(cmd, sizeof cmd, 2, "GET", "v:plain");
+        exec_cmd(fd, cmd, "$5\r\nhello\r\n", "VDEL 后普通键仍在");
+
+        /* 删：VDEL 向量键，重复删除回 :0 */
+        vec_vdel(fd, "v:k2", ":1\r\n");
+        vec_vget_nil(fd, "v:k2");
+        vec_vdel(fd, "v:k2", ":0\r\n");
+
+        if ((i + 1) % step == 0) {
+            printf("  ... vector %d/%d 轮\n", i + 1, loop);
+            fflush(stdout);
+        }
+    }
+    report(c0, t0, "vector loop=%d", loop);
 }
 
 /*=============================================================================
@@ -842,6 +1113,7 @@ static void usage(const char *prog) {
     printf("  %s <ip> <port> verify   <start> <count>\n", prog);
     printf("  %s <ip> <port> expire   <start> <count> <ttl>\n", prog);
     printf("  %s <ip> <port> dbsize   [loop]\n", prog);
+    printf("  %s <ip> <port> vector   [loop]\n", prog);
     printf("  %s <ip> <port> savebench <per_round> <rounds>\n", prog);
     printf("  %s <ip> <port> nosave\n", prog);
 }
@@ -927,6 +1199,8 @@ int main(int argc, char *argv[]) {
         expire_cmds(g_rb.fd, fstart, fcount, fttl);
     } else if (strcmp(test, "dbsize") == 0) {
         dbsize_cmds(g_rb.fd, loop);
+    } else if (strcmp(test, "vector") == 0) {
+        vector_cmds(g_rb.fd, loop);
     } else if (strcmp(test, "savebench") == 0) {
         savebench_cmds(g_rb.fd, sb_per, sb_rounds);
     } else if (strcmp(test, "nosave") == 0) {
